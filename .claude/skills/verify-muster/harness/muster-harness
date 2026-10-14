@@ -1,0 +1,647 @@
+#!/usr/bin/env python3
+"""muster-harness: drive the REAL muster CLI and `muster ui` web panel in an isolated sandbox.
+
+Python 3 standard library only. Subcommands (run `muster-harness -h`):
+  launch <run-id>                         build if needed, isolate, init, start UI, log in
+  doctor <run-id>                         read-only health check of the launched instance
+  cli <run-id> [--stdin T|-] -- ARGS...   run `muster ARGS` inside the sandbox
+  api <run-id> GET|POST PATH [JSON|@file|-]   call the web API with the session cookie
+  tree <run-id> [label]                   hash config/state files into evidence
+  leakcheck <run-id> NEEDLE               fail if NEEDLE appears in any sandbox file
+  screenshot <run-id> VIEW OUT.png [--eval JS]   headless Chrome shot of a panel view
+  cleanup <run-id> [--keep-scratch]       stop ONLY our UI process, remove scratch (never evidence)
+
+Layout: scratch /tmp/muster-verify/<id>/ (deleted by cleanup),
+        evidence /tmp/muster-verify-evidence/<id>/ (never deleted by this tool).
+Override roots with MUSTER_VERIFY_ROOT / MUSTER_VERIFY_EVIDENCE_ROOT, binary with MUSTER_BIN.
+"""
+import base64
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+import urllib.parse
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+SCRATCH_ROOT = Path(os.environ.get("MUSTER_VERIFY_ROOT", "/tmp/muster-verify"))
+EVIDENCE_ROOT = Path(os.environ.get("MUSTER_VERIFY_EVIDENCE_ROOT", "/tmp/muster-verify-evidence"))
+REDACT_KEYS = {"value", "plaintext", "secret", "password"}
+
+
+def die(msg, code=1):
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def repo_root():
+    out = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=SCRIPT_DIR,
+                         capture_output=True, text=True)
+    if out.returncode != 0:
+        die("cannot resolve repo root with git rev-parse --show-toplevel")
+    return Path(out.stdout.strip())
+
+
+def git_head(root):
+    out = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True)
+    return out.stdout.strip()
+
+
+class Run:
+    def __init__(self, run_id):
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", run_id or ""):
+            die("run-id must match [A-Za-z0-9._-]+")
+        self.id = run_id
+        self.scratch = SCRATCH_ROOT / run_id
+        self.evidence = EVIDENCE_ROOT / run_id
+        self.home = self.scratch / "home"
+        self.bin_dir = self.scratch / "bin"
+        self.meta_file = self.scratch / "meta.json"
+
+    @property
+    def config_dir(self):
+        return self.home / ".config" / "muster"
+
+    @property
+    def state_dir(self):
+        return self.home / ".local" / "state" / "muster"
+
+    def meta(self):
+        if not self.meta_file.exists():
+            die(f"no launched instance '{self.id}' (missing {self.meta_file}); run launch first")
+        return json.loads(self.meta_file.read_text())
+
+    def env(self):
+        e = {k: v for k, v in os.environ.items() if not k.startswith("MUSTER_")}
+        e.update({
+            "HOME": str(self.home),
+            "XDG_CONFIG_HOME": str(self.home / ".config"),
+            "XDG_STATE_HOME": str(self.home / ".local/state"),
+            "XDG_DATA_HOME": str(self.home / ".local/share"),
+            "XDG_CACHE_HOME": str(self.home / ".cache"),
+            "PATH": f"{self.bin_dir}{os.pathsep}{e.get('PATH', '')}",
+        })
+        return e
+
+    def evidence_write(self, kind, text):
+        self.evidence.mkdir(parents=True, exist_ok=True)
+        n = len(list(self.evidence.glob("[0-9][0-9][0-9]-*"))) + 1
+        path = self.evidence / f"{n:03d}-{kind}.txt"
+        path.write_text(text)
+        return path
+
+
+def redact(obj):
+    if isinstance(obj, dict):
+        return {k: ("<redacted>" if k in REDACT_KEYS and isinstance(v, str) else redact(v))
+                for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [redact(v) for v in obj]
+    return obj
+
+
+def redact_text(text):
+    try:
+        return json.dumps(redact(json.loads(text)), indent=2)
+    except ValueError:
+        return text
+
+
+# ---------------------------------------------------------------- binary / build
+
+def find_binary(root):
+    if os.environ.get("MUSTER_BIN"):
+        return Path(os.environ["MUSTER_BIN"]).resolve(), False
+    return root / "target" / "debug" / "muster", True
+
+
+def build(root):
+    env = dict(os.environ)
+    if not shutil.which("cargo"):
+        cargo_bin = Path.home() / ".cargo" / "bin"
+        env["PATH"] = f"{cargo_bin}{os.pathsep}{env.get('PATH', '')}"
+        if not shutil.which("cargo", path=env["PATH"]):
+            die("cargo not found (try: source ~/.cargo/env)")
+    print("building (cargo build)...", flush=True)
+    r = subprocess.run(["cargo", "build", "--quiet"], cwd=root, env=env)
+    if r.returncode != 0:
+        die("cargo build failed")
+
+
+# ---------------------------------------------------------------- http
+
+def http(port, method, path, cookie=None, body=None, timeout=15):
+    import http.client
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+    headers = {"Host": f"127.0.0.1:{port}"}
+    if cookie:
+        headers["Cookie"] = cookie
+    data = None
+    if body is not None:
+        data = body if isinstance(body, str) else json.dumps(body)
+        headers["Content-Type"] = "application/json"
+    conn.request(method, path, body=data, headers=headers)
+    resp = conn.getresponse()
+    raw = resp.read().decode("utf-8", "replace")
+    out = (resp.status, dict(resp.getheaders()), raw)
+    conn.close()
+    return out
+
+
+def exchange_token(port, token):
+    status, headers, _ = http(port, "GET", f"/?token={token}")
+    cookie = headers.get("Set-Cookie", "")
+    m = re.search(r"muster_session=[^;]+", cookie)
+    if status != 200 or not m:
+        die(f"token exchange failed: status={status}")
+    return m.group(0)
+
+
+def api_status_ok(port, cookie):
+    try:
+        status, _, raw = http(port, "GET", "/api/status", cookie)
+        return status == 200 and json.loads(raw).get("ok") is True
+    except Exception:
+        return False
+
+
+def start_ui(run, muster_bin, logname):
+    """Start `muster ui` in its own session; return (pid, port, token)."""
+    log = run.scratch / logname
+    with open(log, "wb") as out:
+        proc = subprocess.Popen(
+            [str(muster_bin), "--format", "json", "ui", "--no-open", "--port", "0"],
+            env=run.env(), stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+            start_new_session=True)
+    deadline = time.time() + 20
+    info = None
+    while time.time() < deadline:
+        line = log.read_text().splitlines()[:1]
+        if line:
+            try:
+                info = json.loads(line[0])
+                break
+            except ValueError:
+                pass
+        if proc.poll() is not None:
+            die(f"muster ui exited early: {log.read_text()[:500]}")
+        time.sleep(0.1)
+    if not info:
+        proc.kill()
+        die("muster ui printed no URL within 20s")
+    return proc.pid, info["port"], info["token"]
+
+
+def port_open(port):
+    with socket.socket() as s:
+        s.settimeout(0.5)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def ps_command(pid):
+    r = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True)
+    return r.stdout.strip()
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def stop_pid(pid, muster_bin):
+    """SIGINT then SIGKILL, only if the pid still looks like our `muster ui`."""
+    if not pid_alive(pid):
+        return "already-gone"
+    cmd = ps_command(pid)
+    if not cmd or " ui" not in cmd or "muster" not in cmd:
+        return f"refused (pid {pid} is no longer our muster ui: {cmd!r})"
+    os.kill(pid, signal.SIGINT)
+    for _ in range(50):
+        if not pid_alive(pid) or "<defunct>" in ps_command(pid):
+            return "stopped"
+        time.sleep(0.1)
+    os.kill(pid, signal.SIGKILL)
+    time.sleep(0.3)
+    return "killed"
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_launch(a):
+    run = Run(a.run_id)
+    if run.scratch.exists():
+        die(f"{run.scratch} already exists; pick a new run-id or run cleanup {run.id}")
+    root = repo_root()
+    muster_bin, do_build = find_binary(root)
+    if do_build:
+        build(root)
+    if not muster_bin.exists():
+        die(f"binary not found: {muster_bin}")
+    for sub in (".config", ".local/state", ".local/share", ".cache"):
+        (run.home / sub).mkdir(parents=True, exist_ok=True)
+    run.bin_dir.mkdir(parents=True, exist_ok=True)
+    run.evidence.mkdir(parents=True, exist_ok=True)
+    r = subprocess.run([str(muster_bin), "--yes", "init"], env=run.env(),
+                       stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    if r.returncode != 0:
+        shutil.rmtree(run.scratch, ignore_errors=True)
+        die(f"muster init failed ({r.returncode}): {r.stderr.strip()[:500]}")
+    pid, port, token = start_ui(run, muster_bin, "ui.log")
+    meta = {"run_id": run.id, "pid": pid, "port": port, "bin": str(muster_bin),
+            "repo_root": str(root), "head": git_head(root), "started": time.time()}
+    (run.scratch / "ui.pid").write_text(str(pid))
+    (run.scratch / "ui.port").write_text(str(port))
+    run.meta_file.write_text(json.dumps(meta))
+    cookie = exchange_token(port, token)
+    (run.scratch / "cookie").write_text(cookie)
+    os.chmod(run.scratch / "cookie", 0o600)
+    if not api_status_ok(port, cookie):
+        stop_pid(pid, muster_bin)
+        die("UI is listening but GET /api/status did not return ok:true")
+    ver = subprocess.run([str(muster_bin), "--version"], capture_output=True, text=True).stdout.strip()
+    (run.evidence / "launch.json").write_text(json.dumps({**meta, "version": ver}, indent=2))
+    print(f"READY run={run.id} pid={pid} port={port} {ver} scratch={run.scratch} evidence={run.evidence}")
+
+
+def load_live(run):
+    meta = run.meta()
+    cookie = (run.scratch / "cookie").read_text().strip()
+    return meta, cookie
+
+
+def cmd_doctor(a):
+    run = Run(a.run_id)
+    meta, cookie = load_live(run)
+    pid, port = meta["pid"], meta["port"]
+    results = []
+
+    def check(name, status, detail=""):
+        results.append(status)
+        print(f"{status:5} {name} {detail}".rstrip())
+
+    alive = pid_alive(pid)
+    check("pid-alive", "PASS" if alive else "FAIL", f"pid={pid}")
+    cmd = ps_command(pid) if alive else ""
+    ours = bool(cmd) and meta["bin"] in cmd and " ui" in cmd
+    check("pid-is-our-muster-ui", "PASS" if ours else "FAIL", cmd[:100])
+    owner = None
+    if shutil.which("lsof"):
+        r = subprocess.run(["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+                           capture_output=True, text=True)
+        owner = r.stdout.split()
+    elif shutil.which("ss"):
+        r = subprocess.run(["ss", "-ltnpH", f"sport = :{port}"], capture_output=True, text=True)
+        owner = re.findall(r"pid=(\d+)", r.stdout)
+    if owner is None:
+        check("port-owned-by-pid", "SKIP", "no lsof/ss available")
+    else:
+        check("port-owned-by-pid", "PASS" if str(pid) in owner else "FAIL",
+              f"port={port} owners={owner}")
+    ver = subprocess.run([meta["bin"], "--version"], capture_output=True, text=True).stdout.strip()
+    check("binary-runs", "PASS" if ver else "FAIL", ver)
+    head = git_head(Path(meta["repo_root"]))
+    check("head-unchanged-since-launch", "PASS" if head == meta["head"] else "FAIL",
+          f"launch={meta['head'][:10]} now={head[:10]}")
+    newest = 0.0
+    files = subprocess.run(["git", "ls-files", "src", "Cargo.toml", "Cargo.lock"],
+                           cwd=meta["repo_root"], capture_output=True, text=True).stdout.split()
+    for f in files:
+        p = Path(meta["repo_root"]) / f
+        if p.exists():
+            newest = max(newest, p.stat().st_mtime)
+    stale = Path(meta["bin"]).stat().st_mtime + 1 < newest
+    check("binary-not-stale", "FAIL" if stale else "PASS",
+          "sources newer than binary: rebuild and relaunch" if stale else "")
+    check("session-cookie-valid", "PASS" if api_status_ok(port, cookie) else "FAIL",
+          "GET /api/status ok:true")
+    sys.exit(1 if "FAIL" in results else 0)
+
+
+def cmd_cli(a):
+    run = Run(a.run_id)
+    meta = run.meta()
+    args = a.args[1:] if a.args and a.args[0] == "--" else a.args
+    if not args:
+        die("usage: cli <run-id> [--stdin TEXT|-] -- <muster args>")
+    if a.stdin is None:
+        stdin_data = None
+    elif a.stdin == "-":
+        stdin_data = sys.stdin.read()
+    else:
+        stdin_data = a.stdin
+    r = subprocess.run([meta["bin"], *args], env=run.env(), input=stdin_data,
+                       stdin=None if stdin_data is not None else subprocess.DEVNULL,
+                       capture_output=True, text=True, cwd=str(run.home))
+    out_text = ("<withheld: --reveal output holds plaintext>" if "--reveal" in args
+                else redact_text(r.stdout))
+    ev = (f"$ muster {' '.join(args)}\n"
+          f"{'(stdin supplied, not logged)' + chr(10) if stdin_data is not None else ''}"
+          f"exit={r.returncode}\n--- stdout\n{out_text}\n--- stderr\n{r.stderr}")
+    path = run.evidence_write("cli", ev)
+    sys.stdout.write(r.stdout)
+    sys.stderr.write(r.stderr)
+    print(f"[exit={r.returncode} evidence={path}]", file=sys.stderr)
+    sys.exit(r.returncode)
+
+
+def cmd_api(a):
+    run = Run(a.run_id)
+    meta, cookie = load_live(run)
+    method = a.method.upper()
+    path = a.path if a.path.startswith("/") else "/api/" + a.path
+    body = None
+    if a.body is not None:
+        if a.body == "-":
+            body = sys.stdin.read()
+        elif a.body.startswith("@"):
+            body = Path(a.body[1:]).read_text()
+        else:
+            body = a.body
+        json.loads(body)  # fail early on malformed JSON
+    status, _, raw = http(meta["port"], method, path, cookie, body)
+    shown = "<withheld: reveal response holds plaintext>" if "reveal" in path else redact_text(raw)
+    ev = (f"{method} {path}\n"
+          f"request: {redact_text(body) if body else '(none)'}\n"
+          f"status={status}\n--- response\n{shown}\n")
+    p = run.evidence_write("api", ev)
+    print(f"HTTP {status}")
+    print(raw)
+    print(f"[evidence={p}]", file=sys.stderr)
+    sys.exit(0 if 200 <= status < 300 else 1)
+
+
+def sandbox_files(run):
+    for base in (run.config_dir, run.state_dir):
+        if base.exists():
+            for p in sorted(base.rglob("*")):
+                if p.is_file() and ".git" not in p.relative_to(base).parts:
+                    yield p
+
+
+def cmd_tree(a):
+    run = Run(a.run_id)
+    run.meta()
+    lines = []
+    for p in sandbox_files(run):
+        h = hashlib.sha256(p.read_bytes()).hexdigest()[:16]
+        lines.append(f"{h} {p.stat().st_size:8d} {p.relative_to(run.home)}")
+    out = "\n".join(lines) + "\n"
+    path = run.evidence_write(f"tree-{a.label}", out)
+    print(out, end="")
+    print(f"[evidence={path}]", file=sys.stderr)
+
+
+def cmd_leakcheck(a):
+    run = Run(a.run_id)
+    run.meta()
+    needle = a.needle.encode()
+    hits = []
+    for p in sandbox_files(run):
+        if needle in p.read_bytes():
+            hits.append(str(p.relative_to(run.home)))
+    ev_dir = run.evidence
+    ev_dir.mkdir(parents=True, exist_ok=True)
+    print("LEAK in: " + ", ".join(hits) if hits else
+          f"CLEAN: needle absent from {sum(1 for _ in sandbox_files(run))} config/state files")
+    sys.exit(1 if hits else 0)
+
+
+# ---- minimal websocket client for Chrome DevTools Protocol
+
+class WS:
+    def __init__(self, url):
+        u = urllib.parse.urlparse(url)
+        self.sock = socket.create_connection((u.hostname, u.port), timeout=30)
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.sock.sendall((f"GET {u.path} HTTP/1.1\r\nHost: {u.hostname}:{u.port}\r\n"
+                           f"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                           f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise RuntimeError("websocket handshake failed")
+            buf += chunk
+        if b" 101 " not in buf.split(b"\r\n")[0]:
+            raise RuntimeError(f"websocket handshake refused: {buf[:100]!r}")
+        self.buf = buf.split(b"\r\n\r\n", 1)[1]
+        self.next_id = 0
+
+    def _read(self, n):
+        while len(self.buf) < n:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise RuntimeError("websocket closed")
+            self.buf += chunk
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    def send(self, obj):
+        data = json.dumps(obj).encode()
+        mask = os.urandom(4)
+        n = len(data)
+        head = b"\x81" + (bytes([0x80 | n]) if n < 126 else
+                          b"\xfe" + n.to_bytes(2, "big") if n < 65536 else
+                          b"\xff" + n.to_bytes(8, "big"))
+        self.sock.sendall(head + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+    def recv(self):
+        message = b""
+        while True:
+            b0, b1 = self._read(2)
+            n = b1 & 0x7F
+            if n == 126:
+                n = int.from_bytes(self._read(2), "big")
+            elif n == 127:
+                n = int.from_bytes(self._read(8), "big")
+            payload = self._read(n)
+            op = b0 & 0x0F
+            if op == 8:
+                raise RuntimeError("websocket closed by peer")
+            if op in (1, 0):
+                message += payload
+                if b0 & 0x80:
+                    return json.loads(message)
+
+    def call(self, method, params=None):
+        self.next_id += 1
+        self.send({"id": self.next_id, "method": method, "params": params or {}})
+        while True:
+            msg = self.recv()
+            if msg.get("id") == self.next_id:
+                if "error" in msg:
+                    raise RuntimeError(f"{method}: {msg['error']}")
+                return msg.get("result", {})
+
+    def eval(self, js):
+        r = self.call("Runtime.evaluate", {"expression": js, "returnByValue": True, "awaitPromise": True})
+        return r.get("result", {}).get("value")
+
+
+def find_chrome():
+    env = os.environ.get("CHROME_BIN")
+    if env:
+        return env
+    for name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser"):
+        p = shutil.which(name)
+        if p:
+            return p
+    mac = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    if os.path.exists(mac):
+        return mac
+    die("no Chrome/Chromium found (set CHROME_BIN)")
+
+
+def cmd_screenshot(a):
+    """Starts a SECOND short-lived `muster ui` on the same sandbox (fresh one-time token),
+    so the main instance's session cookie is untouched."""
+    import http.client
+    run = Run(a.run_id)
+    meta = run.meta()
+    out = Path(a.out)
+    if not out.is_absolute():
+        run.evidence.mkdir(parents=True, exist_ok=True)
+        out = run.evidence / out
+    out.parent.mkdir(parents=True, exist_ok=True)
+    pid, port, token = start_ui(run, Path(meta["bin"]), f"ui-shot-{int(time.time())}.log")
+    (run.scratch / "ui-shot.pid").write_text(str(pid))
+    profile = run.scratch / f"chrome-{int(time.time())}"
+    profile.mkdir()
+    chrome = None
+    try:
+        args = [find_chrome(), "--headless=new", "--remote-debugging-port=0",
+                f"--user-data-dir={profile}", "--window-size=1280,900", "--hide-scrollbars",
+                "--no-first-run", "--disable-gpu", "about:blank"]
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            args.insert(1, "--no-sandbox")
+        chrome = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                  start_new_session=True)
+        active = profile / "DevToolsActivePort"
+        for _ in range(150):
+            if active.exists() and active.read_text().strip():
+                break
+            time.sleep(0.1)
+        else:
+            die("Chrome did not expose a DevTools port")
+        dport = int(active.read_text().split()[0])
+        conn = http.client.HTTPConnection("127.0.0.1", dport, timeout=10)
+        conn.request("GET", "/json/list")
+        pages = [t for t in json.loads(conn.getresponse().read()) if t.get("type") == "page"]
+        ws = WS(pages[0]["webSocketDebuggerUrl"])
+        ws.call("Page.enable")
+        ws.call("Emulation.setDeviceMetricsOverride",
+                {"width": 1280, "height": 900, "deviceScaleFactor": 1, "mobile": False})
+        ws.call("Page.navigate", {"url": f"http://127.0.0.1:{port}/?token={token}"})
+        for _ in range(100):
+            if ws.eval("document.querySelectorAll('#nav [data-view]').length") :
+                break
+            time.sleep(0.1)
+        else:
+            die("panel did not render (token rejected or assets failed)")
+        time.sleep(0.8)
+        if a.view != "dashboard":
+            found = ws.eval(f"(()=>{{const t=document.querySelector('#nav [data-view=\"{a.view}\"]');"
+                            f"if(!t)return false;t.click();return true}})()")
+            if not found:
+                die(f"no nav tab with data-view={a.view!r}")
+            time.sleep(1.2)
+        if a.eval:
+            ws.eval(a.eval)
+            time.sleep(0.8)
+        title = ws.eval("document.querySelector('#title') && document.querySelector('#title').textContent")
+        text = ws.eval("document.querySelector('#view') ? document.querySelector('#view').innerText : ''")
+        shot = ws.call("Page.captureScreenshot", {"format": "png"})
+        out.write_bytes(base64.b64decode(shot["data"]))
+        out.with_suffix(".txt").write_text(f"view={a.view}\ntitle={title}\n--- #view innerText\n{text}\n")
+        print(f"SHOT {out} ({out.stat().st_size} bytes) title={title!r} text={out.with_suffix('.txt')}")
+    finally:
+        if chrome:
+            chrome.terminate()
+            try:
+                chrome.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                chrome.kill()
+        stop_pid(pid, Path(meta["bin"]))
+        shutil.rmtree(profile, ignore_errors=True)
+        try:
+            (run.scratch / "ui-shot.pid").unlink()
+        except FileNotFoundError:
+            pass
+
+
+def cmd_cleanup(a):
+    run = Run(a.run_id)
+    if not run.scratch.exists():
+        print(f"nothing to clean: {run.scratch} absent")
+        return
+    meta = json.loads(run.meta_file.read_text()) if run.meta_file.exists() else {}
+    muster_bin = meta.get("bin", "muster")
+    pids = []
+    for name in ("ui.pid", "ui-shot.pid"):
+        f = run.scratch / name
+        if f.exists():
+            pids.append(int(f.read_text().strip()))
+    for pid in pids:
+        print(f"pid {pid}: {stop_pid(pid, muster_bin)}")
+    port = meta.get("port")
+    if port:
+        print(f"port {port} open after stop: {port_open(port)}")
+    if a.keep_scratch:
+        print(f"scratch kept: {run.scratch}")
+    else:
+        shutil.rmtree(run.scratch, ignore_errors=True)
+        print(f"scratch removed: {run.scratch} exists={run.scratch.exists()}")
+    print(f"evidence kept: {run.evidence}")
+
+
+def main():
+    import argparse
+    p = argparse.ArgumentParser(prog="muster-harness", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    for name, fn in (("launch", cmd_launch), ("doctor", cmd_doctor), ("cleanup", cmd_cleanup),
+                     ("cli", cmd_cli), ("api", cmd_api), ("tree", cmd_tree),
+                     ("leakcheck", cmd_leakcheck), ("screenshot", cmd_screenshot)):
+        s = sub.add_parser(name)
+        s.add_argument("run_id")
+        s.set_defaults(fn=fn)
+        if name == "cli":
+            s.add_argument("--stdin", default=None, help="text for stdin, or - to read ours")
+        elif name == "api":
+            s.add_argument("method")
+            s.add_argument("path")
+            s.add_argument("body", nargs="?")
+        elif name == "tree":
+            s.add_argument("label", nargs="?", default="snapshot")
+        elif name == "leakcheck":
+            s.add_argument("needle")
+        elif name == "screenshot":
+            s.add_argument("view")
+            s.add_argument("out")
+            s.add_argument("--eval", default=None)
+        elif name == "cleanup":
+            s.add_argument("--keep-scratch", action="store_true")
+    argv = sys.argv[1:]
+    tail = []
+    if len(argv) > 1 and argv[0] == "cli" and "--" in argv:
+        i = argv.index("--")
+        argv, tail = argv[:i], argv[i + 1:]
+    a = p.parse_args(argv)
+    if a.cmd == "cli":
+        a.args = tail
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()
