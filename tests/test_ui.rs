@@ -307,3 +307,116 @@ fn ui_dashboard_smoke_and_color_scheme_support() {
         "CSS must support light/dark system theme"
     );
 }
+
+#[test]
+fn web_secret_add_and_rotate_encrypt_values_and_do_not_leak() {
+    let env = support::MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    let mut ui = Ui::start(&env);
+    let payload =
+        serde_json::json!({"path":"web/token", "value":"web-sentinel-initial", "confirm":true})
+            .to_string();
+    assert_eq!(
+        ui.request("POST", "/api/secret/add", None, Some(&payload))
+            .0,
+        401
+    );
+    let (_, headers, _) = ui.authorized("/");
+    let cookie = headers
+        .lines()
+        .find(|line| line.to_ascii_lowercase().starts_with("set-cookie:"))
+        .unwrap()
+        .split_once(':')
+        .unwrap()
+        .1
+        .trim()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    for (action, value) in [
+        ("add", "web-sentinel-initial"),
+        ("rotate", "web-sentinel-rotated"),
+    ] {
+        let path = format!("/api/secret/{action}");
+        let unconfirmed = serde_json::json!({"path":"web/token", "value":value}).to_string();
+        let (status, _, response) = ui.request("POST", &path, Some(&cookie), Some(&unconfirmed));
+        assert_eq!(status, 400);
+        assert!(!response.contains(value));
+        let payload =
+            serde_json::json!({"path":"web/token", "value":value, "confirm":true}).to_string();
+        let (status, _, response) = ui.request("POST", &path, Some(&cookie), Some(&payload));
+        assert_eq!(status, 200);
+        assert!(!response.contains(value));
+        let response: Value = serde_json::from_str(&response).unwrap();
+        assert!(response["cli"].as_str().unwrap().contains("--value-stdin"));
+        let (output, revealed) = env.run_json(&[
+            "--format",
+            "json",
+            "--yes",
+            "secret",
+            "get",
+            "native://web/token",
+            "--reveal",
+        ]);
+        assert!(output.status.success());
+        assert!(revealed
+            .result()
+            .as_str()
+            .is_some_and(|actual| actual == value));
+        let encrypted = std::fs::read(env.config_dir().join("vault/web.age")).unwrap();
+        assert!(!String::from_utf8_lossy(&encrypted).contains(value));
+        let (_, _, history) = ui.request("GET", "/api/history", Some(&cookie), None);
+        assert!(!history.contains(value));
+        assert!(history.contains(&format!("secret.{action}")));
+        let audit =
+            std::fs::read_to_string(env.path().join(".local/state/muster/history.jsonl")).unwrap();
+        assert!(!audit.contains(value));
+    }
+}
+
+#[test]
+fn web_secret_writes_reject_stdin_and_oversize_bodies() {
+    let env = support::MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    let mut ui = Ui::start(&env);
+    let (_, headers, html) = ui.authorized("/");
+    assert!(html.contains("type=\"password\" autocomplete=\"new-password\""));
+    let cookie = headers
+        .lines()
+        .find(|line| line.to_ascii_lowercase().starts_with("set-cookie:"))
+        .unwrap()
+        .split_once(':')
+        .unwrap()
+        .1
+        .trim()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let body = serde_json::json!({"name":"token", "group":"web", "value":"test-input", "value-stdin":true, "confirm":true}).to_string();
+    assert_eq!(
+        ui.request("POST", "/api/secret/add", Some(&cookie), Some(&body))
+            .0,
+        400
+    );
+    let body =
+        serde_json::json!({"name":"token", "group":"web", "value":"test-input", "confirm":true})
+            .to_string();
+    assert_eq!(
+        ui.request("POST", "/api/secret/add", Some(&cookie), Some(&body))
+            .0,
+        200
+    );
+    let body = serde_json::json!({"path":"web/token", "value":"x".repeat(65536), "confirm":true})
+        .to_string();
+    assert_eq!(
+        ui.request("POST", "/api/secret/rotate", Some(&cookie), Some(&body))
+            .0,
+        413
+    );
+    assert_eq!(
+        ui.request("GET", "/api/secret/add", Some(&cookie), None).0,
+        405
+    );
+}

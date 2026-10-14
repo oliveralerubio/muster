@@ -11,6 +11,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use secrecy::zeroize::{Zeroize, Zeroizing};
 use serde::{Deserialize, Serialize};
 
 use crate::errors::MusterError;
@@ -50,6 +51,12 @@ struct SecretEntry {
     created_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     updated_by: Option<String>,
+}
+
+impl Drop for SecretEntry {
+    fn drop(&mut self) {
+        self.ciphertext_or_value.zeroize();
+    }
 }
 
 /// Plaintext sidecar: same shape as [`GroupData`] minus the values.
@@ -161,6 +168,7 @@ impl Vault {
             .secrets
             .get_mut(name)
             .ok_or_else(|| not_found(group, name))?;
+        entry.ciphertext_or_value.zeroize();
         entry.ciphertext_or_value = value.expose().to_owned();
         entry.updated_at = now();
         entry.updated_by = self.actor.clone();
@@ -351,8 +359,10 @@ impl Vault {
     }
 
     fn write(&self, data: &GroupData) -> Result<(), MusterError> {
-        let plaintext = serde_json::to_vec(data)
-            .map_err(|e| MusterError::Operational(format!("cannot serialize group: {e}")))?;
+        let plaintext = Zeroizing::new(
+            serde_json::to_vec(data)
+                .map_err(|e| MusterError::Operational(format!("cannot serialize group: {e}")))?,
+        );
         write_atomic(
             &self.age_path(&data.group),
             &encrypt(&plaintext, &data.recipients)?,
@@ -407,7 +417,7 @@ fn encrypt(plaintext: &[u8], recipients: &[String]) -> Result<Vec<u8>, MusterErr
     Ok(out)
 }
 
-fn decrypt(armored: &[u8], id: &Identity) -> Result<Vec<u8>, MusterError> {
+fn decrypt(armored: &[u8], id: &Identity) -> Result<Zeroizing<Vec<u8>>, MusterError> {
     let decryptor =
         age::Decryptor::new(age::armor::ArmoredReader::new(armored)).map_err(crypto_err)?;
     let mut reader = decryptor
@@ -418,7 +428,7 @@ fn decrypt(armored: &[u8], id: &Identity) -> Result<Vec<u8>, MusterError> {
             }
             other => crypto_err(other),
         })?;
-    let mut plaintext = Vec::new();
+    let mut plaintext = Zeroizing::new(Vec::new());
     reader.read_to_end(&mut plaintext).map_err(crypto_err)?;
     Ok(plaintext)
 }

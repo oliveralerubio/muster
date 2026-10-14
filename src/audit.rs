@@ -18,7 +18,7 @@ pub fn record(state_dir: &Path, action: &str, subject: &str) -> Result<(), Muste
     let at = time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_default();
-    let line = json!({ "at": at, "action": action, "subject": subject });
+    let line = json!({ "at": at, "action": action, "subject": subject, "actor": crate::machine::load_name(state_dir) });
     let path = state_dir.join(FILE);
     let io = |e: std::io::Error| MusterError::Operational(format!("{}: {e}", path.display()));
     std::fs::create_dir_all(state_dir).map_err(io)?;

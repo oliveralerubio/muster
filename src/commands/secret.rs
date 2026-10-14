@@ -132,12 +132,20 @@ pub const CHECK: CommandSpec = CommandSpec {
 };
 
 fn add(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
+    let value = read_value(ctx, params)?;
+    add_with_value(ctx, params, value)
+}
+
+pub(crate) fn add_with_value(
+    ctx: &mut Context,
+    params: &Params,
+    value: SecretValue,
+) -> Result<Value, MusterError> {
     let (group, name) = parse_path(params)?;
     let allow = params.get_list("allow");
     for entry in &allow {
         validate_allow_entry(entry).map_err(MusterError::Usage)?;
     }
-    let value = read_value(ctx, params)?;
 
     let vault = Vault::open(&ctx.config_dir)?;
     if vault.groups()?.contains(&group) && vault.list(&group)?.iter().any(|s| s.name == name) {
@@ -159,6 +167,7 @@ fn add(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let identity = Identity::load(&ctx.state_dir)?;
     let mut vault = vault.with_actor(machine::load_name(&ctx.state_dir));
     let recipients = resolve_recipients(ctx, &vault, &group, &identity)?;
+    crate::audit::record(&ctx.state_dir, "secret.add", &format!("{group}/{name}"))?;
     vault.add(&group, &name, value, &recipients, &identity)?;
     if !allow.is_empty() {
         let mut manifest = Manifest::load(&ctx.config_dir)?;
@@ -213,8 +222,16 @@ fn list(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
 }
 
 fn rotate(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
-    let (group, name) = parse_path(params)?;
     let value = read_value(ctx, params)?;
+    rotate_with_value(ctx, params, value)
+}
+
+pub(crate) fn rotate_with_value(
+    ctx: &mut Context,
+    params: &Params,
+    value: SecretValue,
+) -> Result<Value, MusterError> {
+    let (group, name) = parse_path(params)?;
 
     let vault = Vault::open(&ctx.config_dir)?;
     if !vault.groups()?.contains(&group) || !vault.list(&group)?.iter().any(|s| s.name == name) {
@@ -234,6 +251,7 @@ fn rotate(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
 
     let identity = Identity::load(&ctx.state_dir)?;
     let mut vault = vault.with_actor(machine::load_name(&ctx.state_dir));
+    crate::audit::record(&ctx.state_dir, "secret.rotate", &format!("{group}/{name}"))?;
     vault.rotate(&group, &name, value, &identity)?;
 
     git::commit_if_configured(

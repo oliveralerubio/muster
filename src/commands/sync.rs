@@ -44,6 +44,56 @@ pub const SPEC: CommandSpec = CommandSpec {
 };
 
 fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
+    let _lock = if ctx.dry_run {
+        None
+    } else {
+        std::fs::create_dir_all(&ctx.state_dir).map_err(sync_io)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).truncate(false).read(true).write(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let file = options
+            .open(ctx.state_dir.join("sync.lock"))
+            .map_err(sync_io)?;
+        match file.try_lock() {
+            Ok(()) => Some(file),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                ctx.diag(Diagnostic::new(
+                    Severity::Info,
+                    "sync_skipped_locked",
+                    "another sync is running",
+                ));
+                return Ok(json!({"skipped": "locked", "applied": false}));
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(sync_io(e)),
+        }
+    };
+    let result = sync(ctx, params);
+    if !ctx.dry_run {
+        let outcome = match &result {
+            Ok(_) if !ctx.failed() => "ok",
+            Err(e) if e.to_string().contains("conflict with") => "conflict",
+            _ => "error",
+        };
+        let status = json!({
+            "ts": time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
+            "result": outcome,
+            "applied": result.as_ref().ok().and_then(|r| r["applied"].as_bool()).unwrap_or(false),
+        });
+        let pending = ctx.state_dir.join("sync-status.json.partial");
+        std::fs::write(&pending, status.to_string()).map_err(sync_io)?;
+        std::fs::rename(pending, ctx.state_dir.join("sync-status.json")).map_err(sync_io)?;
+    }
+    result
+}
+
+fn sync_io(e: std::io::Error) -> MusterError {
+    MusterError::Operational(format!("sync state: {e}"))
+}
+
+/// The lock file remains in place: unlinking it would allow a second inode
+/// to be locked while a waiting process still owns the first one.
+fn sync(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     Manifest::load(&ctx.config_dir)?;
     let target = target(params)?;
     let transport = if ctx.dry_run {
