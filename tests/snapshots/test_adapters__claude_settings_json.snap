@@ -1,0 +1,28 @@
+---
+source: tests/test_adapters.rs
+expression: read(rel)
+---
+{
+  "model": "opus",
+  "permissions": {
+    "allow": [
+      "Bash(ls:*)"
+    ],
+    "deny": [
+      "Read(./.env)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "lint"
+          }
+        ]
+      }
+    ]
+  }
+}

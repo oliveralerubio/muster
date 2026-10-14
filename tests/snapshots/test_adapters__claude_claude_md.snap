@@ -1,0 +1,7 @@
+---
+source: tests/test_adapters.rs
+expression: read(rel)
+---
+<!-- BEGIN MUSTER MANAGED BLOCK: edits inside are overwritten -->
+@AGENTS.md
+<!-- END MUSTER MANAGED BLOCK -->

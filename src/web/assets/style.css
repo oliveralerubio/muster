@@ -1,0 +1,178 @@
+:root {
+  --bg: #ffffff;
+  --surface: #f7f7f8;
+  --border: #e2e2e6;
+  --text: #1b1b1f;
+  --muted: #65656d;
+  --primary: #0969da;
+  --danger: #cf222e;
+  --focus: #0969da;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --border: #30363d;
+    --text: #c9d1d9;
+    --muted: #8b949e;
+    --primary: #58a6ff;
+    --danger: #f85149;
+    --focus: #58a6ff;
+  }
+}
+
+:root[data-theme="light"] {
+  --bg: #ffffff;
+  --surface: #f7f7f8;
+  --border: #e2e2e6;
+  --text: #1b1b1f;
+  --muted: #65656d;
+  --primary: #0969da;
+  --danger: #cf222e;
+  --focus: #0969da;
+}
+
+:root[data-theme="dark"] {
+  --bg: #0d1117;
+  --surface: #161b22;
+  --border: #30363d;
+  --text: #c9d1d9;
+  --muted: #8b949e;
+  --primary: #58a6ff;
+  --danger: #f85149;
+  --focus: #58a6ff;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 system-ui, -apple-system, sans-serif;
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+
+a { color: var(--primary); }
+.skip { position: absolute; left: -9999px; }
+.skip:focus { left: 8px; top: 8px; background: var(--bg); padding: 8px; z-index: 10; border: 2px solid var(--focus); }
+
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+
+header.top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--border);
+  padding: 8px 16px;
+  background: var(--surface);
+  gap: 16px;
+}
+
+.brand { font-weight: 700; font-size: 16px; letter-spacing: -0.02em; }
+nav ul { list-style: none; margin: 0; padding: 0; display: flex; gap: 4px; flex-wrap: wrap; }
+nav button {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text);
+  padding: 6px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  font: inherit;
+}
+nav button[aria-selected="true"] {
+  background: var(--bg);
+  border-color: var(--border);
+  font-weight: 600;
+}
+nav button:hover { background: var(--bg); }
+
+#theme {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 6px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+main {
+  flex: 1;
+  padding: 24px;
+  max-width: 1100px;
+  width: 100%;
+  margin: 0 auto;
+}
+
+h1 { margin: 0 0 16px; font-size: 22px; }
+h2 { margin: 24px 0 8px; font-size: 16px; }
+
+.actions { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+button.btn, .actions button {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 6px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  font: inherit;
+}
+button.primary { background: var(--primary); color: #fff; border-color: var(--primary); }
+button.danger { background: var(--danger); color: #fff; border-color: var(--danger); }
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 8px;
+  font-size: 13px;
+}
+th, td {
+  text-align: left;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+th { background: var(--surface); font-weight: 600; }
+code, pre { font-family: var(--font-mono); font-size: 12px; }
+pre {
+  background: var(--surface);
+  padding: 12px;
+  border-radius: 6px;
+  overflow-x: auto;
+  border: 1px solid var(--border);
+}
+
+footer.cli {
+  border-top: 1px solid var(--border);
+  padding: 8px 16px;
+  background: var(--surface);
+  font-size: 12px;
+  color: var(--muted);
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+footer.cli code { color: var(--text); }
+
+dialog {
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 20px;
+  max-width: 500px;
+}
+dialog::backdrop { background: rgba(0, 0, 0, 0.4); }
+dialog output.secret {
+  display: block;
+  font-family: var(--font-mono);
+  background: var(--surface);
+  border: 1px dashed var(--border);
+  padding: 12px;
+  margin: 12px 0;
+  min-height: 24px;
+  word-break: break-all;
+}
