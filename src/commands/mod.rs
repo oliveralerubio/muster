@@ -14,6 +14,7 @@ pub mod revoke;
 pub mod schedule;
 pub mod schema;
 pub mod secret;
+pub mod skill;
 pub mod status;
 pub mod sync;
 pub mod ui;

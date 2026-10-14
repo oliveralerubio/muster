@@ -124,6 +124,46 @@ pub fn pull(dir: &Path) -> Result<Pulled, MusterError> {
     Ok(Pulled::Updated)
 }
 
+/// Shallow copy of `url` at `git_ref` (default: the remote HEAD) in `dest`:
+/// `git clone --depth 1` the first time, then `git fetch --depth 1` and a
+/// forced checkout of `FETCH_HEAD`. Returns the checked-out commit.
+pub fn shallow_fetch(url: &str, git_ref: Option<&str>, dest: &Path) -> Result<String, MusterError> {
+    if is_repo(dest) {
+        check(dest, &["remote", "set-url", REMOTE, url])?;
+        let target = git_ref.unwrap_or("HEAD");
+        check(dest, &["fetch", "--quiet", "--depth", "1", REMOTE, target])?;
+        check(dest, &["checkout", "--quiet", "--force", "FETCH_HEAD"])?;
+    } else {
+        if dest.exists() {
+            std::fs::remove_dir_all(dest)
+                .map_err(|e| MusterError::Operational(format!("{}: {e}", dest.display())))?;
+        }
+        let parent = dest.parent().unwrap_or(dest);
+        std::fs::create_dir_all(parent)
+            .map_err(|e| MusterError::Operational(format!("{}: {e}", parent.display())))?;
+        let dest_text = dest.to_string_lossy();
+        let mut args = vec!["clone", "--quiet", "--depth", "1"];
+        if let Some(r) = git_ref {
+            args.extend(["--branch", r]);
+        }
+        args.extend(["--", url, &dest_text]);
+        check(parent, &args)?;
+    }
+    head_commit(dest)
+}
+
+/// The commit `HEAD` points at.
+pub fn head_commit(dir: &Path) -> Result<String, MusterError> {
+    let out = run(dir, &["rev-parse", "HEAD"])?;
+    if !out.status.success() {
+        return Err(MusterError::Operational(format!(
+            "git rev-parse failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 /// `git --version`, or `None` when git cannot be run.
 pub fn version() -> Option<String> {
     let out = Command::new("git").arg("--version").output().ok()?;

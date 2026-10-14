@@ -37,6 +37,29 @@ pub struct AgentsConfig {
 pub struct SkillsConfig {
     /// Path of the skills directory, relative to the config repository.
     pub source: String,
+    /// External git repositories whose skills are vendored into `source`
+    /// (`muster skill add --url`). Provenance is pinned in `skills.lock`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remote: Vec<SkillRemote>,
+}
+
+/// `[[agents.skills.remote]]`: one subscribed upstream skills repository.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SkillRemote {
+    /// Source id, recorded as the `origin` of its skills in `skills.lock`.
+    pub name: String,
+    /// Any git URL (`https://`, `ssh`, `file://`).
+    pub url: String,
+    /// Branch or tag to follow. Default: the remote's default branch.
+    #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub git_ref: Option<String>,
+    /// Subdirectory of the repository holding one directory per skill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Only these skills are vendored. Empty: every skill under `path`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub include: Vec<String>,
 }
 
 /// `[agents.instructions]`.

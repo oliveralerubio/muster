@@ -93,6 +93,11 @@ const ROUTES: &[Route] = &[
     post("secret/rm", "secret.rm"),
     post("proposal/create", "proposal.create"),
     post("proposal/accept", "proposal.accept"),
+    get("skills", "skill.list"),
+    post("skills/check", "skill.check"),
+    post("skills/add", "skill.add"),
+    post("skills/update", "skill.update"),
+    post("skills/rm", "skill.rm"),
 ];
 /// Body keys that map to global flags rather than command parameters.
 const CONFIRM: &str = "confirm";
