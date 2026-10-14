@@ -730,6 +730,9 @@ version = 1
 [agents]
 enabled = ["claude", "codex", "opencode"]
 
+[secrets."native://core/api_key"]
+allow = ["claude", "codex", "opencode"]
+
 [mcp.vault_service]
 command = "npx"
 env = { SECRET_KEY = "native://core/api_key", PLAIN = "allowed" }

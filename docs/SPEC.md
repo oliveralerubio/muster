@@ -123,7 +123,7 @@ El mismo producto sirve a dos públicos:
 63. Como agente de IA, quiero que, sin terminal interactiva, Muster nunca se quede esperando una respuesta y falle con un error claro si falta `--yes`, para no colgarme.
 64. Como agente de IA, quiero obtener el JSON Schema de la configuración y la lista de comandos, para generar configuración válida a la primera.
 65. Como agente de IA, quiero conectarme a un servidor MCP de Muster para consultar el estado, planificar cambios y proponerlos, para operar Muster como herramienta.
-66. Como dev, quiero que el servidor MCP no entregue valores de secretos a los agentes salvo que yo lo permita de forma explícita para un secreto concreto, porque un agente puede filtrar lo que lee.
+66. Como dev, quiero que el servidor MCP no entregue valores de secretos a los agentes salvo que yo lo permita de forma explícita para un secreto concreto, porque un agente puede filtrar lo que lee. `secret_reveal` exige que la referencia esté en `[mcp_server] reveal` **y** que su `allow` incluya al agente que llama, identificado por `clientInfo.name` del `initialize` (contiene "claude" → claude, "codex" → codex, "opencode" → opencode, "antigravity"/"agy" → antigravity; cualquier otro cliente queda denegado).
 67. Como dev, quiero que los cambios propuestos por un agente pasen por el mismo plan y la misma aprobación que los míos, para que un agente no aplique cambios peligrosos solo.
 68. Como agente de IA, quiero una skill o documento de instrucciones incluido que explique cómo usar Muster, para operarlo sin prueba y error.
 
@@ -175,6 +175,7 @@ El mismo producto sirve a dos públicos:
   - Errores tipados: no disponible, no autorizado, no encontrado, límite alcanzado, referencia inválida.
   - Proveedores incluidos: nativo (por defecto) y `env`. Bitwarden, 1Password, Doppler e Infisical como adaptadores opcionales.
   - En el manifiesto se guardan **referencias** a secretos (`native://grupo/nombre`, `env://VAR`, `op://…`, `bws://…`), nunca valores.
+  - **Aislamiento por agente (denegado por defecto):** cada secreto declara qué agentes pueden recibirlo en `[secrets."<referencia>"] allow = ["claude", "codex@mi-repo"]` del `muster.toml` del repo de configuración (o con `muster secret add <ruta> --allow <agente>`). `agente` concede en todas partes; `agente@proyecto` solo al aplicar ese proyecto (`--project DIR`, cuyo nombre de carpeta es `proyecto`). Un secreto sin `allow` no llega a ningún agente. Al generar la configuración de un agente, una referencia no permitida no se escribe (ni el valor ni la referencia): se omite esa clave de `env`/`headers` y se emite el aviso `secret_not_allowed_for_agent` con el agente y la referencia, nunca el valor; el resto de la configuración se aplica. El `muster.toml` de un proyecto no puede concederse secretos. La persona, desde la CLI (`muster secret get --reveal`), siempre puede leerlos. `muster secret list` muestra la lista `allow` de cada secreto.
 - **Adaptadores de agente**
   - Uno por herramienta. Cada uno declara qué archivos y alcances gestiona, qué capacidades soporta (instrucciones, MCP, subagentes, skills, hooks, permisos, modelos), plataformas y versión mínima.
   - Traducen la configuración canónica al formato nativo.

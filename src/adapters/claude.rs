@@ -143,7 +143,7 @@ fn render_mcp(
                     let args: Vec<Value> = server.args.iter().cloned().map(Value::String).collect();
                     entry.insert("args".into(), Value::Array(args));
                 }
-                let env = resolve_mcp_map(&server.env, desired.secrets, "Claude Code", name, plan);
+                let env = resolve_mcp_map(&server.env, desired, &ADAPTER, name, plan);
                 if !env.is_empty() {
                     let map: Map<String, Value> = env
                         .into_iter()
@@ -155,8 +155,7 @@ fn render_mcp(
             Transport::Remote { url } => {
                 entry.insert("type".into(), Value::String("http".into()));
                 entry.insert("url".into(), Value::String(url.to_string()));
-                let headers =
-                    resolve_mcp_map(&server.headers, desired.secrets, "Claude Code", name, plan);
+                let headers = resolve_mcp_map(&server.headers, desired, &ADAPTER, name, plan);
                 if !headers.is_empty() {
                     let map: Map<String, Value> = headers
                         .into_iter()

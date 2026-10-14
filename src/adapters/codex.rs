@@ -103,8 +103,7 @@ fn render_config(
                             }
                             table.insert("args", Item::Value(Value::Array(arr)));
                         }
-                        let env =
-                            resolve_mcp_map(&server.env, desired.secrets, "Codex", name, plan);
+                        let env = resolve_mcp_map(&server.env, desired, &ADAPTER, name, plan);
                         if !env.is_empty() {
                             let mut inline = InlineTable::new();
                             for (k, v) in env {
@@ -116,7 +115,7 @@ fn render_config(
                     Transport::Remote { url } => {
                         table.insert("url", toml_edit::value(url.to_string()));
                         let headers =
-                            resolve_mcp_map(&server.headers, desired.secrets, "Codex", name, plan);
+                            resolve_mcp_map(&server.headers, desired, &ADAPTER, name, plan);
                         if !headers.is_empty() {
                             let mut inline = InlineTable::new();
                             for (k, v) in headers {

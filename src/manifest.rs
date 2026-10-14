@@ -51,6 +51,11 @@ pub struct Manifest {
     /// Managed dotfiles, keyed by target path relative to `$HOME`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub files: BTreeMap<String, ManagedDotfile>,
+    /// Per-secret agent access, keyed by secret reference
+    /// (`native://app/api`, `env://VAR`, ...). Deny by default: a reference
+    /// with no `allow` entry reaches no agent.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub secrets: BTreeMap<String, SecretPolicy>,
     /// Configuration for the built-in MCP server (`muster mcp`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_server: Option<McpServerConfig>,
@@ -238,6 +243,49 @@ impl Default for Manifest {
     }
 }
 
+/// Which agents may receive a secret (`[secrets."<reference>"]`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SecretPolicy {
+    /// Agents allowed to receive the secret: an adapter id (`claude`) grants
+    /// it everywhere; `agent@project` only inside that project (the project
+    /// directory's name). Empty = no agent (the human CLI always can).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
+}
+
+impl SecretPolicy {
+    /// Whether `agent` may receive the secret when rendering for `project`
+    /// (`None` = user scope).
+    pub fn allows(&self, agent: &str, project: Option<&str>) -> bool {
+        self.allow.iter().any(|entry| match entry.split_once('@') {
+            None => entry == agent,
+            Some((a, p)) => a == agent && project == Some(p),
+        })
+    }
+}
+
+/// `agent` or `agent@project`, with `agent` a known adapter id.
+pub fn validate_allow_entry(entry: &str) -> Result<(), String> {
+    let (agent, project) = match entry.split_once('@') {
+        Some((a, p)) => (a, Some(p)),
+        None => (entry, None),
+    };
+    if crate::adapters::find(agent).is_none() {
+        let known: Vec<_> = crate::adapters::ADAPTERS.iter().map(|a| a.id).collect();
+        return Err(format!(
+            "unknown agent `{agent}` in allow entry `{entry}` (known: {})",
+            known.join(", ")
+        ));
+    }
+    if project.is_some_and(|p| p.is_empty() || p.contains(['/', '\\', '@'])) {
+        return Err(format!(
+            "invalid allow entry `{entry}`: expected <agent> or <agent>@<project>"
+        ));
+    }
+    Ok(())
+}
+
 /// Built-in MCP server configuration (`muster mcp`).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -259,6 +307,7 @@ impl Manifest {
             agents: None,
             mcp: BTreeMap::new(),
             files: BTreeMap::new(),
+            secrets: BTreeMap::new(),
             mcp_server: None,
             team: None,
             extensions: BTreeMap::new(),
@@ -306,6 +355,14 @@ impl Manifest {
             return Err(invalid(format!(
                 "unknown key `{key}` (extension keys must start with `{EXTENSION_PREFIX}`)"
             )));
+        }
+        for (reference, policy) in &manifest.secrets {
+            crate::secrets::SecretRef::parse(reference)
+                .map_err(|e| invalid(format!("secrets: {e}")))?;
+            for entry in &policy.allow {
+                validate_allow_entry(entry)
+                    .map_err(|e| invalid(format!("secrets.\"{reference}\".allow: {e}")))?;
+            }
         }
         if manifest.required_approvals() == 0 {
             return Err(invalid(
@@ -360,6 +417,31 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.exit_code(), 3);
+    }
+
+    #[test]
+    fn secret_allow_is_deny_by_default_and_scopes_agent_at_project() {
+        let m = Manifest::parse(
+            "version = 1\n[secrets.\"env://A\"]\nallow = [\"claude\", \"codex@repo\"]\n[secrets.\"env://B\"]\n",
+            "muster.toml",
+        )
+        .unwrap();
+        let a = &m.secrets["env://A"];
+        assert!(a.allows("claude", None) && a.allows("claude", Some("other")));
+        assert!(!a.allows("codex", None) && !a.allows("codex", Some("other")));
+        assert!(a.allows("codex", Some("repo")));
+        assert!(!m.secrets["env://B"].allows("claude", None));
+        for bad in [
+            "version = 1\n[secrets.\"env://A\"]\nallow = [\"nobody\"]\n",
+            "version = 1\n[secrets.\"env://A\"]\nallow = [\"claude@\"]\n",
+            "version = 1\n[secrets.GLOBAL]\nallow = [\"claude\"]\n",
+        ] {
+            assert_eq!(
+                Manifest::parse(bad, "muster.toml").unwrap_err().exit_code(),
+                3,
+                "{bad}"
+            );
+        }
     }
 
     #[test]

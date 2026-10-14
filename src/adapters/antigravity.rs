@@ -101,8 +101,7 @@ fn render_mcp(
                     let args: Vec<Value> = server.args.iter().cloned().map(Value::String).collect();
                     entry.insert("args".into(), Value::Array(args));
                 }
-                let env =
-                    resolve_mcp_map(&server.env, desired.secrets, "Antigravity CLI", name, plan);
+                let env = resolve_mcp_map(&server.env, desired, &ADAPTER, name, plan);
                 if !env.is_empty() {
                     entry.insert("env".into(), string_map(env));
                 }
@@ -110,13 +109,7 @@ fn render_mcp(
             Transport::Remote { url } => {
                 // Antigravity accepts only `serverUrl` for remote servers.
                 entry.insert("serverUrl".into(), Value::String(url.to_string()));
-                let headers = resolve_mcp_map(
-                    &server.headers,
-                    desired.secrets,
-                    "Antigravity CLI",
-                    name,
-                    plan,
-                );
+                let headers = resolve_mcp_map(&server.headers, desired, &ADAPTER, name, plan);
                 if !headers.is_empty() {
                     entry.insert("headers".into(), string_map(headers));
                 }

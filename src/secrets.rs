@@ -180,6 +180,31 @@ pub fn is_reference(value: &str) -> bool {
         .is_some_and(|(prefix, _)| Scheme::ALL.iter().any(|s| s.as_str() == prefix))
 }
 
+/// Which agent may receive which secret, for one render target: the
+/// manifest's `[secrets."<reference>"] allow` lists plus the project being
+/// rendered (`None` = user scope). Deny by default.
+#[derive(Debug, Clone, Default)]
+pub struct SecretAccess {
+    policies: std::collections::BTreeMap<String, crate::manifest::SecretPolicy>,
+    project: Option<String>,
+}
+
+impl SecretAccess {
+    pub fn new(
+        policies: std::collections::BTreeMap<String, crate::manifest::SecretPolicy>,
+        project: Option<String>,
+    ) -> Self {
+        Self { policies, project }
+    }
+
+    /// Whether `agent` may receive the secret behind `reference`.
+    pub fn allows(&self, agent: &str, reference: &str) -> bool {
+        self.policies
+            .get(reference)
+            .is_some_and(|p| p.allows(agent, self.project.as_deref()))
+    }
+}
+
 /// Vault group and secret names: letters, digits, `_`, `-`, `.`; no leading dot.
 pub fn is_name(value: &str) -> bool {
     !value.is_empty()

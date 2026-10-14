@@ -291,6 +291,7 @@ fn adapter_apply_resolves_native_mcp_environment_without_persisting_plaintext_or
     let mut manifest = std::fs::read_to_string(&manifest_path).unwrap();
     manifest.push_str(
         "\n[agents]\nenabled = [\"claude\", \"codex\", \"opencode\"]\n\n\
+         [secrets.\"native://app/api\"]\nallow = [\"claude\", \"codex\", \"opencode\"]\n\n\
          [mcp.api]\ncommand = \"api-mcp\"\nenv = { API_KEY = \"native://app/api\", PLAIN = \"visible\" }\n",
     );
     std::fs::write(&manifest_path, manifest).unwrap();
@@ -365,6 +366,7 @@ fn unresolvable_mcp_secret_reports_typed_provider_code_and_is_not_written() {
     let mut manifest = std::fs::read_to_string(&manifest_path).unwrap();
     manifest.push_str(
         "\n[agents]\nenabled = [\"claude\"]\n\n\
+         [secrets.\"native://app/missing\"]\nallow = [\"claude\"]\n\n\
          [mcp.api]\ncommand = \"api-mcp\"\nenv = { API_KEY = \"native://app/missing\" }\n",
     );
     std::fs::write(&manifest_path, manifest).unwrap();
@@ -481,4 +483,239 @@ fn secret_check_lists_every_provider_and_its_availability() {
 
 fn envelope_text(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stderr).to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Secret isolation: per-secret `allow` lists in muster.toml
+// (`[secrets."<reference>"] allow = ["<agent>", "<agent>@<project>"]`)
+// ---------------------------------------------------------------------------
+
+const DENY_BY_DEFAULT_VALUE: &str = "muster-DENY-by-default-9a1c";
+const CLAUDE_ONLY_VALUE: &str = "muster-ALLOW-claude-only-9a2d";
+
+fn apply_for(
+    env: &support::MusterEnv,
+    agent: &str,
+    env_vars: &[(&str, &str)],
+) -> (std::process::Output, support::Envelope) {
+    let mut cmd = env.run(&[
+        "--format", "json", "agents", "apply", "--agent", agent, "--yes",
+    ]);
+    for (key, value) in env_vars {
+        cmd.env(key, value);
+    }
+    support::json(cmd)
+}
+
+#[test]
+fn secret_isolation_denies_by_default_to_agents() {
+    let env = initialized();
+    let manifest_path = env.config_dir().join("muster.toml");
+    let mut manifest = std::fs::read_to_string(&manifest_path).unwrap();
+    manifest.push_str(
+        "\n[agents]\nenabled = [\"claude\"]\n\n\
+         [mcp.leaky]\ncommand = \"leaky-mcp\"\nenv = { TOKEN = \"env://GLOBAL_SECRET\" }\n",
+    );
+    std::fs::write(&manifest_path, manifest).unwrap();
+
+    let (output, envelope) = apply_for(&env, "claude", &[("GLOBAL_SECRET", DENY_BY_DEFAULT_VALUE)]);
+    assert!(output.status.success(), "{}", envelope.raw);
+
+    // A secret with no `allow` list reaches NO agent config: neither the
+    // resolved plaintext nor the raw reference may appear.
+    let claude = std::fs::read_to_string(env.path().join(".claude.json")).unwrap();
+    assert!(
+        !claude.contains(DENY_BY_DEFAULT_VALUE),
+        "no-allow secret leaked into claude config: {claude}"
+    );
+    assert!(
+        !claude.contains("env://GLOBAL_SECRET"),
+        "unresolved reference must not be written either: {claude}"
+    );
+}
+
+#[test]
+fn secret_isolation_injects_only_allowed_secrets_per_agent() {
+    let env = initialized();
+    let manifest_path = env.config_dir().join("muster.toml");
+    let mut manifest = std::fs::read_to_string(&manifest_path).unwrap();
+    manifest.push_str(
+        "\n[agents]\nenabled = [\"claude\", \"codex\"]\n\n\
+         [secrets.\"env://ANTHROPIC_API_KEY\"]\nallow = [\"claude\"]\n\n\
+         [mcp.github]\ncommand = \"api-mcp\"\nenv = { KEY = \"env://ANTHROPIC_API_KEY\" }\n",
+    );
+    std::fs::write(&manifest_path, manifest).unwrap();
+
+    // Claude is in the allow list: the resolved secret lands in its config.
+    let (claude_out, claude_env) =
+        apply_for(&env, "claude", &[("ANTHROPIC_API_KEY", CLAUDE_ONLY_VALUE)]);
+    assert!(claude_out.status.success(), "{}", claude_env.raw);
+    let claude = std::fs::read_to_string(env.path().join(".claude.json")).unwrap();
+    assert!(
+        claude.contains(CLAUDE_ONLY_VALUE),
+        "allowed secret must be injected into claude config: {claude}"
+    );
+
+    // Codex is NOT in the allow list: no plaintext, no raw reference, and a
+    // typed diagnostic naming the denial.
+    let (codex_out, codex_env) =
+        apply_for(&env, "codex", &[("ANTHROPIC_API_KEY", CLAUDE_ONLY_VALUE)]);
+    assert!(codex_out.status.success(), "{}", codex_env.raw);
+    assert!(
+        codex_env
+            .raw
+            .to_string()
+            .contains("secret_not_allowed_for_agent"),
+        "denied injection must emit secret_not_allowed_for_agent: {}",
+        codex_env.raw
+    );
+    let codex = std::fs::read_to_string(env.path().join(".codex/config.toml")).unwrap();
+    assert!(
+        !codex.contains(CLAUDE_ONLY_VALUE),
+        "secret leaked into codex config: {codex}"
+    );
+    assert!(
+        !codex.contains("env://ANTHROPIC_API_KEY"),
+        "reference must be omitted, not written raw: {codex}"
+    );
+}
+
+#[test]
+fn secret_isolation_allows_human_cli_access() {
+    let env = initialized();
+    let manifest_path = env.config_dir().join("muster.toml");
+    let mut manifest = std::fs::read_to_string(&manifest_path).unwrap();
+    // A policy entry with no `allow`: no agent may receive it.
+    manifest.push_str("\n[secrets.\"native://app/api\"]\n");
+    std::fs::write(&manifest_path, manifest).unwrap();
+
+    let added = add(&env, "app/api", SEED);
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+
+    // The human, via the CLI, can always reveal regardless of any allow list.
+    let (output, envelope) = env.run_json(&[
+        "--format",
+        "json",
+        "secret",
+        "get",
+        "native://app/api",
+        "--reveal",
+        "--yes",
+    ]);
+    assert!(output.status.success(), "{}", envelope.raw);
+    assert_eq!(envelope.result().as_str(), Some(SEED));
+}
+
+#[test]
+fn secret_isolation_agent_at_project_grants_only_in_that_project() {
+    let env = initialized();
+    let manifest_path = env.config_dir().join("muster.toml");
+    let mut manifest = std::fs::read_to_string(&manifest_path).unwrap();
+    manifest.push_str(
+        "\n[agents]\nenabled = [\"claude\"]\n\n\
+         [secrets.\"env://REPO_TOKEN\"]\nallow = [\"claude@my-repo\"]\n\n\
+         [mcp.github]\ncommand = \"api-mcp\"\nenv = { TOKEN = \"env://REPO_TOKEN\" }\n",
+    );
+    std::fs::write(&manifest_path, manifest).unwrap();
+
+    // In user/global scope, `claude@my-repo` does NOT grant to claude.
+    let (global_out, global_env) =
+        apply_for(&env, "claude", &[("REPO_TOKEN", "scoped-token-1234")]);
+    assert!(global_out.status.success(), "{}", global_env.raw);
+    assert!(
+        global_env
+            .raw
+            .to_string()
+            .contains("secret_not_allowed_for_agent"),
+        "denied scoped injection must emit secret_not_allowed_for_agent: {}",
+        global_env.raw
+    );
+    let claude = std::fs::read_to_string(env.path().join(".claude.json")).unwrap();
+    assert!(!claude.contains("scoped-token-1234"));
+
+    // In project scope `my-repo`, `claude@my-repo` DOES grant to claude.
+    let project_dir = env.path().join("my-repo");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let project_muster_dir = project_dir.join(".muster");
+    std::fs::create_dir_all(&project_muster_dir).unwrap();
+    std::fs::write(
+        project_muster_dir.join("muster.toml"),
+        "version = 1\n[agents]\nenabled = [\"claude\"]\n\n\
+         [mcp.github]\ncommand = \"api-mcp\"\nenv = { TOKEN = \"env://REPO_TOKEN\" }\n",
+    )
+    .unwrap();
+
+    let mut cmd = env.run(&[
+        "--format",
+        "json",
+        "sync",
+        "--project",
+        project_dir.to_str().unwrap(),
+        "--yes",
+    ]);
+    cmd.env("REPO_TOKEN", "scoped-token-1234");
+    let (proj_out, proj_env) = support::json(cmd);
+    assert!(proj_out.status.success(), "{}", proj_env.raw);
+    let project_claude = std::fs::read_to_string(project_dir.join(".mcp.json")).unwrap();
+    assert!(
+        project_claude.contains("scoped-token-1234"),
+        "allowed scoped secret must be injected into project claude config: {project_claude}"
+    );
+}
+
+#[test]
+fn secret_add_allow_records_the_grant_and_list_reports_it() {
+    let env = initialized();
+    let added = env
+        .run(&[
+            "--format",
+            "json",
+            "secret",
+            "add",
+            "app/api",
+            "--value-stdin",
+            "--allow",
+            "claude",
+            "--allow",
+            "codex@my-repo",
+        ])
+        .write_stdin(SEED.as_bytes())
+        .output()
+        .expect("secret add --allow");
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    let manifest = std::fs::read_to_string(env.config_dir().join("muster.toml")).unwrap();
+    assert!(manifest.contains("native://app/api"), "{manifest}");
+    assert!(!manifest.contains(SEED));
+
+    let (output, envelope) = env.run_json(&["--format", "json", "secret", "list"]);
+    assert!(output.status.success(), "{}", envelope.raw);
+    assert_eq!(
+        envelope.result()[0]["allow"],
+        serde_json::json!(["claude", "codex@my-repo"])
+    );
+
+    // Unknown agents are rejected before anything is stored.
+    let bad = env
+        .run(&[
+            "--format",
+            "json",
+            "secret",
+            "add",
+            "app/other",
+            "--value-stdin",
+            "--allow",
+            "nobody",
+        ])
+        .write_stdin(SEED.as_bytes())
+        .output()
+        .expect("secret add --allow nobody");
+    assert_eq!(bad.status.code(), Some(2));
 }

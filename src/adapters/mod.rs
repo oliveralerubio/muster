@@ -21,7 +21,7 @@ use serde_json::{Map, Value};
 
 use crate::errors::MusterError;
 use crate::output::{Diagnostic, Severity};
-use crate::secrets::SecretValue;
+use crate::secrets::{SecretAccess, SecretValue};
 use config::{AgentsConfig, McpServer, Transport};
 
 /// Where a managed path is rooted.
@@ -105,6 +105,8 @@ pub struct Desired<'a> {
     pub instructions: Option<&'a str>,
     /// Resolved secrets injected into MCP env and headers; render stays pure.
     pub secrets: &'a BTreeMap<String, SecretValue>,
+    /// Which agents may receive which of those secrets (deny by default).
+    pub access: &'a SecretAccess,
     /// Agent Skills read from `[agents.skills]`: skill name -> file path
     /// relative to the skill directory (`SKILL.md`, `refs/x.md`) -> contents.
     pub skills: &'a Skills,
@@ -284,12 +286,13 @@ pub fn is_secret_reference(value: &str) -> bool {
     crate::secrets::is_reference(value)
 }
 
-/// `map` with secret references replaced by their resolved values; a reference
-/// that could not be resolved drops its key with a warning.
+/// `map` with secret references replaced by their resolved values. A
+/// reference this agent is not allowed to receive, or that could not be
+/// resolved, drops its key with a warning (never the value or the reference).
 fn resolve_mcp_map(
     map: &BTreeMap<String, String>,
-    secrets: &BTreeMap<String, SecretValue>,
-    adapter: &str,
+    desired: &Desired,
+    adapter: &Adapter,
     server: &str,
     plan: &mut RenderPlan,
 ) -> BTreeMap<String, String> {
@@ -297,21 +300,37 @@ fn resolve_mcp_map(
     for (key, value) in map {
         if !is_secret_reference(value) {
             kept.insert(key.clone(), value.clone());
-        } else if let Some(secret) = secrets.get(value) {
-            kept.insert(key.clone(), secret.expose().to_owned());
-        } else {
-            plan.diagnostics.push(
-                Diagnostic::new(
-                    Severity::Warning,
-                    "secret_reference_unresolved",
-                    format!(
-                        "{adapter}: MCP server `{server}` key `{key}` references a secret \
-                         that could not be resolved, so it was not written"
-                    ),
-                )
-                .with_path(format!("mcp.{server}")),
-            );
+            continue;
         }
+        let (code, why) = if !desired.access.allows(adapter.id, value) {
+            (
+                "secret_not_allowed_for_agent",
+                format!(
+                    "{value} is not allowed for agent `{}` (add it to \
+                     [secrets.\"{value}\"] allow in muster.toml)",
+                    adapter.id
+                ),
+            )
+        } else if let Some(secret) = desired.secrets.get(value) {
+            kept.insert(key.clone(), secret.expose().to_owned());
+            continue;
+        } else {
+            (
+                "secret_reference_unresolved",
+                "it references a secret that could not be resolved".to_string(),
+            )
+        };
+        plan.diagnostics.push(
+            Diagnostic::new(
+                Severity::Warning,
+                code,
+                format!(
+                    "{}: MCP server `{server}` key `{key}`: {why}, so it was not written",
+                    adapter.name
+                ),
+            )
+            .with_path(format!("mcp.{server}")),
+        );
     }
     kept
 }

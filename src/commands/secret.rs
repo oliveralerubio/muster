@@ -11,7 +11,7 @@ use crate::errors::MusterError;
 use crate::git;
 use crate::identity::Identity;
 use crate::machine;
-use crate::manifest::Manifest;
+use crate::manifest::{validate_allow_entry, Manifest, SecretPolicy};
 use crate::output::{Diagnostic, Severity};
 use crate::providers::Providers;
 use crate::registry::{CommandSpec, ParamKind, ParamSpec, Params};
@@ -36,6 +36,14 @@ pub const ADD: CommandSpec = CommandSpec {
             required: false,
             positional: false,
         },
+        ParamSpec {
+            name: "allow",
+            about: "Agent allowed to receive the secret (repeatable): <agent> everywhere or \
+                    <agent>@<project> only in that project. Without it no agent receives it",
+            kind: ParamKind::List,
+            required: false,
+            positional: false,
+        },
     ],
     mutating: true,
     handler: add,
@@ -43,7 +51,7 @@ pub const ADD: CommandSpec = CommandSpec {
 
 pub const LIST: CommandSpec = CommandSpec {
     name: "secret.list",
-    about: "List secret names, groups and readers (never values)",
+    about: "List secret names, groups, readers and allowed agents (never values)",
     params: &[],
     mutating: false,
     handler: list,
@@ -125,6 +133,10 @@ pub const CHECK: CommandSpec = CommandSpec {
 
 fn add(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let (group, name) = parse_path(params)?;
+    let allow = params.get_list("allow");
+    for entry in &allow {
+        validate_allow_entry(entry).map_err(MusterError::Usage)?;
+    }
     let value = read_value(ctx, params)?;
 
     let vault = Vault::open(&ctx.config_dir)?;
@@ -140,6 +152,7 @@ fn add(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
             "group": group,
             "name": name,
             "reference": format!("native://{group}/{name}"),
+            "allow": allow,
         }));
     }
 
@@ -147,6 +160,16 @@ fn add(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let mut vault = vault.with_actor(machine::load_name(&ctx.state_dir));
     let recipients = resolve_recipients(ctx, &vault, &group, &identity)?;
     vault.add(&group, &name, value, &recipients, &identity)?;
+    if !allow.is_empty() {
+        let mut manifest = Manifest::load(&ctx.config_dir)?;
+        manifest.secrets.insert(
+            format!("native://{group}/{name}"),
+            SecretPolicy {
+                allow: allow.clone(),
+            },
+        );
+        manifest.save(&ctx.config_dir)?;
+    }
 
     git::commit_if_configured(
         &ctx.config_dir,
@@ -157,6 +180,7 @@ fn add(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         "group": group,
         "name": name,
         "reference": format!("native://{group}/{name}"),
+        "allow": allow,
     }))
 }
 
@@ -166,10 +190,17 @@ fn list(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
     let mut secrets = Vec::new();
     for group in vault.groups()? {
         for meta in vault.list(&group)? {
+            let reference = format!("native://{group}/{}", meta.name);
+            let allow = manifest
+                .as_ref()
+                .and_then(|m| m.secrets.get(&reference))
+                .map(|p| p.allow.clone())
+                .unwrap_or_default();
             secrets.push(json!({
                 "group": group,
                 "name": meta.name,
-                "reference": format!("native://{group}/{}", meta.name),
+                "reference": reference,
+                "allow": allow,
                 "created_at": meta.created_at,
                 "updated_at": meta.updated_at,
                 "created_by": meta.created_by,
@@ -241,6 +272,14 @@ fn rm(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
 
     let identity = Identity::load(&ctx.state_dir)?;
     vault.remove(&group, &name, &identity)?;
+    let mut manifest = Manifest::load(&ctx.config_dir)?;
+    if manifest
+        .secrets
+        .remove(&format!("native://{group}/{name}"))
+        .is_some()
+    {
+        manifest.save(&ctx.config_dir)?;
+    }
 
     git::commit_if_configured(
         &ctx.config_dir,

@@ -153,11 +153,19 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
     let instructions = read_instructions(ctx, &merged)?;
     let skills = read_skills(ctx, &merged)?;
     let secrets = resolve_secrets(ctx, &merged.mcp);
+    // Grants come only from the config repo's manifest: a project's own
+    // `.muster/muster.toml` cannot grant itself secrets.
+    let project = match &options.target {
+        Target::Global => None,
+        Target::Project(dir) => dir.file_name().map(|n| n.to_string_lossy().into_owned()),
+    };
+    let access = crate::secrets::SecretAccess::new(manifest.secrets.clone(), project);
     let desired = Desired {
         agents: &merged.agents,
         mcp: &merged.mcp,
         instructions: instructions.as_deref(),
         secrets: &secrets,
+        access: &access,
         skills: &skills,
     };
 

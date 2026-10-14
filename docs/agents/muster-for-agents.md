@@ -59,19 +59,23 @@ The MCP server runs over stdio using newline-delimited JSON-RPC 2.0.
 | `status` | `status` | Fleet machines, sync state, local machine identity | No |
 | `doctor` | `doctor` | Machine health, binary versions, permissions (`fix` is hidden) | No |
 | `plan` | `plan` | Desired vs. current state diff (secrets redacted) | No |
-| `secret_list_meta` | `secret.list` | Secret metadata, groups, readers (never secret values) | No |
+| `secret_list_meta` | `secret.list` | Secret metadata, groups, readers, allowed agents (never secret values) | No |
 | `propose_change` | `proposal.create` | Stashes a proposed config change and returns its plan | Proposal only |
 | `secret_reveal` | `secret.get --reveal` | Reveals an explicitly allowlisted secret reference | Read-only |
 
 ### Safety Boundaries
 
 - **No Unsupervised Mutating Actions:** Commands like `sync`, `init`, `agents.apply`, `secret.add`, or `rollback` are not exposed directly as MCP tools.
-- **Secret Hygiene:** Plaintext secret values are never exposed across tools, listings, plans, or diffs. The only exception is `secret_reveal`, which strictly verifies that the requested reference is listed in `muster.toml`:
+- **Secret Hygiene:** Plaintext secret values are never exposed across tools, listings, plans, or diffs. The only exception is `secret_reveal`, which requires BOTH that the reference is listed in `[mcp_server] reveal` AND that the secret's `allow` list grants the calling agent:
   ```toml
   [mcp_server]
   reveal = ["native://ci/deploy_token"]
+
+  [secrets."native://ci/deploy_token"]
+  allow = ["claude"]          # or "codex@my-repo" for one project only
   ```
-  Any unlisted reference returns a `security` diagnostic and `isError: true`.
+  The calling agent is identified from the `initialize` request's `clientInfo.name` (contains `claude` -> claude, `codex` -> codex, `opencode` -> opencode, `antigravity`/`agy` -> antigravity). Unknown clients are never granted. A denied reveal returns a `security` diagnostic and `isError: true`.
+- **Secret isolation in generated configs:** deny by default. When Muster renders an agent's MCP `env`/`headers`, a secret reference resolves only if its `[secrets."<ref>"] allow` grants that agent (`agent` everywhere, `agent@project` only in that project's scope). Otherwise the key is omitted and a `secret_not_allowed_for_agent` warning is emitted.
 
 ## Proposal Flow (Agents Proposing Changes)
 

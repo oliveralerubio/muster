@@ -76,7 +76,7 @@ fn render(desired: &Desired, current: &Current, plan: &mut RenderPlan) -> Result
                         .map(Value::from)
                         .collect();
                     entry.insert("command".into(), Value::Array(argv));
-                    let env = resolve_mcp_map(&server.env, desired.secrets, "OpenCode", name, plan);
+                    let env = resolve_mcp_map(&server.env, desired, &ADAPTER, name, plan);
                     if !env.is_empty() {
                         entry.insert("environment".into(), string_map(env));
                     }
@@ -84,8 +84,7 @@ fn render(desired: &Desired, current: &Current, plan: &mut RenderPlan) -> Result
                 Transport::Remote { url } => {
                     entry.insert("type".into(), "remote".into());
                     entry.insert("url".into(), url.into());
-                    let headers =
-                        resolve_mcp_map(&server.headers, desired.secrets, "OpenCode", name, plan);
+                    let headers = resolve_mcp_map(&server.headers, desired, &ADAPTER, name, plan);
                     if !headers.is_empty() {
                         entry.insert("headers".into(), string_map(headers));
                     }

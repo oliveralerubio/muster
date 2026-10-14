@@ -6,8 +6,11 @@
 //! prints with `--format json`. Only read-only commands are exposed, plus
 //! `propose_change` (records a proposal and returns its plan, never applies)
 //! and `secret_reveal` (refused unless the reference is listed in the
-//! manifest's `[mcp_server] reveal`). stdout carries protocol only.
+//! manifest's `[mcp_server] reveal` AND its `[secrets."<ref>"] allow` grants
+//! the calling agent, identified from `initialize` `clientInfo.name`).
+//! stdout carries protocol only.
 
+use std::cell::RefCell;
 use std::io::{BufRead, Write};
 
 use serde_json::{json, Map, Value};
@@ -18,7 +21,7 @@ use crate::errors::MusterError;
 use crate::manifest::Manifest;
 use crate::output::{self, Envelope};
 use crate::registry::{self, CommandSpec, ParamKind, ParamSpec, Params};
-use crate::secrets::SecretRef;
+use crate::secrets::{SecretAccess, SecretRef};
 
 /// Newest protocol revision first; a client asking for another one gets this.
 const SUPPORTED_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
@@ -119,7 +122,10 @@ impl Tool {
         }
         let about = self.spec().about;
         let description = if self.name == "secret_reveal" {
-            format!("{about}. Refused unless the reference is listed in muster.toml [mcp_server] reveal")
+            format!(
+                "{about}. Refused unless the reference is listed in muster.toml [mcp_server] reveal \
+                 and its [secrets.\"<reference>\"] allow grants the calling agent"
+            )
         } else {
             about.to_string()
         };
@@ -195,7 +201,10 @@ fn type_matches(kind: ParamKind, value: &Value) -> bool {
 
 /// Serve until stdin reaches EOF (exit 0). SIGINT is handled in `main` (130).
 pub fn serve(globals: Globals) -> i32 {
-    let server = Server { globals };
+    let server = Server {
+        globals,
+        agent: RefCell::new(None),
+    };
     let mut stdout = std::io::stdout().lock();
     for line in std::io::stdin().lock().lines() {
         let line = match line {
@@ -223,6 +232,25 @@ pub fn serve(globals: Globals) -> i32 {
 
 struct Server {
     globals: Globals,
+    /// Adapter id of the connected client (from `initialize` `clientInfo`);
+    /// `None` = unknown client, which no secret allow list grants.
+    agent: RefCell<Option<&'static str>>,
+}
+
+/// Map an MCP client name to the adapter id its secrets are granted to.
+fn client_agent(name: &str) -> Option<&'static str> {
+    let name = name.to_ascii_lowercase();
+    if name.contains("claude") {
+        Some("claude")
+    } else if name.contains("codex") {
+        Some("codex")
+    } else if name.contains("opencode") {
+        Some("opencode")
+    } else if name.contains("antigravity") || name.contains("agy") {
+        Some("antigravity")
+    } else {
+        None
+    }
 }
 
 impl Server {
@@ -250,7 +278,14 @@ impl Server {
         let id = id?;
         let params = message.get("params").unwrap_or(&Value::Null);
         let outcome = match method {
-            "initialize" => Ok(initialize(params)),
+            "initialize" => {
+                let client = params
+                    .pointer("/clientInfo/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                *self.agent.borrow_mut() = client_agent(client);
+                Ok(initialize(params))
+            }
             "ping" => Ok(json!({})),
             "tools/list" => {
                 Ok(json!({ "tools": TOOLS.iter().map(Tool::describe).collect::<Vec<_>>() }))
@@ -298,22 +333,36 @@ impl Server {
         cli::execute(spec, globals, arguments, false).0
     }
 
-    /// `Ok` only when the reference is listed in `[mcp_server] reveal`.
+    /// `Ok` only when the reference is listed in `[mcp_server] reveal` and
+    /// its `[secrets."<ref>"] allow` grants the calling agent.
     fn reveal_allowed(&self, arguments: &Params) -> Result<(), MusterError> {
         let reference = SecretRef::parse(arguments.get_string("reference").unwrap_or(""))?;
         let ctx = Context::new(self.globals.clone())?;
         let manifest = Manifest::load(&ctx.config_dir)?;
-        let allowed = manifest.mcp_server.as_ref().is_some_and(|server| {
+        let listed = manifest.mcp_server.as_ref().is_some_and(|server| {
             server
                 .reveal
                 .iter()
                 .any(|r| SecretRef::parse(r).is_ok_and(|r| r.as_str() == reference.as_str()))
         });
-        if allowed {
+        if !listed {
+            return Err(MusterError::Security(format!(
+                "{reference} may not be revealed over MCP; list it in muster.toml [mcp_server] reveal to allow it"
+            )));
+        }
+        let agent = *self.agent.borrow();
+        let granted = agent.is_some_and(|agent| {
+            SecretAccess::new(manifest.secrets.clone(), None).allows(agent, reference.as_str())
+        });
+        if granted {
             Ok(())
         } else {
             Err(MusterError::Security(format!(
-                "{reference} may not be revealed over MCP; list it in muster.toml [mcp_server] reveal to allow it"
+                "{reference} may not be revealed to {} over MCP; add the agent to muster.toml \
+                 [secrets.\"{reference}\"] allow",
+                agent.map_or("an unidentified client".to_string(), |a| format!(
+                    "agent `{a}`"
+                ))
             )))
         }
     }
