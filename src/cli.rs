@@ -31,11 +31,28 @@ where
     let (name, sub) = leaf(&matches);
     let spec = registry::find(&name).expect("parser is built from the registry");
     let globals = globals(&matches);
+    if spec.name == crate::mcp::SPEC.name {
+        return crate::mcp::serve(globals);
+    }
     let (format, quiet) = (globals.format.unwrap_or(Format::Text), globals.quiet);
+    let (envelope, code) = execute(spec, globals, &params(spec, sub), true);
+    output::render(&envelope, format, quiet);
+    code
+}
 
+/// Run one registry command and build its envelope and exit code. Shared by
+/// the CLI and the MCP server so both report exactly the same result. With
+/// `interactive = false` confirmations never prompt (`--yes` or exit 2).
+pub fn execute(
+    spec: &'static CommandSpec,
+    globals: Globals,
+    params: &Params,
+    interactive: bool,
+) -> (Envelope, i32) {
     let (result, mut diagnostics, failed) = match Context::new(globals) {
         Ok(mut ctx) => {
-            let result = (spec.handler)(&mut ctx, &params(spec, sub));
+            ctx.is_tty &= interactive;
+            let result = (spec.handler)(&mut ctx, params);
             (result, ctx.take_diagnostics(), ctx.failed())
         }
         Err(err) => (Err(err), Vec::new(), false),
@@ -48,12 +65,7 @@ where
             (false, Value::Null, err.exit_code())
         }
     };
-    output::render(
-        &Envelope::new(spec.name, ok, result, diagnostics),
-        format,
-        quiet,
-    );
-    code
+    (Envelope::new(spec.name, ok, result, diagnostics), code)
 }
 
 /// The full clap parser: global options plus one (nested) subcommand per spec.

@@ -6,6 +6,7 @@ pub mod import;
 pub mod init;
 pub mod machine;
 pub mod plan;
+pub mod proposal;
 pub mod revoke;
 pub mod schema;
 pub mod secret;

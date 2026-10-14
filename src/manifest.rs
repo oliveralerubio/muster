@@ -40,6 +40,9 @@ pub struct Manifest {
     /// Managed dotfiles, keyed by target path relative to `$HOME`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub files: BTreeMap<String, ManagedDotfile>,
+    /// Configuration for the built-in MCP server (`muster mcp`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_server: Option<McpServerConfig>,
     // Later tickets add members, groups and profiles.
     #[serde(flatten)]
     #[schemars(skip)]
@@ -99,6 +102,15 @@ impl Default for Manifest {
     }
 }
 
+/// Built-in MCP server configuration (`muster mcp`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct McpServerConfig {
+    /// Secret references explicitly allowed to be revealed through MCP.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reveal: Vec<String>,
+}
+
 impl Manifest {
     pub fn new() -> Self {
         Self {
@@ -108,6 +120,7 @@ impl Manifest {
             agents: None,
             mcp: BTreeMap::new(),
             files: BTreeMap::new(),
+            mcp_server: None,
             extensions: BTreeMap::new(),
         }
     }
