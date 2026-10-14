@@ -1,6 +1,7 @@
 pub mod agents;
 pub mod approve;
 pub mod enroll;
+pub mod import;
 pub mod init;
 pub mod machine;
 pub mod plan;

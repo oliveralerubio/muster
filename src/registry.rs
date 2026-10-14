@@ -103,6 +103,9 @@ pub static COMMANDS: &[CommandSpec] = &[
     crate::commands::secret::RM,
     crate::commands::secret::GET,
     crate::commands::secret::CHECK,
+    crate::commands::import::BWS,
+    crate::commands::import::CHEZMOI,
+    crate::commands::import::CUARTEL,
 ];
 
 pub fn find(name: &str) -> Option<&'static CommandSpec> {
