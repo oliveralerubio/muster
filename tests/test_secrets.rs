@@ -295,7 +295,7 @@ fn adapter_apply_resolves_native_mcp_environment_without_persisting_plaintext_or
     );
     std::fs::write(&manifest_path, manifest).unwrap();
 
-    let (output, envelope) = env.run_json(&["--format", "json", "agents", "apply"]);
+    let (output, envelope) = env.run_json(&["--format", "json", "agents", "apply", "--yes"]);
     assert!(output.status.success(), "{}", envelope.raw);
     assert!(!String::from_utf8_lossy(&output.stdout).contains(SEED));
     assert!(!String::from_utf8_lossy(&output.stderr).contains(SEED));
@@ -368,7 +368,7 @@ fn unresolvable_mcp_secret_reports_typed_provider_code_and_is_not_written() {
          [mcp.api]\ncommand = \"api-mcp\"\nenv = { API_KEY = \"native://app/missing\" }\n",
     );
     std::fs::write(&manifest_path, manifest).unwrap();
-    let (output, envelope) = env.run_json(&["--format", "json", "agents", "apply"]);
+    let (output, envelope) = env.run_json(&["--format", "json", "agents", "apply", "--yes"]);
     assert!(output.status.success(), "{}", envelope.raw);
     let text = envelope.raw.to_string();
     assert!(text.contains("secret_not_found"), "{text}");

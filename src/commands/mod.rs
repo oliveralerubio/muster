@@ -3,6 +3,7 @@ pub mod approve;
 pub mod enroll;
 pub mod init;
 pub mod machine;
+pub mod plan;
 pub mod revoke;
 pub mod schema;
 pub mod secret;

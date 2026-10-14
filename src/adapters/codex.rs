@@ -16,6 +16,7 @@ use crate::errors::MusterError;
 const CONFIG: ManagedFile = ManagedFile {
     base: Base::Home,
     path: ".codex/config.toml",
+    project: Some(".codex/config.toml"),
     scope: Scope::User,
     format: FileFormat::Toml,
     purpose: "Codex CLI configuration and MCP servers",
@@ -24,6 +25,7 @@ const CONFIG: ManagedFile = ManagedFile {
 const INSTRUCTIONS: ManagedFile = ManagedFile {
     base: Base::Home,
     path: ".codex/AGENTS.md",
+    project: Some("AGENTS.md"),
     scope: Scope::User,
     format: FileFormat::Markdown,
     purpose: "User instructions",

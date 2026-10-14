@@ -18,6 +18,7 @@ use crate::errors::MusterError;
 const SETTINGS: ManagedFile = ManagedFile {
     base: Base::Home,
     path: ".claude/settings.json",
+    project: Some(".claude/settings.json"),
     scope: Scope::User,
     format: FileFormat::Json,
     purpose: "Claude Code settings (model, permissions, hooks)",
@@ -26,6 +27,7 @@ const SETTINGS: ManagedFile = ManagedFile {
 const MCP: ManagedFile = ManagedFile {
     base: Base::Home,
     path: ".claude.json",
+    project: Some(".mcp.json"),
     scope: Scope::User,
     format: FileFormat::Json,
     purpose: "User-scoped MCP servers",
@@ -34,6 +36,7 @@ const MCP: ManagedFile = ManagedFile {
 const INSTRUCTIONS: ManagedFile = ManagedFile {
     base: Base::Home,
     path: ".claude/CLAUDE.md",
+    project: Some("CLAUDE.md"),
     scope: Scope::User,
     format: FileFormat::Markdown,
     purpose: "User instructions; imports AGENTS.md",
@@ -42,6 +45,7 @@ const INSTRUCTIONS: ManagedFile = ManagedFile {
 const AGENTS_COPY: ManagedFile = ManagedFile {
     base: Base::Home,
     path: ".claude/AGENTS.md",
+    project: Some("AGENTS.md"),
     scope: Scope::User,
     format: FileFormat::Markdown,
     purpose: "Copy of the canonical AGENTS.md imported by CLAUDE.md",

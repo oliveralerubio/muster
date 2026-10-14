@@ -16,6 +16,7 @@ use crate::errors::MusterError;
 const CONFIG: ManagedFile = ManagedFile {
     base: Base::XdgConfig,
     path: "opencode/opencode.json",
+    project: Some("opencode.json"),
     scope: Scope::User,
     format: FileFormat::Json,
     purpose: "OpenCode configuration and MCP servers",
@@ -24,6 +25,7 @@ const CONFIG: ManagedFile = ManagedFile {
 const INSTRUCTIONS: ManagedFile = ManagedFile {
     base: Base::XdgConfig,
     path: "opencode/AGENTS.md",
+    project: Some("AGENTS.md"),
     scope: Scope::User,
     format: FileFormat::Markdown,
     purpose: "User instructions",

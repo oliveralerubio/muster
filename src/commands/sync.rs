@@ -1,11 +1,11 @@
-//! `muster sync`: exchange the config repo with its git remote.
-//!
-//! Git transport only; the apply engine (plan, generations, rollback) builds on
-//! top of this later.
+//! `muster sync`: git transport of the config repo (when it has a remote),
+//! then plan + apply through the engine. `--dry-run` = plan only.
 
 use serde_json::{json, Value};
 
+use crate::commands::plan::{target, PROJECT_PARAM};
 use crate::context::Context;
+use crate::engine::{self, Options};
 use crate::errors::MusterError;
 use crate::git::{self, Pulled};
 use crate::manifest::Manifest;
@@ -14,7 +14,7 @@ use crate::registry::{CommandSpec, ParamKind, ParamSpec, Params};
 
 pub const SPEC: CommandSpec = CommandSpec {
     name: "sync",
-    about: "Pull and push the config repo with its git remote",
+    about: "Pull/push the config repo, then apply the desired state (backup, generation)",
     params: &[
         ParamSpec {
             name: "remote",
@@ -25,18 +25,19 @@ pub const SPEC: CommandSpec = CommandSpec {
         },
         ParamSpec {
             name: "pull",
-            about: "Only pull from the remote",
+            about: "Only pull from the remote (no push)",
             kind: ParamKind::Bool,
             required: false,
             positional: false,
         },
         ParamSpec {
             name: "push",
-            about: "Only push to the remote",
+            about: "Only push to the remote (no pull)",
             kind: ParamKind::Bool,
             required: false,
             positional: false,
         },
+        PROJECT_PARAM,
     ],
     mutating: true,
     handler: run,
@@ -44,25 +45,40 @@ pub const SPEC: CommandSpec = CommandSpec {
 
 fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     Manifest::load(&ctx.config_dir)?;
+    let target = target(params)?;
+    let transport = if ctx.dry_run {
+        Value::Null
+    } else {
+        transport(ctx, params)?
+    };
+    let plan = engine::plan(
+        ctx,
+        &Options {
+            target,
+            agent: None,
+        },
+    )?;
+    let mut result = engine::apply(ctx, plan)?;
+    result["transport"] = transport;
+    Ok(result)
+}
+
+/// Commit local config changes and exchange them with the remote. Skipped
+/// when the repo has no remote and no transport flag was given.
+fn transport(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let (only_pull, only_push) = (params.get_bool("pull"), params.get_bool("push"));
+    let remote = params.get_string("remote");
+    if let Some(url) = remote {
+        git::set_remote(&ctx.config_dir, url)?;
+    }
+    if !(git::has_remote(&ctx.config_dir) || only_pull || only_push) {
+        return Ok(Value::Null);
+    }
     let (do_pull, do_push) = match (only_pull, only_push) {
         (false, false) => (true, true),
         flags => flags,
     };
-    let remote = params.get_string("remote");
-    if ctx.dry_run {
-        return Ok(json!({
-            "dry_run": true,
-            "remote": remote,
-            "pull": do_pull,
-            "push": do_push,
-        }));
-    }
-    if let Some(url) = remote {
-        git::set_remote(&ctx.config_dir, url)?;
-    }
     let committed = git::commit_if_configured(&ctx.config_dir, "chore(muster): sync")?;
-
     let mut pulled = Value::Null;
     if do_pull {
         ctx.progress("Pulling config repo…");

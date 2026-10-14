@@ -297,8 +297,9 @@ command = "npx"
     )
     .expect("write manifest");
 
-    let (output, envelope) =
-        env.run_json(&["agents", "apply", "--agent", "codex", "--format", "json"]);
+    let (output, envelope) = env.run_json(&[
+        "agents", "apply", "--yes", "--agent", "codex", "--format", "json",
+    ]);
     assert!(
         output.status.success(),
         "apply must succeed even with untranslated features"
@@ -335,7 +336,7 @@ fn failure_in_one_adapter_does_not_block_the_others() {
     // Make ~/.claude impossible to use as a directory: a plain file is in the way.
     std::fs::write(env.path().join(".claude"), "not a directory").expect("blocker");
 
-    let (output, envelope) = env.run_json(&["agents", "apply", "--format", "json"]);
+    let (output, envelope) = env.run_json(&["agents", "apply", "--yes", "--format", "json"]);
     assert!(
         output.status.success(),
         "apply must not fail wholesale; per-adapter failures are diagnostics"
@@ -408,7 +409,7 @@ headers = { X-Team = "core" }
 fn generated_files_match_snapshots_per_adapter() {
     let env = MusterEnv::new();
     seed_full_config(&env);
-    env.run(&["agents", "apply"]).assert().code(0);
+    env.run(&["agents", "apply", "--yes"]).assert().code(0);
 
     let read = |rel: &str| {
         std::fs::read_to_string(env.path().join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
@@ -475,7 +476,7 @@ env = { SECRET_KEY = "native://core/api_key", PLAIN = "allowed" }
     )
     .expect("write manifest");
 
-    let (output, envelope) = env.run_json(&["agents", "apply", "--format", "json"]);
+    let (output, envelope) = env.run_json(&["agents", "apply", "--yes", "--format", "json"]);
     assert!(output.status.success());
     assert!(envelope.ok());
 
@@ -510,8 +511,8 @@ fn reapplying_changes_nothing_and_keeps_hand_written_instructions() {
     std::fs::create_dir_all(claude_md.parent().unwrap()).expect("claude dir");
     std::fs::write(&claude_md, "# My own notes\n").expect("seed CLAUDE.md");
 
-    env.run(&["agents", "apply"]).assert().code(0);
-    let (output, envelope) = env.run_json(&["agents", "apply", "--format", "json"]);
+    env.run(&["agents", "apply", "--yes"]).assert().code(0);
+    let (output, envelope) = env.run_json(&["agents", "apply", "--yes", "--format", "json"]);
     assert!(output.status.success());
     for agent in envelope.result()["agents"].as_array().expect("agents") {
         for file in agent["files"].as_array().expect("files") {
@@ -541,7 +542,7 @@ fn unparsable_native_file_fails_only_that_adapter_and_is_left_untouched() {
     std::fs::create_dir_all(&dir).expect("opencode dir");
     std::fs::write(dir.join("opencode.json"), "{ not json").expect("seed");
 
-    let (output, envelope) = env.run_json(&["agents", "apply", "--format", "json"]);
+    let (output, envelope) = env.run_json(&["agents", "apply", "--yes", "--format", "json"]);
     assert!(output.status.success());
     let diags = envelope.diagnostics().as_array().expect("diagnostics");
     assert!(

@@ -40,7 +40,7 @@ pub enum Scope {
     User,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FileFormat {
     Json,
@@ -52,8 +52,12 @@ pub enum FileFormat {
 #[derive(Debug, PartialEq, Eq, Serialize)]
 pub struct ManagedFile {
     pub base: Base,
-    /// Path relative to `base`.
+    /// Path relative to `base`. Also the key of this file in [`Current`].
     pub path: &'static str,
+    /// Path relative to a project root when the agent reads a project-scoped
+    /// equivalent of this file; `None` = user scope only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project: Option<&'static str>,
     pub scope: Scope,
     pub format: FileFormat,
     pub purpose: &'static str,
@@ -358,6 +362,22 @@ fn markdown_block(current: Option<&String>, body: &str) -> String {
     format!("{}\n\n{block}", text.trim_end())
 }
 
+/// `text` without Muster's managed block (the inverse of [`markdown_block`]).
+pub(crate) fn strip_markdown_block(text: &str) -> String {
+    match (text.find(BLOCK_BEGIN), text.find(BLOCK_END)) {
+        (Some(start), Some(end)) if start < end => {
+            let after = text[end + BLOCK_END.len()..].trim_start_matches('\n');
+            let before = text[..start].trim_end();
+            match (before.is_empty(), after.is_empty()) {
+                (true, _) => after.to_string(),
+                (false, true) => format!("{before}\n"),
+                (false, false) => format!("{before}\n\n{after}"),
+            }
+        }
+        _ => text.to_string(),
+    }
+}
+
 /// `pre_tool_use` -> `PreToolUse`.
 fn pascal_case(snake: &str) -> String {
     snake
@@ -386,6 +406,8 @@ mod tests {
         assert!(second.contains("\nv2\n") && !second.contains("v1"));
         assert!(second.ends_with("trailing notes\n"));
         assert_eq!(markdown_block(Some(&second), "v2"), second, "idempotent");
+        assert_eq!(strip_markdown_block(&second), "# Mine\n\ntrailing notes\n");
+        assert_eq!(strip_markdown_block(&markdown_block(None, "v1")), "");
     }
 
     #[test]
