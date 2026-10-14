@@ -6,6 +6,7 @@ pub mod commands;
 pub mod context;
 pub mod errors;
 pub mod identity;
+pub mod machine;
 pub mod manifest;
 pub mod output;
 pub mod registry;

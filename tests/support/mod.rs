@@ -97,3 +97,13 @@ impl Envelope {
         &self.raw["diagnostics"]
     }
 }
+
+impl MusterEnv {
+    /// Put an executable `#!/bin/sh` script named `name` in the temp bin dir.
+    pub fn fake_exe(&self, name: &str, script: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let path = self.bin.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).expect("write fake exe");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+}

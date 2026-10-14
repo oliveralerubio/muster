@@ -80,7 +80,11 @@ impl Params {
 }
 
 /// Every command Muster knows. Register new commands here.
-pub static COMMANDS: &[CommandSpec] = &[crate::commands::schema::SPEC];
+pub static COMMANDS: &[CommandSpec] = &[
+    crate::commands::init::SPEC,
+    crate::commands::schema::SPEC,
+    crate::commands::status::SPEC,
+];
 
 pub fn find(name: &str) -> Option<&'static CommandSpec> {
     COMMANDS.iter().find(|c| c.name == name)
