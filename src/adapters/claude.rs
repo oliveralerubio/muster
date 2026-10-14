@@ -5,15 +5,19 @@
 //!   `hooks` (`PreToolUse`, `Stop`...).
 //! - `~/.claude.json`: `mcpServers.<name>`.
 //! - `~/.claude/AGENTS.md` + `~/.claude/CLAUDE.md` (managed block `@AGENTS.md`).
+//! - `~/.claude/skills/<skill>/...` (project `.claude/skills/`): Agent Skills
+//!   declared in `[agents.skills]`, one whole file per skill file.
 
 use serde_json::{Map, Value};
 
 use super::{
-    child_object, json_object, json_text, markdown_block, pascal_case, resolve_mcp_map, transport,
-    Adapter, Base, Capability, Current, Desired, FileFormat, ManagedFile, RenderPlan, RenderedFile,
-    Scope, Transport,
+    child_object, json_object, json_text, markdown_block, pascal_case, push_skills,
+    resolve_mcp_map, transport, Adapter, Base, Capability, Current, Desired, FileFormat,
+    ManagedFile, RenderPlan, RenderedFile, Scope, Transport,
 };
 use crate::errors::MusterError;
+
+const SKILLS_DIR: &str = ".claude/skills";
 
 const SETTINGS: ManagedFile = ManagedFile {
     base: Base::Home,
@@ -54,6 +58,7 @@ const AGENTS_COPY: ManagedFile = ManagedFile {
 pub static ADAPTER: Adapter = Adapter {
     id: "claude",
     name: "Claude Code",
+    binary: "claude",
     experimental: false,
     platforms: &["linux", "macos", "windows"],
     min_version: "1.0.0",
@@ -64,6 +69,7 @@ pub static ADAPTER: Adapter = Adapter {
         Capability::Models,
         Capability::Permissions,
         Capability::Hooks,
+        Capability::Skills,
     ],
     files: &[SETTINGS, MCP, INSTRUCTIONS, AGENTS_COPY],
     render: Some(render),
@@ -73,6 +79,7 @@ fn render(desired: &Desired, current: &Current, plan: &mut RenderPlan) -> Result
     render_settings(desired, current.get(SETTINGS.path), plan)?;
     render_mcp(desired, current.get(MCP.path), plan)?;
     render_instructions(desired, current, plan);
+    push_skills(desired, Base::Home, SKILLS_DIR, SKILLS_DIR, plan);
     Ok(())
 }
 
@@ -142,7 +149,7 @@ fn render_mcp(
                     let args: Vec<Value> = server.args.iter().cloned().map(Value::String).collect();
                     entry.insert("args".into(), Value::Array(args));
                 }
-                let env = resolve_mcp_map(&server.env, desired.secrets, "Claude Code", name, plan);
+                let env = resolve_mcp_map(&server.env, desired, &ADAPTER, name, plan);
                 if !env.is_empty() {
                     let map: Map<String, Value> = env
                         .into_iter()
@@ -154,8 +161,7 @@ fn render_mcp(
             Transport::Remote { url } => {
                 entry.insert("type".into(), Value::String("http".into()));
                 entry.insert("url".into(), Value::String(url.to_string()));
-                let headers =
-                    resolve_mcp_map(&server.headers, desired.secrets, "Claude Code", name, plan);
+                let headers = resolve_mcp_map(&server.headers, desired, &ADAPTER, name, plan);
                 if !headers.is_empty() {
                     let map: Map<String, Value> = headers
                         .into_iter()

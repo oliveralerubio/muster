@@ -104,7 +104,10 @@ fn list(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
                 .iter()
                 .map(|f: &ManagedFile| {
                     json!({
-                        "path": roots.resolve(f),
+                        "path": f.path,
+                        "base": f.base,
+                        "project": f.project,
+                        "resolved": roots.resolve(f),
                         "scope": f.scope,
                         "format": f.format,
                         "purpose": f.purpose,

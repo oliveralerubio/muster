@@ -8,6 +8,7 @@
 //! [`Adapter::render`] and write the results. Render only rewrites the keys it
 //! manages and keeps everything else in the file.
 
+pub mod antigravity;
 pub mod claude;
 pub mod codex;
 pub mod config;
@@ -20,7 +21,7 @@ use serde_json::{Map, Value};
 
 use crate::errors::MusterError;
 use crate::output::{Diagnostic, Severity};
-use crate::secrets::SecretValue;
+use crate::secrets::{SecretAccess, SecretValue};
 use config::{AgentsConfig, McpServer, Transport};
 
 /// Where a managed path is rooted.
@@ -75,6 +76,7 @@ pub enum Capability {
     Models,
     Permissions,
     Hooks,
+    Skills,
 }
 
 impl Capability {
@@ -86,6 +88,7 @@ impl Capability {
             Self::Models => "models",
             Self::Permissions => "permissions",
             Self::Hooks => "hooks",
+            Self::Skills => "skills",
         }
     }
 }
@@ -102,7 +105,15 @@ pub struct Desired<'a> {
     pub instructions: Option<&'a str>,
     /// Resolved secrets injected into MCP env and headers; render stays pure.
     pub secrets: &'a BTreeMap<String, SecretValue>,
+    /// Which agents may receive which of those secrets (deny by default).
+    pub access: &'a SecretAccess,
+    /// Agent Skills read from `[agents.skills]`: skill name -> file path
+    /// relative to the skill directory (`SKILL.md`, `refs/x.md`) -> contents.
+    pub skills: &'a Skills,
 }
+
+/// Skill name -> relative file path -> contents.
+pub type Skills = BTreeMap<String, BTreeMap<String, String>>;
 
 impl Desired<'_> {
     /// Features this configuration uses (drives "not supported" diagnostics).
@@ -137,6 +148,9 @@ impl Desired<'_> {
         if !self.agents.hooks.is_empty() {
             used.push(Capability::Hooks);
         }
+        if !self.skills.is_empty() {
+            used.push(Capability::Skills);
+        }
         used
     }
 }
@@ -162,9 +176,23 @@ impl std::fmt::Debug for RenderedFile {
     }
 }
 
+/// A whole file Muster owns at a path computed at render time (one file of
+/// an installed skill), outside the adapter's static [`ManagedFile`] list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedTreeFile {
+    pub base: Base,
+    /// Path relative to `base`.
+    pub path: String,
+    /// Path relative to a project root; `None` = user scope only.
+    pub project: Option<String>,
+    pub contents: String,
+}
+
 #[derive(Debug, Default)]
 pub struct RenderPlan {
     pub files: Vec<RenderedFile>,
+    /// Whole files at render-time paths (always [`FileFormat::Text`]).
+    pub tree: Vec<RenderedTreeFile>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -175,6 +203,8 @@ type RenderFn = fn(&Desired, &Current, &mut RenderPlan) -> Result<(), MusterErro
 pub struct Adapter {
     pub id: &'static str,
     pub name: &'static str,
+    /// Executable name on `PATH` (detection, doctor, installer default).
+    pub binary: &'static str,
     pub experimental: bool,
     pub platforms: &'static [&'static str],
     pub min_version: &'static str,
@@ -225,23 +255,12 @@ impl Adapter {
     }
 }
 
-static GEMINI: Adapter = Adapter {
-    id: "gemini",
-    name: "Gemini CLI",
-    experimental: true,
-    platforms: &["linux", "macos", "windows"],
-    min_version: "",
-    capabilities: &[],
-    files: &[],
-    render: None,
-};
-
 /// Every adapter Muster knows, stable ones first.
 pub static ADAPTERS: &[&Adapter] = &[
     &claude::ADAPTER,
     &codex::ADAPTER,
     &opencode::ADAPTER,
-    &GEMINI,
+    &antigravity::ADAPTER,
 ];
 
 pub fn find(id: &str) -> Option<&'static Adapter> {
@@ -267,12 +286,34 @@ pub fn is_secret_reference(value: &str) -> bool {
     crate::secrets::is_reference(value)
 }
 
-/// `map` with secret references replaced by their resolved values; a reference
-/// that could not be resolved drops its key with a warning.
+/// One whole file per skill file: `<global_dir>/<skill>/<rel>` under `base`,
+/// and `<project_dir>/<skill>/<rel>` under a project root.
+fn push_skills(
+    desired: &Desired,
+    base: Base,
+    global_dir: &str,
+    project_dir: &str,
+    plan: &mut RenderPlan,
+) {
+    for (skill, files) in desired.skills {
+        for (rel, contents) in files {
+            plan.tree.push(RenderedTreeFile {
+                base,
+                path: format!("{global_dir}/{skill}/{rel}"),
+                project: Some(format!("{project_dir}/{skill}/{rel}")),
+                contents: contents.clone(),
+            });
+        }
+    }
+}
+
+/// `map` with secret references replaced by their resolved values. A
+/// reference this agent is not allowed to receive, or that could not be
+/// resolved, drops its key with a warning (never the value or the reference).
 fn resolve_mcp_map(
     map: &BTreeMap<String, String>,
-    secrets: &BTreeMap<String, SecretValue>,
-    adapter: &str,
+    desired: &Desired,
+    adapter: &Adapter,
     server: &str,
     plan: &mut RenderPlan,
 ) -> BTreeMap<String, String> {
@@ -280,21 +321,37 @@ fn resolve_mcp_map(
     for (key, value) in map {
         if !is_secret_reference(value) {
             kept.insert(key.clone(), value.clone());
-        } else if let Some(secret) = secrets.get(value) {
-            kept.insert(key.clone(), secret.expose().to_owned());
-        } else {
-            plan.diagnostics.push(
-                Diagnostic::new(
-                    Severity::Warning,
-                    "secret_reference_unresolved",
-                    format!(
-                        "{adapter}: MCP server `{server}` key `{key}` references a secret \
-                         that could not be resolved, so it was not written"
-                    ),
-                )
-                .with_path(format!("mcp.{server}")),
-            );
+            continue;
         }
+        let (code, why) = if !desired.access.allows(adapter.id, value) {
+            (
+                "secret_not_allowed_for_agent",
+                format!(
+                    "{value} is not allowed for agent `{}` (add it to \
+                     [secrets.\"{value}\"] allow in muster.toml)",
+                    adapter.id
+                ),
+            )
+        } else if let Some(secret) = desired.secrets.get(value) {
+            kept.insert(key.clone(), secret.expose().to_owned());
+            continue;
+        } else {
+            (
+                "secret_reference_unresolved",
+                "it references a secret that could not be resolved".to_string(),
+            )
+        };
+        plan.diagnostics.push(
+            Diagnostic::new(
+                Severity::Warning,
+                code,
+                format!(
+                    "{}: MCP server `{server}` key `{key}`: {why}, so it was not written",
+                    adapter.name
+                ),
+            )
+            .with_path(format!("mcp.{server}")),
+        );
     }
     kept
 }

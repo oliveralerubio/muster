@@ -151,12 +151,22 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
         None => enabled_adapters(Some(&merged.agents))?,
     };
     let instructions = read_instructions(ctx, &merged)?;
+    let skills = read_skills(ctx, &merged)?;
     let secrets = resolve_secrets(ctx, &merged.mcp);
+    // Grants come only from the config repo's manifest: a project's own
+    // `.muster/muster.toml` cannot grant itself secrets.
+    let project = match &options.target {
+        Target::Global => None,
+        Target::Project(dir) => dir.file_name().map(|n| n.to_string_lossy().into_owned()),
+    };
+    let access = crate::secrets::SecretAccess::new(manifest.secrets.clone(), project);
     let desired = Desired {
         agents: &merged.agents,
         mcp: &merged.mcp,
         instructions: instructions.as_deref(),
         secrets: &secrets,
+        access: &access,
+        skills: &skills,
     };
 
     let roots = Roots::from_env()?;
@@ -181,6 +191,27 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
                 }
                 for entry in planned {
                     merge_entry(&mut entries, entry);
+                }
+                // Render-time files (skills) this adapter no longer renders.
+                for (path, record) in records {
+                    let path = PathBuf::from(path);
+                    if record.target != key
+                        || record.agent != adapter.id
+                        || entries.contains_key(&path)
+                    {
+                        continue;
+                    }
+                    match read_optional(&path) {
+                        Ok(before) => {
+                            if let Some(entry) = unmanaged_entry(adapter.id, &path, before, record)
+                            {
+                                merge_entry(&mut entries, entry);
+                            }
+                        }
+                        Err(err) => {
+                            ctx.diag(adapter_failure(adapter.id, adapter.name, &err.to_string()))
+                        }
+                    }
                 }
                 agents.insert(adapter.id, None);
             }
@@ -356,6 +387,34 @@ fn plan_adapter(
             executable: false,
             created,
             drift,
+        });
+    }
+    // Whole files at render-time paths (skills): Muster owns the file.
+    for file in &rendered.tree {
+        let path = match target {
+            Target::Global => roots.base(file.base).join(&file.path),
+            Target::Project(dir) => match &file.project {
+                Some(project) => dir.join(project),
+                None => continue,
+            },
+        };
+        let before = match pending.get(&path) {
+            Some(entry) => entry.before.clone(),
+            None => read_optional(&path)?,
+        };
+        let record = ours(&path);
+        entries.push(Entry {
+            created: record.map_or(before.is_none(), |r| r.created),
+            drift: record.is_some_and(|r| before.as_deref() != Some(r.contents.as_str())),
+            path,
+            agents: vec![adapter.id],
+            format: FileFormat::Text,
+            before,
+            after: Some(file.contents.clone()),
+            managed: true,
+            owned: ownership::owned_keys(FileFormat::Text, &file.contents),
+            private: record.is_some_and(|r| r.private),
+            executable: false,
         });
     }
     Ok((entries, rendered.diagnostics))
@@ -594,6 +653,14 @@ pub fn apply(ctx: &mut Context, mut plan: Plan) -> Result<Value, MusterError> {
         return Ok(plan.to_json(false, false, plan.base_generation()));
     }
 
+    // Roots never pruned when a whole file's emptied directories are removed.
+    let mut keep: Vec<PathBuf> = match Roots::from_env() {
+        Ok(roots) => vec![roots.home, roots.xdg_config],
+        Err(_) => Vec::new(),
+    };
+    if let Target::Project(dir) = &plan.target {
+        keep.push(dir.clone());
+    }
     let mut pending = store::begin(&ctx.state_dir)?;
     let mut failed: BTreeSet<&'static str> = BTreeSet::new();
     for entry in &plan.entries {
@@ -610,7 +677,14 @@ pub fn apply(ctx: &mut Context, mut plan: Plan) -> Result<Value, MusterError> {
             }
             match &entry.after {
                 Some(after) => write_file(&entry.path, after, entry.private, entry.executable),
-                None => std::fs::remove_file(&entry.path).map_err(|e| io_error(&entry.path, e)),
+                None => {
+                    std::fs::remove_file(&entry.path).map_err(|e| io_error(&entry.path, e))?;
+                    // Whole files (skills) leave no empty skill directories.
+                    if entry.format == FileFormat::Text {
+                        remove_empty_parents(&entry.path, &keep);
+                    }
+                    Ok(())
+                }
             }
         })();
         if let Err(err) = result {
@@ -806,9 +880,13 @@ impl Roots {
 
     /// User-scope path of a managed file.
     pub fn resolve(&self, file: &ManagedFile) -> PathBuf {
-        match file.base {
-            Base::Home => self.home.join(file.path),
-            Base::XdgConfig => self.xdg_config.join(file.path),
+        self.base(file.base).join(file.path)
+    }
+
+    fn base(&self, base: Base) -> &Path {
+        match base {
+            Base::Home => &self.home,
+            Base::XdgConfig => &self.xdg_config,
         }
     }
 
@@ -934,6 +1012,76 @@ fn read_instructions(
     }
 }
 
+/// Files of every skill under `[agents.skills] source`: one subdirectory per
+/// skill, regular files only (any depth), keyed by `/`-separated relative path.
+fn read_skills(ctx: &mut Context, merged: &layer::Merged) -> Result<adapters::Skills, MusterError> {
+    let mut skills = adapters::Skills::new();
+    let Some(dir) = merged.skills_path()? else {
+        return Ok(skills);
+    };
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            ctx.diag(
+                Diagnostic::new(
+                    Severity::Warning,
+                    "skills_missing",
+                    format!(
+                        "skills source {} does not exist; skills were not installed",
+                        dir.display()
+                    ),
+                )
+                .with_path(dir.display().to_string()),
+            );
+            return Ok(skills);
+        }
+        Err(e) => return Err(io_error(&dir, e)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|e| io_error(&dir, e))?;
+        let file_type = entry.file_type().map_err(|e| io_error(&entry.path(), e))?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !file_type.is_dir() || name.starts_with('.') {
+            continue;
+        }
+        let mut files = BTreeMap::new();
+        collect_skill_files(&entry.path(), "", &mut files)?;
+        if files.is_empty() {
+            continue;
+        }
+        if !is_valid_skill(&name, &files, ctx, &entry.path()) {
+            continue;
+        }
+        skills.insert(name, files);
+    }
+    Ok(skills)
+}
+
+fn collect_skill_files(
+    dir: &Path,
+    prefix: &str,
+    files: &mut BTreeMap<String, String>,
+) -> Result<(), MusterError> {
+    for entry in std::fs::read_dir(dir).map_err(|e| io_error(dir, e))? {
+        let entry = entry.map_err(|e| io_error(dir, e))?;
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(|e| io_error(&path, e))?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let rel = format!("{prefix}{name}");
+        if file_type.is_dir() {
+            collect_skill_files(&path, &format!("{rel}/"), files)?;
+        } else if file_type.is_file() {
+            let text = std::fs::read_to_string(&path).map_err(|e| io_error(&path, e))?;
+            files.insert(rel, text);
+        }
+    }
+    Ok(())
+}
+
 fn read_optional(path: &Path) -> Result<Option<String>, MusterError> {
     match std::fs::read_to_string(path) {
         Ok(text) => Ok(Some(text)),
@@ -991,4 +1139,101 @@ fn write_file(
 
 fn io_error(path: &Path, e: std::io::Error) -> MusterError {
     MusterError::Operational(format!("{}: {e}", path.display()))
+}
+
+/// Remove the directories above `path` that are left empty, stopping below a
+/// root in `keep` (and never removing a root's direct child, like `~/.gemini`).
+fn remove_empty_parents(path: &Path, keep: &[PathBuf]) {
+    let mut dir = path.parent();
+    while let Some(current) = dir {
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        if keep.iter().any(|k| k == current || k == parent) {
+            break;
+        }
+        // Fails (and stops) as soon as a directory still holds anything.
+        if std::fs::remove_dir(current).is_err() {
+            break;
+        }
+        dir = Some(parent);
+    }
+}
+
+fn is_valid_skill(
+    name: &str,
+    files: &BTreeMap<String, String>,
+    ctx: &mut Context,
+    skill_dir: &Path,
+) -> bool {
+    let Some(skill_md) = files.get("SKILL.md") else {
+        ctx.diag(
+            Diagnostic::new(
+                Severity::Warning,
+                "skill_invalid",
+                format!("skill `{name}` has no SKILL.md; skipped"),
+            )
+            .with_path(skill_dir.display().to_string()),
+        );
+        return false;
+    };
+
+    if !has_valid_frontmatter(skill_md) {
+        ctx.diag(
+            Diagnostic::new(
+                Severity::Warning,
+                "skill_invalid",
+                format!(
+                    "skill `{name}` SKILL.md must have YAML frontmatter with non-empty `name` and `description`; skipped"
+                ),
+            )
+            .with_path(skill_dir.join("SKILL.md").display().to_string()),
+        );
+        return false;
+    }
+
+    true
+}
+
+fn has_valid_frontmatter(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with("---") {
+        return false;
+    }
+    let after_start = &trimmed[3..];
+    let after_newline = if let Some(rest) = after_start.strip_prefix("\r\n") {
+        rest
+    } else if let Some(rest) = after_start.strip_prefix('\n') {
+        rest
+    } else {
+        return false;
+    };
+
+    let Some(end_idx) = after_newline.find("\n---") else {
+        return false;
+    };
+    let fm_block = &after_newline[..end_idx];
+
+    let mut has_name = false;
+    let mut has_desc = false;
+
+    for line in fm_block.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((key, val)) = line.split_once(':') {
+            let key = key.trim();
+            let val = val.trim().trim_matches(|c| c == '\'' || c == '"').trim();
+            if !val.is_empty() {
+                if key == "name" {
+                    has_name = true;
+                } else if key == "description" {
+                    has_desc = true;
+                }
+            }
+        }
+    }
+
+    has_name && has_desc
 }

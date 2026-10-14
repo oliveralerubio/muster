@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentsConfig {
-    /// Adapter ids to apply (`claude`, `codex`, `opencode`). Default: every stable adapter.
+    /// Adapter ids to apply (`claude`, `codex`, `opencode`, `antigravity`). Default: every stable adapter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<Vec<String>>,
     /// Shared instructions (AGENTS.md).
@@ -25,6 +25,18 @@ pub struct AgentsConfig {
     /// Lifecycle hooks keyed by snake_case event (`pre_tool_use`, `stop`...).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub hooks: BTreeMap<String, Hook>,
+    /// Agent Skills installed from the config repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills: Option<SkillsConfig>,
+}
+
+/// `[agents.skills]`: a directory of the config repository holding one
+/// subdirectory per skill (`<source>/<skill>/SKILL.md` plus any extra files).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SkillsConfig {
+    /// Path of the skills directory, relative to the config repository.
+    pub source: String,
 }
 
 /// `[agents.instructions]`.

@@ -377,6 +377,25 @@ fn agents_install_downloads_and_verifies_sha256_refusing_mismatch() {
     assert!(!env.path().join(".local/bin/codex").exists());
 }
 
+#[test]
+fn agents_install_antigravity_installs_the_agy_binary() {
+    let env = MusterEnv::new();
+    init(&env);
+    let artifact = env.path().join("artifacts").join("agy");
+    write(&artifact, "#!/bin/sh\necho \"agy 1.3.0\"\n");
+    let sha = "f4b6c1e9b86760e8688506eb7301f385986370c143a0d9ed8123ce646b81a516";
+    let url = format!("file://{}", artifact.display());
+    let lock =
+        format!("[agents.antigravity]\nversion = \"1.3.0\"\nurl = \"{url}\"\nsha256 = \"{sha}\"\n");
+    write(&env.config_dir().join("muster.lock"), &lock);
+
+    let res = ok(&env, &["agents", "install", "--agent", "antigravity"]);
+    assert_eq!(res["installed"][0]["agent"], "antigravity");
+    assert_eq!(res["installed"][0]["action"], "install");
+    assert!(env.path().join(".local/bin/agy").is_file());
+    assert!(!env.path().join(".local/bin/antigravity").exists());
+}
+
 // --- schedule ---------------------------------------------------------------
 
 #[test]

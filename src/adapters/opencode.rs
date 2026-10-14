@@ -3,13 +3,15 @@
 //! Managed files (under `$XDG_CONFIG_HOME/opencode/`):
 //! - `opencode.json`: `model`, `mcp.<name>` (`type: local|remote`).
 //! - `AGENTS.md`: canonical instructions.
+//! - `skills/<skill>/...` (project `.opencode/skills/`): Agent Skills declared
+//!   in `[agents.skills]`.
 
 use serde_json::{Map, Value};
 
 use super::{
-    child_object, json_object, json_text, markdown_block, resolve_mcp_map, transport, Adapter,
-    Base, Capability, Current, Desired, FileFormat, ManagedFile, RenderPlan, RenderedFile, Scope,
-    Transport,
+    child_object, json_object, json_text, markdown_block, push_skills, resolve_mcp_map, transport,
+    Adapter, Base, Capability, Current, Desired, FileFormat, ManagedFile, RenderPlan, RenderedFile,
+    Scope, Transport,
 };
 use crate::errors::MusterError;
 
@@ -31,11 +33,15 @@ const INSTRUCTIONS: ManagedFile = ManagedFile {
     purpose: "User instructions",
 };
 
+const SKILLS_DIR: &str = "opencode/skills";
+const PROJECT_SKILLS_DIR: &str = ".opencode/skills";
+
 const SCHEMA_URL: &str = "https://opencode.ai/config.json";
 
 pub static ADAPTER: Adapter = Adapter {
     id: "opencode",
     name: "OpenCode",
+    binary: "opencode",
     experimental: false,
     platforms: &["linux", "macos", "windows"],
     min_version: "0.1.0",
@@ -44,6 +50,7 @@ pub static ADAPTER: Adapter = Adapter {
         Capability::McpStdio,
         Capability::McpRemote,
         Capability::Models,
+        Capability::Skills,
     ],
     files: &[CONFIG, INSTRUCTIONS],
     render: Some(render),
@@ -75,7 +82,7 @@ fn render(desired: &Desired, current: &Current, plan: &mut RenderPlan) -> Result
                         .map(Value::from)
                         .collect();
                     entry.insert("command".into(), Value::Array(argv));
-                    let env = resolve_mcp_map(&server.env, desired.secrets, "OpenCode", name, plan);
+                    let env = resolve_mcp_map(&server.env, desired, &ADAPTER, name, plan);
                     if !env.is_empty() {
                         entry.insert("environment".into(), string_map(env));
                     }
@@ -83,8 +90,7 @@ fn render(desired: &Desired, current: &Current, plan: &mut RenderPlan) -> Result
                 Transport::Remote { url } => {
                     entry.insert("type".into(), "remote".into());
                     entry.insert("url".into(), url.into());
-                    let headers =
-                        resolve_mcp_map(&server.headers, desired.secrets, "OpenCode", name, plan);
+                    let headers = resolve_mcp_map(&server.headers, desired, &ADAPTER, name, plan);
                     if !headers.is_empty() {
                         entry.insert("headers".into(), string_map(headers));
                     }
@@ -105,6 +111,13 @@ fn render(desired: &Desired, current: &Current, plan: &mut RenderPlan) -> Result
             contents: markdown_block(current.get(INSTRUCTIONS.path), text),
         });
     }
+    push_skills(
+        desired,
+        Base::XdgConfig,
+        SKILLS_DIR,
+        PROJECT_SKILLS_DIR,
+        plan,
+    );
     Ok(())
 }
 

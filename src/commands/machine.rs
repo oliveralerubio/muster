@@ -92,6 +92,7 @@ fn list(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
         };
         machines.push(json!({
             "name": name,
+            "status": "active",
             "recipient": m.recipient,
             "platform": m.platform,
             "version": m.muster_version,

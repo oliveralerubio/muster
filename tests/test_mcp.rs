@@ -85,6 +85,11 @@ impl McpServer {
 
     /// Full MCP handshake: initialize, read result, notify initialized.
     fn initialize(&mut self) -> Value {
+        self.initialize_as("muster-test")
+    }
+
+    /// Handshake announcing `client` as `clientInfo.name` (maps to an agent).
+    fn initialize_as(&mut self, client: &str) -> Value {
         self.send(&json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -92,7 +97,7 @@ impl McpServer {
             "params": {
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {},
-                "clientInfo": {"name": "muster-test", "version": "0.0.0"}
+                "clientInfo": {"name": client, "version": "0.0.0"}
             }
         }));
         let result = self.read_response()["result"].clone();
@@ -324,7 +329,8 @@ fn every_read_only_tool_matches_its_cli_command() {
     init_machine(&env);
     seed_secret(&env, "ci/deploy_token", REVEAL_VALUE);
     let manifest = format!(
-        "{}\n[mcp_server]\nreveal = [\"native://ci/deploy_token\"]\n",
+        "{}\n[mcp_server]\nreveal = [\"native://ci/deploy_token\"]\n\n\
+         [secrets.\"native://ci/deploy_token\"]\nallow = [\"claude\"]\n",
         manifest_text(&env)
     );
     std::fs::write(env.config_dir().join("muster.toml"), manifest).unwrap();
@@ -351,7 +357,7 @@ fn every_read_only_tool_matches_its_cli_command() {
         ),
     ];
     let mut server = McpServer::spawn(&env);
-    server.initialize();
+    server.initialize_as("claude-code");
     for (id, (tool, arguments, cli_args)) in cases.into_iter().enumerate() {
         let (_, cli) = env.run_json(cli_args);
         let mcp = envelope_of(&server.call_tool(id as i64 + 2, tool, arguments));
@@ -653,13 +659,14 @@ fn secret_reveal_returns_only_the_explicitly_allowed_secret() {
     init_machine(&env);
     seed_secret(&env, "ci/deploy_token", REVEAL_VALUE);
     let manifest = format!(
-        "{}\n[mcp_server]\nreveal = [\"native://ci/deploy_token\"]\n",
+        "{}\n[mcp_server]\nreveal = [\"native://ci/deploy_token\"]\n\n\
+         [secrets.\"native://ci/deploy_token\"]\nallow = [\"claude\"]\n",
         manifest_text(&env)
     );
     std::fs::write(env.config_dir().join("muster.toml"), manifest).unwrap();
 
     let mut server = McpServer::spawn(&env);
-    server.initialize();
+    server.initialize_as("claude-code");
     let result = server.call_tool(
         2,
         "secret_reveal",
@@ -672,6 +679,69 @@ fn secret_reveal_returns_only_the_explicitly_allowed_secret() {
     let listing = tool_text(&server.call_tool(3, "secret_list_meta", json!({})));
     assert!(!listing.contains(REVEAL_VALUE), "{listing}");
     server.shutdown();
+}
+
+/// Manifest listing the token for MCP reveal and granting it only to claude.
+fn reveal_granted_to_claude(env: &MusterEnv) {
+    let manifest = format!(
+        "{}\n[mcp_server]\nreveal = [\"native://ci/deploy_token\"]\n\n\
+         [secrets.\"native://ci/deploy_token\"]\nallow = [\"claude\"]\n",
+        manifest_text(env)
+    );
+    std::fs::write(env.config_dir().join("muster.toml"), manifest).unwrap();
+}
+
+#[test]
+fn secret_reveal_succeeds_for_a_client_in_the_secret_allow_list() {
+    let env = MusterEnv::new();
+    init_machine(&env);
+    seed_secret(&env, "ci/deploy_token", REVEAL_VALUE);
+    reveal_granted_to_claude(&env);
+
+    let mut server = McpServer::spawn(&env);
+    server.initialize_as("claude-code");
+    let result = server.call_tool(
+        2,
+        "secret_reveal",
+        json!({"reference": "native://ci/deploy_token"}),
+    );
+    server.shutdown();
+    let envelope = envelope_of(&result);
+    assert_eq!(result["isError"], json!(false), "{envelope}");
+    assert_eq!(envelope["result"], json!(REVEAL_VALUE));
+}
+
+#[test]
+fn secret_reveal_is_denied_to_a_client_outside_the_secret_allow_list() {
+    let env = MusterEnv::new();
+    init_machine(&env);
+    seed_secret(&env, "ci/deploy_token", REVEAL_VALUE);
+    reveal_granted_to_claude(&env);
+
+    // Listed in [mcp_server] reveal, but codex is not in the secret's allow
+    // list; an unidentified client is never granted either.
+    for client in ["codex-mcp-client", "muster-test"] {
+        let mut server = McpServer::spawn(&env);
+        server.initialize_as(client);
+        let result = server.call_tool(
+            2,
+            "secret_reveal",
+            json!({"reference": "native://ci/deploy_token"}),
+        );
+        server.shutdown();
+        let text = tool_text(&result);
+        assert!(
+            !text.contains(REVEAL_VALUE),
+            "{client} reveal leaked: {text}"
+        );
+        assert_eq!(result["isError"], json!(true), "{client}: {text}");
+        let envelope = envelope_of(&result);
+        assert_eq!(
+            envelope["diagnostics"][0]["code"],
+            json!("security"),
+            "{client}: {envelope}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

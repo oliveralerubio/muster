@@ -7,9 +7,6 @@ use crate::errors::MusterError;
 
 const NAME_FILE: &str = "machine";
 
-/// Agent CLIs Muster knows how to manage.
-pub const KNOWN_AGENTS: &[&str] = &["claude", "codex", "opencode"];
-
 /// `<os>-<arch>`, e.g. `linux-x86_64`.
 pub fn platform() -> String {
     format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
@@ -70,12 +67,13 @@ pub fn save_name(state_dir: &Path, name: &str) -> Result<(), MusterError> {
         .map_err(|e| MusterError::Operational(format!("{}: {e}", path.display())))
 }
 
-/// Known agent CLIs found as executables on `PATH`.
+/// Ids of the stable agents whose CLI is found as an executable on `PATH`.
 pub fn detect_agents() -> Vec<String> {
-    KNOWN_AGENTS
+    crate::adapters::ADAPTERS
         .iter()
-        .filter(|agent| find_executable(agent).is_some())
-        .map(|agent| agent.to_string())
+        .filter(|a| !a.experimental && a.available())
+        .filter(|a| find_executable(a.binary).is_some())
+        .map(|a| a.id.to_string())
         .collect()
 }
 

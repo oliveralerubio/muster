@@ -59,19 +59,38 @@ The MCP server runs over stdio using newline-delimited JSON-RPC 2.0.
 | `status` | `status` | Fleet machines, sync state, local machine identity | No |
 | `doctor` | `doctor` | Machine health, binary versions, permissions (`fix` is hidden) | No |
 | `plan` | `plan` | Desired vs. current state diff (secrets redacted) | No |
-| `secret_list_meta` | `secret.list` | Secret metadata, groups, readers (never secret values) | No |
+| `secret_list_meta` | `secret.list` | Secret metadata, groups, readers, allowed agents (never secret values) | No |
 | `propose_change` | `proposal.create` | Stashes a proposed config change and returns its plan | Proposal only |
 | `secret_reveal` | `secret.get --reveal` | Reveals an explicitly allowlisted secret reference | Read-only |
 
 ### Safety Boundaries
 
 - **No Unsupervised Mutating Actions:** Commands like `sync`, `init`, `agents.apply`, `secret.add`, or `rollback` are not exposed directly as MCP tools.
-- **Secret Hygiene:** Plaintext secret values are never exposed across tools, listings, plans, or diffs. The only exception is `secret_reveal`, which strictly verifies that the requested reference is listed in `muster.toml`:
+- **Secret Hygiene:** Plaintext secret values are never exposed across tools, listings, plans, or diffs. The only exception is `secret_reveal`, which requires BOTH that the reference is listed in `[mcp_server] reveal` AND that the secret's `allow` list grants the calling agent:
   ```toml
   [mcp_server]
   reveal = ["native://ci/deploy_token"]
+
+  [secrets."native://ci/deploy_token"]
+  allow = ["claude"]          # or "codex@my-repo" for one project only
   ```
-  Any unlisted reference returns a `security` diagnostic and `isError: true`.
+  The calling agent is identified from the `initialize` request's `clientInfo.name` (contains `claude` -> claude, `codex` -> codex, `opencode` -> opencode, `antigravity`/`agy` -> antigravity). Unknown clients are never granted. A denied reveal returns a `security` diagnostic and `isError: true`.
+- **Secret isolation in generated configs:** deny by default. When Muster renders an agent's MCP `env`/`headers`, a secret reference resolves only if its `[secrets."<ref>"] allow` grants that agent (`agent` everywhere, `agent@project` only in that project's scope). Otherwise the key is omitted and a `secret_not_allowed_for_agent` warning is emitted.
+
+## Agent Skills
+
+`[agents.skills] source = "skills"` in `muster.toml` points to a folder with one subfolder per skill (`SKILL.md` with `name` and `description` frontmatter, plus any files). `agents apply` / `sync` install them for every supported agent:
+
+| Agent | User scope | Project scope |
+|---|---|---|
+| Claude Code | `~/.claude/skills/<skill>/` | `.claude/skills/<skill>/` |
+| Codex | `~/.agents/skills/<skill>/` | `.agents/skills/<skill>/` |
+| OpenCode | `$XDG_CONFIG_HOME/opencode/skills/<skill>/` | `.opencode/skills/<skill>/` |
+| Antigravity CLI | `~/.gemini/antigravity-cli/skills/<skill>/` | `.agents/skills/<skill>/` |
+
+- Project scope uses `<project>/.muster/muster.toml`; Codex and Antigravity share `.agents/skills`.
+- Removed skills are deleted on the next apply; hand-added skills are never touched.
+- Invalid skills (no `SKILL.md`, or missing `name`/`description`) are skipped with a `skill_invalid` warning; exit code stays `0`.
 
 ## Proposal Flow (Agents Proposing Changes)
 

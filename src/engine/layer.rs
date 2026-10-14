@@ -79,6 +79,9 @@ pub struct Merged {
     /// Directory the instructions source resolves against (the layer that
     /// declared `[agents.instructions]`, else the first layer).
     pub instructions_dir: PathBuf,
+    /// Directory the skills source resolves against (the layer that declared
+    /// `[agents.skills]`, else the first layer).
+    pub skills_dir: PathBuf,
 }
 
 /// Layers rendered into `machine`'s user-scope files, lowest precedence
@@ -173,6 +176,7 @@ pub fn merge(layers: &[Layer]) -> Merged {
     let mut agents = AgentsConfig::default();
     let mut mcp = BTreeMap::new();
     let mut instructions_dir = layers.first().map(|l| l.dir.clone()).unwrap_or_default();
+    let mut skills_dir = instructions_dir.clone();
     for layer in layers {
         let over = &layer.agents;
         if over.enabled.is_some() {
@@ -181,6 +185,10 @@ pub fn merge(layers: &[Layer]) -> Merged {
         if over.instructions.is_some() {
             agents.instructions = over.instructions.clone();
             instructions_dir = layer.dir.clone();
+        }
+        if over.skills.is_some() {
+            agents.skills = over.skills.clone();
+            skills_dir = layer.dir.clone();
         }
         if over.permissions.is_some() {
             agents.permissions = over.permissions.clone();
@@ -193,6 +201,7 @@ pub fn merge(layers: &[Layer]) -> Merged {
         agents,
         mcp,
         instructions_dir,
+        skills_dir,
     }
 }
 
@@ -201,24 +210,35 @@ impl Merged {
     pub fn instructions_path(&self) -> Result<(PathBuf, bool), MusterError> {
         let declared = self.agents.instructions.as_ref();
         let source = declared.map_or(DEFAULT_INSTRUCTIONS_SOURCE, |i| i.source.as_str());
-        let relative = Path::new(source);
-        if relative.is_absolute()
-            || relative
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir))
-        {
-            return Err(MusterError::InvalidConfig {
-                message: format!(
-                    "instructions source `{source}` must be a path inside the config repository"
-                ),
-                path: Some(format!(
-                    "{}: agents.instructions.source",
-                    manifest::FILE_NAME
-                )),
-            });
-        }
+        let relative = inside_repo(source, "instructions")?;
         Ok((self.instructions_dir.join(relative), declared.is_some()))
     }
+
+    /// Path of the skills directory, when `[agents.skills]` is declared.
+    pub fn skills_path(&self) -> Result<Option<PathBuf>, MusterError> {
+        match &self.agents.skills {
+            Some(skills) => Ok(Some(
+                self.skills_dir.join(inside_repo(&skills.source, "skills")?),
+            )),
+            None => Ok(None),
+        }
+    }
+}
+
+/// `source` as a relative path that cannot leave the config repository.
+fn inside_repo<'s>(source: &'s str, key: &str) -> Result<&'s Path, MusterError> {
+    let relative = Path::new(source);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(MusterError::InvalidConfig {
+            message: format!("{key} source `{source}` must be a path inside the config repository"),
+            path: Some(format!("{}: agents.{key}.source", manifest::FILE_NAME)),
+        });
+    }
+    Ok(relative)
 }
 
 #[cfg(test)]

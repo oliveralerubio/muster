@@ -4,14 +4,19 @@
 //! - `~/.codex/config.toml`: `model`, `[mcp_servers.<name>]`. Uses `toml_edit`
 //!   to preserve formatting, comments and unmanaged sections.
 //! - `~/.codex/AGENTS.md`: canonical instructions.
+//! - `~/.agents/skills/<skill>/...` (project `.agents/skills/`, shared with
+//!   Antigravity): Agent Skills declared in `[agents.skills]`.
 
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, Value};
 
 use super::{
-    markdown_block, resolve_mcp_map, transport, Adapter, Base, Capability, Current, Desired,
-    FileFormat, ManagedFile, RenderPlan, RenderedFile, Scope, Transport,
+    markdown_block, push_skills, resolve_mcp_map, transport, Adapter, Base, Capability, Current,
+    Desired, FileFormat, ManagedFile, RenderPlan, RenderedFile, Scope, Transport,
 };
 use crate::errors::MusterError;
+
+/// Cross-agent skills directory, the same in `$HOME` and in a project.
+const SKILLS_DIR: &str = ".agents/skills";
 
 const CONFIG: ManagedFile = ManagedFile {
     base: Base::Home,
@@ -34,6 +39,7 @@ const INSTRUCTIONS: ManagedFile = ManagedFile {
 pub static ADAPTER: Adapter = Adapter {
     id: "codex",
     name: "Codex",
+    binary: "codex",
     experimental: false,
     platforms: &["linux", "macos", "windows"],
     min_version: "1.0.0",
@@ -42,6 +48,7 @@ pub static ADAPTER: Adapter = Adapter {
         Capability::McpStdio,
         Capability::McpRemote,
         Capability::Models,
+        Capability::Skills,
     ],
     files: &[CONFIG, INSTRUCTIONS],
     render: Some(render),
@@ -50,6 +57,7 @@ pub static ADAPTER: Adapter = Adapter {
 fn render(desired: &Desired, current: &Current, plan: &mut RenderPlan) -> Result<(), MusterError> {
     render_config(desired, current.get(CONFIG.path), plan)?;
     render_instructions(desired, current.get(INSTRUCTIONS.path), plan);
+    push_skills(desired, Base::Home, SKILLS_DIR, SKILLS_DIR, plan);
     Ok(())
 }
 
@@ -102,8 +110,7 @@ fn render_config(
                             }
                             table.insert("args", Item::Value(Value::Array(arr)));
                         }
-                        let env =
-                            resolve_mcp_map(&server.env, desired.secrets, "Codex", name, plan);
+                        let env = resolve_mcp_map(&server.env, desired, &ADAPTER, name, plan);
                         if !env.is_empty() {
                             let mut inline = InlineTable::new();
                             for (k, v) in env {
@@ -115,7 +122,7 @@ fn render_config(
                     Transport::Remote { url } => {
                         table.insert("url", toml_edit::value(url.to_string()));
                         let headers =
-                            resolve_mcp_map(&server.headers, desired.secrets, "Codex", name, plan);
+                            resolve_mcp_map(&server.headers, desired, &ADAPTER, name, plan);
                         if !headers.is_empty() {
                             let mut inline = InlineTable::new();
                             for (k, v) in headers {

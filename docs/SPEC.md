@@ -123,7 +123,7 @@ El mismo producto sirve a dos públicos:
 63. Como agente de IA, quiero que, sin terminal interactiva, Muster nunca se quede esperando una respuesta y falle con un error claro si falta `--yes`, para no colgarme.
 64. Como agente de IA, quiero obtener el JSON Schema de la configuración y la lista de comandos, para generar configuración válida a la primera.
 65. Como agente de IA, quiero conectarme a un servidor MCP de Muster para consultar el estado, planificar cambios y proponerlos, para operar Muster como herramienta.
-66. Como dev, quiero que el servidor MCP no entregue valores de secretos a los agentes salvo que yo lo permita de forma explícita para un secreto concreto, porque un agente puede filtrar lo que lee.
+66. Como dev, quiero que el servidor MCP no entregue valores de secretos a los agentes salvo que yo lo permita de forma explícita para un secreto concreto, porque un agente puede filtrar lo que lee. `secret_reveal` exige que la referencia esté en `[mcp_server] reveal` **y** que su `allow` incluya al agente que llama, identificado por `clientInfo.name` del `initialize` (contiene "claude" → claude, "codex" → codex, "opencode" → opencode, "antigravity"/"agy" → antigravity; cualquier otro cliente queda denegado).
 67. Como dev, quiero que los cambios propuestos por un agente pasen por el mismo plan y la misma aprobación que los míos, para que un agente no aplique cambios peligrosos solo.
 68. Como agente de IA, quiero una skill o documento de instrucciones incluido que explique cómo usar Muster, para operarlo sin prueba y error.
 
@@ -139,7 +139,7 @@ El mismo producto sirve a dos públicos:
 ### Producto y alcance
 - Producto open source con licencia **Apache-2.0**. El mismo núcleo sirve al modo individual y al modo equipo. Un hub alojado de pago se especificará más adelante sobre el mismo modelo de datos.
 - **Dependencia externa obligatoria: solo Git.** chezmoi, Bitwarden (`bws`/`bw`), Tailscale y el model hub dejan de ser obligatorios.
-- **Agentes soportados de forma completa en v1: Claude Code, Codex y OpenCode.** Gemini/Antigravity, Pi y Hermes, como adaptadores experimentales.
+- **Agentes soportados de forma completa en v1: Claude Code, Codex, OpenCode y Antigravity CLI.** Pi y Hermes, como adaptadores experimentales.
 - **Plataformas:** Linux, WSL2 y macOS. Windows nativo no entra.
 - Lenguaje: **Rust** en todo lo que Rust permita (CLI, núcleo, bóveda, adaptadores, servidor MCP y servidor de la interfaz web). La interfaz web es HTML, CSS y JavaScript estáticos incrustados en el binario. Se distribuye como un único binario sin runtime. Muster es un repositorio nuevo escrito desde cero; Cuartel (privado) solo sirve como referencia de diseño y no se copia su historial.
 
@@ -175,6 +175,7 @@ El mismo producto sirve a dos públicos:
   - Errores tipados: no disponible, no autorizado, no encontrado, límite alcanzado, referencia inválida.
   - Proveedores incluidos: nativo (por defecto) y `env`. Bitwarden, 1Password, Doppler e Infisical como adaptadores opcionales.
   - En el manifiesto se guardan **referencias** a secretos (`native://grupo/nombre`, `env://VAR`, `op://…`, `bws://…`), nunca valores.
+  - **Aislamiento por agente (denegado por defecto):** cada secreto declara qué agentes pueden recibirlo en `[secrets."<referencia>"] allow = ["claude", "codex@mi-repo"]` del `muster.toml` del repo de configuración (o con `muster secret add <ruta> --allow <agente>`). `agente` concede en todas partes; `agente@proyecto` solo al aplicar ese proyecto (`--project DIR`, cuyo nombre de carpeta es `proyecto`). Un secreto sin `allow` no llega a ningún agente. Al generar la configuración de un agente, una referencia no permitida no se escribe (ni el valor ni la referencia): se omite esa clave de `env`/`headers` y se emite el aviso `secret_not_allowed_for_agent` con el agente y la referencia, nunca el valor; el resto de la configuración se aplica. El `muster.toml` de un proyecto no puede concederse secretos. La persona, desde la CLI (`muster secret get --reveal`), siempre puede leerlos. `muster secret list` muestra la lista `allow` de cada secreto.
 - **Adaptadores de agente**
   - Uno por herramienta. Cada uno declara qué archivos y alcances gestiona, qué capacidades soporta (instrucciones, MCP, subagentes, skills, hooks, permisos, modelos), plataformas y versión mínima.
   - Traducen la configuración canónica al formato nativo.
@@ -182,6 +183,16 @@ El mismo producto sirve a dos públicos:
   - Informan de lo que no pueden traducir.
   - Un fallo queda aislado a ese agente.
   - AGENTS.md es el formato canónico de instrucciones. CLAUDE.md se genera o enlaza a partir de él.
+  - **Skills** (`[agents.skills] source = "skills"`, una carpeta por skill con `SKILL.md` y archivos extra): los cuatro agentes las soportan. Muster copia cada archivo tal cual; las skills que se quitan de la fuente se borran en el siguiente apply y las que el usuario añade a mano no se tocan. Una skill sin `SKILL.md` o sin `name`/`description` en el frontmatter se omite con el aviso `skill_invalid`. Rutas:
+
+    | Agente | Usuario | Proyecto |
+    |---|---|---|
+    | Claude Code | `~/.claude/skills/<skill>/` | `.claude/skills/<skill>/` |
+    | Codex | `~/.agents/skills/<skill>/` | `.agents/skills/<skill>/` |
+    | OpenCode | `$XDG_CONFIG_HOME/opencode/skills/<skill>/` | `.opencode/skills/<skill>/` |
+    | Antigravity CLI | `~/.gemini/antigravity-cli/skills/<skill>/` | `.agents/skills/<skill>/` |
+
+    Codex y Antigravity comparten `.agents/skills` en proyecto; el archivo se escribe una sola vez.
   - La traducción de formatos imita el modelo de rulesync, pero se implementa con código propio.
 - **Motor de aplicación**
   - Reemplaza a chezmoi: estado deseado → plan → diff → apply idempotente.
@@ -229,6 +240,7 @@ El mismo producto sirve a dos públicos:
 - **Gobierno en equipos**
   - Los cambios en miembros, grupos, destinatarios y perfiles de equipo requieren la firma o aprobación de un administrador.
   - Las aprobaciones se registran en el historial de Git del repo de configuración.
+  - **Quórum de aprobaciones:** `[team] required_approvals = N` en el manifiesto (entero ≥ 1, por defecto 1; 0 es error de configuración). Se aplica a `approve` (alta de máquina) y `member approve` (alta de miembro). El administrador que aprueba primero cuenta como la aprobación 1. Por debajo del quórum la solicitud queda pendiente y cada aprobación se guarda con el nombre del administrador en el repo de configuración (en la solicitud de alta o en el miembro pendiente), para que otro administrador la complete desde otra máquina. Un mismo administrador no cuenta dos veces (`already_approved_by_caller`, código de salida 5). Al llegar al quórum se ejecuta la aprobación normal (re-cifrado y alta). La clave de recuperación es una vía de emergencia y cuenta como aprobación completa sea cual sea N.
   - En v1 la protección de ramas o revisión del remoto Git es la barrera recomendada. El servidor de autorización llega con el hub alojado.
 - **Migración desde el Muster actual**
   - `muster import bws` lee los secretos del proyecto de Bitwarden y los guarda en la bóveda nativa.
@@ -308,7 +320,7 @@ Opciones globales: `--config`, `--format text|json`, `--yes`, `--dry-run` (en to
 - Windows nativo (WSL2 sí entra).
 - Sincronizar la memoria de los agentes entre máquinas.
 - Catálogo o marketplace público de plugins de terceros.
-- Soporte completo de Gemini/Antigravity, Pi y Hermes (quedan como experimentales).
+- Soporte completo de Pi y Hermes (quedan como experimentales).
 - Cualquier dependencia del model hub personal y de Tailscale. Se mantiene solo como configuración opcional del usuario.
 - La transferencia de logins OAuth de los agentes por SSH: queda como experimental y desactivada por defecto.
 - Telemetría.
@@ -325,10 +337,9 @@ Opciones globales: `--config`, `--format text|json`, `--yes`, `--dry-run` (en to
   2. Rotar cualquier credencial encontrada.
   3. Reescribir el historial una sola vez.
 - **Decisiones abiertas** que no bloquean el inicio:
-  - el nombre del producto en inglés (o mantener "Muster" con subtítulo);
-  - el número mínimo de aprobaciones de administrador en equipos.
+  - el nombre del producto en inglés (o mantener "Muster" con subtítulo).
 - **Datos a verificar** al implementar los adaptadores:
-  - si Gemini CLI fue reemplazado por Antigravity CLI;
+  - reemplazo verificado: Antigravity CLI (`agy`) reemplazó al CLI anterior de Google para niveles de consumo el 2026-06-18 y mantiene rutas bajo `~/.gemini/`;
   - los formatos actuales de configuración de cada agente.
 - **Lanzamiento:**
   - Show HN exige que el autor escriba el post y las respuestas sin IA.

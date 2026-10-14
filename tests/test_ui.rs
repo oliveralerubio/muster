@@ -70,7 +70,7 @@ impl Ui {
     ) -> (u16, String, String) {
         let mut stream = TcpStream::connect(&self.address).expect("connect to UI localhost");
         stream
-            .set_read_timeout(Some(Duration::from_secs(3)))
+            .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         let body = body.unwrap_or("");
         write!(

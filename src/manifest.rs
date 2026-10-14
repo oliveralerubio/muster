@@ -51,13 +51,37 @@ pub struct Manifest {
     /// Managed dotfiles, keyed by target path relative to `$HOME`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub files: BTreeMap<String, ManagedDotfile>,
+    /// Per-secret agent access, keyed by secret reference
+    /// (`native://app/api`, `env://VAR`, ...). Deny by default: a reference
+    /// with no `allow` entry reaches no agent.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub secrets: BTreeMap<String, SecretPolicy>,
     /// Configuration for the built-in MCP server (`muster mcp`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_server: Option<McpServerConfig>,
+    /// Team governance settings (`[team]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<TeamConfig>,
     // Later tickets add members, groups and profiles.
     #[serde(flatten)]
     #[schemars(skip)]
     pub extensions: BTreeMap<String, serde_json::Value>,
+}
+
+/// Team governance settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TeamConfig {
+    /// Distinct admins that must approve a machine enrollment or a member
+    /// before it takes effect (>= 1). The recovery key always counts as a
+    /// full approval (break-glass).
+    #[serde(default = "default_required_approvals")]
+    #[schemars(range(min = 1))]
+    pub required_approvals: u32,
+}
+
+fn default_required_approvals() -> u32 {
+    1
 }
 
 /// Public half of the offline recovery key. The secret half is never stored.
@@ -150,6 +174,10 @@ pub struct Member {
     /// Admin who approved the invitation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approved_by: Option<String>,
+    /// Admins who approved the invitation so far, while it waits for the
+    /// team quorum (`[team] required_approvals`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approvals: Vec<String>,
 }
 
 /// A secret group: one vault file encrypted for its readers (+ the recovery key).
@@ -215,6 +243,49 @@ impl Default for Manifest {
     }
 }
 
+/// Which agents may receive a secret (`[secrets."<reference>"]`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SecretPolicy {
+    /// Agents allowed to receive the secret: an adapter id (`claude`) grants
+    /// it everywhere; `agent@project` only inside that project (the project
+    /// directory's name). Empty = no agent (the human CLI always can).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
+}
+
+impl SecretPolicy {
+    /// Whether `agent` may receive the secret when rendering for `project`
+    /// (`None` = user scope).
+    pub fn allows(&self, agent: &str, project: Option<&str>) -> bool {
+        self.allow.iter().any(|entry| match entry.split_once('@') {
+            None => entry == agent,
+            Some((a, p)) => a == agent && project == Some(p),
+        })
+    }
+}
+
+/// `agent` or `agent@project`, with `agent` a known adapter id.
+pub fn validate_allow_entry(entry: &str) -> Result<(), String> {
+    let (agent, project) = match entry.split_once('@') {
+        Some((a, p)) => (a, Some(p)),
+        None => (entry, None),
+    };
+    if crate::adapters::find(agent).is_none() {
+        let known: Vec<_> = crate::adapters::ADAPTERS.iter().map(|a| a.id).collect();
+        return Err(format!(
+            "unknown agent `{agent}` in allow entry `{entry}` (known: {})",
+            known.join(", ")
+        ));
+    }
+    if project.is_some_and(|p| p.is_empty() || p.contains(['/', '\\', '@'])) {
+        return Err(format!(
+            "invalid allow entry `{entry}`: expected <agent> or <agent>@<project>"
+        ));
+    }
+    Ok(())
+}
+
 /// Built-in MCP server configuration (`muster mcp`).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -236,7 +307,9 @@ impl Manifest {
             agents: None,
             mcp: BTreeMap::new(),
             files: BTreeMap::new(),
+            secrets: BTreeMap::new(),
             mcp_server: None,
+            team: None,
             extensions: BTreeMap::new(),
         }
     }
@@ -283,7 +356,25 @@ impl Manifest {
                 "unknown key `{key}` (extension keys must start with `{EXTENSION_PREFIX}`)"
             )));
         }
+        for (reference, policy) in &manifest.secrets {
+            crate::secrets::SecretRef::parse(reference)
+                .map_err(|e| invalid(format!("secrets: {e}")))?;
+            for entry in &policy.allow {
+                validate_allow_entry(entry)
+                    .map_err(|e| invalid(format!("secrets.\"{reference}\".allow: {e}")))?;
+            }
+        }
+        if manifest.required_approvals() == 0 {
+            return Err(invalid(
+                "`team.required_approvals` must be at least 1".to_string(),
+            ));
+        }
         Ok(manifest)
+    }
+
+    /// Distinct admin approvals a sensitive team change needs (default 1).
+    pub fn required_approvals(&self) -> u32 {
+        self.team.as_ref().map_or(1, |t| t.required_approvals)
     }
 }
 
@@ -308,6 +399,49 @@ mod tests {
         let err = Manifest::parse("version = 1\nbogus = true\n", "muster.toml").unwrap_err();
         assert_eq!(err.exit_code(), 3);
         assert!(err.to_string().contains("bogus"));
+    }
+
+    #[test]
+    fn team_required_approvals_defaults_to_one_and_rejects_zero() {
+        let m = Manifest::parse("version = 1\n[team]\n", "muster.toml").unwrap();
+        assert_eq!(m.required_approvals(), 1);
+        let m = Manifest::parse(
+            "version = 1\n[team]\nrequired_approvals = 2\n",
+            "muster.toml",
+        )
+        .unwrap();
+        assert_eq!(m.required_approvals(), 2);
+        let err = Manifest::parse(
+            "version = 1\n[team]\nrequired_approvals = 0\n",
+            "muster.toml",
+        )
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 3);
+    }
+
+    #[test]
+    fn secret_allow_is_deny_by_default_and_scopes_agent_at_project() {
+        let m = Manifest::parse(
+            "version = 1\n[secrets.\"env://A\"]\nallow = [\"claude\", \"codex@repo\"]\n[secrets.\"env://B\"]\n",
+            "muster.toml",
+        )
+        .unwrap();
+        let a = &m.secrets["env://A"];
+        assert!(a.allows("claude", None) && a.allows("claude", Some("other")));
+        assert!(!a.allows("codex", None) && !a.allows("codex", Some("other")));
+        assert!(a.allows("codex", Some("repo")));
+        assert!(!m.secrets["env://B"].allows("claude", None));
+        for bad in [
+            "version = 1\n[secrets.\"env://A\"]\nallow = [\"nobody\"]\n",
+            "version = 1\n[secrets.\"env://A\"]\nallow = [\"claude@\"]\n",
+            "version = 1\n[secrets.GLOBAL]\nallow = [\"claude\"]\n",
+        ] {
+            assert_eq!(
+                Manifest::parse(bad, "muster.toml").unwrap_err().exit_code(),
+                3,
+                "{bad}"
+            );
+        }
     }
 
     #[test]

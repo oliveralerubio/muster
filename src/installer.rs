@@ -36,7 +36,7 @@ pub struct Pin {
     pub url: String,
     /// Lowercase hex SHA-256 of the executable.
     pub sha256: String,
-    /// Installed file name (defaults to the agent id).
+    /// Installed file name (defaults to the adapter's binary, else the agent id).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bin: Option<String>,
 }
@@ -92,7 +92,7 @@ pub fn install(
     bin_dir: &Path,
     dry_run: bool,
 ) -> Result<Outcome, MusterError> {
-    let path = bin_dir.join(pin.bin.as_deref().unwrap_or(agent));
+    let path = bin_dir.join(default_bin(agent, pin));
     let expected = pin.sha256.to_ascii_lowercase();
     let outcome = |action| Outcome {
         agent: agent.to_string(),
@@ -117,6 +117,16 @@ pub fn install(
         write_executable(&path, &bytes)?;
     }
     Ok(outcome("install"))
+}
+
+/// `pin.bin`, else the adapter's executable name (`antigravity` -> `agy`),
+/// else the agent id.
+fn default_bin<'a>(agent: &'a str, pin: &'a Pin) -> &'a str {
+    pin.bin.as_deref().unwrap_or_else(|| {
+        crate::adapters::find(agent)
+            .map(|a| a.binary)
+            .unwrap_or(agent)
+    })
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
