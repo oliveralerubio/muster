@@ -11,6 +11,9 @@ schemars = "1"
 thiserror = "2"
 ctrlc = "3.4"
 toml = "1.1.8"
+age = { version = "0.12", features = ["armor"] }
+secrecy = "0.10"
+time = { version = "0.3", features = ["formatting"] }
 
 [dev-dependencies]
 assert_cmd = "2.0"
