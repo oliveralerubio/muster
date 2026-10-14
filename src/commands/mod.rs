@@ -1,8 +1,10 @@
 pub mod agents;
 pub mod approve;
 pub mod enroll;
+pub mod group;
 pub mod init;
 pub mod machine;
+pub mod member;
 pub mod plan;
 pub mod revoke;
 pub mod schema;

@@ -50,8 +50,11 @@ fn run(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
         }));
     }
 
+    let team = crate::team::drift(&ctx.config_dir, &manifest);
     Ok(json!({
         "config_path": ctx.config_dir,
         "machines": machines,
+        "pending": team["pending"],
+        "drift": team["drift"],
     }))
 }

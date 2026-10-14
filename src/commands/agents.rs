@@ -88,5 +88,9 @@ fn apply(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         agent: params.get_string("agent"),
     };
     let plan = engine::plan(ctx, &options)?;
-    engine::apply(ctx, plan)
+    let result = engine::apply(ctx, plan)?;
+    if options.agent.is_none() {
+        crate::team::record_applied(ctx, &result)?;
+    }
+    Ok(result)
 }

@@ -1,0 +1,334 @@
+//! `muster member`: team members (invite → pending → approve; role, profile, revoke).
+
+use serde_json::{json, Value};
+
+use crate::context::Context;
+use crate::errors::MusterError;
+use crate::fleet::EnrollmentRequest;
+use crate::machine;
+use crate::manifest::{Manifest, Member, MemberStatus, Role};
+use crate::output::{Diagnostic, Severity};
+use crate::registry::{CommandSpec, ParamKind, ParamSpec, Params};
+use crate::team::{self, RECOVERY_KEY_PARAM, ROTATION_ADVICE};
+use crate::vault::Vault;
+
+const NAME: ParamSpec = ParamSpec {
+    name: "name",
+    about: "Member name",
+    kind: ParamKind::String,
+    required: true,
+    positional: true,
+};
+
+const ROLE: ParamSpec = ParamSpec {
+    name: "role",
+    about: "Team role: admin or member",
+    kind: ParamKind::String,
+    required: false,
+    positional: false,
+};
+
+pub const ADD: CommandSpec = CommandSpec {
+    name: "member.add",
+    about: "Invite a team member (pending until an admin approves)",
+    params: &[NAME, ROLE],
+    mutating: true,
+    handler: add,
+};
+
+pub const APPROVE: CommandSpec = CommandSpec {
+    name: "member.approve",
+    about: "Approve a pending member and grant their machines their groups",
+    params: &[NAME, RECOVERY_KEY_PARAM],
+    mutating: true,
+    handler: approve,
+};
+
+pub const LIST: CommandSpec = CommandSpec {
+    name: "member.list",
+    about: "List team members, roles, status and machines",
+    params: &[],
+    mutating: false,
+    handler: list,
+};
+
+pub const ROLE_SPEC: CommandSpec = CommandSpec {
+    name: "member.role",
+    about: "Change a member's role (admin or member)",
+    params: &[
+        NAME,
+        ParamSpec {
+            required: true,
+            ..ROLE
+        },
+    ],
+    mutating: true,
+    handler: role,
+};
+
+pub const PROFILE: CommandSpec = CommandSpec {
+    name: "member.profile",
+    about: "Assign a member's personal agent profile",
+    params: &[
+        NAME,
+        ParamSpec {
+            name: "profile",
+            about: "Profile name from [profiles] (empty to clear)",
+            kind: ParamKind::String,
+            required: true,
+            positional: false,
+        },
+    ],
+    mutating: true,
+    handler: profile,
+};
+
+pub const RM: CommandSpec = CommandSpec {
+    name: "member.rm",
+    about: "Revoke a member and all their machines; lists secrets to rotate",
+    params: &[NAME, RECOVERY_KEY_PARAM],
+    mutating: true,
+    handler: rm,
+};
+
+fn name(params: &Params) -> Result<String, MusterError> {
+    let name = params
+        .get_string("name")
+        .ok_or_else(|| MusterError::Usage("member name is required".into()))?;
+    machine::validate_name(name)
+}
+
+fn parse_role(params: &Params) -> Result<Role, MusterError> {
+    match params.get_string("role").unwrap_or("member") {
+        "admin" => Ok(Role::Admin),
+        "member" => Ok(Role::Member),
+        other => Err(MusterError::Usage(format!(
+            "invalid role '{other}': expected admin or member"
+        ))),
+    }
+}
+
+fn existing<'m>(manifest: &'m mut Manifest, name: &str) -> Result<&'m mut Member, MusterError> {
+    manifest
+        .members
+        .get_mut(name)
+        .ok_or_else(|| MusterError::Usage(format!("member '{name}' does not exist")))
+}
+
+fn add(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
+    let name = name(params)?;
+    let role = parse_role(params)?;
+    let mut manifest = Manifest::load(&ctx.config_dir)?;
+    let actor = team::admin(&manifest, &ctx.state_dir)?;
+    team::materialize(&mut manifest);
+    if manifest.members.contains_key(&name) {
+        return Err(MusterError::Usage(format!(
+            "member '{name}' already exists"
+        )));
+    }
+    manifest.members.insert(
+        name.clone(),
+        Member {
+            role,
+            status: MemberStatus::Pending,
+            invited_by: Some(actor.member.clone()),
+            ..Member::default()
+        },
+    );
+    let result = json!({
+        "member": name,
+        "role": role,
+        "status": MemberStatus::Pending,
+        "invited_by": actor.member,
+    });
+    if ctx.dry_run {
+        return Ok(result);
+    }
+    manifest.save(&ctx.config_dir)?;
+    team::commit(ctx, &actor, &format!("feat(team): invite member {name}"))?;
+    Ok(result)
+}
+
+fn approve(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
+    let name = name(params)?;
+    let before = Manifest::load(&ctx.config_dir)?;
+    let actor = team::admin(&before, &ctx.state_dir)?;
+    if actor.member == name {
+        return Err(MusterError::Security(
+            "nobody can approve their own membership".into(),
+        ));
+    }
+    let mut manifest = before.clone();
+    let member = existing(&mut manifest, &name)?;
+    if member.status != MemberStatus::Pending {
+        return Err(MusterError::Usage(format!(
+            "member '{name}' is not pending"
+        )));
+    }
+    member.status = MemberStatus::Active;
+    member.approved_by = Some(actor.member.clone());
+    team::check_self_grant(ctx, &before, &manifest, &actor)?;
+    ctx.confirm(&format!("Approve member '{name}'?"))?;
+
+    let identity = team::unlock(ctx, params, &manifest)?;
+    let mut vault = Vault::open(&ctx.config_dir)?;
+    let changes = team::pending_rekeys(&vault, &manifest)?;
+    team::check_can_rekey(&vault, &changes, &identity)?;
+    let result = |groups: Vec<String>| {
+        json!({
+            "member": name,
+            "status": MemberStatus::Active,
+            "approved_by": actor.member,
+            "reencrypted_groups": groups,
+        })
+    };
+    if ctx.dry_run {
+        return Ok(result(changes.into_iter().map(|(g, _)| g).collect()));
+    }
+    manifest.save(&ctx.config_dir)?;
+    let groups = team::rekey(&mut vault, &manifest, &identity)?;
+    team::commit(ctx, &actor, &format!("feat(team): approve member {name}"))?;
+    Ok(result(groups))
+}
+
+fn list(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
+    let manifest = Manifest::load(&ctx.config_dir)?;
+    let members: Vec<Value> = team::members(&manifest)
+        .into_iter()
+        .map(|(name, m)| {
+            let machines: Vec<Value> = m
+                .machines
+                .iter()
+                .map(|x| json!({ "name": x, "enrolled": manifest.machines.contains_key(x) }))
+                .collect();
+            let groups: Vec<&String> = manifest
+                .groups
+                .keys()
+                .filter(|g| team::reads(&manifest, g, &name))
+                .collect();
+            json!({
+                "name": name,
+                "role": m.role,
+                "status": m.status,
+                "implicit": manifest.members.is_empty(),
+                "machines": machines,
+                "groups": groups,
+                "profile": m.profile,
+                "invited_by": m.invited_by,
+                "approved_by": m.approved_by,
+            })
+        })
+        .collect();
+    Ok(json!({ "members": members }))
+}
+
+fn role(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
+    let name = name(params)?;
+    let role = parse_role(params)?;
+    let mut before = Manifest::load(&ctx.config_dir)?;
+    let actor = team::admin(&before, &ctx.state_dir)?;
+    team::materialize(&mut before);
+    let mut manifest = before.clone();
+    existing(&mut manifest, &name)?.role = role;
+    team::check_self_grant(ctx, &before, &manifest, &actor)?;
+    if !manifest.members.values().any(|m| m.role == Role::Admin) {
+        return Err(MusterError::Usage(
+            "the team needs at least one admin".into(),
+        ));
+    }
+    ctx.confirm(&format!("Change the role of '{name}'?"))?;
+    let result = json!({ "member": name, "role": role });
+    if ctx.dry_run {
+        return Ok(result);
+    }
+    manifest.save(&ctx.config_dir)?;
+    team::commit(ctx, &actor, &format!("feat(team): set role of {name}"))?;
+    Ok(result)
+}
+
+fn profile(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
+    let name = name(params)?;
+    let profile = params.get_string("profile").filter(|p| !p.is_empty());
+    let mut manifest = Manifest::load(&ctx.config_dir)?;
+    let actor = team::admin(&manifest, &ctx.state_dir)?;
+    if let Some(p) = profile {
+        if !manifest.profiles.contains_key(p) {
+            return Err(MusterError::Usage(format!("profile '{p}' is not declared")));
+        }
+    }
+    team::materialize(&mut manifest);
+    existing(&mut manifest, &name)?.profile = profile.map(str::to_string);
+    let result = json!({ "member": name, "profile": profile });
+    if ctx.dry_run {
+        return Ok(result);
+    }
+    manifest.save(&ctx.config_dir)?;
+    team::commit(ctx, &actor, &format!("feat(team): set profile of {name}"))?;
+    Ok(result)
+}
+
+fn rm(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
+    let name = name(params)?;
+    let mut manifest = Manifest::load(&ctx.config_dir)?;
+    let actor = team::admin(&manifest, &ctx.state_dir)?;
+    if actor.member == name {
+        return Err(MusterError::Usage(
+            "you cannot revoke yourself; ask another admin".into(),
+        ));
+    }
+    let member = manifest
+        .members
+        .remove(&name)
+        .ok_or_else(|| MusterError::Usage(format!("member '{name}' does not exist")))?;
+    ctx.confirm(&format!(
+        "Revoke member '{name}' and all their machines? Exposed secrets must be rotated."
+    ))?;
+
+    let mut revoked_recipients = Vec::new();
+    for machine in &member.machines {
+        if let Some(m) = manifest.machines.remove(machine) {
+            revoked_recipients.push(m.recipient);
+        }
+        team::forget_machine(&mut manifest, machine);
+    }
+    for group in manifest.groups.values_mut() {
+        group.readers.members.retain(|m| m != &name);
+    }
+    // A key still used by a remaining machine keeps its access.
+    revoked_recipients.retain(|r| !manifest.machines.values().any(|m| &m.recipient == r));
+
+    let identity = team::unlock(ctx, params, &manifest)?;
+    let mut vault = Vault::open(&ctx.config_dir)?;
+    let exposed = team::exposed_secrets(&vault, &revoked_recipients)?;
+    let changes = team::pending_rekeys(&vault, &manifest)?;
+    team::check_can_rekey(&vault, &changes, &identity)?;
+    let result = |groups: Vec<String>| {
+        json!({
+            "revoked_member": name,
+            "revoked_machines": member.machines,
+            "reencrypted_groups": groups,
+            "exposed_secrets": exposed,
+            "rotation_advice": ROTATION_ADVICE,
+        })
+    };
+    if ctx.dry_run {
+        return Ok(result(changes.into_iter().map(|(g, _)| g).collect()));
+    }
+    manifest.save(&ctx.config_dir)?;
+    let groups = team::rekey(&mut vault, &manifest, &identity)?;
+    for machine in &member.machines {
+        EnrollmentRequest::remove(&ctx.config_dir, machine)?;
+    }
+    team::commit(ctx, &actor, &format!("feat(team): revoke member {name}"))?;
+    if !exposed.is_empty() {
+        ctx.diag(Diagnostic::new(
+            Severity::Warning,
+            "rotate_exposed_secrets",
+            format!(
+                "{} secret(s) were readable by '{name}'; rotate them",
+                exposed.len()
+            ),
+        ));
+    }
+    Ok(result(groups))
+}

@@ -13,6 +13,7 @@ use crate::manifest::{Machine, Manifest};
 use crate::output::{Diagnostic, Severity};
 use crate::registry::{CommandSpec, ParamKind, ParamSpec, Params};
 use crate::secrets::SecretValue;
+use crate::team;
 use crate::vault::Vault;
 
 pub const SPEC: CommandSpec = CommandSpec {
@@ -43,6 +44,13 @@ pub const SPEC: CommandSpec = CommandSpec {
         ParamSpec {
             name: "profile",
             about: "Configuration profile to assign to the approved machine",
+            kind: ParamKind::String,
+            required: false,
+            positional: false,
+        },
+        ParamSpec {
+            name: "member",
+            about: "Team member who owns the machine (team mode; admins only)",
             kind: ParamKind::String,
             required: false,
             positional: false,
@@ -111,28 +119,16 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         }
     };
 
-    // Check every group can be re-encrypted before writing anything.
-    let mut vault = Vault::open(&ctx.config_dir)?;
-    let groups = vault.groups()?;
-    let approver = approver_identity.recipient();
-    for group in &groups {
-        if !vault.readers(group)?.contains(&approver) {
-            return Err(MusterError::Security(format!(
-                "the approver is not a reader of secret group '{group}'; approve with --recovery-key"
-            )));
-        }
-    }
-
-    if ctx.dry_run {
-        return Ok(json!({
-            "dry_run": true,
-            "machine": name,
-            "recipient": req.recipient,
-            "groups": groups,
-        }));
-    }
-
-    let mut manifest = manifest;
+    // Team mode: only admins approve machines, and nobody for themselves.
+    let before = manifest;
+    let member = params.get_string("member");
+    let team_mode = !before.members.is_empty() || member.is_some();
+    let actor = if team_mode && params.get_string("recovery-key").is_none() {
+        Some(team::admin(&before, &ctx.state_dir)?)
+    } else {
+        None
+    };
+    let mut manifest = before.clone();
     manifest.machines.insert(
         name.to_string(),
         Machine {
@@ -143,32 +139,63 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
             last_sync: None,
             role: params.get_string("role").map(str::to_string),
             profile: params.get_string("profile").map(str::to_string),
+            applied_profile: None,
         },
     );
-    manifest.save(&ctx.config_dir)?;
-
-    let mut reencrypted_groups = Vec::new();
-    for group in &groups {
-        let mut readers = vault.readers(group)?;
-        if !readers.contains(&req.recipient) {
-            readers.push(req.recipient.clone());
-        }
-        // Ensure recovery recipient is also a reader if configured
-        if let Some(recovery) = &manifest.recovery {
-            if !readers.contains(&recovery.recipient) {
-                readers.push(recovery.recipient.clone());
-            }
-        }
-        vault.reencrypt(group, &readers, &approver_identity)?;
-        reencrypted_groups.push(group.clone());
+    if let Some(member) = member {
+        team::materialize(&mut manifest);
+        let entry = manifest
+            .members
+            .get_mut(member)
+            .ok_or_else(|| MusterError::Usage(format!("member '{member}' does not exist")))?;
+        entry.machines.push(name.to_string());
     }
+    if let Some(actor) = &actor {
+        team::check_self_grant(ctx, &before, &manifest, actor)?;
+    }
+
+    // Check every changed group can be re-encrypted before writing anything.
+    let mut vault = Vault::open(&ctx.config_dir)?;
+    let changes = team::pending_rekeys(&vault, &manifest)?;
+    for (group, _) in &changes {
+        if !vault
+            .readers(group)?
+            .contains(&approver_identity.recipient())
+        {
+            return Err(MusterError::Security(format!(
+                "the approver is not a reader of secret group '{group}'; approve with --recovery-key"
+            )));
+        }
+    }
+    let groups: Vec<String> = changes.iter().map(|(g, _)| g.clone()).collect();
+
+    if ctx.dry_run {
+        return Ok(json!({
+            "dry_run": true,
+            "machine": name,
+            "recipient": req.recipient,
+            "groups": groups,
+        }));
+    }
+
+    manifest.save(&ctx.config_dir)?;
+    let reencrypted_groups = team::rekey(&mut vault, &manifest, &approver_identity)?;
 
     EnrollmentRequest::remove(&ctx.config_dir, name)?;
 
-    git::commit_if_configured(
-        &ctx.config_dir,
-        &format!("feat(fleet): approve machine {name}"),
-    )?;
+    let summary = format!("feat(fleet): approve machine {name}");
+    match &actor {
+        Some(actor) => {
+            team::commit(ctx, actor, &summary)?;
+            return Ok(json!({
+                "approved": name,
+                "recipient": req.recipient,
+                "member": member,
+                "reencrypted_groups": reencrypted_groups,
+            }));
+        }
+        None => git::commit_if_configured(&ctx.config_dir, &summary)?,
+    };
 
     if git::has_remote(&ctx.config_dir) {
         if let Err(e) = git::push(&ctx.config_dir) {

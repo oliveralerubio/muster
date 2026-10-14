@@ -51,6 +51,7 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     } else {
         transport(ctx, params)?
     };
+    let global = target == engine::Target::Global;
     let plan = engine::plan(
         ctx,
         &Options {
@@ -59,6 +60,9 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         },
     )?;
     let mut result = engine::apply(ctx, plan)?;
+    if global {
+        crate::team::record_applied(ctx, &result)?;
+    }
     result["transport"] = transport;
     Ok(result)
 }
