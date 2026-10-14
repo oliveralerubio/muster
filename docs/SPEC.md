@@ -141,7 +141,7 @@ El mismo producto sirve a dos públicos:
 - **Dependencia externa obligatoria: solo Git.** chezmoi, Bitwarden (`bws`/`bw`), Tailscale y el model hub dejan de ser obligatorios.
 - **Agentes soportados de forma completa en v1: Claude Code, Codex y OpenCode.** Gemini/Antigravity, Pi y Hermes, como adaptadores experimentales.
 - **Plataformas:** Linux, WSL2 y macOS. Windows nativo no entra.
-- Lenguaje: **Python**. Muster es un repositorio nuevo escrito desde cero; Cuartel (privado) solo sirve como referencia de diseño y no se copia su historial.
+- Lenguaje: **Rust** en todo lo que Rust permita (CLI, núcleo, bóveda, adaptadores, servidor MCP y servidor de la interfaz web). La interfaz web es HTML, CSS y JavaScript estáticos incrustados en el binario. Se distribuye como un único binario sin runtime. Muster es un repositorio nuevo escrito desde cero; Cuartel (privado) solo sirve como referencia de diseño y no se copia su historial.
 
 ### Modelo de dominio
 | Concepto | Definición |
@@ -167,7 +167,7 @@ El mismo producto sirve a dos públicos:
   - Cada operación (init, enroll, approve, revoke, secret, profile, plan, sync, rollback, doctor, status, member, group) es una función con entrada y salida estructuradas.
   - La CLI, la API de la interfaz web y el servidor MCP son adaptadores finos sobre esta misma capa. Así se garantiza que todo lo de la interfaz web y del MCP existe en la CLI.
 - **Bóveda nativa**
-  - Formato de archivo age, implementado con una biblioteca incluida en el paquete, sin binario externo. **No se inventa criptografía.**
+  - Formato de archivo age, implementado con el crate `age` (rage) compilado en el binario, sin binario externo. **No se inventa criptografía.**
   - Operaciones: añadir, rotar, eliminar, listar metadatos, re-cifrar para un nuevo conjunto de destinatarios y resolver una referencia.
   - Los valores descifrados se mantienen en memoria el menor tiempo posible y se ocultan en repr, logs y trazas.
 - **Proveedores de secretos**
@@ -204,7 +204,7 @@ El mismo producto sirve a dos públicos:
   - Cada problema trae una solución sugerida.
   - Nunca hace reparaciones destructivas sin confirmación.
 - **Interfaz web de administración**
-  - Aplicación web incluida en el paquete y servida con `muster ui`.
+  - Aplicación web incrustada en el binario y servida con `muster ui`.
   - Escucha solo en localhost, en un puerto aleatorio, con token de un solo uso.
   - Sin recursos de CDN.
   - Pantallas: panel general, máquinas, miembros, grupos y secretos, perfiles de agentes y MCP (con vista previa del diff), altas pendientes, historial y generaciones, y doctor.
@@ -298,10 +298,9 @@ Opciones globales: `--config`, `--format text|json`, `--yes`, `--dry-run` (en to
   - Snapshots de los archivos generados en cada PR.
   - Una ejecución periódica contra la última versión de cada CLI, que informa sin bloquear.
 - **Seguridad:** tests que siembran secretos de prueba y verifican que no aparecen en stdout, stderr, logs, planes, diffs, historial de Git ni respuestas del MCP. Escaneo de secretos en CI.
-- **Precedente en el repo:**
-  - La suite usa `unittest`.
-  - El test de integración de onboarding ya monta un `$HOME` temporal con copia del repo y wrappers en `.local/bin`. Es la base de la nueva costura.
-  - Los tests actuales que parchean internos (`run_cli`, `binary`) se migran o se retiran a medida que se reemplazan esos módulos.
+- **Herramientas de test:**
+  - Tests de integración de Cargo (`cargo test`) que ejecutan el binario `muster` compilado como subproceso.
+  - Un helper compartido monta el `$HOME` temporal, los directorios XDG y los ejecutables falsos en `PATH`. Es la base de la costura.
 
 ## Out of Scope
 
