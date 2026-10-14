@@ -15,6 +15,7 @@
 //! that hold secrets.
 
 mod diff;
+pub mod dotfiles;
 pub mod layer;
 mod ownership;
 mod store;
@@ -74,6 +75,8 @@ struct Entry {
     managed: bool,
     owned: Vec<Vec<String>>,
     private: bool,
+    /// Written executable (managed dotfiles only).
+    executable: bool,
     created: bool,
     drift: bool,
 }
@@ -186,6 +189,11 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
                 agents.insert(adapter.id, Some(err.to_string()));
             }
         }
+    }
+
+    // Managed dotfiles: user scope only, and not when one adapter is selected.
+    if options.target == Target::Global && options.agent.is_none() {
+        dotfiles::plan(ctx, &manifest, &roots, &ours, records, &key, &mut entries)?;
     }
 
     // Adapters no longer enabled: prune what they own in this target.
@@ -345,6 +353,7 @@ fn plan_adapter(
                 Vec::new()
             },
             private: record.is_some_and(|r| r.private),
+            executable: false,
             created,
             drift,
         });
@@ -376,6 +385,7 @@ fn unmanaged_entry(
         managed: false,
         owned: Vec::new(),
         private: record.private,
+        executable: false,
         created: record.created,
     })
 }
@@ -465,6 +475,7 @@ impl Plan {
     ///  "agents": [{"id": "claude", "status": "planned|applied|unchanged|failed",
     ///              "files": [{"path", "action": "add|modify|remove|unchanged",
     ///                         "changed", "drift", "private", "diff"}]}],
+    ///  "files": [<managed dotfiles, same shape as agent files>],
     ///  "approvals": [{"kind": "hook|mcp_server", "name", "detail"}]}
     /// ```
     /// Last applied generation the plan was computed against.
@@ -504,6 +515,12 @@ impl Plan {
             .iter()
             .map(|a| json!({ "kind": a.kind, "name": a.name, "detail": a.detail }))
             .collect();
+        let files: Vec<Value> = self
+            .entries
+            .iter()
+            .filter(|e| e.agents == [dotfiles::OWNER])
+            .map(|e| self.file_json(e))
+            .collect();
         json!({
             "target": match &self.target {
                 Target::Global => json!("global"),
@@ -514,6 +531,7 @@ impl Plan {
             "generation": generation,
             "changes": self.entries.iter().filter(|e| e.action() != Action::Unchanged).count(),
             "agents": agents,
+            "files": files,
             "approvals": approvals,
         })
     }
@@ -591,7 +609,7 @@ pub fn apply(ctx: &mut Context, mut plan: Plan) -> Result<Value, MusterError> {
                 pending.backup(&entry.path, before)?;
             }
             match &entry.after {
-                Some(after) => write_file(&entry.path, after, entry.private),
+                Some(after) => write_file(&entry.path, after, entry.private, entry.executable),
                 None => std::fs::remove_file(&entry.path).map_err(|e| io_error(&entry.path, e)),
             }
         })();
@@ -622,6 +640,7 @@ fn set_record(state: &mut State, key: &str, entry: &Entry) {
                     owned: entry.owned.clone(),
                     private: entry.private,
                     created: entry.created,
+                    executable: entry.executable,
                     contents: after.clone(),
                 },
             );
@@ -707,7 +726,7 @@ pub fn rollback(ctx: &mut Context, n: u64) -> Result<Value, MusterError> {
             pending.backup(path, before)?;
         }
         match record {
-            Some(record) => write_file(path, &record.contents, record.private)?,
+            Some(record) => write_file(path, &record.contents, record.private, record.executable)?,
             None => std::fs::remove_file(path).map_err(|e| io_error(path, e))?,
         }
     }
@@ -796,6 +815,21 @@ impl Roots {
             Target::Project(dir) => file.project.map(|p| dir.join(p)),
         }
     }
+}
+
+/// Managed files that held resolved secrets as of the last generation (they
+/// must stay 0600). Used by `doctor`.
+pub fn private_files(state_dir: &Path) -> Result<Vec<PathBuf>, MusterError> {
+    Ok(store::latest(state_dir)?
+        .map(|(_, state)| {
+            state
+                .files
+                .into_iter()
+                .filter(|(_, record)| record.private)
+                .map(|(path, _)| PathBuf::from(path))
+                .collect()
+        })
+        .unwrap_or_default())
 }
 
 // ---------------------------------------------------------------------------
@@ -904,8 +938,14 @@ fn read_optional(path: &Path) -> Result<Option<String>, MusterError> {
 }
 
 /// Write via a sibling temp file + rename, keeping the existing file mode, or
-/// forcing 0600 when `private` (the file holds resolved secrets).
-fn write_file(path: &Path, contents: &str, private: bool) -> Result<(), MusterError> {
+/// forcing 0600 when `private` (the file holds resolved secrets). `executable`
+/// adds the execute bits (0755, or 0700 when private).
+fn write_file(
+    path: &Path,
+    contents: &str,
+    private: bool,
+    executable: bool,
+) -> Result<(), MusterError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| io_error(parent, e))?;
     }
@@ -918,7 +958,8 @@ fn write_file(path: &Path, contents: &str, private: bool) -> Result<(), MusterEr
     #[cfg(unix)]
     if private {
         // The plaintext never exists with looser permissions, even briefly.
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mode = if executable { 0o700 } else { 0o600 };
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, mode);
     }
     let mut file = options.open(&tmp).map_err(|e| io_error(&tmp, e))?;
     std::io::Write::write_all(&mut file, contents.as_bytes()).map_err(|e| io_error(&tmp, e))?;
@@ -927,6 +968,15 @@ fn write_file(path: &Path, contents: &str, private: bool) -> Result<(), MusterEr
         if let Ok(meta) = std::fs::metadata(path) {
             std::fs::set_permissions(&tmp, meta.permissions()).map_err(|e| io_error(&tmp, e))?;
         }
+    }
+    #[cfg(unix)]
+    if executable {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::metadata(&tmp).map_err(|e| io_error(&tmp, e))?;
+        let mode = meta.permissions().mode();
+        let exec = if private { 0o100 } else { 0o111 };
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode | exec))
+            .map_err(|e| io_error(&tmp, e))?;
     }
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);

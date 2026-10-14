@@ -33,14 +33,15 @@ where
     let globals = globals(&matches);
     let (format, quiet) = (globals.format.unwrap_or(Format::Text), globals.quiet);
 
-    let (result, mut diagnostics) = match Context::new(globals) {
+    let (result, mut diagnostics, failed) = match Context::new(globals) {
         Ok(mut ctx) => {
             let result = (spec.handler)(&mut ctx, &params(spec, sub));
-            (result, ctx.take_diagnostics())
+            (result, ctx.take_diagnostics(), ctx.failed())
         }
-        Err(err) => (Err(err), Vec::new()),
+        Err(err) => (Err(err), Vec::new(), false),
     };
     let (ok, result, code) = match result {
+        Ok(value) if failed => (false, value, 1),
         Ok(value) => (true, value, 0),
         Err(err) => {
             diagnostics.push(err.to_diagnostic());

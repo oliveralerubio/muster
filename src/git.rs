@@ -124,6 +124,55 @@ pub fn pull(dir: &Path) -> Result<Pulled, MusterError> {
     Ok(Pulled::Updated)
 }
 
+/// `git --version`, or `None` when git cannot be run.
+pub fn version() -> Option<String> {
+    let out = Command::new("git").arg("--version").output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Local view of the config repo, without touching the network.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoStatus {
+    /// Paths with uncommitted changes (`git status --porcelain`).
+    pub changed: usize,
+    pub has_remote: bool,
+    /// Commits ahead of / behind the upstream branch as of the last fetch;
+    /// `None` when the branch has no upstream.
+    pub ahead_behind: Option<(u64, u64)>,
+}
+
+pub fn status(dir: &Path) -> Result<RepoStatus, MusterError> {
+    require_repo(dir)?;
+    let porcelain = run(dir, &["status", "--porcelain"])?;
+    if !porcelain.status.success() {
+        return Err(MusterError::Operational(format!(
+            "git status failed: {}",
+            String::from_utf8_lossy(&porcelain.stderr).trim()
+        )));
+    }
+    let changed = String::from_utf8_lossy(&porcelain.stdout).lines().count();
+    let counts = run(
+        dir,
+        &["rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
+    )?;
+    let ahead_behind = counts
+        .status
+        .success()
+        .then(|| {
+            let text = String::from_utf8_lossy(&counts.stdout).to_string();
+            let mut parts = text.split_whitespace().map(|n| n.parse::<u64>().ok());
+            Some((parts.next()??, parts.next()??))
+        })
+        .flatten();
+    Ok(RepoStatus {
+        changed,
+        has_remote: has_remote(dir),
+        ahead_behind,
+    })
+}
+
 fn current_branch(dir: &Path) -> Result<String, MusterError> {
     let out = run(dir, &["symbolic-ref", "--short", "HEAD"])?;
     if !out.status.success() {

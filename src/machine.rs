@@ -72,14 +72,53 @@ pub fn save_name(state_dir: &Path, name: &str) -> Result<(), MusterError> {
 
 /// Known agent CLIs found as executables on `PATH`.
 pub fn detect_agents() -> Vec<String> {
-    let dirs: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).collect())
-        .unwrap_or_default();
     KNOWN_AGENTS
         .iter()
-        .filter(|agent| dirs.iter().any(|d| is_executable(&d.join(agent))))
+        .filter(|agent| find_executable(agent).is_some())
         .map(|agent| agent.to_string())
         .collect()
+}
+
+/// First executable named `name` on `PATH`.
+pub fn find_executable(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| is_executable(candidate))
+}
+
+/// First line `<exe> --version` prints, or why it could not be read. Gives up
+/// after a few seconds so a hung CLI never hangs the caller.
+pub fn version_output(exe: &Path) -> Result<String, String> {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let mut child = Command::new(exe)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match child.try_wait().map_err(|e| e.to_string())? {
+            Some(_) => break,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("timed out".into());
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+    let output = child.wait_with_output().map_err(|e| e.to_string())?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "printed nothing".into())
 }
 
 #[cfg(unix)]

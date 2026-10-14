@@ -48,6 +48,9 @@ pub struct Manifest {
     /// Declared MCP servers (stdio and remote), keyed by server name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mcp: BTreeMap<String, McpServer>,
+    /// Managed dotfiles, keyed by target path relative to `$HOME`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub files: BTreeMap<String, ManagedDotfile>,
     // Later tickets add members, groups and profiles.
     #[serde(flatten)]
     #[schemars(skip)]
@@ -60,6 +63,21 @@ pub struct Manifest {
 pub struct Recovery {
     /// age x25519 recipient (`age1...`).
     pub recipient: String,
+}
+
+/// A whole file Muster writes under `$HOME` (`muster sync`), with its
+/// contents stored in the config repo.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedDotfile {
+    /// Path of the contents inside the config repo (e.g. `files/.gitconfig`).
+    pub source: String,
+    /// Written with mode 0600 and never shown in diffs.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub private: bool,
+    /// Written executable (0755, or 0700 when private).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub executable: bool,
 }
 
 /// One machine of the fleet.
@@ -185,6 +203,7 @@ impl Manifest {
             profiles: BTreeMap::new(),
             agents: None,
             mcp: BTreeMap::new(),
+            files: BTreeMap::new(),
             extensions: BTreeMap::new(),
         }
     }

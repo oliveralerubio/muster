@@ -39,6 +39,9 @@ pub struct Diagnostic {
     pub severity: Severity,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// How to fix the problem (a command or a short instruction).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggestion: Option<String>,
 }
 
 impl Diagnostic {
@@ -48,6 +51,7 @@ impl Diagnostic {
             message: message.into(),
             severity,
             path: None,
+            suggestion: None,
         }
     }
 
@@ -57,6 +61,11 @@ impl Diagnostic {
 
     pub fn with_path(mut self, path: impl Into<String>) -> Self {
         self.path = Some(path.into());
+        self
+    }
+
+    pub fn with_suggestion(mut self, suggestion: impl Into<String>) -> Self {
+        self.suggestion = Some(suggestion.into());
         self
     }
 }
@@ -113,6 +122,9 @@ pub fn render(envelope: &Envelope, format: Format, quiet: bool) {
                     .map(|p| format!(" ({p})"))
                     .unwrap_or_default();
                 let _ = writeln!(stderr, "{severity}[{}]: {}{at}", d.code, d.message);
+                if let Some(suggestion) = &d.suggestion {
+                    let _ = writeln!(stderr, "  hint: {suggestion}");
+                }
             }
         }
     }

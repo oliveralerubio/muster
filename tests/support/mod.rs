@@ -107,3 +107,29 @@ impl MusterEnv {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
     }
 }
+
+impl MusterEnv {
+    /// Like [`MusterEnv::run`], but PATH is ONLY the temp bin dir, so the
+    /// host's real agent CLIs never leak in. Link what the test needs with
+    /// [`MusterEnv::link_system_exe`] (e.g. `git`).
+    pub fn run_isolated(&self, args: &[&str]) -> Command {
+        let mut cmd = self.run(args);
+        cmd.env("PATH", &self.bin);
+        cmd
+    }
+
+    /// Symlink the host's `name` executable (found on the real PATH) into the
+    /// temp bin dir.
+    pub fn link_system_exe(&self, name: &str) {
+        let link = self.bin.join(name);
+        if link.exists() {
+            return;
+        }
+        let path = std::env::var_os("PATH").expect("PATH");
+        let target = std::env::split_paths(&path)
+            .map(|dir| dir.join(name))
+            .find(|p| p.is_file())
+            .unwrap_or_else(|| panic!("`{name}` not found on PATH"));
+        std::os::unix::fs::symlink(target, link).expect("symlink system exe");
+    }
+}

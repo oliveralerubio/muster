@@ -5,7 +5,7 @@
 //! Callers go through [`Providers`]: it parses a reference, opens the matching
 //! provider on first use and closes every opened provider when dropped.
 
-mod cli;
+pub(crate) mod cli;
 mod env;
 mod native;
 

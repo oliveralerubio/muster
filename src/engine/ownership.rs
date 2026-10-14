@@ -11,11 +11,14 @@ use serde_json::Value;
 use crate::adapters::{strip_markdown_block, FileFormat};
 
 const BLOCK: &str = "block";
+/// Owned key of a whole-file (managed dotfile) record.
+const FILE: &str = "file";
 
 /// Keys an adapter wrote into `rendered` (its output for an empty file).
 pub fn owned_keys(format: FileFormat, rendered: &str) -> Vec<Vec<String>> {
     match format {
         FileFormat::Markdown => vec![vec![BLOCK.to_string()]],
+        FileFormat::Text => vec![vec![FILE.to_string()]],
         FileFormat::Json => match serde_json::from_str::<Value>(rendered) {
             Ok(Value::Object(map)) => map
                 .iter()
@@ -53,6 +56,7 @@ pub fn prune(format: FileFormat, text: &str, keys: &[Vec<String>]) -> String {
     }
     match format {
         FileFormat::Markdown => strip_markdown_block(text),
+        FileFormat::Text => String::new(),
         FileFormat::Json => {
             let Ok(Value::Object(mut map)) = serde_json::from_str::<Value>(text) else {
                 return text.to_string();
@@ -115,6 +119,7 @@ fn remove_json(map: &mut serde_json::Map<String, Value>, key: &[String]) -> bool
 pub fn is_empty(format: FileFormat, text: &str) -> bool {
     match format {
         FileFormat::Markdown => text.trim().is_empty(),
+        FileFormat::Text => text.is_empty(),
         FileFormat::Json => match serde_json::from_str::<Value>(text) {
             Ok(v) => json_empty(&v),
             Err(_) => text.trim().is_empty(),
