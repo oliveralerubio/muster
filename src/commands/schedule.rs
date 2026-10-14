@@ -186,7 +186,10 @@ fn enable(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
                 (timer, systemd_timer(minutes)),
             ]
         }
-        Backend::Launchd => vec![(units.plist.clone(), launchd_plist(&command, minutes, ctx))],
+        Backend::Launchd => vec![(
+            units.plist.clone(),
+            launchd_plist(&command, minutes, &ctx.state_dir),
+        )],
     };
     let paths: Vec<&PathBuf> = files.iter().map(|(p, _)| p).collect();
     let result = |enabled: bool| {
@@ -328,15 +331,20 @@ fn systemd_service(command: &[String]) -> String {
 }
 
 fn systemd_timer(minutes: i64) -> String {
+    let cadence = if minutes == DEFAULT_INTERVAL_MINUTES {
+        "OnCalendar=hourly".to_owned()
+    } else {
+        format!("OnBootSec=5min\nOnUnitActiveSec={minutes}min")
+    };
     format!(
         "# Managed by Muster (`muster schedule`). Removed by `muster schedule disable`.\n\
          [Unit]\n\
          Description=Run Muster sync every {minutes} minutes\n\
          \n\
          [Timer]\n\
-         OnBootSec=5min\n\
-         OnUnitActiveSec={minutes}min\n\
+         {cadence}\n\
          Persistent=true\n\
+         RandomizedDelaySec=300\n\
          Unit={SERVICE}\n\
          \n\
          [Install]\n\
@@ -344,12 +352,12 @@ fn systemd_timer(minutes: i64) -> String {
     )
 }
 
-fn launchd_plist(command: &[String], minutes: i64, ctx: &Context) -> String {
+fn launchd_plist(command: &[String], minutes: i64, state_dir: &Path) -> String {
     let args: String = command
         .iter()
         .map(|a| format!("    <string>{}</string>\n", xml_escape(a)))
         .collect();
-    let log = xml_escape(&ctx.state_dir.join("schedule.log").display().to_string());
+    let log = xml_escape(&state_dir.join("schedule.log").display().to_string());
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
@@ -398,4 +406,28 @@ fn shell_line(command: &[String]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_timer_is_persistent_hourly_with_jitter() {
+        let timer = systemd_timer(DEFAULT_INTERVAL_MINUTES);
+        assert!(timer.contains("OnCalendar=hourly\n"));
+        assert!(timer.contains("Persistent=true\n"));
+        assert!(timer.contains("RandomizedDelaySec=300\n"));
+    }
+
+    #[test]
+    fn launchd_runs_hourly_and_escapes_arguments() {
+        let plist = launchd_plist(
+            &["/bin/muster&test".into(), "sync".into()],
+            60,
+            Path::new("/tmp/state"),
+        );
+        assert!(plist.contains("<integer>3600</integer>"));
+        assert!(plist.contains("/bin/muster&amp;test"));
+    }
 }

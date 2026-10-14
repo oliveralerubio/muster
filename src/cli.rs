@@ -49,10 +49,22 @@ pub fn execute(
     params: &Params,
     interactive: bool,
 ) -> (Envelope, i32) {
+    execute_with(spec, globals, interactive, |ctx| {
+        (spec.handler)(ctx, params)
+    })
+}
+
+/// Shared envelope handling for web-only input that must never enter Params.
+pub(crate) fn execute_with(
+    spec: &'static CommandSpec,
+    globals: Globals,
+    interactive: bool,
+    handler: impl FnOnce(&mut Context) -> Result<Value, MusterError>,
+) -> (Envelope, i32) {
     let (result, mut diagnostics, failed) = match Context::new(globals) {
         Ok(mut ctx) => {
             ctx.is_tty &= interactive;
-            let result = (spec.handler)(&mut ctx, params);
+            let result = handler(&mut ctx);
             (result, ctx.take_diagnostics(), ctx.failed())
         }
         Err(err) => (Err(err), Vec::new(), false),

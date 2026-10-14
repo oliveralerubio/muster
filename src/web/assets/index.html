@@ -47,6 +47,19 @@
     </form>
   </dialog>
 
+  <dialog id="secret-edit">
+    <form id="secret-form">
+      <h2 id="secret-edit-title">Nuevo secreto</h2>
+      <p><label>Nombre (grupo/nombre) <input id="secret-path" required autocomplete="off"></label></p>
+      <p><label>Valor <input id="secret-input" type="password" autocomplete="new-password" required></label></p>
+      <p><label><input id="secret-confirm" type="checkbox" required> Confirmo guardar el valor</label></p>
+      <div class="actions">
+        <button id="secret-save" type="submit" class="primary">Guardar</button>
+        <button id="secret-cancel" type="button">Cancelar</button>
+      </div>
+      <p id="secret-error" role="alert"></p>
+    </form>
+  </dialog>
   <script src="/app.js"></script>
 </body>
 </html>

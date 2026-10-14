@@ -75,7 +75,9 @@ const views = {
     const pending = (r.pending && r.pending.members) || [];
     const drift = r.drift || {};
     const driftCount = (drift.members || []).length + (drift.machines || []).length;
-    render("Dashboard (fleet panel)", [button("Sync now", () => act("Pull, plan and apply now?", "sync"), "primary")],
+    render("Dashboard (fleet panel)", [button("Sincronizar ahora", () => act("Pull, plan and apply now?", "sync"), "primary")],
+      el("h2", {}, "Última sincronización"),
+      el("p", {}, r.sync ? `${r.sync.ts} · ${r.sync.result}` : "Nunca"),
       table(["Machines", "Pending members", "Drift"], [[machines.length, pending.length, driftCount]]),
       el("h2", {}, "Fleet"),
       table(["Name", "Platform", "Version", "Status", "Last sync"],
@@ -120,12 +122,13 @@ const views = {
   async secrets() {
     const data = await api("secrets");
     const secrets = Array.isArray(data.result) ? data.result : [];
-    render("Secrets", [],
+    render("Secrets", [button("Nuevo secreto", () => openSecretEdit(), "primary")],
       el("p", {}, "Metadata only. Revealing a value needs explicit confirmation and is recorded."),
       table(["Reference", "Updated", "By", "Readers", ""],
         secrets.map((s) => [s.reference, s.updated_at || "", s.updated_by || "",
           (s.readers || []).map((r) => r.machine || r.recipient).join(", "),
-          button("Reveal…", () => openReveal(s.reference))])),
+          el("div", { class: "actions" }, button("Reveal…", () => openReveal(s.reference)),
+            button("Cambiar valor", () => openSecretEdit(s.reference)))])),
       diagnostics(data));
   },
 
@@ -240,5 +243,43 @@ $("#reveal-confirm").addEventListener("click", async () => {
     : (data.diagnostics || []).map((d) => d.message).join("\n");
 });
 dialog.addEventListener("close", () => { $("#reveal-value").textContent = ""; });
+
+const editDialog = $("#secret-edit");
+let secretAction = "add";
+function openSecretEdit(reference) {
+  secretAction = reference ? "rotate" : "add";
+  $("#secret-form").reset();
+  $("#secret-edit-title").textContent = reference ? "Cambiar valor" : "Nuevo secreto";
+  $("#secret-path").value = reference || "";
+  $("#secret-path").readOnly = Boolean(reference);
+  $("#secret-error").textContent = "";
+  editDialog.showModal();
+}
+$("#secret-cancel").addEventListener("click", () => editDialog.close());
+editDialog.addEventListener("close", () => $("#secret-form").reset());
+$("#secret-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const input = $("#secret-input");
+  const body = { path: $("#secret-path").value, value: input.value, confirm: $("#secret-confirm").checked };
+  input.value = "";
+  $("#secret-save").disabled = true;
+  try {
+    const pending = api("secret/" + secretAction, body);
+    body.value = "";
+    const data = await pending;
+    if (data.ok) {
+      editDialog.close();
+      await show("secrets");
+    } else {
+      $("#secret-error").textContent = data.error || (data.diagnostics || []).map((d) => d.message).join("\n") || "failed";
+    }
+  } catch (err) {
+    $("#secret-error").textContent = "Failed to save: " + err.message;
+  } finally {
+    body.value = "";
+    input.value = "";
+    $("#secret-save").disabled = false;
+  }
+});
 
 show("dashboard");
