@@ -53,6 +53,11 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         "Revoke machine '{name}'? Its access will be removed and exposed secrets must be rotated."
     ))?;
 
+    // Team mode: only admins revoke machines (the recovery key always can).
+    if !manifest.members.is_empty() && params.get_string("recovery-key").is_none() {
+        crate::team::admin(&manifest, &ctx.state_dir)?;
+    }
+
     // Authorization: either recovery key or caller's identity
     let authorizer_identity = match params.get_string("recovery-key") {
         Some(raw_key) => {
@@ -131,6 +136,7 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     }
 
     manifest.machines.remove(name);
+    crate::team::forget_machine(&mut manifest, name);
     manifest.save(&ctx.config_dir)?;
 
     let mut reencrypted_groups = Vec::new();

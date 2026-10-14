@@ -99,6 +99,7 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
             last_sync: None,
             role: None,
             profile: None,
+            applied_profile: None,
         },
     );
     manifest.save(&config_dir)?;

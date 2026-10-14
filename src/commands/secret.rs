@@ -366,22 +366,14 @@ fn resolve_recipients(
     if vault.groups()?.contains(&group.to_string()) {
         return vault.readers(group);
     }
-    // New group: encrypt for every fleet machine, the recovery key, and this machine.
     let manifest = Manifest::load(&ctx.config_dir)?;
-    let mut recipients = Vec::new();
-    for machine in manifest.machines.values() {
-        if !recipients.contains(&machine.recipient) {
-            recipients.push(machine.recipient.clone());
+    let mut recipients = crate::team::group_recipients(&manifest, group);
+    // When the group is not declared, the creating machine also reads it.
+    if !manifest.groups.contains_key(group) {
+        let mine = identity.recipient();
+        if !recipients.contains(&mine) {
+            recipients.push(mine);
         }
-    }
-    if let Some(recovery) = &manifest.recovery {
-        if !recipients.contains(&recovery.recipient) {
-            recipients.push(recovery.recipient.clone());
-        }
-    }
-    let caller = identity.recipient();
-    if !recipients.contains(&caller) {
-        recipients.push(caller);
     }
     if recipients.is_empty() {
         return Err(MusterError::Usage(

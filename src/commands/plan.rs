@@ -21,7 +21,16 @@ pub const PROJECT_PARAM: ParamSpec = ParamSpec {
 pub const SPEC: CommandSpec = CommandSpec {
     name: "plan",
     about: "Show what sync would change (exact diff, secrets redacted) without writing",
-    params: &[PROJECT_PARAM],
+    params: &[
+        PROJECT_PARAM,
+        ParamSpec {
+            name: "explain",
+            about: "Also report the layer precedence and the layers that apply",
+            kind: ParamKind::Bool,
+            required: false,
+            positional: false,
+        },
+    ],
     mutating: false,
     handler: plan,
 };
@@ -60,7 +69,11 @@ fn plan(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         agent: None,
     };
     let plan = engine::plan(ctx, &options)?;
-    Ok(plan.to_json(true, false, plan.base_generation()))
+    let mut result = plan.to_json(true, false, plan.base_generation());
+    if params.get_bool("explain") {
+        result["explain"] = plan.explain();
+    }
+    Ok(result)
 }
 
 fn rollback(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
