@@ -91,13 +91,18 @@ impl Envelope {
     }
 }
 
+/// The JSON text of an envelope, as printed by `--format json` (and returned
+/// verbatim by MCP tools).
+pub fn json_text(envelope: &Envelope) -> String {
+    serde_json::to_string_pretty(envelope).expect("envelope serializes")
+}
+
 /// Print an envelope. Write errors (e.g. a closed pipe) are ignored on purpose.
 pub fn render(envelope: &Envelope, format: Format, quiet: bool) {
     let mut stdout = std::io::stdout().lock();
     match format {
         Format::Json => {
-            let text = serde_json::to_string_pretty(envelope).expect("envelope serializes");
-            let _ = writeln!(stdout, "{text}");
+            let _ = writeln!(stdout, "{}", json_text(envelope));
         }
         Format::Text => {
             match &envelope.result {
