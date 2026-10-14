@@ -1,0 +1,156 @@
+//! Execution context handed to every command handler: resolved paths, global
+//! flags, TTY detection, confirmation and the diagnostics sink.
+
+use std::io::{BufRead, IsTerminal, Write};
+use std::path::{Path, PathBuf};
+
+use crate::errors::MusterError;
+use crate::output::{Diagnostic, Format};
+
+/// Global options after CLI/`MUSTER_*` precedence has been applied.
+#[derive(Debug, Clone, Default)]
+pub struct Globals {
+    pub config: Option<PathBuf>,
+    pub format: Option<Format>,
+    pub yes: bool,
+    pub dry_run: bool,
+    pub quiet: bool,
+    pub verbose: bool,
+}
+
+pub struct Context {
+    /// Config repository (`--config` > `MUSTER_CONFIG` > `$XDG_CONFIG_HOME/muster`).
+    pub config_dir: PathBuf,
+    /// Local, per-machine state (never inside the config repo).
+    pub state_dir: PathBuf,
+    pub format: Format,
+    pub yes: bool,
+    pub dry_run: bool,
+    pub quiet: bool,
+    pub verbose: bool,
+    pub is_tty: bool,
+    diagnostics: Vec<Diagnostic>,
+}
+
+impl Context {
+    pub fn new(globals: Globals) -> Result<Self, MusterError> {
+        let home = env_path("HOME");
+        let config_dir = match globals.config {
+            Some(dir) => dir,
+            None => xdg_dir("XDG_CONFIG_HOME", home.as_deref(), ".config")?,
+        };
+        Ok(Self {
+            config_dir,
+            state_dir: state_dir(home.as_deref())?,
+            format: globals.format.unwrap_or(Format::Text),
+            yes: globals.yes,
+            dry_run: globals.dry_run,
+            quiet: globals.quiet,
+            verbose: globals.verbose,
+            is_tty: std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
+            diagnostics: Vec::new(),
+        })
+    }
+
+    pub fn diag(&mut self, diagnostic: Diagnostic) {
+        self.diagnostics.push(diagnostic);
+    }
+
+    pub fn take_diagnostics(&mut self) -> Vec<Diagnostic> {
+        std::mem::take(&mut self.diagnostics)
+    }
+
+    /// Progress line on stderr, silenced by `--quiet`.
+    pub fn progress(&self, message: &str) {
+        if !self.quiet {
+            eprintln!("{message}");
+        }
+    }
+
+    /// Extra detail on stderr, shown only with `--verbose`.
+    pub fn detail(&self, message: &str) {
+        if self.verbose {
+            eprintln!("{message}");
+        }
+    }
+
+    /// Ask before a destructive action. `--yes` approves; without a TTY there is
+    /// never a prompt, so the action fails with a usage error (exit 2).
+    pub fn confirm(&self, question: &str) -> Result<(), MusterError> {
+        if self.yes {
+            return Ok(());
+        }
+        if !self.is_tty {
+            return Err(MusterError::Usage(format!(
+                "{question}: confirmation required but no terminal is attached; re-run with --yes"
+            )));
+        }
+        eprint!("{question} [y/N] ");
+        let _ = std::io::stderr().flush();
+        let mut answer = String::new();
+        std::io::stdin()
+            .lock()
+            .read_line(&mut answer)
+            .map_err(|e| MusterError::Operational(format!("cannot read answer: {e}")))?;
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "y" | "yes" => Ok(()),
+            _ => Err(MusterError::Operational("aborted by user".into())),
+        }
+    }
+}
+
+fn env_path(var: &str) -> Option<PathBuf> {
+    std::env::var_os(var)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+/// `$VAR/muster`, else `$HOME/<fallback>/muster`.
+fn xdg_dir(var: &str, home: Option<&Path>, fallback: &str) -> Result<PathBuf, MusterError> {
+    match env_path(var) {
+        Some(base) => Ok(base.join("muster")),
+        None => Ok(require_home(home)?.join(fallback).join("muster")),
+    }
+}
+
+fn state_dir(home: Option<&Path>) -> Result<PathBuf, MusterError> {
+    if cfg!(target_os = "macos") && env_path("XDG_STATE_HOME").is_none() {
+        return Ok(require_home(home)?.join("Library/Application Support/muster"));
+    }
+    xdg_dir("XDG_STATE_HOME", home, ".local/state")
+}
+
+fn require_home(home: Option<&Path>) -> Result<&Path, MusterError> {
+    home.ok_or_else(|| MusterError::Operational("HOME is not set".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx(yes: bool) -> Context {
+        Context {
+            config_dir: PathBuf::new(),
+            state_dir: PathBuf::new(),
+            format: Format::Text,
+            yes,
+            dry_run: false,
+            quiet: false,
+            verbose: false,
+            is_tty: false,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn confirm_without_tty_or_yes_is_a_usage_error() {
+        let err = ctx(false).confirm("delete everything").unwrap_err();
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("--yes"));
+    }
+
+    #[test]
+    fn confirm_with_yes_never_prompts() {
+        assert!(ctx(true).confirm("delete everything").is_ok());
+    }
+}
