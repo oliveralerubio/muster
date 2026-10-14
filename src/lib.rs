@@ -12,6 +12,7 @@ pub mod identity;
 pub mod machine;
 pub mod manifest;
 pub mod output;
+pub mod providers;
 pub mod registry;
 pub mod secrets;
 pub mod vault;

@@ -8,7 +8,7 @@
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, Value};
 
 use super::{
-    markdown_block, transport, without_secret_refs, Adapter, Base, Capability, Current, Desired,
+    markdown_block, resolve_mcp_map, transport, Adapter, Base, Capability, Current, Desired,
     FileFormat, ManagedFile, RenderPlan, RenderedFile, Scope, Transport,
 };
 use crate::errors::MusterError;
@@ -100,7 +100,8 @@ fn render_config(
                             }
                             table.insert("args", Item::Value(Value::Array(arr)));
                         }
-                        let env = without_secret_refs(&server.env, "Codex", name, plan);
+                        let env =
+                            resolve_mcp_map(&server.env, desired.secrets, "Codex", name, plan);
                         if !env.is_empty() {
                             let mut inline = InlineTable::new();
                             for (k, v) in env {
@@ -111,7 +112,8 @@ fn render_config(
                     }
                     Transport::Remote { url } => {
                         table.insert("url", toml_edit::value(url.to_string()));
-                        let headers = without_secret_refs(&server.headers, "Codex", name, plan);
+                        let headers =
+                            resolve_mcp_map(&server.headers, desired.secrets, "Codex", name, plan);
                         if !headers.is_empty() {
                             let mut inline = InlineTable::new();
                             for (k, v) in headers {

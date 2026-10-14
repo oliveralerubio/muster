@@ -4,7 +4,7 @@
 //! files, render, write what changed. Failures are isolated per adapter and
 //! reported as error diagnostics; the other adapters are still applied.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
@@ -15,7 +15,9 @@ use crate::errors::MusterError;
 use crate::machine;
 use crate::manifest::{self, Manifest};
 use crate::output::{Diagnostic, Severity};
+use crate::providers::Providers;
 use crate::registry::{CommandSpec, ParamKind, ParamSpec, Params};
+use crate::secrets::{self, SecretValue};
 
 pub const SPEC: CommandSpec = CommandSpec {
     name: "agents",
@@ -117,10 +119,12 @@ fn apply(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let default_agents = config::AgentsConfig::default();
     let agents = manifest.agents.as_ref().unwrap_or(&default_agents);
     let instructions = read_instructions(ctx, agents)?;
+    let secrets = resolve_mcp_secrets(ctx, &manifest);
     let desired = Desired {
         agents,
         mcp: &manifest.mcp,
         instructions: instructions.as_deref(),
+        secrets: &secrets,
     };
 
     let roots = Roots::from_env()?;
@@ -149,6 +153,42 @@ fn apply(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     Ok(json!({ "dry_run": ctx.dry_run, "agents": results }))
 }
 
+/// Resolve every secret reference in MCP `env`/`headers` through the provider
+/// layer. A failure is a warning carrying the provider's typed code; adapters
+/// then leave that key out (and warn) instead of writing the reference.
+fn resolve_mcp_secrets(ctx: &mut Context, manifest: &Manifest) -> BTreeMap<String, SecretValue> {
+    let mut providers = Providers::new(&ctx.config_dir, &ctx.state_dir);
+    let mut resolved = BTreeMap::new();
+    let mut failed = BTreeSet::new();
+    for (name, server) in &manifest.mcp {
+        for (key, value) in server.env.iter().chain(&server.headers) {
+            if !secrets::is_reference(value)
+                || resolved.contains_key(value)
+                || failed.contains(value)
+            {
+                continue;
+            }
+            match providers.resolve(value) {
+                Ok(secret) => {
+                    resolved.insert(value.clone(), secret);
+                }
+                Err(err) => {
+                    failed.insert(value.clone());
+                    ctx.diag(
+                        Diagnostic::new(
+                            Severity::Warning,
+                            err.code(),
+                            format!("MCP server `{name}` key `{key}`: {err}"),
+                        )
+                        .with_path(format!("{}: mcp.{name}", manifest::FILE_NAME)),
+                    );
+                }
+            }
+        }
+    }
+    resolved
+}
+
 /// Read, render and (unless dry-run) write one adapter's files.
 fn apply_one(
     adapter: &Adapter,
@@ -172,25 +212,43 @@ fn apply_one(
     for rendered in &plan.files {
         let path = roots.resolve(rendered.file);
         let changed = current.get(rendered.file.path) != Some(&rendered.contents);
+        // A file holding a resolved secret is kept private to the user.
+        let private = desired
+            .secrets
+            .values()
+            .any(|s| !s.expose().is_empty() && rendered.contents.contains(s.expose()));
         if changed && !dry_run {
-            write_file(&path, &rendered.contents)?;
+            write_file(&path, &rendered.contents, private)?;
         }
         files.push(json!({ "path": path, "changed": changed }));
     }
     Ok((files, plan.diagnostics))
 }
 
-/// Write via a sibling temp file + rename, keeping the existing file mode.
-fn write_file(path: &Path, contents: &str) -> Result<(), MusterError> {
+/// Write via a sibling temp file + rename, keeping the existing file mode, or
+/// forcing 0600 when `private` (the file holds resolved secrets).
+fn write_file(path: &Path, contents: &str, private: bool) -> Result<(), MusterError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| io_error(parent, e))?;
     }
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".muster-tmp");
     let tmp = PathBuf::from(tmp);
-    std::fs::write(&tmp, contents).map_err(|e| io_error(&tmp, e))?;
-    if let Ok(meta) = std::fs::metadata(path) {
-        std::fs::set_permissions(&tmp, meta.permissions()).map_err(|e| io_error(&tmp, e))?;
+    let _ = std::fs::remove_file(&tmp);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    if private {
+        // The plaintext never exists with looser permissions, even briefly.
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    }
+    let mut file = options.open(&tmp).map_err(|e| io_error(&tmp, e))?;
+    std::io::Write::write_all(&mut file, contents.as_bytes()).map_err(|e| io_error(&tmp, e))?;
+    drop(file);
+    if !private {
+        if let Ok(meta) = std::fs::metadata(path) {
+            std::fs::set_permissions(&tmp, meta.permissions()).map_err(|e| io_error(&tmp, e))?;
+        }
     }
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);

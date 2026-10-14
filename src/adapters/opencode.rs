@@ -7,7 +7,7 @@
 use serde_json::{Map, Value};
 
 use super::{
-    child_object, json_object, json_text, markdown_block, transport, without_secret_refs, Adapter,
+    child_object, json_object, json_text, markdown_block, resolve_mcp_map, transport, Adapter,
     Base, Capability, Current, Desired, FileFormat, ManagedFile, RenderPlan, RenderedFile, Scope,
     Transport,
 };
@@ -73,7 +73,7 @@ fn render(desired: &Desired, current: &Current, plan: &mut RenderPlan) -> Result
                         .map(Value::from)
                         .collect();
                     entry.insert("command".into(), Value::Array(argv));
-                    let env = without_secret_refs(&server.env, "OpenCode", name, plan);
+                    let env = resolve_mcp_map(&server.env, desired.secrets, "OpenCode", name, plan);
                     if !env.is_empty() {
                         entry.insert("environment".into(), string_map(env));
                     }
@@ -81,7 +81,8 @@ fn render(desired: &Desired, current: &Current, plan: &mut RenderPlan) -> Result
                 Transport::Remote { url } => {
                     entry.insert("type".into(), "remote".into());
                     entry.insert("url".into(), url.into());
-                    let headers = without_secret_refs(&server.headers, "OpenCode", name, plan);
+                    let headers =
+                        resolve_mcp_map(&server.headers, desired.secrets, "OpenCode", name, plan);
                     if !headers.is_empty() {
                         entry.insert("headers".into(), string_map(headers));
                     }

@@ -20,6 +20,7 @@ use serde_json::{Map, Value};
 
 use crate::errors::MusterError;
 use crate::output::{Diagnostic, Severity};
+use crate::secrets::SecretValue;
 use config::{AgentsConfig, McpServer, Transport};
 
 /// Where a managed path is rooted.
@@ -84,13 +85,17 @@ impl Capability {
 }
 
 /// Desired canonical state handed to every adapter. Secret references in MCP
-/// `env`/`headers` stay references here; values are never resolved by render.
+/// `env`/`headers` stay references in `mcp`; their values, already resolved by
+/// the caller through the provider layer, come in `secrets` (render never
+/// calls a provider).
 #[derive(Debug, Clone, Copy)]
 pub struct Desired<'a> {
     pub agents: &'a AgentsConfig,
     pub mcp: &'a BTreeMap<String, McpServer>,
     /// Contents of the canonical AGENTS.md, when declared and present.
     pub instructions: Option<&'a str>,
+    /// Resolved secrets injected into MCP env and headers; render stays pure.
+    pub secrets: &'a BTreeMap<String, SecretValue>,
 }
 
 impl Desired<'_> {
@@ -134,11 +139,21 @@ impl Desired<'_> {
 /// A missing key means the file does not exist.
 pub type Current = BTreeMap<&'static str, String>;
 
-/// New full contents for one managed file.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// New full contents for one managed file. Contents may hold resolved secrets,
+/// so `Debug` shows only their length.
+#[derive(Clone, PartialEq, Eq)]
 pub struct RenderedFile {
     pub file: &'static ManagedFile,
     pub contents: String,
+}
+
+impl std::fmt::Debug for RenderedFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RenderedFile")
+            .field("file", &self.file.path)
+            .field("contents", &format_args!("<{} bytes>", self.contents.len()))
+            .finish()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -240,43 +255,39 @@ pub fn default_enabled() -> Vec<&'static str> {
 // Shared render helpers
 // ---------------------------------------------------------------------------
 
-const SECRET_SCHEMES: &[&str] = &[
-    "native://",
-    "env://",
-    "op://",
-    "bws://",
-    "doppler://",
-    "infisical://",
-];
-
-/// Secret references are resolved by a later step, never written as-is or in plaintext.
+/// Secret references are resolved before render (see [`Desired::secrets`]) and
+/// never written as-is.
 pub fn is_secret_reference(value: &str) -> bool {
-    SECRET_SCHEMES.iter().any(|s| value.starts_with(s))
+    crate::secrets::is_reference(value)
 }
 
-/// `map` without secret references; each dropped key gets a warning.
-fn without_secret_refs(
+/// `map` with secret references replaced by their resolved values; a reference
+/// that could not be resolved drops its key with a warning.
+fn resolve_mcp_map(
     map: &BTreeMap<String, String>,
+    secrets: &BTreeMap<String, SecretValue>,
     adapter: &str,
     server: &str,
     plan: &mut RenderPlan,
 ) -> BTreeMap<String, String> {
     let mut kept = BTreeMap::new();
     for (key, value) in map {
-        if is_secret_reference(value) {
+        if !is_secret_reference(value) {
+            kept.insert(key.clone(), value.clone());
+        } else if let Some(secret) = secrets.get(value) {
+            kept.insert(key.clone(), secret.expose().to_owned());
+        } else {
             plan.diagnostics.push(
                 Diagnostic::new(
                     Severity::Warning,
                     "secret_reference_unresolved",
                     format!(
-                        "{adapter}: MCP server `{server}` key `{key}` is a secret reference; \
-                         secret resolution is not available yet, so it was not written"
+                        "{adapter}: MCP server `{server}` key `{key}` references a secret \
+                         that could not be resolved, so it was not written"
                     ),
                 )
                 .with_path(format!("mcp.{server}")),
             );
-        } else {
-            kept.insert(key.clone(), value.clone());
         }
     }
     kept

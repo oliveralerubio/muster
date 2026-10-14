@@ -1,11 +1,12 @@
 //! Execution context handed to every command handler: resolved paths, global
 //! flags, TTY detection, confirmation and the diagnostics sink.
 
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::{BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::errors::MusterError;
 use crate::output::{Diagnostic, Format};
+use crate::secrets::SecretValue;
 
 /// Global options after CLI/`MUSTER_*` precedence has been applied.
 #[derive(Debug, Clone, Default)]
@@ -96,6 +97,41 @@ impl Context {
             "y" | "yes" => Ok(()),
             _ => Err(MusterError::Operational("aborted by user".into())),
         }
+    }
+}
+
+impl Context {
+    /// A secret value piped on stdin (one trailing newline dropped). Refuses a
+    /// terminal: typed input would echo, and argv would leak to `ps`/history.
+    pub fn read_secret_stdin(&self) -> Result<SecretValue, MusterError> {
+        use secrecy::zeroize::Zeroize;
+        let mut stdin = std::io::stdin().lock();
+        if stdin.is_terminal() {
+            return Err(MusterError::Usage(
+                "pipe the secret value on stdin (e.g. `pbpaste | muster secret add app/api --value-stdin`)".into(),
+            ));
+        }
+        let mut bytes = Vec::new();
+        if let Err(e) = stdin.read_to_end(&mut bytes) {
+            bytes.zeroize();
+            return Err(MusterError::Operational(format!("cannot read stdin: {e}")));
+        }
+        let mut text = String::from_utf8(bytes).map_err(|e| {
+            e.into_bytes().zeroize();
+            MusterError::Usage("the secret value must be UTF-8 text".into())
+        })?;
+        if text.ends_with('\n') {
+            text.pop();
+            if text.ends_with('\r') {
+                text.pop();
+            }
+        }
+        if text.is_empty() {
+            return Err(MusterError::Usage(
+                "the secret value on stdin is empty".into(),
+            ));
+        }
+        Ok(SecretValue::new(text))
     }
 }
 

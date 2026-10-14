@@ -1,4 +1,5 @@
 use crate::output::Diagnostic;
+use crate::providers::ProviderError;
 
 /// Every failure a command can report. The variant decides the exit code.
 #[derive(Debug, thiserror::Error)]
@@ -18,6 +19,9 @@ pub enum MusterError {
     Security(String),
     #[error("interrupted")]
     Interrupted,
+    /// A typed secret-provider failure; its kind decides code and exit code.
+    #[error(transparent)]
+    Provider(#[from] ProviderError),
 }
 
 impl MusterError {
@@ -30,6 +34,7 @@ impl MusterError {
             Self::Unavailable(_) => 4,
             Self::Security(_) => 5,
             Self::Interrupted => 130,
+            Self::Provider(e) => e.exit_code(),
         }
     }
 
@@ -42,6 +47,7 @@ impl MusterError {
             Self::Unavailable(_) => "unavailable",
             Self::Security(_) => "security",
             Self::Interrupted => "interrupted",
+            Self::Provider(e) => e.code(),
         }
     }
 

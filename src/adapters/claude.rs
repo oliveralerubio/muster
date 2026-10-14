@@ -9,9 +9,9 @@
 use serde_json::{Map, Value};
 
 use super::{
-    child_object, json_object, json_text, markdown_block, pascal_case, transport,
-    without_secret_refs, Adapter, Base, Capability, Current, Desired, FileFormat, ManagedFile,
-    RenderPlan, RenderedFile, Scope, Transport,
+    child_object, json_object, json_text, markdown_block, pascal_case, resolve_mcp_map, transport,
+    Adapter, Base, Capability, Current, Desired, FileFormat, ManagedFile, RenderPlan, RenderedFile,
+    Scope, Transport,
 };
 use crate::errors::MusterError;
 
@@ -138,7 +138,7 @@ fn render_mcp(
                     let args: Vec<Value> = server.args.iter().cloned().map(Value::String).collect();
                     entry.insert("args".into(), Value::Array(args));
                 }
-                let env = without_secret_refs(&server.env, "Claude Code", name, plan);
+                let env = resolve_mcp_map(&server.env, desired.secrets, "Claude Code", name, plan);
                 if !env.is_empty() {
                     let map: Map<String, Value> = env
                         .into_iter()
@@ -150,7 +150,8 @@ fn render_mcp(
             Transport::Remote { url } => {
                 entry.insert("type".into(), Value::String("http".into()));
                 entry.insert("url".into(), Value::String(url.to_string()));
-                let headers = without_secret_refs(&server.headers, "Claude Code", name, plan);
+                let headers =
+                    resolve_mcp_map(&server.headers, desired.secrets, "Claude Code", name, plan);
                 if !headers.is_empty() {
                     let map: Map<String, Value> = headers
                         .into_iter()

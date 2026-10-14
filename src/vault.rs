@@ -26,6 +26,9 @@ pub struct SecretMeta {
     pub name: String,
     pub created_at: String,
     pub updated_at: String,
+    /// Machine that added / last rotated the secret (unknown for old entries).
+    pub created_by: Option<String>,
+    pub updated_by: Option<String>,
     pub recipients: Vec<String>,
 }
 
@@ -43,6 +46,10 @@ struct SecretEntry {
     ciphertext_or_value: String,
     created_at: String,
     updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    created_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    updated_by: Option<String>,
 }
 
 /// Plaintext sidecar: same shape as [`GroupData`] minus the values.
@@ -58,10 +65,15 @@ struct EntryMeta {
     name: String,
     created_at: String,
     updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    created_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    updated_by: Option<String>,
 }
 
 pub struct Vault {
     dir: PathBuf,
+    actor: Option<String>,
 }
 
 impl Vault {
@@ -69,7 +81,13 @@ impl Vault {
     pub fn open(config_dir: &Path) -> Result<Self, MusterError> {
         let dir = config_dir.join(VAULT_DIR);
         fs::create_dir_all(&dir).map_err(|e| io_err(&dir, e))?;
-        Ok(Self { dir })
+        Ok(Self { dir, actor: None })
+    }
+
+    /// Records `actor` (a machine name) as author of later adds and rotations.
+    pub fn with_actor(mut self, actor: Option<String>) -> Self {
+        self.actor = actor;
+        self
     }
 
     /// Adds a new secret. A new group is created for `recipients`; an existing
@@ -106,6 +124,8 @@ impl Vault {
                 ciphertext_or_value: value.expose().to_owned(),
                 created_at: now.clone(),
                 updated_at: now,
+                created_by: self.actor.clone(),
+                updated_by: self.actor.clone(),
             },
         );
         self.write(&data)
@@ -134,6 +154,7 @@ impl Vault {
             .ok_or_else(|| not_found(group, name))?;
         entry.ciphertext_or_value = value.expose().to_owned();
         entry.updated_at = now();
+        entry.updated_by = self.actor.clone();
         self.write(&data)
     }
 
@@ -155,6 +176,8 @@ impl Vault {
                 name: s.name,
                 created_at: s.created_at,
                 updated_at: s.updated_at,
+                created_by: s.created_by,
+                updated_by: s.updated_by,
                 recipients: meta.recipients.clone(),
             })
             .collect();
@@ -264,6 +287,8 @@ impl Vault {
                     name: s.name.clone(),
                     created_at: s.created_at.clone(),
                     updated_at: s.updated_at.clone(),
+                    created_by: s.created_by.clone(),
+                    updated_by: s.updated_by.clone(),
                 })
                 .collect(),
         };
