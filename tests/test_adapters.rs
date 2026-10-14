@@ -278,6 +278,93 @@ fn antigravity_adapter_writes_global_rules() {
 }
 
 // ---------------------------------------------------------------------------
+// 1b. Agent Skills (`[agents.skills]`)
+// ---------------------------------------------------------------------------
+
+fn seed_antigravity_skills_config(env: &MusterEnv, enabled: &str) {
+    let cfg = env.config_dir();
+    let skills = cfg.join("skills");
+    std::fs::create_dir_all(skills.join("review")).expect("skills/review dir");
+    std::fs::write(
+        skills.join("review/SKILL.md"),
+        "---\nname: review\ndescription: Review code\n---\nReview carefully.\n",
+    )
+    .expect("write SKILL.md");
+    std::fs::write(skills.join("review/checklist.md"), "- tests\n").expect("write checklist.md");
+    std::fs::write(cfg.join("AGENTS.md"), "Be concise.\n").expect("AGENTS.md");
+    std::fs::write(
+        cfg.join("muster.toml"),
+        format!(
+            r#"
+version = 1
+[agents]
+enabled = ["{enabled}"]
+[agents.instructions]
+source = "AGENTS.md"
+[agents.skills]
+source = "skills"
+"#
+        ),
+    )
+    .expect("write manifest");
+}
+
+#[test]
+fn antigravity_adapter_installs_skills_from_config_repo() {
+    let env = MusterEnv::new();
+    seed_antigravity_skills_config(&env, "antigravity");
+    env.run(&["agents", "apply", "--agent", "antigravity", "--yes"])
+        .assert()
+        .code(0);
+    let base = env.path().join(".gemini/antigravity-cli/skills/review");
+    assert_eq!(
+        std::fs::read_to_string(base.join("SKILL.md")).expect("installed SKILL.md"),
+        "---\nname: review\ndescription: Review code\n---\nReview carefully.\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(base.join("checklist.md")).expect("installed checklist.md"),
+        "- tests\n"
+    );
+}
+
+#[test]
+fn antigravity_skills_keep_user_owned_skills() {
+    let env = MusterEnv::new();
+    seed_antigravity_skills_config(&env, "antigravity");
+    let mine = env.path().join(".gemini/antigravity-cli/skills/mine");
+    std::fs::create_dir_all(&mine).expect("user skill dir");
+    std::fs::write(mine.join("SKILL.md"), "mine").expect("write user skill");
+    env.run(&["agents", "apply", "--agent", "antigravity", "--yes"])
+        .assert()
+        .code(0);
+    assert_eq!(
+        std::fs::read_to_string(mine.join("SKILL.md")).expect("user skill must survive"),
+        "mine",
+        "user-owned skill must be left untouched"
+    );
+}
+
+#[test]
+fn skills_on_agent_without_skill_support_warns() {
+    let env = MusterEnv::new();
+    seed_antigravity_skills_config(&env, "opencode");
+    let (output, envelope) = env.run_json(&[
+        "agents", "apply", "--yes", "--agent", "opencode", "--format", "json",
+    ]);
+    assert!(output.status.success(), "apply must still succeed");
+    assert!(envelope.ok());
+    let diags = envelope.diagnostics().as_array().expect("diagnostics list");
+    assert!(
+        diags.iter().any(|d| d["code"] == "unsupported_feature"
+            && d["message"]
+                .as_str()
+                .map(|m| m.to_lowercase().contains("skills"))
+                .unwrap_or(false)),
+        "must warn that skills are unsupported for opencode: {diags:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 2. Format translation & non-destructive merge
 // ---------------------------------------------------------------------------
 

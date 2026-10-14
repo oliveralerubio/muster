@@ -76,6 +76,7 @@ pub enum Capability {
     Models,
     Permissions,
     Hooks,
+    Skills,
 }
 
 impl Capability {
@@ -87,6 +88,7 @@ impl Capability {
             Self::Models => "models",
             Self::Permissions => "permissions",
             Self::Hooks => "hooks",
+            Self::Skills => "skills",
         }
     }
 }
@@ -103,7 +105,13 @@ pub struct Desired<'a> {
     pub instructions: Option<&'a str>,
     /// Resolved secrets injected into MCP env and headers; render stays pure.
     pub secrets: &'a BTreeMap<String, SecretValue>,
+    /// Agent Skills read from `[agents.skills]`: skill name -> file path
+    /// relative to the skill directory (`SKILL.md`, `refs/x.md`) -> contents.
+    pub skills: &'a Skills,
 }
+
+/// Skill name -> relative file path -> contents.
+pub type Skills = BTreeMap<String, BTreeMap<String, String>>;
 
 impl Desired<'_> {
     /// Features this configuration uses (drives "not supported" diagnostics).
@@ -138,6 +146,9 @@ impl Desired<'_> {
         if !self.agents.hooks.is_empty() {
             used.push(Capability::Hooks);
         }
+        if !self.skills.is_empty() {
+            used.push(Capability::Skills);
+        }
         used
     }
 }
@@ -163,9 +174,23 @@ impl std::fmt::Debug for RenderedFile {
     }
 }
 
+/// A whole file Muster owns at a path computed at render time (one file of
+/// an installed skill), outside the adapter's static [`ManagedFile`] list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedTreeFile {
+    pub base: Base,
+    /// Path relative to `base`.
+    pub path: String,
+    /// Path relative to a project root; `None` = user scope only.
+    pub project: Option<String>,
+    pub contents: String,
+}
+
 #[derive(Debug, Default)]
 pub struct RenderPlan {
     pub files: Vec<RenderedFile>,
+    /// Whole files at render-time paths (always [`FileFormat::Text`]).
+    pub tree: Vec<RenderedTreeFile>,
     pub diagnostics: Vec<Diagnostic>,
 }
 

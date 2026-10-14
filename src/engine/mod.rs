@@ -151,12 +151,14 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
         None => enabled_adapters(Some(&merged.agents))?,
     };
     let instructions = read_instructions(ctx, &merged)?;
+    let skills = read_skills(ctx, &merged)?;
     let secrets = resolve_secrets(ctx, &merged.mcp);
     let desired = Desired {
         agents: &merged.agents,
         mcp: &merged.mcp,
         instructions: instructions.as_deref(),
         secrets: &secrets,
+        skills: &skills,
     };
 
     let roots = Roots::from_env()?;
@@ -181,6 +183,27 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
                 }
                 for entry in planned {
                     merge_entry(&mut entries, entry);
+                }
+                // Render-time files (skills) this adapter no longer renders.
+                for (path, record) in records {
+                    let path = PathBuf::from(path);
+                    if record.target != key
+                        || record.agent != adapter.id
+                        || entries.contains_key(&path)
+                    {
+                        continue;
+                    }
+                    match read_optional(&path) {
+                        Ok(before) => {
+                            if let Some(entry) = unmanaged_entry(adapter.id, &path, before, record)
+                            {
+                                merge_entry(&mut entries, entry);
+                            }
+                        }
+                        Err(err) => {
+                            ctx.diag(adapter_failure(adapter.id, adapter.name, &err.to_string()))
+                        }
+                    }
                 }
                 agents.insert(adapter.id, None);
             }
@@ -356,6 +379,34 @@ fn plan_adapter(
             executable: false,
             created,
             drift,
+        });
+    }
+    // Whole files at render-time paths (skills): Muster owns the file.
+    for file in &rendered.tree {
+        let path = match target {
+            Target::Global => roots.base(file.base).join(&file.path),
+            Target::Project(dir) => match &file.project {
+                Some(project) => dir.join(project),
+                None => continue,
+            },
+        };
+        let before = match pending.get(&path) {
+            Some(entry) => entry.before.clone(),
+            None => read_optional(&path)?,
+        };
+        let record = ours(&path);
+        entries.push(Entry {
+            created: record.map_or(before.is_none(), |r| r.created),
+            drift: record.is_some_and(|r| before.as_deref() != Some(r.contents.as_str())),
+            path,
+            agents: vec![adapter.id],
+            format: FileFormat::Text,
+            before,
+            after: Some(file.contents.clone()),
+            managed: true,
+            owned: ownership::owned_keys(FileFormat::Text, &file.contents),
+            private: record.is_some_and(|r| r.private),
+            executable: false,
         });
     }
     Ok((entries, rendered.diagnostics))
@@ -806,9 +857,13 @@ impl Roots {
 
     /// User-scope path of a managed file.
     pub fn resolve(&self, file: &ManagedFile) -> PathBuf {
-        match file.base {
-            Base::Home => self.home.join(file.path),
-            Base::XdgConfig => self.xdg_config.join(file.path),
+        self.base(file.base).join(file.path)
+    }
+
+    fn base(&self, base: Base) -> &Path {
+        match base {
+            Base::Home => &self.home,
+            Base::XdgConfig => &self.xdg_config,
         }
     }
 
@@ -932,6 +987,72 @@ fn read_instructions(
             Ok(None)
         }
     }
+}
+
+/// Files of every skill under `[agents.skills] source`: one subdirectory per
+/// skill, regular files only (any depth), keyed by `/`-separated relative path.
+fn read_skills(ctx: &mut Context, merged: &layer::Merged) -> Result<adapters::Skills, MusterError> {
+    let mut skills = adapters::Skills::new();
+    let Some(dir) = merged.skills_path()? else {
+        return Ok(skills);
+    };
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            ctx.diag(
+                Diagnostic::new(
+                    Severity::Warning,
+                    "skills_missing",
+                    format!(
+                        "skills source {} does not exist; skills were not installed",
+                        dir.display()
+                    ),
+                )
+                .with_path(dir.display().to_string()),
+            );
+            return Ok(skills);
+        }
+        Err(e) => return Err(io_error(&dir, e)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|e| io_error(&dir, e))?;
+        let file_type = entry.file_type().map_err(|e| io_error(&entry.path(), e))?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !file_type.is_dir() || name.starts_with('.') {
+            continue;
+        }
+        let mut files = BTreeMap::new();
+        collect_skill_files(&entry.path(), "", &mut files)?;
+        if !files.is_empty() {
+            skills.insert(name, files);
+        }
+    }
+    Ok(skills)
+}
+
+fn collect_skill_files(
+    dir: &Path,
+    prefix: &str,
+    files: &mut BTreeMap<String, String>,
+) -> Result<(), MusterError> {
+    for entry in std::fs::read_dir(dir).map_err(|e| io_error(dir, e))? {
+        let entry = entry.map_err(|e| io_error(dir, e))?;
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(|e| io_error(&path, e))?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let rel = format!("{prefix}{name}");
+        if file_type.is_dir() {
+            collect_skill_files(&path, &format!("{rel}/"), files)?;
+        } else if file_type.is_file() {
+            let text = std::fs::read_to_string(&path).map_err(|e| io_error(&path, e))?;
+            files.insert(rel, text);
+        }
+    }
+    Ok(())
 }
 
 fn read_optional(path: &Path) -> Result<Option<String>, MusterError> {
