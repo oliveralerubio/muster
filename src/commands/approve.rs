@@ -68,7 +68,7 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
             "machine '{name}' is already a member of the fleet"
         )));
     }
-    let req = EnrollmentRequest::load(&ctx.config_dir, name)?;
+    let mut req = EnrollmentRequest::load(&ctx.config_dir, name)?;
 
     // Authorization: either via caller machine identity or via recovery key.
     let recovery = team::recovery_identity(ctx, params, &manifest)?;
@@ -102,7 +102,9 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
 
     // Team mode: only admins approve machines, and nobody for themselves.
     let before = manifest;
-    let member = params.get_string("member");
+    let role = proposal(params, "role", &mut req.role)?;
+    let profile = proposal(params, "profile", &mut req.profile)?;
+    let member = proposal(params, "member", &mut req.member)?;
     let team_mode = !before.members.is_empty() || member.is_some();
     let actor = if team_mode && !by_recovery {
         Some(team::admin(&before, &ctx.state_dir)?)
@@ -118,12 +120,12 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
             muster_version: req.muster_version.clone(),
             agents: req.agents.clone(),
             last_sync: None,
-            role: params.get_string("role").map(str::to_string),
-            profile: params.get_string("profile").map(str::to_string),
+            role: role.clone(),
+            profile: profile.clone(),
             applied_profile: None,
         },
     );
-    if let Some(member) = member {
+    if let Some(member) = &member {
         team::materialize(&mut manifest);
         let entry = manifest
             .members
@@ -133,6 +135,44 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     }
     if let Some(actor) = &actor {
         team::check_self_grant(ctx, &before, &manifest, actor)?;
+    }
+
+    // Quorum: each admin approval is recorded in the request; the machine is
+    // only enrolled once `[team] required_approvals` distinct admins agreed.
+    // The recovery key is break-glass and counts as a full approval.
+    let quorum = match &actor {
+        Some(actor) => {
+            let mut approvals = req.approvals.clone();
+            let quorum = team::add_approval(ctx, &before, &mut approvals, &actor.member)?;
+            req.approvals = approvals;
+            quorum
+        }
+        None => team::Quorum {
+            received: before.required_approvals() as usize,
+            required: before.required_approvals() as usize,
+        },
+    };
+    if let (Some(actor), false) = (&actor, quorum.reached()) {
+        let result = json!({
+            "machine": name,
+            "status": "pending",
+            "approvals": req.approvals,
+            "approvals_received": quorum.received,
+            "approvals_required": quorum.required,
+        });
+        if ctx.dry_run {
+            return Ok(result);
+        }
+        req.save(&ctx.config_dir)?;
+        team::commit(
+            ctx,
+            actor,
+            &format!(
+                "chore(fleet): approval {}/{} for machine {name}",
+                quorum.received, quorum.required
+            ),
+        )?;
+        return Ok(result);
     }
 
     // Check every changed group can be re-encrypted before writing anything.
@@ -156,6 +196,9 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
             "machine": name,
             "recipient": req.recipient,
             "groups": groups,
+            "status": "active",
+            "approvals_received": quorum.received,
+            "approvals_required": quorum.required,
         }));
     }
 
@@ -170,9 +213,13 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
             team::commit(ctx, actor, &summary)?;
             return Ok(json!({
                 "approved": name,
+                "status": "active",
                 "recipient": req.recipient,
                 "member": member,
                 "reencrypted_groups": reencrypted_groups,
+                "approvals": req.approvals,
+                "approvals_received": quorum.received,
+                "approvals_required": quorum.required,
             }));
         }
         None => git::commit_if_configured(&ctx.config_dir, &summary)?,
@@ -190,7 +237,31 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
 
     Ok(json!({
         "approved": name,
+        "status": "active",
         "recipient": req.recipient,
         "reencrypted_groups": reencrypted_groups,
+        "approvals_received": quorum.received,
+        "approvals_required": quorum.required,
+        "break_glass": by_recovery,
     }))
+}
+
+/// The value of an assignment flag (`--role`, `--profile`, `--member`). The
+/// first approval fixes it in the request; later approvals may omit it but
+/// cannot change it (every admin approves the same change).
+fn proposal(
+    params: &Params,
+    flag: &str,
+    recorded: &mut Option<String>,
+) -> Result<Option<String>, MusterError> {
+    match (params.get_string(flag), recorded.as_deref()) {
+        (Some(given), Some(prev)) if given != prev => Err(MusterError::Usage(format!(
+            "--{flag} '{given}' differs from '{prev}' proposed by an earlier approval"
+        ))),
+        (Some(given), _) => {
+            *recorded = Some(given.to_string());
+            Ok(recorded.clone())
+        }
+        (None, _) => Ok(recorded.clone()),
+    }
 }

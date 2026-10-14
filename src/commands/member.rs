@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 use crate::context::Context;
 use crate::errors::MusterError;
 use crate::fleet::EnrollmentRequest;
+use crate::identity::Identity;
 use crate::machine;
 use crate::manifest::{Manifest, Member, MemberStatus, Role};
 use crate::output::{Diagnostic, Severity};
@@ -158,19 +159,65 @@ fn approve(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
             "nobody can approve their own membership".into(),
         ));
     }
+    // An admin holding the recovery key approves break-glass: it counts as a
+    // full approval regardless of the quorum.
+    let recovery = team::recovery_identity(ctx, params, &before)?;
+    let by_recovery = recovery.is_some();
     let mut manifest = before.clone();
-    let member = existing(&mut manifest, &name)?;
-    if member.status != MemberStatus::Pending {
-        return Err(MusterError::Usage(format!(
-            "member '{name}' is not pending"
-        )));
-    }
-    member.status = MemberStatus::Active;
-    member.approved_by = Some(actor.member.clone());
+    let mut approvals = {
+        let member = existing(&mut manifest, &name)?;
+        if member.status != MemberStatus::Pending {
+            return Err(MusterError::Usage(format!(
+                "member '{name}' is not pending"
+            )));
+        }
+        member.status = MemberStatus::Active;
+        member.approved_by = Some(actor.member.clone());
+        std::mem::take(&mut member.approvals)
+    };
     team::check_self_grant(ctx, &before, &manifest, &actor)?;
     ctx.confirm(&format!("Approve member '{name}'?"))?;
 
-    let identity = team::unlock(ctx, params, &manifest)?;
+    // Quorum: below `[team] required_approvals` the invitation stays pending,
+    // with this admin's approval recorded in the manifest.
+    // The recovery key is break-glass and counts as a full approval.
+    let quorum = if by_recovery {
+        team::Quorum {
+            received: before.required_approvals() as usize,
+            required: before.required_approvals() as usize,
+        }
+    } else {
+        team::add_approval(ctx, &before, &mut approvals, &actor.member)?
+    };
+    if !quorum.reached() {
+        let mut pending = before.clone();
+        existing(&mut pending, &name)?.approvals = approvals.clone();
+        let result = json!({
+            "member": name,
+            "status": MemberStatus::Pending,
+            "approvals": approvals,
+            "approvals_received": quorum.received,
+            "approvals_required": quorum.required,
+        });
+        if ctx.dry_run {
+            return Ok(result);
+        }
+        pending.save(&ctx.config_dir)?;
+        team::commit(
+            ctx,
+            &actor,
+            &format!(
+                "chore(team): approval {}/{} for member {name}",
+                quorum.received, quorum.required
+            ),
+        )?;
+        return Ok(result);
+    }
+
+    let identity = match recovery {
+        Some(identity) => identity,
+        None => Identity::load(&ctx.state_dir)?,
+    };
     let mut vault = Vault::open(&ctx.config_dir)?;
     let changes = team::pending_rekeys(&vault, &manifest)?;
     team::check_can_rekey(&vault, &changes, &identity)?;
@@ -179,12 +226,17 @@ fn approve(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
             "member": name,
             "status": MemberStatus::Active,
             "approved_by": actor.member,
+            "approvals": approvals,
+            "approvals_received": quorum.received,
+            "approvals_required": quorum.required,
             "reencrypted_groups": groups,
+            "break_glass": by_recovery,
         })
     };
     if ctx.dry_run {
         return Ok(result(changes.into_iter().map(|(g, _)| g).collect()));
     }
+    existing(&mut manifest, &name)?.approvals = approvals.clone();
     manifest.save(&ctx.config_dir)?;
     let groups = team::rekey(&mut vault, &manifest, &identity)?;
     team::commit(ctx, &actor, &format!("feat(team): approve member {name}"))?;

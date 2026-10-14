@@ -229,6 +229,7 @@ El mismo producto sirve a dos públicos:
 - **Gobierno en equipos**
   - Los cambios en miembros, grupos, destinatarios y perfiles de equipo requieren la firma o aprobación de un administrador.
   - Las aprobaciones se registran en el historial de Git del repo de configuración.
+  - **Quórum de aprobaciones:** `[team] required_approvals = N` en el manifiesto (entero ≥ 1, por defecto 1; 0 es error de configuración). Se aplica a `approve` (alta de máquina) y `member approve` (alta de miembro). El administrador que aprueba primero cuenta como la aprobación 1. Por debajo del quórum la solicitud queda pendiente y cada aprobación se guarda con el nombre del administrador en el repo de configuración (en la solicitud de alta o en el miembro pendiente), para que otro administrador la complete desde otra máquina. Un mismo administrador no cuenta dos veces (`already_approved_by_caller`, código de salida 5). Al llegar al quórum se ejecuta la aprobación normal (re-cifrado y alta). La clave de recuperación es una vía de emergencia y cuenta como aprobación completa sea cual sea N.
   - En v1 la protección de ramas o revisión del remoto Git es la barrera recomendada. El servidor de autorización llega con el hub alojado.
 - **Migración desde el Muster actual**
   - `muster import bws` lee los secretos del proyecto de Bitwarden y los guarda en la bóveda nativa.
@@ -325,8 +326,7 @@ Opciones globales: `--config`, `--format text|json`, `--yes`, `--dry-run` (en to
   2. Rotar cualquier credencial encontrada.
   3. Reescribir el historial una sola vez.
 - **Decisiones abiertas** que no bloquean el inicio:
-  - el nombre del producto en inglés (o mantener "Muster" con subtítulo);
-  - el número mínimo de aprobaciones de administrador en equipos.
+  - el nombre del producto en inglés (o mantener "Muster" con subtítulo).
 - **Datos a verificar** al implementar los adaptadores:
   - reemplazo verificado: Antigravity CLI (`agy`) reemplazó al CLI anterior de Google para niveles de consumo el 2026-06-18 y mantiene rutas bajo `~/.gemini/`;
   - los formatos actuales de configuración de cada agente.

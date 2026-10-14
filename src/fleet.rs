@@ -19,6 +19,17 @@ pub struct EnrollmentRequest {
     #[serde(default)]
     pub agents: Vec<String>,
     pub created_at: String,
+    /// Admins (member names) who approved this request so far, while it
+    /// waits for the team quorum (`[team] required_approvals`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approvals: Vec<String>,
+    /// Assignment proposed by the first approver; later approvals confirm it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member: Option<String>,
 }
 
 impl EnrollmentRequest {

@@ -516,3 +516,55 @@ pub fn forget_machine(manifest: &mut Manifest, machine: &str) {
         group.readers.machines.retain(|m| m != machine);
     }
 }
+
+/// Progress of a pending change towards its admin quorum
+/// (`[team] required_approvals`).
+#[derive(Debug, Clone, Copy)]
+pub struct Quorum {
+    pub received: usize,
+    pub required: usize,
+}
+
+impl Quorum {
+    pub fn reached(self) -> bool {
+        self.received >= self.required
+    }
+}
+
+/// Record `approver` (an admin member) among the `approvals` already given to
+/// a pending change. The same admin never counts twice (Security, with an
+/// `already_approved_by_caller` diagnostic). Below quorum, emits an info
+/// diagnostic saying how many approvals are still missing.
+pub fn add_approval(
+    ctx: &mut Context,
+    manifest: &Manifest,
+    approvals: &mut Vec<String>,
+    approver: &str,
+) -> Result<Quorum, MusterError> {
+    if approvals.iter().any(|a| a == approver) {
+        ctx.diag(Diagnostic::new(
+            Severity::Error,
+            "already_approved_by_caller",
+            format!("'{approver}' already approved this request; another admin must approve it"),
+        ));
+        return Err(MusterError::Security(format!(
+            "'{approver}' already approved this request; the same admin cannot count twice"
+        )));
+    }
+    approvals.push(approver.to_string());
+    let quorum = Quorum {
+        received: approvals.len(),
+        required: manifest.required_approvals() as usize,
+    };
+    if !quorum.reached() {
+        ctx.diag(Diagnostic::new(
+            Severity::Info,
+            "approval_pending",
+            format!(
+                "{} of {} required approvals; waiting for another admin",
+                quorum.received, quorum.required
+            ),
+        ));
+    }
+    Ok(quorum)
+}

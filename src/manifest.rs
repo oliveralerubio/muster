@@ -54,10 +54,29 @@ pub struct Manifest {
     /// Configuration for the built-in MCP server (`muster mcp`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_server: Option<McpServerConfig>,
+    /// Team governance settings (`[team]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<TeamConfig>,
     // Later tickets add members, groups and profiles.
     #[serde(flatten)]
     #[schemars(skip)]
     pub extensions: BTreeMap<String, serde_json::Value>,
+}
+
+/// Team governance settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TeamConfig {
+    /// Distinct admins that must approve a machine enrollment or a member
+    /// before it takes effect (>= 1). The recovery key always counts as a
+    /// full approval (break-glass).
+    #[serde(default = "default_required_approvals")]
+    #[schemars(range(min = 1))]
+    pub required_approvals: u32,
+}
+
+fn default_required_approvals() -> u32 {
+    1
 }
 
 /// Public half of the offline recovery key. The secret half is never stored.
@@ -150,6 +169,10 @@ pub struct Member {
     /// Admin who approved the invitation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approved_by: Option<String>,
+    /// Admins who approved the invitation so far, while it waits for the
+    /// team quorum (`[team] required_approvals`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approvals: Vec<String>,
 }
 
 /// A secret group: one vault file encrypted for its readers (+ the recovery key).
@@ -237,6 +260,7 @@ impl Manifest {
             mcp: BTreeMap::new(),
             files: BTreeMap::new(),
             mcp_server: None,
+            team: None,
             extensions: BTreeMap::new(),
         }
     }
@@ -283,7 +307,17 @@ impl Manifest {
                 "unknown key `{key}` (extension keys must start with `{EXTENSION_PREFIX}`)"
             )));
         }
+        if manifest.required_approvals() == 0 {
+            return Err(invalid(
+                "`team.required_approvals` must be at least 1".to_string(),
+            ));
+        }
         Ok(manifest)
+    }
+
+    /// Distinct admin approvals a sensitive team change needs (default 1).
+    pub fn required_approvals(&self) -> u32 {
+        self.team.as_ref().map_or(1, |t| t.required_approvals)
     }
 }
 
@@ -308,6 +342,24 @@ mod tests {
         let err = Manifest::parse("version = 1\nbogus = true\n", "muster.toml").unwrap_err();
         assert_eq!(err.exit_code(), 3);
         assert!(err.to_string().contains("bogus"));
+    }
+
+    #[test]
+    fn team_required_approvals_defaults_to_one_and_rejects_zero() {
+        let m = Manifest::parse("version = 1\n[team]\n", "muster.toml").unwrap();
+        assert_eq!(m.required_approvals(), 1);
+        let m = Manifest::parse(
+            "version = 1\n[team]\nrequired_approvals = 2\n",
+            "muster.toml",
+        )
+        .unwrap();
+        assert_eq!(m.required_approvals(), 2);
+        let err = Manifest::parse(
+            "version = 1\n[team]\nrequired_approvals = 0\n",
+            "muster.toml",
+        )
+        .unwrap_err();
+        assert_eq!(err.exit_code(), 3);
     }
 
     #[test]

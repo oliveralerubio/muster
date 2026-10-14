@@ -517,3 +517,150 @@ fn team_status_reports_member_and_machine_profile_drift() {
     assert_eq!(names(&now["machines"]), ["owner-laptop"], "{now}");
     assert_eq!(names(&now["members"]), ["owner"], "{now}");
 }
+
+#[test]
+fn team_quorum_requires_multiple_admin_approvals() {
+    let owner = MusterEnv::new();
+    let second_admin = MusterEnv::new();
+    let joining_machine = MusterEnv::new();
+    init(&owner);
+    let config = owner.config_dir();
+    ok(
+        &owner,
+        &config,
+        &["member", "add", "admin-two", "--role", "admin"],
+    );
+    ok(
+        &owner,
+        &config,
+        &["member", "approve", "admin-two", "--yes"],
+    );
+    join(&owner, &second_admin, "admin-two-laptop", "admin-two");
+
+    // Raise the quorum once a second admin can approve (a quorum of 2 with a
+    // single admin could only be met with the recovery key).
+    let mut manifest = std::fs::read_to_string(config.join("muster.toml")).unwrap();
+    manifest.push_str("\n[team]\nrequired_approvals = 2\n");
+    std::fs::write(config.join("muster.toml"), manifest).unwrap();
+
+    let enrollment = ok(
+        &joining_machine,
+        &config,
+        &["enroll", "--name", "quorum-machine"],
+    );
+    assert_eq!(enrollment["status"], "pending", "{enrollment}");
+    let request_id = "quorum-machine";
+    let first = ok(&owner, &config, &["approve", request_id, "--yes"]);
+    assert_eq!(first["status"], "pending", "{first}");
+    assert_eq!(first["approvals_received"], 1, "{first}");
+    assert_eq!(first["approvals_required"], 2, "{first}");
+
+    let (out, duplicate) = on(&owner, &config, &["approve", request_id, "--yes"]);
+    assert!(
+        !out.status.success(),
+        "duplicate approval must fail: {}",
+        duplicate.raw
+    );
+    assert!(
+        duplicate
+            .raw
+            .to_string()
+            .contains("already_approved_by_caller"),
+        "{}",
+        duplicate.raw
+    );
+
+    let approved = ok(&second_admin, &config, &["approve", request_id, "--yes"]);
+    assert_eq!(approved["status"], "active", "{approved}");
+    let machines = ok(&owner, &config, &["machine", "list"]);
+    assert!(
+        machines["machines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["name"] == "quorum-machine" && m["status"] == "active"),
+        "{machines}"
+    );
+}
+
+#[test]
+fn team_quorum_defaults_to_single_approval_when_omitted() {
+    let owner = MusterEnv::new();
+    let joining_machine = MusterEnv::new();
+    init(&owner);
+    let config = owner.config_dir();
+    let enrollment = ok(
+        &joining_machine,
+        &config,
+        &["enroll", "--name", "default-quorum-machine"],
+    );
+    assert_eq!(enrollment["status"], "pending", "{enrollment}");
+    let request_id = "default-quorum-machine";
+    let approved = ok(&owner, &config, &["approve", request_id, "--yes"]);
+    assert_eq!(approved["status"], "active", "{approved}");
+    let machines = ok(&owner, &config, &["machine", "list"]);
+    assert!(
+        machines["machines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["name"] == "default-quorum-machine" && m["status"] == "active"),
+        "{machines}"
+    );
+}
+
+#[test]
+fn member_quorum_requires_multiple_admin_approvals() {
+    let owner = MusterEnv::new();
+    let second_admin = MusterEnv::new();
+    init(&owner);
+    let config = owner.config_dir();
+    ok(
+        &owner,
+        &config,
+        &["member", "add", "admin-two", "--role", "admin"],
+    );
+    ok(
+        &owner,
+        &config,
+        &["member", "approve", "admin-two", "--yes"],
+    );
+    join(&owner, &second_admin, "admin-two-laptop", "admin-two");
+
+    let mut manifest = std::fs::read_to_string(config.join("muster.toml")).unwrap();
+    manifest.push_str("\n[team]\nrequired_approvals = 2\n");
+    std::fs::write(config.join("muster.toml"), manifest).unwrap();
+
+    ok(
+        &owner,
+        &config,
+        &["member", "add", "charlie", "--role", "member"],
+    );
+    let first = ok(&owner, &config, &["member", "approve", "charlie", "--yes"]);
+    assert_eq!(first["status"], "pending", "{first}");
+    assert_eq!(first["approvals_received"], 1, "{first}");
+    assert_eq!(first["approvals_required"], 2, "{first}");
+
+    let (out, duplicate) = on(&owner, &config, &["member", "approve", "charlie", "--yes"]);
+    assert!(
+        !out.status.success(),
+        "duplicate approval must fail: {}",
+        duplicate.raw
+    );
+    assert!(
+        duplicate
+            .raw
+            .to_string()
+            .contains("already_approved_by_caller"),
+        "{}",
+        duplicate.raw
+    );
+
+    let approved = ok(
+        &second_admin,
+        &config,
+        &["member", "approve", "charlie", "--yes"],
+    );
+    assert_eq!(approved["status"], "active", "{approved}");
+    assert_eq!(approved["approvals_received"], 2, "{approved}");
+}

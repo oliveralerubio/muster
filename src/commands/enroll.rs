@@ -86,6 +86,10 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         muster_version: env!("CARGO_PKG_VERSION").into(),
         agents,
         created_at: now,
+        approvals: Vec::new(),
+        role: None,
+        profile: None,
+        member: None,
     };
 
     let path = req.save(&ctx.config_dir)?;
@@ -115,6 +119,7 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         "machine": name,
         "recipient": identity.recipient(),
         "platform": machine::platform(),
+        "status": "pending",
         "request_path": path,
         "pushed": pushed,
     }))
