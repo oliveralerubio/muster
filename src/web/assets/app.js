@@ -75,9 +75,9 @@ const views = {
     const pending = (r.pending && r.pending.members) || [];
     const drift = r.drift || {};
     const driftCount = (drift.members || []).length + (drift.machines || []).length;
-    render("Dashboard (fleet panel)", [button("Sincronizar ahora", () => act("Pull, plan and apply now?", "sync"), "primary")],
-      el("h2", {}, "Última sincronización"),
-      el("p", {}, r.sync ? `${r.sync.ts} · ${r.sync.result}` : "Nunca"),
+    render("Dashboard (fleet panel)", [button("Sync now", () => act("Pull, plan and apply now?", "sync"), "primary")],
+      el("h2", {}, "Last sync"),
+      el("p", {}, r.sync ? `${r.sync.ts} · ${r.sync.result}` : "Never"),
       table(["Machines", "Pending members", "Drift"], [[machines.length, pending.length, driftCount]]),
       el("h2", {}, "Fleet"),
       table(["Name", "Platform", "Version", "Status", "Last sync"],
@@ -122,13 +122,13 @@ const views = {
   async secrets() {
     const data = await api("secrets");
     const secrets = Array.isArray(data.result) ? data.result : [];
-    render("Secrets", [button("Nuevo secreto", () => openSecretEdit(), "primary")],
+    render("Secrets", [button("New secret", () => openSecretEdit(), "primary")],
       el("p", {}, "Metadata only. Revealing a value needs explicit confirmation and is recorded."),
       table(["Reference", "Updated", "By", "Readers", ""],
         secrets.map((s) => [s.reference, s.updated_at || "", s.updated_by || "",
           (s.readers || []).map((r) => r.machine || r.recipient).join(", "),
           el("div", { class: "actions" }, button("Reveal…", () => openReveal(s.reference)),
-            button("Cambiar valor", () => openSecretEdit(s.reference)))])),
+            button("Change value", () => openSecretEdit(s.reference)))])),
       diagnostics(data));
   },
 
@@ -345,7 +345,7 @@ let secretAction = "add";
 function openSecretEdit(reference) {
   secretAction = reference ? "rotate" : "add";
   $("#secret-form").reset();
-  $("#secret-edit-title").textContent = reference ? "Cambiar valor" : "Nuevo secreto";
+  $("#secret-edit-title").textContent = reference ? "Change value" : "New secret";
   $("#secret-path").value = reference || "";
   $("#secret-path").readOnly = Boolean(reference);
   $("#secret-error").textContent = "";
