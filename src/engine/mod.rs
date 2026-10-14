@@ -18,7 +18,7 @@ mod diff;
 pub mod dotfiles;
 pub mod layer;
 mod ownership;
-mod store;
+pub(crate) mod store;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};

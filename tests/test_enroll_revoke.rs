@@ -71,18 +71,18 @@ fn recovery_key_can_approve_when_no_other_machine_is_available() {
         .as_str()
         .expect("init exposes recovery key once");
     assert_cli_success(&machine, &["--format", "json", "enroll", "--name", "bob"]);
-    assert_cli_success(
-        &machine,
-        &[
-            "--format",
-            "json",
-            "approve",
-            "bob",
-            "--recovery-key",
-            recovery_key,
-            "--yes",
-        ],
-    );
+    let mut cmd = machine.run(&[
+        "--format",
+        "json",
+        "approve",
+        "bob",
+        "--recovery-key-stdin",
+        "--yes",
+    ]);
+    cmd.write_stdin(recovery_key.as_bytes());
+    let (out, env) = support::json(cmd);
+    assert!(out.status.success(), "{}", env.raw);
+    assert!(env.ok());
 }
 
 #[test]

@@ -29,11 +29,22 @@ use crate::vault::Vault;
 /// The single member of a manifest without `[members]`.
 pub const IMPLICIT_MEMBER: &str = "owner";
 
-/// `--recovery-key`, for re-encrypting groups the caller cannot read.
+pub const RECOVERY_KEY_ENV: &str = "MUSTER_RECOVERY_KEY";
+
+/// `--recovery-key`, for re-encrypting groups the caller cannot read (deprecated: use stdin or env).
 pub const RECOVERY_KEY_PARAM: ParamSpec = ParamSpec {
     name: "recovery-key",
-    about: "Offline recovery key, to re-encrypt groups this machine cannot read",
+    about: "Offline recovery key (deprecated: prefer --recovery-key-stdin or MUSTER_RECOVERY_KEY)",
     kind: ParamKind::String,
+    required: false,
+    positional: false,
+};
+
+/// `--recovery-key-stdin`, read offline recovery key from standard input.
+pub const RECOVERY_KEY_STDIN_PARAM: ParamSpec = ParamSpec {
+    name: "recovery-key-stdin",
+    about: "Read offline recovery key from standard input",
+    kind: ParamKind::Bool,
     required: false,
     positional: false,
 };
@@ -261,24 +272,67 @@ pub fn check_self_grant(
     )))
 }
 
-/// Identity used to re-encrypt: the recovery key if given, else this machine's.
-pub fn unlock(
-    ctx: &Context,
+/// The offline recovery key, if one was supplied: `--recovery-key-stdin`, the
+/// deprecated `--recovery-key` argument (warns: it lands in shell history and
+/// `ps`), or [`RECOVERY_KEY_ENV`]. Call once per command: stdin is consumed.
+pub fn recovery_key(
+    ctx: &mut Context,
+    params: &Params,
+) -> Result<Option<SecretValue>, MusterError> {
+    if params.get_bool(RECOVERY_KEY_STDIN_PARAM.name) {
+        return ctx.read_secret_stdin().map(Some);
+    }
+    if let Some(raw) = params.get_string(RECOVERY_KEY_PARAM.name) {
+        ctx.diag(
+            Diagnostic::new(
+                Severity::Warning,
+                "insecure_recovery_key_argument",
+                "the recovery key was passed as a command-line argument, where shell history and \
+                 process listings can record it",
+            )
+            .with_suggestion(format!(
+                "pipe it with --recovery-key-stdin or set {RECOVERY_KEY_ENV}"
+            )),
+        );
+        return Ok(Some(SecretValue::new(raw.to_string())));
+    }
+    Ok(std::env::var(RECOVERY_KEY_ENV)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(|v| SecretValue::new(v.trim().to_string())))
+}
+
+/// The recovery identity, if a key was supplied, checked against the
+/// manifest's recovery recipient.
+pub fn recovery_identity(
+    ctx: &mut Context,
     params: &Params,
     manifest: &Manifest,
-) -> Result<Identity, MusterError> {
-    let Some(raw) = params.get_string("recovery-key") else {
-        return Identity::load(&ctx.state_dir);
+) -> Result<Option<Identity>, MusterError> {
+    let Some(key) = recovery_key(ctx, params)? else {
+        return Ok(None);
     };
-    let identity = Identity::from_secret(&SecretValue::new(raw.to_string()))?;
+    let identity = Identity::from_secret(&key)?;
     match &manifest.recovery {
-        Some(r) if r.recipient == identity.recipient() => Ok(identity),
+        Some(r) if r.recipient == identity.recipient() => Ok(Some(identity)),
         Some(_) => Err(MusterError::Security(
             "provided recovery key does not match manifest recovery recipient".into(),
         )),
         None => Err(MusterError::Security(
             "no recovery key configured in manifest".into(),
         )),
+    }
+}
+
+/// Identity used to re-encrypt: the recovery key if given, else this machine's.
+pub fn unlock(
+    ctx: &mut Context,
+    params: &Params,
+    manifest: &Manifest,
+) -> Result<Identity, MusterError> {
+    match recovery_identity(ctx, params, manifest)? {
+        Some(identity) => Ok(identity),
+        None => Identity::load(&ctx.state_dir),
     }
 }
 

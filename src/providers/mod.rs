@@ -85,6 +85,13 @@ pub trait Provider {
     fn describe(&self) -> Description;
     /// Ready to resolve (CLI installed, identity present...). Does not read secrets.
     fn check(&mut self) -> Result<(), MusterError>;
+    /// Verify `reference` without materialising its plaintext. `Ok(true)`: the
+    /// secret is known to exist and be readable here; `Ok(false)`: only the
+    /// provider was checked (vendor CLIs cannot tell without reading the value).
+    fn locate(&mut self, _reference: &SecretRef) -> Result<bool, MusterError> {
+        self.check()?;
+        Ok(false)
+    }
     /// The plaintext for `reference`; its scheme always matches this provider.
     fn resolve(&mut self, reference: &SecretRef) -> Result<SecretValue, MusterError>;
     /// Drop cached keys or sessions. Called once, when [`Providers`] is dropped.
@@ -124,6 +131,11 @@ impl Providers {
 
     pub fn resolve_ref(&mut self, reference: &SecretRef) -> Result<SecretValue, MusterError> {
         self.provider(reference.scheme()).resolve(reference)
+    }
+
+    /// See [`Provider::locate`].
+    pub fn locate(&mut self, reference: &SecretRef) -> Result<bool, MusterError> {
+        self.provider(reference.scheme()).locate(reference)
     }
 }
 

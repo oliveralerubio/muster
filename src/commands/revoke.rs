@@ -12,7 +12,6 @@ use crate::machine;
 use crate::manifest::Manifest;
 use crate::output::{Diagnostic, Severity};
 use crate::registry::{CommandSpec, ParamKind, ParamSpec, Params};
-use crate::secrets::SecretValue;
 use crate::vault::Vault;
 
 pub const SPEC: CommandSpec = CommandSpec {
@@ -26,13 +25,8 @@ pub const SPEC: CommandSpec = CommandSpec {
             required: true,
             positional: true,
         },
-        ParamSpec {
-            name: "recovery-key",
-            about: "Offline recovery key to authorize re-encryption without another machine",
-            kind: ParamKind::String,
-            required: false,
-            positional: false,
-        },
+        crate::team::RECOVERY_KEY_PARAM,
+        crate::team::RECOVERY_KEY_STDIN_PARAM,
     ],
     mutating: true,
     handler: run,
@@ -54,28 +48,14 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     ))?;
 
     // Team mode: only admins revoke machines (the recovery key always can).
-    if !manifest.members.is_empty() && params.get_string("recovery-key").is_none() {
+    let recovery = crate::team::recovery_identity(ctx, params, &manifest)?;
+    if !manifest.members.is_empty() && recovery.is_none() {
         crate::team::admin(&manifest, &ctx.state_dir)?;
     }
 
     // Authorization: either recovery key or caller's identity
-    let authorizer_identity = match params.get_string("recovery-key") {
-        Some(raw_key) => {
-            let secret = SecretValue::new(raw_key.to_string());
-            let recovery_id = Identity::from_secret(&secret)?;
-            if let Some(recovery) = &manifest.recovery {
-                if recovery.recipient != recovery_id.recipient() {
-                    return Err(MusterError::Security(
-                        "provided recovery key does not match manifest recovery recipient".into(),
-                    ));
-                }
-            } else {
-                return Err(MusterError::Security(
-                    "no recovery key configured in manifest".into(),
-                ));
-            }
-            recovery_id
-        }
+    let authorizer_identity = match recovery {
+        Some(recovery_id) => recovery_id,
         None => {
             let caller_id = Identity::load(&ctx.state_dir)?;
             let is_member = manifest

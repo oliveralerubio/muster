@@ -13,6 +13,7 @@ pub mod fleet;
 pub mod git;
 pub mod identity;
 pub mod importers;
+pub mod installer;
 pub mod machine;
 pub mod manifest;
 pub mod mcp;

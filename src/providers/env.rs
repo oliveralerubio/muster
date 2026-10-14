@@ -20,6 +20,18 @@ impl Provider for Env {
         Ok(())
     }
 
+    fn locate(&mut self, reference: &SecretRef) -> Result<bool, MusterError> {
+        let var = &reference.segments()[0];
+        if std::env::var_os(var).is_none() {
+            return Err(ProviderError::new(
+                ProviderErrorKind::NotFound,
+                format!("environment variable {var} is not set ({reference})"),
+            )
+            .into());
+        }
+        Ok(true)
+    }
+
     fn resolve(&mut self, reference: &SecretRef) -> Result<SecretValue, MusterError> {
         let var = &reference.segments()[0];
         match std::env::var(var) {

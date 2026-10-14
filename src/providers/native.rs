@@ -36,6 +36,23 @@ impl Native {
         }
         Ok(self.identity.as_ref().expect("just loaded"))
     }
+
+    fn existing(&self, reference: &SecretRef) -> Result<(Vault, String, String), MusterError> {
+        let [group, name] = reference.segments() else {
+            unreachable!("SecretRef::parse guarantees native://<group>/<name>");
+        };
+        let not_found = || {
+            ProviderError::new(
+                ProviderErrorKind::NotFound,
+                format!("secret {reference} does not exist in the vault"),
+            )
+        };
+        let vault = Vault::open(&self.config_dir)?;
+        if !vault.groups()?.contains(group) || !vault.list(group)?.iter().any(|m| &m.name == name) {
+            return Err(not_found().into());
+        }
+        Ok((vault, group.to_string(), name.to_string()))
+    }
 }
 
 impl Provider for Native {
@@ -63,23 +80,25 @@ impl Provider for Native {
         Ok(())
     }
 
-    fn resolve(&mut self, reference: &SecretRef) -> Result<SecretValue, MusterError> {
-        let [group, name] = reference.segments() else {
-            unreachable!("SecretRef::parse guarantees native://<group>/<name>");
-        };
-        let not_found = || {
-            ProviderError::new(
-                ProviderErrorKind::NotFound,
-                format!("secret {reference} does not exist in the vault"),
+    /// Metadata only: the secret is listed and this machine is one of its
+    /// group's recipients. Nothing is decrypted.
+    fn locate(&mut self, reference: &SecretRef) -> Result<bool, MusterError> {
+        let (vault, group, _) = self.existing(reference)?;
+        let mine = self.identity()?.recipient();
+        if !vault.readers(&group)?.contains(&mine) {
+            return Err(ProviderError::new(
+                ProviderErrorKind::Unauthorized,
+                format!("native vault: this machine is not a reader of {reference}"),
             )
-        };
-        // Metadata first: tells "missing" apart from "cannot decrypt" without a key.
-        let vault = Vault::open(&self.config_dir)?;
-        if !vault.groups()?.contains(group) || !vault.list(group)?.iter().any(|m| &m.name == name) {
-            return Err(not_found().into());
+            .into());
         }
+        Ok(true)
+    }
+
+    fn resolve(&mut self, reference: &SecretRef) -> Result<SecretValue, MusterError> {
+        let (vault, group, name) = self.existing(reference)?;
         let identity = self.identity()?;
-        vault.get(group, name, identity).map_err(|e| match e {
+        vault.get(&group, &name, identity).map_err(|e| match e {
             MusterError::Security(message) => ProviderError::new(
                 ProviderErrorKind::Unauthorized,
                 format!("native vault: cannot read {reference}: {message}"),

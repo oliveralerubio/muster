@@ -12,6 +12,7 @@ use crate::git;
 use crate::identity::Identity;
 use crate::machine;
 use crate::manifest::Manifest;
+use crate::output::{Diagnostic, Severity};
 use crate::providers::Providers;
 use crate::registry::{CommandSpec, ParamKind, ParamSpec, Params};
 use crate::secrets::{is_name, is_reference, Scheme, SecretRef, SecretValue};
@@ -273,12 +274,25 @@ fn get(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
 fn check(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let mut providers = Providers::new(&ctx.config_dir, &ctx.state_dir);
     if let Some(raw) = params.get_string("reference") {
+        // Never resolves: plaintext is not materialised just to check it.
         let reference = SecretRef::parse(raw)?;
-        providers.resolve_ref(&reference)?;
+        let exists = providers.locate(&reference)?;
+        if !exists {
+            ctx.diag(Diagnostic::new(
+                Severity::Info,
+                "existence_unverified",
+                format!(
+                    "{} is available, but it cannot confirm {reference} without reading the value; \
+                     use `muster secret get` to resolve it",
+                    reference.scheme().as_str()
+                ),
+            ));
+        }
         return Ok(json!({
             "reference": reference.as_str(),
             "provider": reference.scheme(),
-            "resolved": true,
+            "available": true,
+            "exists": if exists { Value::Bool(true) } else { Value::Null },
         }));
     }
     let mut list = Vec::new();

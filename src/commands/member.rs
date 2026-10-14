@@ -9,7 +9,7 @@ use crate::machine;
 use crate::manifest::{Manifest, Member, MemberStatus, Role};
 use crate::output::{Diagnostic, Severity};
 use crate::registry::{CommandSpec, ParamKind, ParamSpec, Params};
-use crate::team::{self, RECOVERY_KEY_PARAM, ROTATION_ADVICE};
+use crate::team::{self, RECOVERY_KEY_PARAM, RECOVERY_KEY_STDIN_PARAM, ROTATION_ADVICE};
 use crate::vault::Vault;
 
 const NAME: ParamSpec = ParamSpec {
@@ -39,7 +39,7 @@ pub const ADD: CommandSpec = CommandSpec {
 pub const APPROVE: CommandSpec = CommandSpec {
     name: "member.approve",
     about: "Approve a pending member and grant their machines their groups",
-    params: &[NAME, RECOVERY_KEY_PARAM],
+    params: &[NAME, RECOVERY_KEY_PARAM, RECOVERY_KEY_STDIN_PARAM],
     mutating: true,
     handler: approve,
 };
@@ -86,7 +86,7 @@ pub const PROFILE: CommandSpec = CommandSpec {
 pub const RM: CommandSpec = CommandSpec {
     name: "member.rm",
     about: "Revoke a member and all their machines; lists secrets to rotate",
-    params: &[NAME, RECOVERY_KEY_PARAM],
+    params: &[NAME, RECOVERY_KEY_PARAM, RECOVERY_KEY_STDIN_PARAM],
     mutating: true,
     handler: rm,
 };

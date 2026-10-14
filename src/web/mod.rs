@@ -67,6 +67,7 @@ const ROUTES: &[Route] = &[
     get("machines", "machine.list"),
     get("members", "member.list"),
     get("groups", "group.list"),
+    get("profiles", "profile.list"),
     get("secrets", "secret.list"),
     get("plan", "plan"),
     get("proposals", "proposal.list"),
@@ -447,7 +448,8 @@ fn parse_params(
             _ => {
                 let canonical = key.replace('_', "-");
                 let known = spec.params.iter().any(|p| p.name == canonical);
-                if !known || hidden.contains(&canonical.as_str()) {
+                // `*-stdin` would read the server's own stdin, never a request.
+                if !known || hidden.contains(&canonical.as_str()) || canonical.ends_with("-stdin") {
                     return Err(MusterError::Usage(format!(
                         "unknown parameter '{key}' for '{}'",
                         spec.name

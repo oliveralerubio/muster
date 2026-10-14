@@ -179,6 +179,26 @@ pub struct Readers {
     pub recipients: Vec<String>,
 }
 
+impl Readers {
+    /// Remove `reader` from members, groups, machines and raw recipients.
+    /// Returns true if any list changed.
+    pub fn remove(&mut self, reader: &str) -> bool {
+        let mut lists = [
+            &mut self.members,
+            &mut self.groups,
+            &mut self.machines,
+            &mut self.recipients,
+        ];
+        let mut removed = false;
+        for list in &mut lists {
+            let before = list.len();
+            list.retain(|r| r != reader);
+            removed |= list.len() != before;
+        }
+        removed
+    }
+}
+
 /// A named agent configuration layer.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

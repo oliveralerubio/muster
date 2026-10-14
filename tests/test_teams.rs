@@ -188,9 +188,23 @@ fn group_readers_control_decryption_with_real_age_identities() {
     let grant = ["group", "grant", "engineering", "--reader", "bob", "--yes"];
     let (out, _) = on(&owner, &config, &grant);
     assert_eq!(out.status.code(), Some(5), "a non-reader cannot re-encrypt");
-    let mut grant = grant.to_vec();
-    grant.extend(["--recovery-key", recovery_key.as_str()]);
-    ok(&owner, &config, &grant);
+    let mut cmd = owner.run(&[
+        "--format",
+        "json",
+        "--config",
+        config.to_str().unwrap(),
+        "group",
+        "grant",
+        "engineering",
+        "--reader",
+        "bob",
+        "--recovery-key-stdin",
+        "--yes",
+    ]);
+    cmd.write_stdin(recovery_key.as_bytes());
+    let (out, envelope) = support::json(cmd);
+    assert!(out.status.success(), "{}", envelope.raw);
+    assert!(envelope.ok());
     assert_eq!(ok(&bob, &config, &get), "REAL_AGE_TEST_SECRET");
     let groups = ok(&owner, &config, &["group", "list"]);
     let engineering = &groups["groups"][0];
@@ -220,7 +234,7 @@ fn revoking_member_revokes_all_associated_machines_and_lists_secrets_to_rotate()
     let get = ["secret", "get", "native://engineering/api-key"];
     ok(&desktop, &config, &get);
 
-    let revoked = ok(
+    let (out, envelope) = on(
         &owner,
         &config,
         &[
@@ -232,6 +246,18 @@ fn revoking_member_revokes_all_associated_machines_and_lists_secrets_to_rotate()
             "--yes",
         ],
     );
+    assert!(out.status.success());
+    assert!(envelope.ok());
+    assert!(
+        envelope.raw["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["code"] == "insecure_recovery_key_argument"),
+        "argv recovery key must warn: {}",
+        envelope.raw
+    );
+    let revoked = envelope.result().clone();
     let mut machines: Vec<_> = revoked["revoked_machines"]
         .as_array()
         .unwrap()

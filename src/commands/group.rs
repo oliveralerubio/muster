@@ -8,7 +8,7 @@ use crate::machine;
 use crate::manifest::{Group, Manifest};
 use crate::output::{Diagnostic, Severity};
 use crate::registry::{CommandSpec, ParamKind, ParamSpec, Params};
-use crate::team::{self, RECOVERY_KEY_PARAM, ROTATION_ADVICE};
+use crate::team::{self, RECOVERY_KEY_PARAM, RECOVERY_KEY_STDIN_PARAM, ROTATION_ADVICE};
 use crate::vault::Vault;
 
 const GROUP: ParamSpec = ParamSpec {
@@ -41,6 +41,7 @@ pub const CREATE: CommandSpec = CommandSpec {
             positional: false,
         },
         RECOVERY_KEY_PARAM,
+        RECOVERY_KEY_STDIN_PARAM,
     ],
     mutating: true,
     handler: create,
@@ -64,6 +65,7 @@ pub const GRANT: CommandSpec = CommandSpec {
             ..READER
         },
         RECOVERY_KEY_PARAM,
+        RECOVERY_KEY_STDIN_PARAM,
     ],
     mutating: true,
     handler: grant,
@@ -79,6 +81,7 @@ pub const REVOKE: CommandSpec = CommandSpec {
             ..READER
         },
         RECOVERY_KEY_PARAM,
+        RECOVERY_KEY_STDIN_PARAM,
     ],
     mutating: true,
     handler: revoke,
@@ -111,20 +114,6 @@ fn add_reader(group: &mut Group, manifest: &Manifest, reader: &str) -> Result<()
         list.push(reader.to_string());
     }
     Ok(())
-}
-
-fn remove_reader(group: &mut Group, reader: &str) -> bool {
-    let mut removed = false;
-    let retain = |list: &mut Vec<String>| {
-        let before = list.len();
-        list.retain(|r| r != reader);
-        list.len() != before
-    };
-    removed |= retain(&mut group.readers.members);
-    removed |= retain(&mut group.readers.groups);
-    removed |= retain(&mut group.readers.machines);
-    removed |= retain(&mut group.readers.recipients);
-    removed
 }
 
 fn create(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
@@ -223,7 +212,7 @@ fn revoke(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         .groups
         .get_mut(&name)
         .ok_or_else(|| MusterError::Usage(format!("group '{name}' does not exist")))?;
-    if !remove_reader(group, reader) {
+    if !group.readers.remove(reader) {
         return Err(MusterError::Usage(format!(
             "'{reader}' is not a reader of '{name}'"
         )));

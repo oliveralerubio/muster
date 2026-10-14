@@ -12,7 +12,6 @@ use crate::machine;
 use crate::manifest::{Machine, Manifest};
 use crate::output::{Diagnostic, Severity};
 use crate::registry::{CommandSpec, ParamKind, ParamSpec, Params};
-use crate::secrets::SecretValue;
 use crate::team;
 use crate::vault::Vault;
 
@@ -27,13 +26,8 @@ pub const SPEC: CommandSpec = CommandSpec {
             required: true,
             positional: true,
         },
-        ParamSpec {
-            name: "recovery-key",
-            about: "Offline recovery key to authorize approval without another machine",
-            kind: ParamKind::String,
-            required: false,
-            positional: false,
-        },
+        team::RECOVERY_KEY_PARAM,
+        team::RECOVERY_KEY_STDIN_PARAM,
         ParamSpec {
             name: "role",
             about: "Role to assign to the approved machine",
@@ -77,23 +71,10 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let req = EnrollmentRequest::load(&ctx.config_dir, name)?;
 
     // Authorization: either via caller machine identity or via recovery key.
-    let approver_identity = match params.get_string("recovery-key") {
-        Some(raw_key) => {
-            let secret = SecretValue::new(raw_key.to_string());
-            let recovery_id = Identity::from_secret(&secret)?;
-            if let Some(recovery) = &manifest.recovery {
-                if recovery.recipient != recovery_id.recipient() {
-                    return Err(MusterError::Security(
-                        "provided recovery key does not match manifest recovery recipient".into(),
-                    ));
-                }
-            } else {
-                return Err(MusterError::Security(
-                    "no recovery key configured in manifest".into(),
-                ));
-            }
-            recovery_id
-        }
+    let recovery = team::recovery_identity(ctx, params, &manifest)?;
+    let by_recovery = recovery.is_some();
+    let approver_identity = match recovery {
+        Some(recovery_id) => recovery_id,
         None => {
             let caller_id = Identity::load(&ctx.state_dir)?;
             if caller_id.recipient() == req.recipient {
@@ -123,7 +104,7 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let before = manifest;
     let member = params.get_string("member");
     let team_mode = !before.members.is_empty() || member.is_some();
-    let actor = if team_mode && params.get_string("recovery-key").is_none() {
+    let actor = if team_mode && !by_recovery {
         Some(team::admin(&before, &ctx.state_dir)?)
     } else {
         None
