@@ -104,10 +104,20 @@ pub fn command() -> Command {
 }
 
 /// Insert `spec` under `parent` following its dotted path, creating group
-/// commands (`secret` for `secret.add`) on the way.
+/// commands (`secret` for `secret.add`) on the way. A spec named like an
+/// existing group (`agents` next to `agents.apply`) makes the group runnable.
 fn insert(parent: Command, path: &[&'static str], spec: &'static CommandSpec) -> Command {
     match path {
         [] => parent,
+        [name] if parent.find_subcommand(name).is_some() => parent.mut_subcommand(name, |group| {
+            with_params(
+                group
+                    .about(spec.about)
+                    .subcommand_required(false)
+                    .arg_required_else_help(false),
+                spec,
+            )
+        }),
         [name] => parent.subcommand(leaf_command(name, spec)),
         [group, rest @ ..] => {
             let parent = if parent.find_subcommand(group).is_some() {
@@ -125,20 +135,22 @@ fn insert(parent: Command, path: &[&'static str], spec: &'static CommandSpec) ->
 }
 
 fn leaf_command(name: &'static str, spec: &'static CommandSpec) -> Command {
-    spec.params
-        .iter()
-        .fold(Command::new(name).about(spec.about), |cmd, p| {
-            let arg = Arg::new(p.name)
-                .long(p.name)
-                .help(p.about)
-                .required(p.required);
-            cmd.arg(match p.kind {
-                ParamKind::String => arg,
-                ParamKind::Bool => arg.action(ArgAction::SetTrue),
-                ParamKind::Int => arg.value_parser(clap::value_parser!(i64)),
-                ParamKind::List => arg.action(ArgAction::Append),
-            })
+    with_params(Command::new(name).about(spec.about), spec)
+}
+
+fn with_params(cmd: Command, spec: &'static CommandSpec) -> Command {
+    spec.params.iter().fold(cmd, |cmd, p| {
+        let arg = Arg::new(p.name)
+            .long(p.name)
+            .help(p.about)
+            .required(p.required);
+        cmd.arg(match p.kind {
+            ParamKind::String => arg,
+            ParamKind::Bool => arg.action(ArgAction::SetTrue),
+            ParamKind::Int => arg.value_parser(clap::value_parser!(i64)),
+            ParamKind::List => arg.action(ArgAction::Append),
         })
+    })
 }
 
 /// Walk to the innermost subcommand; returns its dotted name and matches.

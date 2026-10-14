@@ -1,0 +1,14 @@
+---
+source: tests/test_adapters.rs
+expression: read(rel)
+---
+model = "gpt-5.1-codex"
+
+[mcp_servers.docs]
+url = "https://mcp.example.com/mcp"
+http_headers = { X-Team = "core" }
+
+[mcp_servers.github]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+env = { GITHUB_TOKEN = "${GITHUB_TOKEN}" }

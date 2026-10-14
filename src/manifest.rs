@@ -10,6 +10,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub use crate::adapters::config::{AgentsConfig, McpServer};
 use crate::errors::MusterError;
 
 pub const FILE_NAME: &str = "muster.toml";
@@ -30,6 +31,12 @@ pub struct Manifest {
     /// Fleet machines, keyed by machine name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub machines: BTreeMap<String, Machine>,
+    /// Agent configuration: enabled adapters, shared instructions, hooks, permissions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agents: Option<AgentsConfig>,
+    /// Declared MCP servers (stdio and remote), keyed by server name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mcp: BTreeMap<String, McpServer>,
     // Later tickets add members, groups and profiles.
     #[serde(flatten)]
     #[schemars(skip)]
@@ -74,6 +81,8 @@ impl Manifest {
             version: 1,
             recovery: None,
             machines: BTreeMap::new(),
+            agents: None,
+            mcp: BTreeMap::new(),
             extensions: BTreeMap::new(),
         }
     }

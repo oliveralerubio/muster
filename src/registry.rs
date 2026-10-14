@@ -81,6 +81,8 @@ impl Params {
 
 /// Every command Muster knows. Register new commands here.
 pub static COMMANDS: &[CommandSpec] = &[
+    crate::commands::agents::SPEC,
+    crate::commands::agents::APPLY_SPEC,
     crate::commands::init::SPEC,
     crate::commands::schema::SPEC,
     crate::commands::status::SPEC,

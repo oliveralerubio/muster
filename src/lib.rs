@@ -1,6 +1,7 @@
 //! Muster: sync machines, AI agent configuration and secrets.
 #![forbid(unsafe_code)]
 
+pub mod adapters;
 pub mod cli;
 pub mod commands;
 pub mod context;
