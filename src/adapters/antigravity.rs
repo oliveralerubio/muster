@@ -8,9 +8,9 @@
 //!   `command`/`args`/`env`; remote `serverUrl`/`headers`, never `url`).
 //! - `~/.gemini/AGENTS.md`: canonical instructions (plain Markdown, no
 //!   frontmatter).
-//! - `~/.gemini/antigravity-cli/skills/<skill>/...`: Agent Skills declared in
-//!   `[agents.skills]`, one whole file per skill file. Skills Muster does not
-//!   declare are left alone.
+//! - `~/.gemini/antigravity-cli/skills/<skill>/...` (project `.agents/skills/`,
+//!   shared with Codex): Agent Skills declared in `[agents.skills]`, one whole
+//!   file per skill file. Skills Muster does not declare are left alone.
 //!
 //! Model, permissions and hooks have no documented configuration, so they are
 //! not declared and the framework warns that they are skipped.
@@ -18,13 +18,15 @@
 use serde_json::{Map, Value};
 
 use super::{
-    child_object, json_object, json_text, markdown_block, resolve_mcp_map, transport, Adapter,
-    Base, Capability, Current, Desired, FileFormat, ManagedFile, RenderPlan, RenderedFile,
-    RenderedTreeFile, Scope, Transport,
+    child_object, json_object, json_text, markdown_block, push_skills, resolve_mcp_map, transport,
+    Adapter, Base, Capability, Current, Desired, FileFormat, ManagedFile, RenderPlan, RenderedFile,
+    Scope, Transport,
 };
 use crate::errors::MusterError;
 
 const SKILLS_DIR: &str = ".gemini/antigravity-cli/skills";
+/// Workspace skills directory, shared with Codex.
+const PROJECT_SKILLS_DIR: &str = ".agents/skills";
 
 const MCP: ManagedFile = ManagedFile {
     base: Base::Home,
@@ -70,17 +72,7 @@ fn render(desired: &Desired, current: &Current, plan: &mut RenderPlan) -> Result
             contents: markdown_block(current.get(INSTRUCTIONS.path), text),
         });
     }
-    for (skill, files) in desired.skills {
-        for (rel, contents) in files {
-            plan.tree.push(RenderedTreeFile {
-                base: Base::Home,
-                path: format!("{SKILLS_DIR}/{skill}/{rel}"),
-                // No documented project-scoped skills directory.
-                project: None,
-                contents: contents.clone(),
-            });
-        }
-    }
+    push_skills(desired, Base::Home, SKILLS_DIR, PROJECT_SKILLS_DIR, plan);
     Ok(())
 }
 

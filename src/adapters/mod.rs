@@ -286,6 +286,27 @@ pub fn is_secret_reference(value: &str) -> bool {
     crate::secrets::is_reference(value)
 }
 
+/// One whole file per skill file: `<global_dir>/<skill>/<rel>` under `base`,
+/// and `<project_dir>/<skill>/<rel>` under a project root.
+fn push_skills(
+    desired: &Desired,
+    base: Base,
+    global_dir: &str,
+    project_dir: &str,
+    plan: &mut RenderPlan,
+) {
+    for (skill, files) in desired.skills {
+        for (rel, contents) in files {
+            plan.tree.push(RenderedTreeFile {
+                base,
+                path: format!("{global_dir}/{skill}/{rel}"),
+                project: Some(format!("{project_dir}/{skill}/{rel}")),
+                contents: contents.clone(),
+            });
+        }
+    }
+}
+
 /// `map` with secret references replaced by their resolved values. A
 /// reference this agent is not allowed to receive, or that could not be
 /// resolved, drops its key with a warning (never the value or the reference).

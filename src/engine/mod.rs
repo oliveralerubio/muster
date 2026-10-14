@@ -653,6 +653,14 @@ pub fn apply(ctx: &mut Context, mut plan: Plan) -> Result<Value, MusterError> {
         return Ok(plan.to_json(false, false, plan.base_generation()));
     }
 
+    // Roots never pruned when a whole file's emptied directories are removed.
+    let mut keep: Vec<PathBuf> = match Roots::from_env() {
+        Ok(roots) => vec![roots.home, roots.xdg_config],
+        Err(_) => Vec::new(),
+    };
+    if let Target::Project(dir) = &plan.target {
+        keep.push(dir.clone());
+    }
     let mut pending = store::begin(&ctx.state_dir)?;
     let mut failed: BTreeSet<&'static str> = BTreeSet::new();
     for entry in &plan.entries {
@@ -669,7 +677,14 @@ pub fn apply(ctx: &mut Context, mut plan: Plan) -> Result<Value, MusterError> {
             }
             match &entry.after {
                 Some(after) => write_file(&entry.path, after, entry.private, entry.executable),
-                None => std::fs::remove_file(&entry.path).map_err(|e| io_error(&entry.path, e)),
+                None => {
+                    std::fs::remove_file(&entry.path).map_err(|e| io_error(&entry.path, e))?;
+                    // Whole files (skills) leave no empty skill directories.
+                    if entry.format == FileFormat::Text {
+                        remove_empty_parents(&entry.path, &keep);
+                    }
+                    Ok(())
+                }
             }
         })();
         if let Err(err) = result {
@@ -1033,9 +1048,13 @@ fn read_skills(ctx: &mut Context, merged: &layer::Merged) -> Result<adapters::Sk
         }
         let mut files = BTreeMap::new();
         collect_skill_files(&entry.path(), "", &mut files)?;
-        if !files.is_empty() {
-            skills.insert(name, files);
+        if files.is_empty() {
+            continue;
         }
+        if !is_valid_skill(&name, &files, ctx, &entry.path()) {
+            continue;
+        }
+        skills.insert(name, files);
     }
     Ok(skills)
 }
@@ -1120,4 +1139,101 @@ fn write_file(
 
 fn io_error(path: &Path, e: std::io::Error) -> MusterError {
     MusterError::Operational(format!("{}: {e}", path.display()))
+}
+
+/// Remove the directories above `path` that are left empty, stopping below a
+/// root in `keep` (and never removing a root's direct child, like `~/.gemini`).
+fn remove_empty_parents(path: &Path, keep: &[PathBuf]) {
+    let mut dir = path.parent();
+    while let Some(current) = dir {
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        if keep.iter().any(|k| k == current || k == parent) {
+            break;
+        }
+        // Fails (and stops) as soon as a directory still holds anything.
+        if std::fs::remove_dir(current).is_err() {
+            break;
+        }
+        dir = Some(parent);
+    }
+}
+
+fn is_valid_skill(
+    name: &str,
+    files: &BTreeMap<String, String>,
+    ctx: &mut Context,
+    skill_dir: &Path,
+) -> bool {
+    let Some(skill_md) = files.get("SKILL.md") else {
+        ctx.diag(
+            Diagnostic::new(
+                Severity::Warning,
+                "skill_invalid",
+                format!("skill `{name}` has no SKILL.md; skipped"),
+            )
+            .with_path(skill_dir.display().to_string()),
+        );
+        return false;
+    };
+
+    if !has_valid_frontmatter(skill_md) {
+        ctx.diag(
+            Diagnostic::new(
+                Severity::Warning,
+                "skill_invalid",
+                format!(
+                    "skill `{name}` SKILL.md must have YAML frontmatter with non-empty `name` and `description`; skipped"
+                ),
+            )
+            .with_path(skill_dir.join("SKILL.md").display().to_string()),
+        );
+        return false;
+    }
+
+    true
+}
+
+fn has_valid_frontmatter(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with("---") {
+        return false;
+    }
+    let after_start = &trimmed[3..];
+    let after_newline = if let Some(rest) = after_start.strip_prefix("\r\n") {
+        rest
+    } else if let Some(rest) = after_start.strip_prefix('\n') {
+        rest
+    } else {
+        return false;
+    };
+
+    let Some(end_idx) = after_newline.find("\n---") else {
+        return false;
+    };
+    let fm_block = &after_newline[..end_idx];
+
+    let mut has_name = false;
+    let mut has_desc = false;
+
+    for line in fm_block.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((key, val)) = line.split_once(':') {
+            let key = key.trim();
+            let val = val.trim().trim_matches(|c| c == '\'' || c == '"').trim();
+            if !val.is_empty() {
+                if key == "name" {
+                    has_name = true;
+                } else if key == "description" {
+                    has_desc = true;
+                }
+            }
+        }
+    }
+
+    has_name && has_desc
 }

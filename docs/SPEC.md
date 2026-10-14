@@ -183,6 +183,16 @@ El mismo producto sirve a dos públicos:
   - Informan de lo que no pueden traducir.
   - Un fallo queda aislado a ese agente.
   - AGENTS.md es el formato canónico de instrucciones. CLAUDE.md se genera o enlaza a partir de él.
+  - **Skills** (`[agents.skills] source = "skills"`, una carpeta por skill con `SKILL.md` y archivos extra): los cuatro agentes las soportan. Muster copia cada archivo tal cual; las skills que se quitan de la fuente se borran en el siguiente apply y las que el usuario añade a mano no se tocan. Una skill sin `SKILL.md` o sin `name`/`description` en el frontmatter se omite con el aviso `skill_invalid`. Rutas:
+
+    | Agente | Usuario | Proyecto |
+    |---|---|---|
+    | Claude Code | `~/.claude/skills/<skill>/` | `.claude/skills/<skill>/` |
+    | Codex | `~/.agents/skills/<skill>/` | `.agents/skills/<skill>/` |
+    | OpenCode | `$XDG_CONFIG_HOME/opencode/skills/<skill>/` | `.opencode/skills/<skill>/` |
+    | Antigravity CLI | `~/.gemini/antigravity-cli/skills/<skill>/` | `.agents/skills/<skill>/` |
+
+    Codex y Antigravity comparten `.agents/skills` en proyecto; el archivo se escribe una sola vez.
   - La traducción de formatos imita el modelo de rulesync, pero se implementa con código propio.
 - **Motor de aplicación**
   - Reemplaza a chezmoi: estado deseado → plan → diff → apply idempotente.

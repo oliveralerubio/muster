@@ -345,23 +345,21 @@ fn antigravity_skills_keep_user_owned_skills() {
 }
 
 #[test]
-fn skills_on_agent_without_skill_support_warns() {
+fn opencode_supports_skills_without_unsupported_warning() {
     let env = MusterEnv::new();
     seed_antigravity_skills_config(&env, "opencode");
     let (output, envelope) = env.run_json(&[
         "agents", "apply", "--yes", "--agent", "opencode", "--format", "json",
     ]);
-    assert!(output.status.success(), "apply must still succeed");
+    assert!(output.status.success(), "apply must succeed");
     assert!(envelope.ok());
     let diags = envelope.diagnostics().as_array().expect("diagnostics list");
     assert!(
-        diags.iter().any(|d| d["code"] == "unsupported_feature"
-            && d["message"]
-                .as_str()
-                .map(|m| m.to_lowercase().contains("skills"))
-                .unwrap_or(false)),
-        "must warn that skills are unsupported for opencode: {diags:?}"
+        !diags.iter().any(|d| d["code"] == "unsupported_feature"),
+        "opencode supports skills: {diags:?}"
     );
+    let installed = env.path().join(".config/opencode/skills/review/SKILL.md");
+    assert!(installed.is_file(), "skill installed for opencode");
 }
 
 // ---------------------------------------------------------------------------

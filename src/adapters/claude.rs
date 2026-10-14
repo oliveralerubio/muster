@@ -5,15 +5,19 @@
 //!   `hooks` (`PreToolUse`, `Stop`...).
 //! - `~/.claude.json`: `mcpServers.<name>`.
 //! - `~/.claude/AGENTS.md` + `~/.claude/CLAUDE.md` (managed block `@AGENTS.md`).
+//! - `~/.claude/skills/<skill>/...` (project `.claude/skills/`): Agent Skills
+//!   declared in `[agents.skills]`, one whole file per skill file.
 
 use serde_json::{Map, Value};
 
 use super::{
-    child_object, json_object, json_text, markdown_block, pascal_case, resolve_mcp_map, transport,
-    Adapter, Base, Capability, Current, Desired, FileFormat, ManagedFile, RenderPlan, RenderedFile,
-    Scope, Transport,
+    child_object, json_object, json_text, markdown_block, pascal_case, push_skills,
+    resolve_mcp_map, transport, Adapter, Base, Capability, Current, Desired, FileFormat,
+    ManagedFile, RenderPlan, RenderedFile, Scope, Transport,
 };
 use crate::errors::MusterError;
+
+const SKILLS_DIR: &str = ".claude/skills";
 
 const SETTINGS: ManagedFile = ManagedFile {
     base: Base::Home,
@@ -65,6 +69,7 @@ pub static ADAPTER: Adapter = Adapter {
         Capability::Models,
         Capability::Permissions,
         Capability::Hooks,
+        Capability::Skills,
     ],
     files: &[SETTINGS, MCP, INSTRUCTIONS, AGENTS_COPY],
     render: Some(render),
@@ -74,6 +79,7 @@ fn render(desired: &Desired, current: &Current, plan: &mut RenderPlan) -> Result
     render_settings(desired, current.get(SETTINGS.path), plan)?;
     render_mcp(desired, current.get(MCP.path), plan)?;
     render_instructions(desired, current, plan);
+    push_skills(desired, Base::Home, SKILLS_DIR, SKILLS_DIR, plan);
     Ok(())
 }
 

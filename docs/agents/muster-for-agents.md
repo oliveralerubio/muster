@@ -77,6 +77,21 @@ The MCP server runs over stdio using newline-delimited JSON-RPC 2.0.
   The calling agent is identified from the `initialize` request's `clientInfo.name` (contains `claude` -> claude, `codex` -> codex, `opencode` -> opencode, `antigravity`/`agy` -> antigravity). Unknown clients are never granted. A denied reveal returns a `security` diagnostic and `isError: true`.
 - **Secret isolation in generated configs:** deny by default. When Muster renders an agent's MCP `env`/`headers`, a secret reference resolves only if its `[secrets."<ref>"] allow` grants that agent (`agent` everywhere, `agent@project` only in that project's scope). Otherwise the key is omitted and a `secret_not_allowed_for_agent` warning is emitted.
 
+## Agent Skills
+
+`[agents.skills] source = "skills"` in `muster.toml` points to a folder with one subfolder per skill (`SKILL.md` with `name` and `description` frontmatter, plus any files). `agents apply` / `sync` install them for every supported agent:
+
+| Agent | User scope | Project scope |
+|---|---|---|
+| Claude Code | `~/.claude/skills/<skill>/` | `.claude/skills/<skill>/` |
+| Codex | `~/.agents/skills/<skill>/` | `.agents/skills/<skill>/` |
+| OpenCode | `$XDG_CONFIG_HOME/opencode/skills/<skill>/` | `.opencode/skills/<skill>/` |
+| Antigravity CLI | `~/.gemini/antigravity-cli/skills/<skill>/` | `.agents/skills/<skill>/` |
+
+- Project scope uses `<project>/.muster/muster.toml`; Codex and Antigravity share `.agents/skills`.
+- Removed skills are deleted on the next apply; hand-added skills are never touched.
+- Invalid skills (no `SKILL.md`, or missing `name`/`description`) are skipped with a `skill_invalid` warning; exit code stays `0`.
+
 ## Proposal Flow (Agents Proposing Changes)
 
 When an agent needs to adjust Muster configuration (e.g. adding an MCP server, tuning agent instructions, modifying dotfiles):
