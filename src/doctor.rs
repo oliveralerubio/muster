@@ -389,7 +389,11 @@ fn expect_mode(_: &Path, _: u32, _: &mut Vec<Diagnostic>, _: &mut Vec<Repair>) {
 // ---------------------------------------------------------------------------
 
 fn check_agents(ctx: &Context, manifest: &Manifest) -> Check {
-    let merged = layer::merge(&layer::global_layers(&ctx.config_dir, manifest));
+    let merged = layer::merge(&layer::global_layers(
+        &ctx.config_dir,
+        manifest,
+        crate::machine::load_name(&ctx.state_dir).as_deref(),
+    ));
     let declared: Vec<String> = merged
         .agents
         .enabled
@@ -673,7 +677,11 @@ fn engine_suggestion(code: &str) -> &'static str {
 /// Every secret reference in MCP `env`/`headers`: one provider check per
 /// scheme, then one resolution per reference (values dropped at once).
 fn check_keys(ctx: &Context, manifest: &Manifest) -> Check {
-    let merged = layer::merge(&layer::global_layers(&ctx.config_dir, manifest));
+    let merged = layer::merge(&layer::global_layers(
+        &ctx.config_dir,
+        manifest,
+        crate::machine::load_name(&ctx.state_dir).as_deref(),
+    ));
     let mut diags = Vec::new();
     let mut by_scheme: BTreeMap<Scheme, Vec<(String, SecretRef)>> = BTreeMap::new();
     for (server, config) in &merged.mcp {

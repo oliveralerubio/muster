@@ -19,4 +19,5 @@ pub mod output;
 pub mod providers;
 pub mod registry;
 pub mod secrets;
+pub mod team;
 pub mod vault;

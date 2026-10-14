@@ -110,6 +110,7 @@ pub struct Plan {
     approved: Approved,
     base: Option<(u64, State)>,
     secrets: BTreeMap<String, SecretValue>,
+    layers: Vec<layer::Layer>,
 }
 
 /// `muster plan` / `sync` / `agents apply` options.
@@ -125,7 +126,11 @@ pub struct Options<'a> {
 pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
     let manifest = Manifest::load(&ctx.config_dir)?;
     let layers = match &options.target {
-        Target::Global => layer::global_layers(&ctx.config_dir, &manifest),
+        Target::Global => layer::global_layers(
+            &ctx.config_dir,
+            &manifest,
+            crate::machine::load_name(&ctx.state_dir).as_deref(),
+        ),
         Target::Project(dir) => layer::project_layers(dir)?,
     };
     // The single place layers become desired state.
@@ -252,6 +257,7 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
         approved,
         base,
         secrets,
+        layers,
     })
 }
 
@@ -473,6 +479,11 @@ impl Plan {
     ///  "approvals": [{"kind": "hook|mcp_server", "name", "detail"}]}
     /// ```
     /// Last applied generation the plan was computed against.
+    /// The layers this plan merged and the fixed precedence (`--explain`).
+    pub fn explain(&self) -> Value {
+        layer::explain(&self.layers)
+    }
+
     pub fn base_generation(&self) -> Option<u64> {
         self.base.as_ref().map(|(n, _)| *n)
     }

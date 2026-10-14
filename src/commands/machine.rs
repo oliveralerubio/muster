@@ -9,6 +9,8 @@ use crate::identity::Identity;
 use crate::machine;
 use crate::manifest::Manifest;
 use crate::registry::{CommandSpec, ParamKind, ParamSpec, Params};
+use crate::team;
+use crate::vault::Vault;
 
 pub const LIST: CommandSpec = CommandSpec {
     name: "machine.list",
@@ -66,6 +68,14 @@ pub const ASSIGN: CommandSpec = CommandSpec {
             required: false,
             positional: false,
         },
+        ParamSpec {
+            name: "member",
+            about: "Team member who owns the machine (admins only)",
+            kind: ParamKind::String,
+            required: false,
+            positional: false,
+        },
+        crate::team::RECOVERY_KEY_PARAM,
     ],
     mutating: true,
     handler: assign,
@@ -140,14 +150,37 @@ fn assign(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
 
     let role = params.get_string("role");
     let profile = params.get_string("profile");
+    let member = params.get_string("member");
 
-    if role.is_none() && profile.is_none() {
+    if role.is_none() && profile.is_none() && member.is_none() {
         return Err(MusterError::Usage(
-            "specify at least one of --role or --profile".into(),
+            "specify at least one of --role, --profile or --member".into(),
         ));
     }
 
     let mut manifest = Manifest::load(&ctx.config_dir)?;
+    // Team mode: profiles and ownership are admin changes.
+    let actor = if manifest.members.is_empty() && member.is_none() {
+        None
+    } else {
+        Some(team::admin(&manifest, &ctx.state_dir)?)
+    };
+    let before = manifest.clone();
+    if let Some(member) = member {
+        if !manifest.machines.contains_key(name) {
+            return Err(MusterError::Usage(format!(
+                "machine '{name}' is not enrolled"
+            )));
+        }
+        team::materialize(&mut manifest);
+        team::forget_machine(&mut manifest, name);
+        manifest
+            .members
+            .get_mut(member)
+            .ok_or_else(|| MusterError::Usage(format!("member '{member}' does not exist")))?
+            .machines
+            .push(name.to_string());
+    }
     let entry = manifest
         .machines
         .get_mut(name)
@@ -161,25 +194,39 @@ fn assign(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     }
     let (role, profile) = (entry.role.clone(), entry.profile.clone());
 
-    if ctx.dry_run {
-        return Ok(json!({
-            "dry_run": true,
-            "machine": name,
-            "role": role,
-            "profile": profile,
-        }));
+    let mut vault = Vault::open(&ctx.config_dir)?;
+    let changes = team::pending_rekeys(&vault, &manifest)?;
+    let identity = if changes.is_empty() {
+        None
+    } else {
+        let identity = team::unlock(ctx, params, &manifest)?;
+        team::check_can_rekey(&vault, &changes, &identity)?;
+        Some(identity)
+    };
+    if let Some(actor) = &actor {
+        team::check_self_grant(ctx, &before, &manifest, actor)?;
     }
-
-    manifest.save(&ctx.config_dir)?;
-
-    crate::git::commit_if_configured(
-        &ctx.config_dir,
-        &format!("chore(fleet): update machine {name}"),
-    )?;
-
-    Ok(json!({
+    let result = json!({
         "machine": name,
         "role": role,
         "profile": profile,
-    }))
+        "member": team::owner_of(&manifest, name),
+        "reencrypted_groups": changes.iter().map(|(g, _)| g.clone()).collect::<Vec<_>>(),
+    });
+    if ctx.dry_run {
+        return Ok(result);
+    }
+
+    manifest.save(&ctx.config_dir)?;
+    if let Some(identity) = identity {
+        team::rekey(&mut vault, &manifest, &identity)?;
+    }
+    let summary = format!("chore(fleet): update machine {name}");
+    match &actor {
+        Some(actor) => team::commit(ctx, actor, &summary)?,
+        None => {
+            crate::git::commit_if_configured(&ctx.config_dir, &summary)?;
+        }
+    }
+    Ok(result)
 }

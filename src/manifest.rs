@@ -31,7 +31,18 @@ pub struct Manifest {
     /// Fleet machines, keyed by machine name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub machines: BTreeMap<String, Machine>,
-    /// Agent configuration: enabled adapters, shared instructions, hooks, permissions.
+    /// Team members, keyed by member name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub members: BTreeMap<String, Member>,
+    /// Secret groups, keyed by group name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub groups: BTreeMap<String, Group>,
+    /// Agent configuration profiles, keyed by profile name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub profiles: BTreeMap<String, Profile>,
+    /// Agent configuration: enabled adapters, shared instructions, hooks,
+    /// permissions. In team mode this is the approved team profile (the
+    /// lowest-precedence layer).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agents: Option<AgentsConfig>,
     /// Declared MCP servers (stdio and remote), keyed by server name.
@@ -94,6 +105,88 @@ pub struct Machine {
     /// Agent configuration profile applied to the machine.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// Digest of the team-approved layers this machine last applied
+    /// (written by `sync`/`agents apply`; compared by `status`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_profile: Option<String>,
+}
+
+/// Team role of a member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    Admin,
+    #[default]
+    Member,
+}
+
+/// Lifecycle of a member: invited (pending) until an admin approves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum MemberStatus {
+    #[default]
+    Pending,
+    Active,
+}
+
+/// A person of the team with one or more machines.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Member {
+    #[serde(default)]
+    pub role: Role,
+    #[serde(default)]
+    pub status: MemberStatus,
+    /// Names of the member's machines (entries of `[machines]`, or names
+    /// reserved for machines that have not enrolled yet).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub machines: Vec<String>,
+    /// Personal agent profile (layered above group profiles).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    /// Member who invited this member.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invited_by: Option<String>,
+    /// Admin who approved the invitation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_by: Option<String>,
+}
+
+/// A secret group: one vault file encrypted for its readers (+ the recovery key).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Group {
+    #[serde(default)]
+    pub readers: Readers,
+    /// Agent profile applied to the group's member readers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+}
+
+/// Readers of a secret group.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Readers {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<String>,
+    /// Other groups whose readers also read this one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub machines: Vec<String>,
+    /// Raw age recipients (`age1...`) outside the fleet (e.g. CI keys).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recipients: Vec<String>,
+}
+
+/// A named agent configuration layer.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Profile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agents: Option<AgentsConfig>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mcp: BTreeMap<String, McpServer>,
 }
 
 impl Default for Manifest {
@@ -117,6 +210,9 @@ impl Manifest {
             version: 1,
             recovery: None,
             machines: BTreeMap::new(),
+            members: BTreeMap::new(),
+            groups: BTreeMap::new(),
+            profiles: BTreeMap::new(),
             agents: None,
             mcp: BTreeMap::new(),
             files: BTreeMap::new(),
@@ -216,6 +312,7 @@ mod tests {
                 last_sync: None,
                 role: Some("workstation".into()),
                 profile: None,
+                applied_profile: None,
             },
         );
         let text = toml::to_string_pretty(&m).unwrap();
