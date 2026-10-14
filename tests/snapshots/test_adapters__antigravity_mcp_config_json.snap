@@ -1,0 +1,24 @@
+---
+source: tests/test_adapters.rs
+expression: read(rel)
+---
+{
+  "mcpServers": {
+    "docs": {
+      "serverUrl": "https://mcp.example.com/mcp",
+      "headers": {
+        "X-Team": "core"
+      }
+    },
+    "github": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-github"
+      ],
+      "env": {
+        "GITHUB_TOKEN": "${GITHUB_TOKEN}"
+      }
+    }
+  }
+}

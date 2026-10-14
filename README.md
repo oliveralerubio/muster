@@ -2,7 +2,7 @@
 
 > Sync your machines, AI coding agents and secrets. Local-first, team-ready.
 
-Muster keeps the configuration of your AI coding agents (Claude Code, Codex, OpenCode, Gemini CLI) identical across every machine you own, and across every member of your team, including rules, MCP servers, profiles and the secrets they need.
+Muster keeps the configuration of your AI coding agents (Claude Code, Codex, OpenCode, Antigravity CLI) identical across every machine you own, and across every member of your team, including rules, MCP servers, profiles and the secrets they need.
 
 - **Machines:** a fleet inventory. Enroll a new laptop in one command.
 - **Agents:** one source of truth (`AGENTS.md` and a universal MCP manifest) rendered into each agent's native format, without clobbering local edits.

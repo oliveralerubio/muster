@@ -36,6 +36,7 @@ const SCHEMA_URL: &str = "https://opencode.ai/config.json";
 pub static ADAPTER: Adapter = Adapter {
     id: "opencode",
     name: "OpenCode",
+    binary: "opencode",
     experimental: false,
     platforms: &["linux", "macos", "windows"],
     min_version: "0.1.0",

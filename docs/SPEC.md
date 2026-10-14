@@ -139,7 +139,7 @@ El mismo producto sirve a dos públicos:
 ### Producto y alcance
 - Producto open source con licencia **Apache-2.0**. El mismo núcleo sirve al modo individual y al modo equipo. Un hub alojado de pago se especificará más adelante sobre el mismo modelo de datos.
 - **Dependencia externa obligatoria: solo Git.** chezmoi, Bitwarden (`bws`/`bw`), Tailscale y el model hub dejan de ser obligatorios.
-- **Agentes soportados de forma completa en v1: Claude Code, Codex y OpenCode.** Gemini/Antigravity, Pi y Hermes, como adaptadores experimentales.
+- **Agentes soportados de forma completa en v1: Claude Code, Codex, OpenCode y Antigravity CLI.** Pi y Hermes, como adaptadores experimentales.
 - **Plataformas:** Linux, WSL2 y macOS. Windows nativo no entra.
 - Lenguaje: **Rust** en todo lo que Rust permita (CLI, núcleo, bóveda, adaptadores, servidor MCP y servidor de la interfaz web). La interfaz web es HTML, CSS y JavaScript estáticos incrustados en el binario. Se distribuye como un único binario sin runtime. Muster es un repositorio nuevo escrito desde cero; Cuartel (privado) solo sirve como referencia de diseño y no se copia su historial.
 
@@ -308,7 +308,7 @@ Opciones globales: `--config`, `--format text|json`, `--yes`, `--dry-run` (en to
 - Windows nativo (WSL2 sí entra).
 - Sincronizar la memoria de los agentes entre máquinas.
 - Catálogo o marketplace público de plugins de terceros.
-- Soporte completo de Gemini/Antigravity, Pi y Hermes (quedan como experimentales).
+- Soporte completo de Pi y Hermes (quedan como experimentales).
 - Cualquier dependencia del model hub personal y de Tailscale. Se mantiene solo como configuración opcional del usuario.
 - La transferencia de logins OAuth de los agentes por SSH: queda como experimental y desactivada por defecto.
 - Telemetría.
@@ -328,7 +328,7 @@ Opciones globales: `--config`, `--format text|json`, `--yes`, `--dry-run` (en to
   - el nombre del producto en inglés (o mantener "Muster" con subtítulo);
   - el número mínimo de aprobaciones de administrador en equipos.
 - **Datos a verificar** al implementar los adaptadores:
-  - si Gemini CLI fue reemplazado por Antigravity CLI;
+  - reemplazo verificado: Antigravity CLI (`agy`) reemplazó al CLI anterior de Google para niveles de consumo el 2026-06-18 y mantiene rutas bajo `~/.gemini/`;
   - los formatos actuales de configuración de cada agente.
 - **Lanzamiento:**
   - Show HN exige que el autor escriba el post y las respuestas sin IA.

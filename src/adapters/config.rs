@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentsConfig {
-    /// Adapter ids to apply (`claude`, `codex`, `opencode`). Default: every stable adapter.
+    /// Adapter ids to apply (`claude`, `codex`, `opencode`, `antigravity`). Default: every stable adapter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<Vec<String>>,
     /// Shared instructions (AGENTS.md).

@@ -427,16 +427,17 @@ fn check_agents(ctx: &Context, manifest: &Manifest) -> Check {
             );
             continue;
         }
-        let Some(exe) = machine::find_executable(id) else {
+        let binary = adapter.binary;
+        let Some(exe) = machine::find_executable(binary) else {
             diags.push(
                 Diagnostic::new(
                     Severity::Warning,
                     "missing_binary",
-                    format!("{} is enabled but `{id}` is not on PATH", adapter.name),
+                    format!("{} is enabled but `{binary}` is not on PATH", adapter.name),
                 )
                 .with_path(id.clone())
                 .with_suggestion(format!(
-                    "install {} (`{id}`, version {} or newer) or remove `{id}` from [agents] enabled",
+                    "install {} (`{binary}`, version {} or newer) or remove `{id}` from [agents] enabled",
                     adapter.name, adapter.min_version
                 )),
             );

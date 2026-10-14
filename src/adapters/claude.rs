@@ -54,6 +54,7 @@ const AGENTS_COPY: ManagedFile = ManagedFile {
 pub static ADAPTER: Adapter = Adapter {
     id: "claude",
     name: "Claude Code",
+    binary: "claude",
     experimental: false,
     platforms: &["linux", "macos", "windows"],
     min_version: "1.0.0",

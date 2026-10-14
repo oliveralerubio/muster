@@ -34,6 +34,7 @@ const INSTRUCTIONS: ManagedFile = ManagedFile {
 pub static ADAPTER: Adapter = Adapter {
     id: "codex",
     name: "Codex",
+    binary: "codex",
     experimental: false,
     platforms: &["linux", "macos", "windows"],
     min_version: "1.0.0",

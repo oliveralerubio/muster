@@ -8,6 +8,7 @@
 //! [`Adapter::render`] and write the results. Render only rewrites the keys it
 //! manages and keeps everything else in the file.
 
+pub mod antigravity;
 pub mod claude;
 pub mod codex;
 pub mod config;
@@ -175,6 +176,8 @@ type RenderFn = fn(&Desired, &Current, &mut RenderPlan) -> Result<(), MusterErro
 pub struct Adapter {
     pub id: &'static str,
     pub name: &'static str,
+    /// Executable name on `PATH` (detection, doctor, installer default).
+    pub binary: &'static str,
     pub experimental: bool,
     pub platforms: &'static [&'static str],
     pub min_version: &'static str,
@@ -225,23 +228,12 @@ impl Adapter {
     }
 }
 
-static GEMINI: Adapter = Adapter {
-    id: "gemini",
-    name: "Gemini CLI",
-    experimental: true,
-    platforms: &["linux", "macos", "windows"],
-    min_version: "",
-    capabilities: &[],
-    files: &[],
-    render: None,
-};
-
 /// Every adapter Muster knows, stable ones first.
 pub static ADAPTERS: &[&Adapter] = &[
     &claude::ADAPTER,
     &codex::ADAPTER,
     &opencode::ADAPTER,
-    &GEMINI,
+    &antigravity::ADAPTER,
 ];
 
 pub fn find(id: &str) -> Option<&'static Adapter> {

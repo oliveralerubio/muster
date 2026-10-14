@@ -208,6 +208,18 @@ fn status_before_init_reports_operational_failure_exit_1() {
 }
 
 #[test]
+fn init_detects_antigravity_by_its_agy_binary() {
+    let env = support::MusterEnv::new();
+    env.fake_exe("agy", "exit 0");
+    let (output, envelope) = init_yes(&env);
+    assert!(output.status.success());
+    let agents = envelope.result()["detected_agents"]
+        .as_array()
+        .expect("detected_agents array");
+    assert!(agents.contains(&"antigravity".into()), "{agents:?}");
+}
+
+#[test]
 fn init_detects_installed_agents_and_offers_import() {
     let env = support::MusterEnv::new();
     env.fake_exe("claude", "exit 0");

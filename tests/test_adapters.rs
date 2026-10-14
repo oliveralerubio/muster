@@ -108,6 +108,175 @@ fn agents_json_envelope_lists_adapters() {
     );
 }
 
+#[test]
+fn antigravity_replaces_gemini_in_agent_list() {
+    let env = MusterEnv::new();
+    seed_config(&env);
+    let (output, envelope) = env.run_json(&["agents", "--format", "json"]);
+    assert!(output.status.success(), "agents must succeed");
+    assert!(envelope.ok(), "envelope ok=true");
+
+    let list = envelope.result()["agents"]
+        .as_array()
+        .expect("result.agents list");
+
+    let antigravity: Vec<&serde_json::Value> = list
+        .iter()
+        .filter(|a| a["id"].as_str() == Some("antigravity"))
+        .collect();
+    let antigravity: &serde_json::Value = antigravity
+        .first()
+        .expect("adapter with id \"antigravity\" must be listed in result.agents");
+    assert_eq!(
+        antigravity["name"].as_str(),
+        Some("Antigravity CLI"),
+        "antigravity adapter name"
+    );
+    assert_eq!(
+        antigravity["experimental"].as_bool(),
+        Some(false),
+        "antigravity must not be experimental"
+    );
+
+    // Antigravity CLI replaced the previous Google agent CLI.
+    assert!(
+        list.iter().all(|a| a["id"].as_str() != Some("gemini")),
+        "no adapter may keep id \"gemini\""
+    );
+    assert!(
+        list.iter().all(|a| !a["name"]
+            .as_str()
+            .map(|n| n.contains("Gemini"))
+            .unwrap_or(false)),
+        "no adapter name may contain \"Gemini\""
+    );
+
+    let capabilities: Vec<&str> = antigravity["capabilities"]
+        .as_array()
+        .expect("capabilities list")
+        .iter()
+        .filter_map(|c| c.as_str())
+        .collect();
+    for expected in ["instructions", "mcp_stdio", "mcp_remote"] {
+        assert!(
+            capabilities.contains(&expected),
+            "antigravity capabilities must include {expected}: {capabilities:?}"
+        );
+    }
+
+    let user_paths: Vec<&str> = antigravity["files"]
+        .as_array()
+        .expect("files list")
+        .iter()
+        .filter_map(|f| f["path"].as_str())
+        .collect();
+    for expected in [".gemini/AGENTS.md", ".gemini/config/mcp_config.json"] {
+        assert!(
+            user_paths.contains(&expected),
+            "antigravity managed user files must include {expected}: {user_paths:?}"
+        );
+    }
+    let project_paths: Vec<&str> = antigravity["files"]
+        .as_array()
+        .expect("files list")
+        .iter()
+        .filter_map(|f| f["project"].as_str())
+        .collect();
+    for expected in ["AGENTS.md", ".agents/mcp_config.json"] {
+        assert!(
+            project_paths.contains(&expected),
+            "antigravity managed project files must include {expected}: {project_paths:?}"
+        );
+    }
+}
+
+fn seed_antigravity_config(env: &MusterEnv) {
+    let cfg = env.config_dir();
+    std::fs::create_dir_all(&cfg).expect("config repo dir");
+    std::fs::write(cfg.join("AGENTS.md"), "Be concise.\n").expect("AGENTS.md");
+    std::fs::write(
+        cfg.join("muster.toml"),
+        r#"
+version = 1
+[agents]
+enabled = ["antigravity"]
+[agents.instructions]
+source = "AGENTS.md"
+[mcp.github]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+[mcp.remote]
+url = "https://example.com/mcp"
+"#,
+    )
+    .expect("write manifest");
+}
+
+#[test]
+fn antigravity_adapter_writes_mcp_config_with_server_url() {
+    let env = MusterEnv::new();
+    seed_antigravity_config(&env);
+    env.run(&["agents", "apply", "--agent", "antigravity", "--yes"])
+        .assert()
+        .code(0);
+    let path = env.path().join(".gemini/config/mcp_config.json");
+    let cfg: Value =
+        serde_json::from_str(&std::fs::read_to_string(path).expect("read")).expect("valid JSON");
+    assert_eq!(cfg["mcpServers"]["github"]["command"], "npx");
+    let remote = &cfg["mcpServers"]["remote"];
+    assert_eq!(remote["serverUrl"], "https://example.com/mcp");
+    assert!(
+        remote.get("url").is_none(),
+        "remote must not use url: {remote}"
+    );
+    assert!(
+        remote.get("httpUrl").is_none(),
+        "remote must not use httpUrl: {remote}"
+    );
+}
+
+#[test]
+fn antigravity_adapter_preserves_unmanaged_mcp_keys() {
+    let env = MusterEnv::new();
+    seed_antigravity_config(&env);
+    let dir = env.path().join(".gemini/config");
+    std::fs::create_dir_all(&dir).expect("gemini config dir");
+    std::fs::write(
+        dir.join("mcp_config.json"),
+        r#"{ "mcpServers": { "mine": { "command": "my-tool", "disabled": true } } }"#,
+    )
+    .expect("seed MCP config");
+    env.run(&["agents", "apply", "--agent", "antigravity", "--yes"])
+        .assert()
+        .code(0);
+    let cfg: Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("mcp_config.json")).expect("read"))
+            .expect("valid JSON");
+    assert_eq!(
+        cfg["mcpServers"]["mine"],
+        serde_json::json!({"command":"my-tool","disabled":true})
+    );
+    assert!(
+        cfg["mcpServers"]["github"].is_object(),
+        "github must be added: {cfg}"
+    );
+}
+
+#[test]
+fn antigravity_adapter_writes_global_rules() {
+    let env = MusterEnv::new();
+    seed_antigravity_config(&env);
+    env.run(&["agents", "apply", "--agent", "antigravity", "--yes"])
+        .assert()
+        .code(0);
+    let rules = std::fs::read_to_string(env.path().join(".gemini/AGENTS.md"))
+        .expect("global AGENTS.md must exist");
+    assert!(
+        rules.contains("Be concise."),
+        "global rules must be copied: {rules}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 2. Format translation & non-destructive merge
 // ---------------------------------------------------------------------------
@@ -377,7 +546,7 @@ fn seed_full_config(env: &MusterEnv) {
 version = 1
 
 [agents]
-enabled = ["claude", "codex", "opencode"]
+enabled = ["claude", "codex", "opencode", "antigravity"]
 
 [agents.models]
 claude = "opus"
@@ -423,6 +592,11 @@ fn generated_files_match_snapshots_per_adapter() {
         ("codex_agents_md", ".codex/AGENTS.md"),
         ("opencode_opencode_json", ".config/opencode/opencode.json"),
         ("opencode_agents_md", ".config/opencode/AGENTS.md"),
+        (
+            "antigravity_mcp_config_json",
+            ".gemini/config/mcp_config.json",
+        ),
+        ("antigravity_agents_md", ".gemini/AGENTS.md"),
     ] {
         insta::assert_snapshot!(name, read(rel));
     }
