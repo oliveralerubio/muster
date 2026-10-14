@@ -55,6 +55,15 @@ impl Identity {
             })
     }
 
+    /// Parses an `AGE-SECRET-KEY-...` string (e.g. the offline recovery key).
+    pub fn from_secret(key: &SecretValue) -> Result<Self, MusterError> {
+        key.expose()
+            .trim()
+            .parse::<age::x25519::Identity>()
+            .map(Self)
+            .map_err(|_| MusterError::Security("invalid age secret key".into()))
+    }
+
     /// The `AGE-SECRET-KEY-...` string, wrapped so it cannot be printed by accident.
     pub fn secret_key(&self) -> SecretValue {
         SecretValue::new(self.0.to_string().expose_secret().to_owned())

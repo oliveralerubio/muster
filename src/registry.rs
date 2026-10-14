@@ -26,6 +26,8 @@ pub struct ParamSpec {
     pub about: &'static str,
     pub kind: ParamKind,
     pub required: bool,
+    /// Taken by position (`muster approve bob`) instead of `--name`.
+    pub positional: bool,
 }
 
 /// One operation. `handler` never prints, exits or reads stdin: it returns the
@@ -86,6 +88,14 @@ pub static COMMANDS: &[CommandSpec] = &[
     crate::commands::init::SPEC,
     crate::commands::schema::SPEC,
     crate::commands::status::SPEC,
+    crate::commands::sync::SPEC,
+    crate::commands::enroll::SPEC,
+    crate::commands::approve::SPEC,
+    crate::commands::revoke::SPEC,
+    crate::commands::machine::LIST,
+    crate::commands::machine::ASSIGN,
+    crate::commands::machine::RM,
+    crate::commands::secret::LIST,
 ];
 
 pub fn find(name: &str) -> Option<&'static CommandSpec> {

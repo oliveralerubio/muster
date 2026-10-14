@@ -33,6 +33,7 @@ pub const APPLY_SPEC: CommandSpec = CommandSpec {
         about: "Apply a single adapter (claude, codex, opencode)",
         kind: ParamKind::String,
         required: false,
+        positional: false,
     }],
     mutating: true,
     handler: apply,
