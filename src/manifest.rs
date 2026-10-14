@@ -60,6 +60,12 @@ pub struct Machine {
     /// RFC 3339 timestamp of the last successful sync, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_sync: Option<String>,
+    /// Free-form role of the machine in the fleet (e.g. `workstation`, `server`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// Agent configuration profile applied to the machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 impl Default for Manifest {
@@ -167,6 +173,8 @@ mod tests {
                 muster_version: "0.1.0".into(),
                 agents: vec!["claude".into()],
                 last_sync: None,
+                role: Some("workstation".into()),
+                profile: None,
             },
         );
         let text = toml::to_string_pretty(&m).unwrap();

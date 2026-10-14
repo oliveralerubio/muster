@@ -41,6 +41,21 @@ pub fn default_name() -> String {
     }
 }
 
+/// Fleet machine names: lowercase letters, digits and `-`.
+pub fn validate_name(name: &str) -> Result<String, MusterError> {
+    let valid = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    if valid {
+        Ok(name.to_string())
+    } else {
+        Err(MusterError::Usage(format!(
+            "invalid machine name '{name}': use lowercase letters, digits and '-'"
+        )))
+    }
+}
+
 /// This machine's fleet name, recorded in `<state_dir>/machine`.
 pub fn load_name(state_dir: &Path) -> Option<String> {
     fs::read_to_string(state_dir.join(NAME_FILE))

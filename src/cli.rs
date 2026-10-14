@@ -128,10 +128,8 @@ fn leaf_command(name: &'static str, spec: &'static CommandSpec) -> Command {
     spec.params
         .iter()
         .fold(Command::new(name).about(spec.about), |cmd, p| {
-            let arg = Arg::new(p.name)
-                .long(p.name)
-                .help(p.about)
-                .required(p.required);
+            let arg = Arg::new(p.name).help(p.about).required(p.required);
+            let arg = if p.positional { arg } else { arg.long(p.name) };
             cmd.arg(match p.kind {
                 ParamKind::String => arg,
                 ParamKind::Bool => arg.action(ArgAction::SetTrue),

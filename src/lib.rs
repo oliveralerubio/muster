@@ -5,6 +5,8 @@ pub mod cli;
 pub mod commands;
 pub mod context;
 pub mod errors;
+pub mod fleet;
+pub mod git;
 pub mod identity;
 pub mod machine;
 pub mod manifest;

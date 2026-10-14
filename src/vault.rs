@@ -147,14 +147,7 @@ impl Vault {
 
     /// Metadata for every secret in `group`, sorted by name. Needs no identity.
     pub fn list(&self, group: &str) -> Result<Vec<SecretMeta>, MusterError> {
-        validate_segment("group", group)?;
-        let path = self.meta_path(group);
-        let text = fs::read_to_string(&path).map_err(|e| io_err(&path, e))?;
-        let meta: GroupMeta =
-            serde_json::from_str(&text).map_err(|e| MusterError::InvalidConfig {
-                message: format!("corrupt vault metadata: {e}"),
-                path: Some(path.display().to_string()),
-            })?;
+        let meta = self.read_meta(group)?;
         let mut list: Vec<SecretMeta> = meta
             .secrets
             .into_iter()
@@ -167,6 +160,26 @@ impl Vault {
             .collect();
         list.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(list)
+    }
+
+    /// Names of every group in the vault, sorted. Needs no identity.
+    pub fn groups(&self) -> Result<Vec<String>, MusterError> {
+        let entries = fs::read_dir(&self.dir).map_err(|e| io_err(&self.dir, e))?;
+        let mut groups = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| io_err(&self.dir, e))?;
+            let file = entry.file_name();
+            if let Some(group) = file.to_str().and_then(|f| f.strip_suffix(".meta.json")) {
+                groups.push(group.to_owned());
+            }
+        }
+        groups.sort();
+        Ok(groups)
+    }
+
+    /// Current recipients (readers) of `group`, from metadata. Needs no identity.
+    pub fn readers(&self, group: &str) -> Result<Vec<String>, MusterError> {
+        Ok(self.read_meta(group)?.recipients)
     }
 
     /// Re-encrypts `group` for exactly `new_recipients`.
@@ -206,6 +219,16 @@ impl Vault {
 
     fn meta_path(&self, group: &str) -> PathBuf {
         self.dir.join(format!("{group}.meta.json"))
+    }
+
+    fn read_meta(&self, group: &str) -> Result<GroupMeta, MusterError> {
+        validate_segment("group", group)?;
+        let path = self.meta_path(group);
+        let text = fs::read_to_string(&path).map_err(|e| io_err(&path, e))?;
+        serde_json::from_str(&text).map_err(|e| MusterError::InvalidConfig {
+            message: format!("corrupt vault metadata: {e}"),
+            path: Some(path.display().to_string()),
+        })
     }
 
     fn read(&self, group: &str, id: &Identity) -> Result<GroupData, MusterError> {

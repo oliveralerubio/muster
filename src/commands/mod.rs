@@ -1,3 +1,9 @@
+pub mod approve;
+pub mod enroll;
 pub mod init;
+pub mod machine;
+pub mod revoke;
 pub mod schema;
+pub mod secret;
 pub mod status;
+pub mod sync;

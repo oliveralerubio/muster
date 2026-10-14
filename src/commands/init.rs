@@ -23,6 +23,7 @@ pub const SPEC: CommandSpec = CommandSpec {
         about: "Name of this machine in the fleet [default: hostname]",
         kind: ParamKind::String,
         required: false,
+        positional: false,
     }],
     mutating: true,
     handler: run,
@@ -43,7 +44,7 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         )));
     }
     let name = match params.get_string("machine") {
-        Some(name) => validate_name(name)?,
+        Some(name) => machine::validate_name(name)?,
         None => machine::default_name(),
     };
     let agents = machine::detect_agents();
@@ -96,6 +97,8 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
             muster_version: env!("CARGO_PKG_VERSION").into(),
             agents: agents.clone(),
             last_sync: None,
+            role: None,
+            profile: None,
         },
     );
     manifest.save(&config_dir)?;
@@ -127,20 +130,6 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         "recovery_recipient": recovery.recipient(),
         "detected_agents": agents,
     }))
-}
-
-fn validate_name(name: &str) -> Result<String, MusterError> {
-    let valid = !name.is_empty()
-        && name
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
-    if valid {
-        Ok(name.to_string())
-    } else {
-        Err(MusterError::Usage(format!(
-            "invalid machine name '{name}': use lowercase letters, digits and '-'"
-        )))
-    }
 }
 
 fn create_dir(path: &Path) -> Result<(), MusterError> {

@@ -1,0 +1,190 @@
+//! Thin wrapper over the `git` binary for the config repo (commit, remote,
+//! push, pull). Git is the spec's only external dependency.
+
+use std::path::Path;
+use std::process::{Command, Output};
+
+use crate::errors::MusterError;
+
+const REMOTE: &str = "origin";
+
+/// Outcome of [`pull`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pulled {
+    /// The remote has no branch yet; nothing to pull.
+    Empty,
+    /// Local history now contains the remote branch (fast-forward or rebase).
+    Updated,
+    /// Local history was unrelated to the remote (a machine joining an existing
+    /// fleet): it was saved under `backup` and replaced by the remote branch.
+    Joined { backup: &'static str },
+}
+
+const JOIN_BACKUP_REF: &str = "refs/muster/pre-join";
+
+pub fn is_repo(dir: &Path) -> bool {
+    dir.join(".git").exists()
+}
+
+/// Stages everything and commits when the config dir is a git repo with
+/// changes. Returns whether a commit was created.
+pub fn commit_if_configured(dir: &Path, message: &str) -> Result<bool, MusterError> {
+    if !is_repo(dir) {
+        return Ok(false);
+    }
+    check(dir, &["add", "-A"])?;
+    if run(dir, &["diff", "--cached", "--quiet"])?.status.success() {
+        return Ok(false);
+    }
+    let mut args: Vec<&str> = Vec::new();
+    // Fresh machines often have no git identity; never fail a fleet operation on it.
+    if !has_config(dir, "user.email") {
+        args.extend([
+            "-c",
+            "user.name=Muster",
+            "-c",
+            "user.email=muster@localhost",
+        ]);
+    }
+    args.extend(["commit", "--quiet", "-m", message]);
+    check(dir, &args)?;
+    Ok(true)
+}
+
+pub fn has_remote(dir: &Path) -> bool {
+    is_repo(dir) && run(dir, &["remote", "get-url", REMOTE]).is_ok_and(|o| o.status.success())
+}
+
+/// Adds or updates the `origin` remote.
+pub fn set_remote(dir: &Path, url: &str) -> Result<(), MusterError> {
+    require_repo(dir)?;
+    if has_remote(dir) {
+        check(dir, &["remote", "set-url", REMOTE, url])
+    } else {
+        check(dir, &["remote", "add", REMOTE, url])
+    }
+}
+
+/// Pushes the current branch to `origin` (no-op without local commits).
+pub fn push(dir: &Path) -> Result<(), MusterError> {
+    require_remote(dir)?;
+    if !has_commits(dir) {
+        return Ok(());
+    }
+    let branch = current_branch(dir)?;
+    let refspec = format!("HEAD:refs/heads/{branch}");
+    check(dir, &["push", "--quiet", "-u", REMOTE, &refspec])
+}
+
+/// Fetches `origin` and integrates its copy of the current branch.
+pub fn pull(dir: &Path) -> Result<Pulled, MusterError> {
+    require_remote(dir)?;
+    check(dir, &["fetch", "--quiet", REMOTE])?;
+    let branch = current_branch(dir)?;
+    let upstream = format!("{REMOTE}/{branch}");
+    let upstream_ref = format!("refs/remotes/{upstream}");
+    if !run(dir, &["rev-parse", "--verify", "--quiet", &upstream_ref])?
+        .status
+        .success()
+    {
+        return Ok(Pulled::Empty);
+    }
+    if !has_commits(dir) {
+        check(dir, &["reset", "--quiet", "--hard", &upstream])?;
+        return Ok(Pulled::Joined {
+            backup: JOIN_BACKUP_REF,
+        });
+    }
+    let related = run(dir, &["merge-base", "HEAD", &upstream])?
+        .status
+        .success();
+    if !related {
+        check(dir, &["update-ref", JOIN_BACKUP_REF, "HEAD"])?;
+        check(dir, &["reset", "--quiet", "--hard", &upstream])?;
+        return Ok(Pulled::Joined {
+            backup: JOIN_BACKUP_REF,
+        });
+    }
+    let mut args: Vec<&str> = Vec::new();
+    if !has_config(dir, "user.email") {
+        args.extend([
+            "-c",
+            "user.name=Muster",
+            "-c",
+            "user.email=muster@localhost",
+        ]);
+    }
+    args.extend(["rebase", "--quiet", &upstream]);
+    if let Err(e) = check(dir, &args) {
+        let _ = run(dir, &["rebase", "--abort"]);
+        return Err(MusterError::Operational(format!(
+            "local changes conflict with {upstream}; resolve manually: {e}"
+        )));
+    }
+    Ok(Pulled::Updated)
+}
+
+fn current_branch(dir: &Path) -> Result<String, MusterError> {
+    let out = run(dir, &["symbolic-ref", "--short", "HEAD"])?;
+    if !out.status.success() {
+        return Err(MusterError::Operational(
+            "config repo is on a detached HEAD; check out a branch first".into(),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn has_commits(dir: &Path) -> bool {
+    run(dir, &["rev-parse", "--verify", "--quiet", "HEAD"]).is_ok_and(|o| o.status.success())
+}
+
+fn has_config(dir: &Path, key: &str) -> bool {
+    run(dir, &["config", "--get", key])
+        .is_ok_and(|o| o.status.success() && !o.stdout.trim_ascii().is_empty())
+}
+
+fn require_repo(dir: &Path) -> Result<(), MusterError> {
+    if is_repo(dir) {
+        Ok(())
+    } else {
+        Err(MusterError::Operational(format!(
+            "{} is not a git repository; run `muster init` first",
+            dir.display()
+        )))
+    }
+}
+
+fn require_remote(dir: &Path) -> Result<(), MusterError> {
+    require_repo(dir)?;
+    if has_remote(dir) {
+        Ok(())
+    } else {
+        Err(MusterError::Usage(
+            "no remote configured; run `muster sync --remote <url>` first".into(),
+        ))
+    }
+}
+
+fn run(dir: &Path, args: &[&str]) -> Result<Output, MusterError> {
+    Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .map_err(|e| MusterError::Unavailable(format!("cannot run git: {e}")))
+}
+
+fn check(dir: &Path, args: &[&str]) -> Result<(), MusterError> {
+    let out = run(dir, args)?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(MusterError::Operational(format!(
+            "git {} failed: {}",
+            args.iter()
+                .find(|a| !a.starts_with('-') && !a.contains('='))
+                .unwrap_or(&"command"),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )))
+    }
+}
