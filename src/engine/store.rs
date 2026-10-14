@@ -35,6 +35,8 @@ pub struct Record {
     pub private: bool,
     /// Muster created the file (it did not exist before the first apply).
     pub created: bool,
+    /// Written executable (managed dotfiles).
+    pub executable: bool,
     pub contents: String,
 }
 
@@ -64,6 +66,8 @@ struct DiskRecord {
     owned: Vec<Vec<String>>,
     private: bool,
     created: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    executable: bool,
     snapshot: String,
 }
 
@@ -140,6 +144,7 @@ pub fn load(state_dir: &Path, n: u64) -> Result<State, MusterError> {
                 owned: r.owned,
                 private: r.private,
                 created: r.created,
+                executable: r.executable,
                 contents,
             },
         );
@@ -210,6 +215,7 @@ impl Pending {
                     owned: record.owned.clone(),
                     private: record.private,
                     created: record.created,
+                    executable: record.executable,
                     snapshot,
                 },
             );

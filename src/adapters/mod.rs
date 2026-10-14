@@ -46,6 +46,8 @@ pub enum FileFormat {
     Json,
     Toml,
     Markdown,
+    /// Whole file owned by Muster (managed dotfiles).
+    Text,
 }
 
 /// A file an adapter manages (only some keys/blocks inside it).

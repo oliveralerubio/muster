@@ -71,6 +71,33 @@ fn bws_field(reference: &SecretRef, stdout: String) -> Result<String, ProviderEr
     }
 }
 
+/// Every secret of a Bitwarden project (`bws secret list [PROJECT] --output
+/// json`) as `(key, value)` pairs, for `muster import bws`. The CLI output is
+/// zeroized; parse errors never quote it.
+pub fn bws_list(project: Option<&str>) -> Result<Vec<(String, SecretValue)>, MusterError> {
+    #[derive(serde::Deserialize)]
+    struct Item {
+        key: String,
+        value: String,
+    }
+    let mut args = vec!["secret".to_string(), "list".to_string()];
+    args.extend(project.map(str::to_string));
+    args.extend(["--output".to_string(), "json".to_string()]);
+    let mut stdout = Cli::new(&BWS).run(&args)?;
+    let parsed = serde_json::from_str::<Vec<Item>>(&stdout);
+    stdout.zeroize();
+    let items = parsed.map_err(|_| {
+        ProviderError::new(
+            ProviderErrorKind::Unavailable,
+            "bws secret list did not return a JSON array of {key, value} objects",
+        )
+    })?;
+    Ok(items
+        .into_iter()
+        .map(|item| (item.key, SecretValue::new(item.value)))
+        .collect())
+}
+
 pub static DOPPLER: CliSpec = CliSpec {
     scheme: Scheme::Doppler,
     name: "Doppler",
