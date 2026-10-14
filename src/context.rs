@@ -31,6 +31,7 @@ pub struct Context {
     pub verbose: bool,
     pub is_tty: bool,
     diagnostics: Vec<Diagnostic>,
+    failed: bool,
 }
 
 impl Context {
@@ -50,6 +51,7 @@ impl Context {
             verbose: globals.verbose,
             is_tty: std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
             diagnostics: Vec::new(),
+            failed: false,
         })
     }
 
@@ -59,6 +61,16 @@ impl Context {
 
     pub fn take_diagnostics(&mut self) -> Vec<Diagnostic> {
         std::mem::take(&mut self.diagnostics)
+    }
+
+    /// The command ran and has a result, but must report `ok: false` and exit 1
+    /// (e.g. `doctor` found error diagnostics).
+    pub fn mark_failed(&mut self) {
+        self.failed = true;
+    }
+
+    pub fn failed(&self) -> bool {
+        self.failed
     }
 
     /// Progress line on stderr, silenced by `--quiet`.
@@ -175,6 +187,7 @@ mod tests {
             verbose: false,
             is_tty: false,
             diagnostics: Vec::new(),
+            failed: false,
         }
     }
 

@@ -5,6 +5,7 @@ pub mod adapters;
 pub mod cli;
 pub mod commands;
 pub mod context;
+pub mod doctor;
 pub mod engine;
 pub mod errors;
 pub mod fleet;

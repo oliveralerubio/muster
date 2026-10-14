@@ -787,6 +787,21 @@ impl Roots {
     }
 }
 
+/// Managed files that held resolved secrets as of the last generation (they
+/// must stay 0600). Used by `doctor`.
+pub fn private_files(state_dir: &Path) -> Result<Vec<PathBuf>, MusterError> {
+    Ok(store::latest(state_dir)?
+        .map(|(_, state)| {
+            state
+                .files
+                .into_iter()
+                .filter(|(_, record)| record.private)
+                .map(|(path, _)| PathBuf::from(path))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------

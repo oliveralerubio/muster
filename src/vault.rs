@@ -6,7 +6,7 @@
 //! - `vault/<group>.age`       armored age ciphertext of [`GroupData`] JSON
 //! - `vault/<group>.meta.json` names, timestamps and recipients only
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -69,6 +69,15 @@ struct EntryMeta {
     created_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     updated_by: Option<String>,
+}
+
+/// One integrity problem found by [`Vault::verify`]. Never carries values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Problem {
+    pub group: String,
+    /// The offending file.
+    pub path: PathBuf,
+    pub message: String,
 }
 
 pub struct Vault {
@@ -234,6 +243,77 @@ impl Vault {
             return Err(invalid());
         }
         self.get(group, name, id)
+    }
+
+    /// Integrity of every group: both files present, metadata readable, a
+    /// valid age header and, when `id` is one of the group's readers, a
+    /// successful decryption (values are dropped at once).
+    pub fn verify(&self, id: Option<&Identity>) -> Result<Vec<Problem>, MusterError> {
+        let entries = fs::read_dir(&self.dir).map_err(|e| io_err(&self.dir, e))?;
+        let mut groups = BTreeSet::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| io_err(&self.dir, e))?;
+            let file = entry.file_name();
+            let file = file.to_string_lossy();
+            if let Some(group) = file
+                .strip_suffix(".meta.json")
+                .or_else(|| file.strip_suffix(".age"))
+            {
+                groups.insert(group.to_owned());
+            }
+        }
+        let mut problems = Vec::new();
+        for group in groups {
+            let (age_path, meta_path) = (self.age_path(&group), self.meta_path(&group));
+            let mut problem = |path: &Path, message: String| {
+                problems.push(Problem {
+                    group: group.clone(),
+                    path: path.to_path_buf(),
+                    message,
+                })
+            };
+            if !age_path.is_file() {
+                problem(
+                    &meta_path,
+                    format!("{group}.age is missing (metadata without ciphertext)"),
+                );
+                continue;
+            }
+            if !meta_path.is_file() {
+                problem(
+                    &age_path,
+                    format!("{group}.meta.json is missing (ciphertext without metadata)"),
+                );
+                continue;
+            }
+            let readers = match self.read_meta(&group) {
+                Ok(meta) => meta.recipients,
+                Err(e) => {
+                    problem(&meta_path, e.to_string());
+                    continue;
+                }
+            };
+            let armored = match fs::read(&age_path) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    problem(&age_path, io_err(&age_path, e).to_string());
+                    continue;
+                }
+            };
+            if let Err(e) = age::Decryptor::new(age::armor::ArmoredReader::new(&armored[..])) {
+                problem(&age_path, format!("not a valid age file: {e}"));
+                continue;
+            }
+            if let Some(id) = id.filter(|id| readers.contains(&id.recipient())) {
+                if let Err(e) = self.read(&group, id) {
+                    problem(
+                        &age_path,
+                        format!("this machine is a reader but cannot decrypt it: {e}"),
+                    );
+                }
+            }
+        }
+        Ok(problems)
     }
 
     fn age_path(&self, group: &str) -> PathBuf {
