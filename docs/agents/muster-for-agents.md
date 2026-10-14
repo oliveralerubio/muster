@@ -92,6 +92,18 @@ The MCP server runs over stdio using newline-delimited JSON-RPC 2.0.
 - Removed skills are deleted on the next apply; hand-added skills are never touched.
 - Invalid skills (no `SKILL.md`, or missing `name`/`description`) are skipped with a `skill_invalid` warning; exit code stays `0`.
 
+### Skill lifecycle commands
+
+- Own skills: `muster skill add <name> --description "..."` scaffolds `<source>/<name>/SKILL.md`.
+- Subscriptions: `muster skill add --url <git> [--ref <ref>] [--path <dir>] [--include a,b] [--source-name <id>]` adds `[[agents.skills.remote]]` to `muster.toml` and vendors the skills into the skills folder.
+- `skill.list` is offline: it reads `skills.lock`, the per-machine status cache (`<state>/skills-status.json`) and on-disk hashes. Each skill has `origin`, `version`, `updated_at`, `status`, `modified`, `needs_attention`.
+- `skill.check [name]` fetches sources (shallow git into `$XDG_CACHE_HOME/muster/skill-sources/`). Diagnostics: `skill_update_available`, `skill_deprecated`, `skill_upstream_removed`, `skill_source_unreachable`.
+- `skill.update <name>|--all [--force] [--dry-run] --yes`: result `updated[].files` has `added`, `changed`, `removed`. Refuses `upstream_removed` and locally `modified` skills (unless `--force`).
+- `skill.rm <name> --yes` deletes; `--detach` keeps a subscribed skill as `origin = "local"`.
+- Statuses: `local | up_to_date | update_available | deprecated | upstream_removed | unknown`. Deprecated wins over update_available. Nothing is updated or deleted without an explicit command.
+- Team mode: `add`, `update`, `rm` need an admin (exit 5 otherwise); `list` and `check` are open to members.
+- Web API: `GET /api/skills`, `POST /api/skills/check|add|update|rm` (`{"confirm": true}` for update/rm).
+
 ## Proposal Flow (Agents Proposing Changes)
 
 When an agent needs to adjust Muster configuration (e.g. adding an MCP server, tuning agent instructions, modifying dotfiles):

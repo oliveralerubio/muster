@@ -193,6 +193,12 @@ El mismo producto sirve a dos públicos:
     | Antigravity CLI | `~/.gemini/antigravity-cli/skills/<skill>/` | `.agents/skills/<skill>/` |
 
     Codex y Antigravity comparten `.agents/skills` en proyecto; el archivo se escribe una sola vez.
+  - **Ciclo de vida de skills** (`muster skill`): skills propias (en el repo de configuración, bajo `[agents.skills] source`) y suscritas desde repositorios git externos (`[[agents.skills.remote]]` con `name`, `url`, `ref`, `path`, `include` opcionales). Las externas se copian (vendoring) en la carpeta de skills, así que el motor y los adaptadores no cambian y todas las máquinas las reciben por la sincronización git normal.
+    - `skills.lock` (TOML, junto a `muster.toml`, versionado): por skill `name`, `origin` (`local` o id de la fuente), `commit` (externas), `content_hash` (`sha256:` sobre rutas relativas ordenadas y contenido normalizado a LF), `version` (frontmatter de `SKILL.md`) y `updated_at` (RFC 3339).
+    - Estados: `local`, `up_to_date`, `update_available`, `deprecated` (frontmatter upstream `deprecated: true` o `deprecated: "<motivo>"`; gana a `update_available`), `upstream_removed`, `unknown` (sin comprobar o fuente inalcanzable; se conserva el último estado conocido). La última comprobación se guarda por máquina en `<state>/skills-status.json` (no versionado).
+    - Comandos: `skill list` (sin red), `skill add <nombre>` / `skill add --url`, `skill check [nombre]`, `skill update <nombre>|--all [--force] [--dry-run]` (resumen de archivos añadidos/cambiados/eliminados), `skill rm <nombre> [--detach]`. `update` y `rm` piden confirmación (`--yes`). Nunca se aplica una actualización ni se borra una skill sin orden explícita; una skill editada a mano aparece como `modified` y `update` se niega sin `--force`.
+    - En modo equipo solo los administradores añaden, actualizan o quitan skills (commits con `Muster-Actor`); los miembros pueden listar y comprobar.
+    - Panel web: pestaña Skills con estado, botón para comprobar repositorios, actualizar (con resumen de archivos), quitar y, para `upstream_removed`, conservar como propia o eliminar; un punto en la pestaña avisa cuando algo requiere atención.
   - La traducción de formatos imita el modelo de rulesync, pero se implementa con código propio.
 - **Motor de aplicación**
   - Reemplaza a chezmoi: estado deseado → plan → diff → apply idempotente.

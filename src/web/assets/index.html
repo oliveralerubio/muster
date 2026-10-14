@@ -17,6 +17,7 @@
         <li><button type="button" role="tab" data-view="machines">Machines</button></li>
         <li><button type="button" role="tab" data-view="team">Members &amp; groups</button></li>
         <li><button type="button" role="tab" data-view="secrets">Secrets</button></li>
+        <li><button type="button" role="tab" data-view="skills">Skills <span id="skills-dot" class="dot" hidden title="Needs attention"></span></button></li>
         <li><button type="button" role="tab" data-view="profiles">Profiles &amp; diff</button></li>
         <li><button type="button" role="tab" data-view="history">History</button></li>
         <li><button type="button" role="tab" data-view="doctor">Doctor</button></li>
@@ -47,6 +48,19 @@
     </form>
   </dialog>
 
+  <dialog id="secret-edit">
+    <form id="secret-form">
+      <h2 id="secret-edit-title">New secret</h2>
+      <p><label>Name (group/name) <input id="secret-path" required autocomplete="off"></label></p>
+      <p><label>Value <input id="secret-input" type="password" autocomplete="new-password" required></label></p>
+      <p><label><input id="secret-confirm" type="checkbox" required> I confirm saving this value</label></p>
+      <div class="actions">
+        <button id="secret-save" type="submit" class="primary">Save</button>
+        <button id="secret-cancel" type="button">Cancel</button>
+      </div>
+      <p id="secret-error" role="alert"></p>
+    </form>
+  </dialog>
   <script src="/app.js"></script>
 </body>
 </html>

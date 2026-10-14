@@ -11,6 +11,9 @@
 //!   POST; confirmations need `{"confirm": true}` (the CLI's `--yes`).
 //! - `POST /api/secret/reveal {"name", "confirm": true}` is the only path that
 //!   returns a secret value, and it is recorded in the local history first.
+//! - `POST /api/secret/add|rotate` accepts `path`, `value` and `confirm: true`.
+//!   Values go directly to the shared vault handlers, never command parameters,
+//!   responses or history; the CLI equivalent uses `--value-stdin`.
 
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
@@ -33,9 +36,9 @@ const COOKIE: &str = "muster_session";
 const MAX_BODY: u64 = 64 * 1024;
 
 /// One API route: `GET|POST /api/<path>` runs `command`. Commands that read
-/// secrets from stdin, bootstrap identities or start servers (`init`,
-/// `secret add|rotate`, `ui`, `mcp`) are deliberately absent; secret values
-/// only leave through the audited `secret/reveal` route.
+/// stdin, bootstrap identities or start servers (`init`, `ui`, `mcp`) are
+/// absent. Secret writes use a dedicated body-only path; values only leave
+/// through the audited `secret/reveal` route.
 struct Route {
     path: &'static str,
     command: &'static str,
@@ -93,6 +96,11 @@ const ROUTES: &[Route] = &[
     post("secret/rm", "secret.rm"),
     post("proposal/create", "proposal.create"),
     post("proposal/accept", "proposal.accept"),
+    get("skills", "skill.list"),
+    post("skills/check", "skill.check"),
+    post("skills/add", "skill.add"),
+    post("skills/update", "skill.update"),
+    post("skills/rm", "skill.rm"),
 ];
 /// Body keys that map to global flags rather than command parameters.
 const CONFIRM: &str = "confirm";
@@ -277,11 +285,12 @@ impl Ui {
         match (name, post) {
             ("history", false) => return self.history(),
             ("secret/reveal", true) => return self.reveal(body),
+            ("secret/add" | "secret/rotate", true) => return self.write_secret(name, body),
             _ => {}
         }
         let Some(route) = ROUTES.iter().find(|r| r.path == name && r.post == post) else {
             let other = ROUTES.iter().any(|r| r.path == name) || name == "history";
-            return if other || name == "secret/reveal" {
+            return if other || matches!(name, "secret/reveal" | "secret/add" | "secret/rotate") {
                 Reply::error(405, &format!("wrong method for /api/{name}"))
             } else {
                 Reply::error(404, &format!("unknown API route /api/{name}"))
@@ -335,6 +344,66 @@ impl Ui {
             vec![err.to_diagnostic()],
             cli,
             status,
+        )
+    }
+
+    fn write_secret(&self, route: &str, mut body: Map<String, Value>) -> Reply {
+        use crate::commands::secret;
+        use crate::secrets::SecretValue;
+        let spec = if route == "secret/add" {
+            &secret::ADD
+        } else {
+            &secret::ROTATE
+        };
+        // Move the value into zeroizing storage before validating anything else.
+        let value = match body.remove("value") {
+            Some(Value::String(value)) => SecretValue::new(value),
+            _ => return Reply::error(400, "value must be a string"),
+        };
+        if body.get(CONFIRM).and_then(Value::as_bool) != Some(true) {
+            return Reply::error(400, "secret writes require confirm: true");
+        }
+        if !body.contains_key("path") {
+            if let Some(name) = body.remove("name") {
+                let path = match (body.remove("group"), name) {
+                    (Some(Value::String(group)), Value::String(name)) => {
+                        Value::String(format!("{group}/{name}"))
+                    }
+                    (None, name) => name,
+                    _ => return Reply::error(400, "name and group must be strings"),
+                };
+                body.insert("path".into(), path);
+            }
+        }
+        let (mut params, flags) = match parse_params(spec, &[], body) {
+            Ok(parsed) => parsed,
+            Err(e) => return self.failure(spec, &cli_line(spec, &[], Flags::default()), e),
+        };
+        params.push(("value-stdin".into(), Value::Bool(true)));
+        let cli = cli_line(spec, &params, flags);
+        let mut typed = Params::default();
+        for (k, v) in params {
+            typed.set(k, v);
+        }
+        let globals = Globals {
+            config: Some(self.config_dir.clone()),
+            format: Some(Format::Json),
+            yes: true,
+            dry_run: flags.dry_run,
+            quiet: true,
+            verbose: false,
+        };
+        let (envelope, code) = crate::cli::execute_with(spec, globals, false, |ctx| {
+            if route == "secret/add" {
+                secret::add_with_value(ctx, &typed, value)
+            } else {
+                secret::rotate_with_value(ctx, &typed, value)
+            }
+        });
+        reply(
+            &envelope,
+            &cli,
+            if code == 0 { 200 } else { http_status(code) },
         )
     }
 
@@ -589,16 +658,19 @@ fn read_json(request: &mut Request) -> Result<Map<String, Value>, Reply> {
     if !json_type {
         return Err(Reply::error(415, "POST bodies must be application/json"));
     }
-    let mut text = String::new();
+    let mut text = secrecy::zeroize::Zeroizing::new(Vec::new());
     request
         .as_reader()
-        .take(MAX_BODY)
-        .read_to_string(&mut text)
+        .take(MAX_BODY + 1)
+        .read_to_end(&mut text)
         .map_err(|_| Reply::error(400, "unreadable body"))?;
-    if text.trim().is_empty() {
+    if text.len() as u64 > MAX_BODY {
+        return Err(Reply::error(413, "body exceeds 64 KB"));
+    }
+    if text.iter().all(u8::is_ascii_whitespace) {
         return Ok(Map::new());
     }
-    match serde_json::from_str(&text) {
+    match serde_json::from_slice(&text) {
         Ok(Value::Object(map)) => Ok(map),
         _ => Err(Reply::error(400, "the body must be a JSON object")),
     }

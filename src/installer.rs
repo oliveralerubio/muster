@@ -14,9 +14,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::errors::MusterError;
+use crate::hash::sha256_hex;
 
 pub const LOCK_FILE: &str = "muster.lock";
 
@@ -127,13 +127,6 @@ fn default_bin<'a>(agent: &'a str, pin: &'a Pin) -> &'a str {
             .map(|a| a.binary)
             .unwrap_or(agent)
     })
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
 }
 
 /// `file://` is read directly; `https://` goes through `curl` (exit 4 if missing).

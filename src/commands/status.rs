@@ -51,7 +51,18 @@ fn run(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
     }
 
     let team = crate::team::drift(&ctx.config_dir, &manifest);
+    let sync = match std::fs::read(ctx.state_dir.join("sync-status.json")) {
+        Ok(bytes) => serde_json::from_slice::<Value>(&bytes)
+            .map_err(|e| MusterError::Operational(format!("invalid sync status: {e}")))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Value::Null,
+        Err(e) => {
+            return Err(MusterError::Operational(format!(
+                "cannot read sync status: {e}"
+            )))
+        }
+    };
     Ok(json!({
+        "sync": sync,
         "config_path": ctx.config_dir,
         "machines": machines,
         "pending": team["pending"],

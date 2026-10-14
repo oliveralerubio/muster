@@ -76,6 +76,8 @@ const views = {
     const drift = r.drift || {};
     const driftCount = (drift.members || []).length + (drift.machines || []).length;
     render("Dashboard (fleet panel)", [button("Sync now", () => act("Pull, plan and apply now?", "sync"), "primary")],
+      el("h2", {}, "Last sync"),
+      el("p", {}, r.sync ? `${r.sync.ts} · ${r.sync.result}` : "Never"),
       table(["Machines", "Pending members", "Drift"], [[machines.length, pending.length, driftCount]]),
       el("h2", {}, "Fleet"),
       table(["Name", "Platform", "Version", "Status", "Last sync"],
@@ -120,12 +122,71 @@ const views = {
   async secrets() {
     const data = await api("secrets");
     const secrets = Array.isArray(data.result) ? data.result : [];
-    render("Secrets", [],
+    render("Secrets", [button("New secret", () => openSecretEdit(), "primary")],
       el("p", {}, "Metadata only. Revealing a value needs explicit confirmation and is recorded."),
       table(["Reference", "Updated", "By", "Readers", ""],
         secrets.map((s) => [s.reference, s.updated_at || "", s.updated_by || "",
           (s.readers || []).map((r) => r.machine || r.recipient).join(", "),
-          button("Reveal…", () => openReveal(s.reference))])),
+          el("div", { class: "actions" }, button("Reveal…", () => openReveal(s.reference)),
+            button("Change value", () => openSecretEdit(s.reference)))])),
+      diagnostics(data));
+  },
+
+  async skills() {
+    const data = await api("skills");
+    const r = data.result || {};
+    const skills = r.skills || [];
+    updateSkillsDot(r);
+    const badgeClass = {
+      local: "", up_to_date: "success", update_available: "info",
+      deprecated: "warning", upstream_removed: "danger", unknown: "",
+    };
+    const statusLabel = {
+      local: "own", up_to_date: "up to date", update_available: "update available",
+      deprecated: "deprecated", upstream_removed: "removed upstream", unknown: "unknown",
+    };
+    const rows = skills.map((s) => {
+      const status = el("span", { class: "badge " + (badgeClass[s.status] || "") }, statusLabel[s.status] || s.status);
+      if (s.reason) status.setAttribute("title", s.reason);
+      const actions = [];
+      if (s.status === "upstream_removed") {
+        actions.push(button("Keep as own", () => act(`Keep ${s.name} as an own skill and stop following ${s.origin}?`, "skills/rm", { name: s.name, detach: true })));
+        actions.push(button("Delete", () => act(`Delete skill ${s.name} and its files?`, "skills/rm", { name: s.name }), "danger"));
+      } else {
+        if (s.origin !== "local") actions.push(button("Update", () => updateSkill(s)));
+        actions.push(button("Remove", () => act(`Delete skill ${s.name} and its files?`, "skills/rm", { name: s.name }), "danger"));
+      }
+      return [
+        s.name,
+        el("span", { class: "badge" + (s.origin === "local" ? "" : " info") }, s.origin === "local" ? "own" : s.origin),
+        s.version || "",
+        s.updated_at || "",
+        status,
+        s.modified ? el("span", { class: "badge warning", title: "Edited locally since it was vendored" }, "modified") : "",
+        el("span", { class: "actions" }, actions),
+      ];
+    });
+    const name = el("input", { type: "text", placeholder: "new-skill", "aria-label": "Skill name" });
+    const description = el("input", { type: "text", placeholder: "Description", "aria-label": "Skill description" });
+    const url = el("input", { type: "url", placeholder: "https://github.com/org/skills", "aria-label": "Repository URL" });
+    const path = el("input", { type: "text", placeholder: "path (optional)", "aria-label": "Skills directory in the repository" });
+    const include = el("input", { type: "text", placeholder: "only: a,b (optional)", "aria-label": "Skills to include" });
+    render("Skills", [
+      button("Check repositories", async () => { await api("skills/check", {}); await show("skills"); }, "primary"),
+      button("Update all", () => updateAll()),
+    ],
+      el("p", {}, r.checked_at ? `Last upstream check: ${r.checked_at}.` : "Upstream sources not checked yet on this machine."),
+      table(["Name", "Origin", "Version", "Updated", "Status", "", ""], rows),
+      el("h2", {}, "Add an own skill"),
+      el("div", { class: "skill-form" }, name, description,
+        button("Create", () => act(`Create skill ${name.value}?`, "skills/add", { name: name.value, description: description.value || undefined }))),
+      el("h2", {}, "Subscribe to a repository"),
+      el("div", { class: "skill-form" }, url, path, include,
+        button("Subscribe", () => act(`Subscribe to ${url.value}?`, "skills/add", {
+          url: url.value,
+          path: path.value || undefined,
+          include: include.value ? include.value.split(",").map((x) => x.trim()).filter(Boolean) : undefined,
+        }))),
       diagnostics(data));
   },
 
@@ -169,6 +230,44 @@ const views = {
       diagnostics(data));
   },
 };
+
+// Skills: the tab shows a dot while anything needs a decision.
+function updateSkillsDot(result) {
+  $("#skills-dot").hidden = !(result && result.attention > 0);
+}
+
+function fileSummary(files) {
+  const part = (label, list) => (list && list.length ? `${label}: ${list.join(", ")}` : null);
+  return [part("added", files.added), part("changed", files.changed), part("removed", files.removed)]
+    .filter(Boolean).join("; ") || "no file changes";
+}
+
+// Preview with a dry run, then confirm with the per-file summary.
+async function confirmUpdate(body) {
+  const preview = await api("skills/update", Object.assign({ dry_run: true }, body));
+  if (!preview.ok) {
+    alert((preview.diagnostics || []).map((d) => d.message).join("\n") || "update failed");
+    return;
+  }
+  const updates = (preview.result && preview.result.updated) || [];
+  if (!updates.length) {
+    alert("Nothing to update.");
+    return;
+  }
+  const lines = updates.map((u) => `${u.name}${u.version ? " " + u.version : ""}: ${fileSummary(u.files || {})}`);
+  await act("Apply these updates?\n\n" + lines.join("\n"), "skills/update", body);
+}
+
+function updateSkill(skill) {
+  if (skill.modified && !confirm(`${skill.name} was edited locally. Overwrite the local changes?`)) return;
+  return confirmUpdate(skill.modified ? { name: skill.name, force: true } : { name: skill.name });
+}
+
+function updateAll() {
+  return confirmUpdate({ all: true });
+}
+
+api("skills").then((data) => updateSkillsDot(data.result)).catch(() => {});
 
 let current = "dashboard";
 const tabs = Array.from(document.querySelectorAll("#nav [role=tab]"));
@@ -240,5 +339,43 @@ $("#reveal-confirm").addEventListener("click", async () => {
     : (data.diagnostics || []).map((d) => d.message).join("\n");
 });
 dialog.addEventListener("close", () => { $("#reveal-value").textContent = ""; });
+
+const editDialog = $("#secret-edit");
+let secretAction = "add";
+function openSecretEdit(reference) {
+  secretAction = reference ? "rotate" : "add";
+  $("#secret-form").reset();
+  $("#secret-edit-title").textContent = reference ? "Change value" : "New secret";
+  $("#secret-path").value = reference || "";
+  $("#secret-path").readOnly = Boolean(reference);
+  $("#secret-error").textContent = "";
+  editDialog.showModal();
+}
+$("#secret-cancel").addEventListener("click", () => editDialog.close());
+editDialog.addEventListener("close", () => $("#secret-form").reset());
+$("#secret-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const input = $("#secret-input");
+  const body = { path: $("#secret-path").value, value: input.value, confirm: $("#secret-confirm").checked };
+  input.value = "";
+  $("#secret-save").disabled = true;
+  try {
+    const pending = api("secret/" + secretAction, body);
+    body.value = "";
+    const data = await pending;
+    if (data.ok) {
+      editDialog.close();
+      await show("secrets");
+    } else {
+      $("#secret-error").textContent = data.error || (data.diagnostics || []).map((d) => d.message).join("\n") || "failed";
+    }
+  } catch (err) {
+    $("#secret-error").textContent = "Failed to save: " + err.message;
+  } finally {
+    body.value = "";
+    input.value = "";
+    $("#secret-save").disabled = false;
+  }
+});
 
 show("dashboard");
