@@ -5,10 +5,10 @@
 //!   exchanged for an HttpOnly, SameSite=Strict session cookie. Everything else
 //!   without a valid session answers 401.
 //! - Every asset is embedded in the binary; the CSP allows only this origin.
-//! - The API is the registry: `GET|POST /api/<command>` (dots or slashes,
-//!   e.g. `/api/member/approve`) runs the same handler as the CLI and returns
-//!   its envelope plus `cli`, the equivalent command line. Mutating commands
-//!   need POST; confirmations need `{"confirm": true}` (the CLI's `--yes`).
+//! - The API is an explicit table (`ROUTES`) over the registry: each route runs
+//!   its command through `cli::execute`, exactly like the CLI, and returns the
+//!   envelope plus `cli`, the equivalent command line. Reads are GET, changes
+//!   POST; confirmations need `{"confirm": true}` (the CLI's `--yes`).
 //! - `POST /api/secret/reveal {"name", "confirm": true}` is the only path that
 //!   returns a secret value, and it is recorded in the local history first.
 
@@ -31,9 +31,68 @@ const APP_JS: &str = include_str!("assets/app.js");
 
 const COOKIE: &str = "muster_session";
 const MAX_BODY: u64 = 64 * 1024;
-/// Commands the web API never runs: they read secrets from stdin, start
-/// servers, bootstrap identities, or reveal values outside the audited path.
-const BLOCKED: &[&str] = &["ui", "init", "secret.add", "secret.rotate", "secret.get"];
+
+/// One API route: `GET|POST /api/<path>` runs `command`. Commands that read
+/// secrets from stdin, bootstrap identities or start servers (`init`,
+/// `secret add|rotate`, `ui`, `mcp`) are deliberately absent; secret values
+/// only leave through the audited `secret/reveal` route.
+struct Route {
+    path: &'static str,
+    command: &'static str,
+    post: bool,
+    /// Parameters this route does not accept (e.g. `doctor --fix` on GET).
+    hidden: &'static [&'static str],
+}
+
+const fn get(path: &'static str, command: &'static str) -> Route {
+    Route {
+        path,
+        command,
+        post: false,
+        hidden: &[],
+    }
+}
+
+const fn post(path: &'static str, command: &'static str) -> Route {
+    Route {
+        path,
+        command,
+        post: true,
+        hidden: &[],
+    }
+}
+
+const ROUTES: &[Route] = &[
+    get("status", "status"),
+    get("machines", "machine.list"),
+    get("members", "member.list"),
+    get("groups", "group.list"),
+    get("secrets", "secret.list"),
+    get("plan", "plan"),
+    get("proposals", "proposal.list"),
+    Route {
+        hidden: &["fix"],
+        ..get("doctor", "doctor")
+    },
+    post("doctor", "doctor"),
+    post("sync", "sync"),
+    post("rollback", "rollback"),
+    post("approve", "approve"),
+    post("revoke", "revoke"),
+    post("machine/assign", "machine.assign"),
+    post("machine/rm", "machine.rm"),
+    post("member/add", "member.add"),
+    post("member/approve", "member.approve"),
+    post("member/role", "member.role"),
+    post("member/profile", "member.profile"),
+    post("member/rm", "member.rm"),
+    post("group/create", "group.create"),
+    post("group/grant", "group.grant"),
+    post("group/revoke", "group.revoke"),
+    post("secret/rm", "secret.rm"),
+    post("proposal/create", "proposal.create"),
+    post("proposal/accept", "proposal.accept"),
+];
 /// Body keys that map to global flags rather than command parameters.
 const CONFIRM: &str = "confirm";
 const DRY_RUN: &str = "dry_run";
@@ -192,7 +251,7 @@ impl Ui {
             (Method::Get, "/style.css") => Reply::new(200, "text/css; charset=utf-8", STYLE_CSS),
             (Method::Get, "/app.js") => Reply::new(200, "text/javascript; charset=utf-8", APP_JS),
             (_, p) if p.starts_with("/api/") => {
-                let name = p["/api/".len()..].trim_matches('/').replace('/', ".");
+                let name = p["/api/".len()..].trim_matches('/').to_owned();
                 match method {
                     Method::Get => {
                         let body = query
@@ -214,28 +273,35 @@ impl Ui {
     }
 
     fn api(&mut self, name: &str, post: bool, body: Map<String, Value>) -> Reply {
-        let name = alias(name);
-        match name {
-            "history" => return self.history(),
-            "secret.reveal" if post => return self.reveal(body),
-            "secret.reveal" => return Reply::error(405, "reveal requires POST"),
+        match (name, post) {
+            ("history", false) => return self.history(),
+            ("secret/reveal", true) => return self.reveal(body),
             _ => {}
         }
-        let Some(spec) = registry::find(name).filter(|s| !BLOCKED.contains(&s.name)) else {
-            return Reply::error(404, &format!("unknown API command '{name}'"));
+        let Some(route) = ROUTES.iter().find(|r| r.path == name && r.post == post) else {
+            let other = ROUTES.iter().any(|r| r.path == name) || name == "history";
+            return if other || name == "secret/reveal" {
+                Reply::error(405, &format!("wrong method for /api/{name}"))
+            } else {
+                Reply::error(404, &format!("unknown API route /api/{name}"))
+            };
         };
-        if spec.mutating && !post {
-            return Reply::error(405, &format!("'{name}' changes state: use POST"));
-        }
-        let (params, flags) = match parse_params(spec, body) {
+        let spec = registry::find(route.command).expect("routes map to registered commands");
+        let (params, flags) = match parse_params(spec, route.hidden, body) {
             Ok(parsed) => parsed,
             Err(e) => return self.failure(spec, &cli_line(spec, &[], Flags::default()), e),
         };
         self.execute(spec, &params, flags)
     }
 
-    /// Run a registry handler exactly like the CLI does (same globals, no TTY).
-    fn execute(&self, spec: &CommandSpec, params: &[(String, Value)], flags: Flags) -> Reply {
+    /// Run a command exactly like the CLI does (`cli::execute`, never prompting:
+    /// confirmation comes from the body).
+    fn execute(
+        &self,
+        spec: &'static CommandSpec,
+        params: &[(String, Value)],
+        flags: Flags,
+    ) -> Reply {
         let cli = cli_line(spec, params, flags);
         let mut typed = Params::default();
         for (k, v) in params {
@@ -249,22 +315,14 @@ impl Ui {
             quiet: true,
             verbose: false,
         };
-        let mut ctx = match Context::new(globals) {
-            Ok(ctx) => ctx,
-            Err(e) => return self.failure(spec, &cli, e),
+        let (envelope, code) = crate::cli::execute(spec, globals, &typed, false);
+        // A command that ran but reported problems (e.g. doctor) keeps its result.
+        let status = if code == 0 || !envelope.result.is_null() {
+            200
+        } else {
+            http_status(code)
         };
-        // Never prompt on the server's terminal: confirmation comes from the body.
-        ctx.is_tty = false;
-        let result = (spec.handler)(&mut ctx, &typed);
-        let mut diagnostics = ctx.take_diagnostics();
-        let (ok, result, status) = match result {
-            Ok(value) => (!ctx.failed(), value, 200),
-            Err(e) => {
-                diagnostics.push(e.to_diagnostic());
-                (false, Value::Null, http_status(e.exit_code()))
-            }
-        };
-        envelope(spec.name, ok, result, diagnostics, &cli, status)
+        reply(&envelope, &cli, status)
     }
 
     fn failure(&self, spec: &CommandSpec, cli: &str, err: MusterError) -> Reply {
@@ -373,21 +431,11 @@ struct Flags {
     dry_run: bool,
 }
 
-/// Friendly view names → registry commands.
-fn alias(name: &str) -> &str {
-    match name {
-        "machines" => "machine.list",
-        "members" => "member.list",
-        "groups" => "group.list",
-        "secrets" => "secret.list",
-        other => other,
-    }
-}
-
 /// JSON body → typed params in spec order, plus the confirm/dry-run flags.
 /// Unknown keys and wrong types are usage errors (exit 2 → HTTP 400).
 fn parse_params(
     spec: &CommandSpec,
+    hidden: &[&str],
     body: Map<String, Value>,
 ) -> Result<(Vec<(String, Value)>, Flags), MusterError> {
     let mut flags = Flags::default();
@@ -398,7 +446,8 @@ fn parse_params(
             DRY_RUN | "dry-run" => flags.dry_run = as_bool(&value, &key)?,
             _ => {
                 let canonical = key.replace('_', "-");
-                if !spec.params.iter().any(|p| p.name == canonical) {
+                let known = spec.params.iter().any(|p| p.name == canonical);
+                if !known || hidden.contains(&canonical.as_str()) {
                     return Err(MusterError::Usage(format!(
                         "unknown parameter '{key}' for '{}'",
                         spec.name
@@ -498,6 +547,12 @@ fn shell_quote(word: &str) -> String {
     }
 }
 
+fn reply(envelope: &Envelope, cli: &str, status: u16) -> Reply {
+    let mut value = serde_json::to_value(envelope).expect("envelope serializes");
+    value["cli"] = Value::from(cli);
+    Reply::json(status, value)
+}
+
 fn envelope(
     command: &str,
     ok: bool,
@@ -506,10 +561,11 @@ fn envelope(
     cli: &str,
     status: u16,
 ) -> Reply {
-    let envelope = Envelope::new(command, ok, result, diagnostics);
-    let mut value = serde_json::to_value(&envelope).expect("envelope serializes");
-    value["cli"] = Value::from(cli);
-    Reply::json(status, value)
+    reply(
+        &Envelope::new(command, ok, result, diagnostics),
+        cli,
+        status,
+    )
 }
 
 fn http_status(exit_code: i32) -> u16 {

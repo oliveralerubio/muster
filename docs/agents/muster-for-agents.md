@@ -1,0 +1,97 @@
+# Muster for AI Agents
+
+Guide for autonomous and human-supervised AI agents interacting with Muster via the CLI or over the Model Context Protocol (MCP).
+
+## Operating Modes
+
+Agents interact with Muster through two surfaces:
+
+1. **MCP stdio server (`muster mcp`):** Native JSON-RPC 2.0 tool interface with safety boundaries. Mutating actions are gated behind a proposal workflow.
+2. **CLI (`muster --format json <command>`):** Scriptable CLI emitting a single JSON envelope on stdout and logs on stderr. Non-interactive invocations require `--yes` for commands that prompt.
+
+## Output Contract & JSON Envelope
+
+Every CLI command with `--format json`, and every MCP tool call result, produces exactly one JSON envelope:
+
+```json
+{
+  "schema_version": 1,
+  "command": "status",
+  "ok": true,
+  "result": { ... },
+  "diagnostics": []
+}
+```
+
+- `schema_version`: Always `1`.
+- `command`: Canonical dotted command name (e.g., `status`, `proposal.create`, `secret.list`).
+- `ok`: `true` when the operation succeeded, `false` otherwise.
+- `result`: Command-specific payload on success (`null` on failure).
+- `diagnostics`: Array of structured diagnostic items:
+  - `code`: Stable machine-readable error/warning code (e.g., `usage`, `security`, `invalid_config`, `outdated_binary`, `drift`).
+  - `message`: Human-readable summary.
+  - `severity`: `"error"`, `"warning"`, or `"info"`.
+  - `path`: (Optional) Associated filesystem path.
+  - `suggestion`: (Optional) Command or hint to resolve the diagnostic.
+
+## Exit Codes
+
+Muster CLI exits with predictable process codes:
+
+| Code | Name | Description |
+|---|---|---|
+| `0` | Success | Command succeeded (including valid `--dry-run`). |
+| `1` | Operational | State or environment failure (uninitialized repo, missing secret, doctor failure). |
+| `2` | Usage | Invalid flags, syntax, missing arguments, or interactive prompt without `--yes` in non-TTY. |
+| `3` | Invalid Config | Parse failure in `muster.toml` or invalid manifest schema. |
+| `4` | Unavailable | External dependency (git) or secret provider CLI unavailable. |
+| `5` | Security | Unauthorized action, recipient key mismatch, or self-approval attempt. |
+| `130` | Interrupted | SIGINT received (clean termination). |
+
+## MCP Server (`muster mcp`)
+
+The MCP server runs over stdio using newline-delimited JSON-RPC 2.0.
+
+### Supported Tools
+
+| Tool | Registry Equivalent | Description | Mutating? |
+|---|---|---|---|
+| `status` | `status` | Fleet machines, sync state, local machine identity | No |
+| `doctor` | `doctor` | Machine health, binary versions, permissions (`fix` is hidden) | No |
+| `plan` | `plan` | Desired vs. current state diff (secrets redacted) | No |
+| `secret_list_meta` | `secret.list` | Secret metadata, groups, readers (never secret values) | No |
+| `propose_change` | `proposal.create` | Stashes a proposed config change and returns its plan | Proposal only |
+| `secret_reveal` | `secret.get --reveal` | Reveals an explicitly allowlisted secret reference | Read-only |
+
+### Safety Boundaries
+
+- **No Unsupervised Mutating Actions:** Commands like `sync`, `init`, `agents.apply`, `secret.add`, or `rollback` are not exposed directly as MCP tools.
+- **Secret Hygiene:** Plaintext secret values are never exposed across tools, listings, plans, or diffs. The only exception is `secret_reveal`, which strictly verifies that the requested reference is listed in `muster.toml`:
+  ```toml
+  [mcp_server]
+  reveal = ["native://ci/deploy_token"]
+  ```
+  Any unlisted reference returns a `security` diagnostic and `isError: true`.
+
+## Proposal Flow (Agents Proposing Changes)
+
+When an agent needs to adjust Muster configuration (e.g. adding an MCP server, tuning agent instructions, modifying dotfiles):
+
+1. **Agent proposes a change (`propose_change` tool):**
+   ```json
+   {
+     "path": "muster.toml",
+     "contents": "...",
+     "message": "add postgres MCP server"
+   }
+   ```
+2. **Muster validates and stashes:**
+   - Validates paths: restricted to configuration files (cannot escape, cannot touch `vault/`, `.git/`, or `proposals/`).
+   - If targeting `muster.toml`, checks manifest syntax and schema.
+   - Computes an isolated plan showing the exact diff and required approvals.
+   - Writes proposal files to `<config>/proposals/<id>/`.
+   - Returns the proposal ID and engine plan.
+3. **Human reviews and accepts:**
+   - Human inspects: `muster proposal list` or checks the plan.
+   - Human accepts: `muster proposal accept <id>` (copies files into config repo and creates git commit).
+   - Human syncs: `muster sync` (runs standard plan and interactive approval for new hooks/MCP servers).

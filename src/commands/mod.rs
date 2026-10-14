@@ -8,6 +8,7 @@ pub mod init;
 pub mod machine;
 pub mod member;
 pub mod plan;
+pub mod proposal;
 pub mod revoke;
 pub mod schema;
 pub mod secret;

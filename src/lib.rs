@@ -15,6 +15,7 @@ pub mod identity;
 pub mod importers;
 pub mod machine;
 pub mod manifest;
+pub mod mcp;
 pub mod output;
 pub mod providers;
 pub mod registry;
