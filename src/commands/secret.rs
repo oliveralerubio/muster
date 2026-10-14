@@ -258,7 +258,9 @@ fn get(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let mut providers = Providers::new(&ctx.config_dir, &ctx.state_dir);
     let value = providers.resolve_ref(&reference)?;
     if reveal {
-        // The one explicit reveal path: the value becomes the envelope result.
+        // The one explicit reveal path: the value becomes the envelope result,
+        // and only once the reveal is on record.
+        crate::audit::record(&ctx.state_dir, "secret.reveal", reference.as_str())?;
         return Ok(Value::String(value.expose().to_owned()));
     }
     Ok(json!({

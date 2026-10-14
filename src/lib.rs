@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 pub mod adapters;
+pub mod audit;
 pub mod cli;
 pub mod commands;
 pub mod context;
@@ -20,3 +21,4 @@ pub mod registry;
 pub mod secrets;
 pub mod team;
 pub mod vault;
+pub mod web;

@@ -13,3 +13,4 @@ pub mod schema;
 pub mod secret;
 pub mod status;
 pub mod sync;
+pub mod ui;

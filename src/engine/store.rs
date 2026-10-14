@@ -109,6 +109,27 @@ pub fn numbers(state_dir: &Path) -> Result<Vec<u64>, MusterError> {
     Ok(numbers)
 }
 
+/// Metadata of every committed generation, ascending: number, creation time,
+/// kind and rollback source. Never file contents (snapshots may hold secrets).
+pub fn summaries(state_dir: &Path) -> Result<Vec<Value>, MusterError> {
+    let mut out = Vec::new();
+    for n in numbers(state_dir)? {
+        let meta_path = root(state_dir).join(n.to_string()).join(META);
+        let text = std::fs::read_to_string(&meta_path).map_err(|e| io_error(&meta_path, e))?;
+        let disk: DiskGeneration = serde_json::from_str(&text).map_err(|e| {
+            MusterError::Operational(format!("{}: corrupt generation: {e}", meta_path.display()))
+        })?;
+        out.push(serde_json::json!({
+            "number": disk.number,
+            "created_at": disk.created_at,
+            "kind": disk.kind,
+            "rollback_of": disk.rollback_of,
+            "files": disk.files.keys().collect::<Vec<_>>(),
+        }));
+    }
+    Ok(out)
+}
+
 /// The most recent generation and its state.
 pub fn latest(state_dir: &Path) -> Result<Option<(u64, State)>, MusterError> {
     match numbers(state_dir)?.last() {

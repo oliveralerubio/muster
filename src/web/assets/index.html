@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Muster admin panel</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="top">
+    <span class="brand">Muster</span>
+    <nav aria-label="Views">
+      <ul id="nav" role="tablist" aria-orientation="horizontal">
+        <li><button type="button" role="tab" data-view="dashboard" aria-selected="true">Dashboard</button></li>
+        <li><button type="button" role="tab" data-view="machines">Machines</button></li>
+        <li><button type="button" role="tab" data-view="team">Members &amp; groups</button></li>
+        <li><button type="button" role="tab" data-view="secrets">Secrets</button></li>
+        <li><button type="button" role="tab" data-view="profiles">Profiles &amp; diff</button></li>
+        <li><button type="button" role="tab" data-view="history">History</button></li>
+        <li><button type="button" role="tab" data-view="doctor">Doctor</button></li>
+      </ul>
+    </nav>
+    <button type="button" id="theme" aria-label="Toggle light or dark theme">Theme</button>
+  </header>
+
+  <main id="main" tabindex="-1">
+    <h1 id="title">Dashboard</h1>
+    <div id="actions" class="actions"></div>
+    <div id="view" aria-live="polite"></div>
+  </main>
+
+  <footer class="cli" aria-live="polite">
+    <span>CLI equivalent:</span> <code id="cli">muster status</code>
+  </footer>
+
+  <dialog id="reveal">
+    <form method="dialog">
+      <h2>Reveal secret</h2>
+      <p>Reveal the plaintext of <code id="reveal-name"></code>? The reveal is recorded in the history.</p>
+      <output id="reveal-value" class="secret"></output>
+      <div class="actions">
+        <button type="button" id="reveal-confirm" class="danger">Reveal</button>
+        <button value="cancel">Close</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="/app.js"></script>
+</body>
+</html>

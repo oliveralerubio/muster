@@ -659,6 +659,11 @@ fn restore_record(next: &mut State, base: &State, entry: &Entry) {
     };
 }
 
+/// Metadata of every generation (for history views); no file contents.
+pub fn generations(state_dir: &std::path::Path) -> Result<Vec<Value>, MusterError> {
+    store::summaries(state_dir)
+}
+
 /// Restore the exact managed files of generation `n`; recorded as a new
 /// generation. Files Muster created after `n` are removed; files it only
 /// adopted later are left as they are.
