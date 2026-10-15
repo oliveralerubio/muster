@@ -5,7 +5,7 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -90,7 +90,7 @@ jobs:
 
       - name: Generate locked dependency inventory
         run: |
-          cargo tree --locked --all-features --prefix none > dist/DEPENDENCY-INVENTORY.txt
+          cargo tree --locked --all-features --target all --prefix none > dist/DEPENDENCY-INVENTORY.txt
           cat dist/DEPENDENCY-INVENTORY.txt
 
       - name: Generate SHA256SUMS
