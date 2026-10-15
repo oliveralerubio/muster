@@ -13,7 +13,7 @@ ctrlc = "3.4"
 toml = "1.1.8"
 age = { version = "0.12", features = ["armor"] }
 secrecy = "0.10"
-time = { version = "0.3", features = ["formatting"] }
+time = { version = "0.3", features = ["formatting", "parsing"] }
 toml_edit = "0.25.17"
 tiny_http = "0.12"
 # SHA-256 of pinned agent CLI artifacts (`agents install`); already in the tree via `age`.

@@ -417,3 +417,95 @@ fn revoke_reencrypts_lists_exposed_secrets_and_machine_list_shows_roles() {
         &["--format", "json", "machine", "rm", "bob", "--yes"],
     );
 }
+
+#[test]
+fn rotated_secret_reaches_authorized_machine_on_next_sync_only() {
+    let (_remote_guard, remote) = bare_remote();
+    let remote = remote.to_str().unwrap();
+    let alice = support::MusterEnv::new();
+    let bob = support::MusterEnv::new();
+    let outsider = support::MusterEnv::new();
+    for machine in [&alice, &bob, &outsider] {
+        machine.link_system_exe("git");
+        assert_cli_success(machine, &["--format", "json", "init", "--yes"]);
+        assert_cli_success(machine, &["--format", "json", "sync", "--remote", remote]);
+    }
+    assert_cli_success(&bob, &["--format", "json", "enroll", "--name", "bob"]);
+    assert_cli_success(&alice, &["--format", "json", "sync", "--pull"]);
+    assert_cli_success(&alice, &["--format", "json", "approve", "bob", "--yes"]);
+
+    let old = "rotation-old-test-value";
+    let new = "rotation-new-test-value";
+    let write_secret = |action: &str, value: &str| {
+        let output = alice
+            .run_isolated(&[
+                "--format",
+                "json",
+                "secret",
+                action,
+                "app/token",
+                "--value-stdin",
+            ])
+            .write_stdin(value)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        for stream in [&output.stdout, &output.stderr] {
+            let text = String::from_utf8_lossy(stream);
+            assert!(!text.contains(old) && !text.contains(new), "secret leaked");
+        }
+    };
+    let verify = |machine: &support::MusterEnv, expected: &str| {
+        let output = machine
+            .run_isolated(&[
+                "--format",
+                "json",
+                "--yes",
+                "secret",
+                "get",
+                "native://app/token",
+                "--reveal",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let envelope: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            envelope["result"].as_str() == Some(expected),
+            "wrong secret version"
+        );
+    };
+    write_secret("add", old);
+    assert_cli_success(&alice, &["--format", "json", "sync"]);
+    assert_cli_success(&bob, &["--format", "json", "sync"]);
+    verify(&bob, old);
+
+    write_secret("rotate", new);
+    verify(&alice, new);
+    verify(&bob, old);
+    assert_cli_success(&alice, &["--format", "json", "sync"]);
+    assert_cli_success(&bob, &["--format", "json", "sync"]);
+    verify(&bob, new);
+    assert_cli_success(&outsider, &["--format", "json", "sync"]);
+    assert!(
+        fs::read(bob.config_dir().join("vault/app.age")).unwrap()
+            == fs::read(outsider.config_dir().join("vault/app.age")).unwrap()
+    );
+    let denied = outsider
+        .run_isolated(&[
+            "--format",
+            "json",
+            "--yes",
+            "secret",
+            "get",
+            "native://app/token",
+            "--reveal",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(denied.status.code(), Some(5));
+    for stream in [&denied.stdout, &denied.stderr] {
+        let text = String::from_utf8_lossy(stream);
+        assert!(!text.contains(old) && !text.contains(new), "secret leaked");
+    }
+}

@@ -98,6 +98,8 @@ pub fn bws_list(project: Option<&str>) -> Result<Vec<(String, SecretValue)>, Mus
         .collect())
 }
 
+/// `doppler://<project>/<config>/<NAME>` selects exactly one config secret.
+/// CLI flags: https://github.com/DopplerHQ/cli/blob/master/pkg/cmd/secrets.go
 pub static DOPPLER: CliSpec = CliSpec {
     scheme: Scheme::Doppler,
     name: "Doppler",
@@ -119,6 +121,10 @@ pub static DOPPLER: CliSpec = CliSpec {
     extract: plain,
 };
 
+/// `infisical://<project-id>/<environment>/[<folder>/...]<NAME>`.
+/// No folder means `/`, regardless of local CLI configuration. Credentials
+/// come from the vendor login or environment, never command-line arguments.
+/// https://infisical.com/docs/cli/reference#sm-secrets-get
 pub static INFISICAL: CliSpec = CliSpec {
     scheme: Scheme::Infisical,
     name: "Infisical",
@@ -128,7 +134,9 @@ pub static INFISICAL: CliSpec = CliSpec {
         let s = r.segments();
         let (project, env) = (&s[0], &s[1]);
         let secret = s.last().expect("at least 3 segments").clone();
-        let mut args = vec![
+        let path = format!("/{}", s[2..s.len() - 1].join("/"));
+        vec![
+            "sm".into(),
             "secrets".into(),
             "get".into(),
             secret,
@@ -136,16 +144,48 @@ pub static INFISICAL: CliSpec = CliSpec {
             project.clone(),
             "--env".into(),
             env.clone(),
-            "--plain".into(),
-        ];
-        if s.len() > 3 {
-            let path = format!("/{}", s[2..s.len() - 1].join("/"));
-            args.extend(["--path".into(), path]);
-        }
-        args
+            "--path".into(),
+            path,
+            "--output".into(),
+            "json".into(),
+            "--silent".into(),
+        ]
     },
-    extract: plain,
+    extract: infisical_value,
 };
+
+/// JSON preserves empty/multiline values. The CLI represents missing names
+/// with the reserved value `*not found*`; plain output silently omits them.
+fn infisical_value(reference: &SecretRef, mut stdout: String) -> Result<String, ProviderError> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Secret {
+        secret_key: String,
+        secret_value: String,
+    }
+    let parsed = serde_json::from_str::<Vec<Secret>>(&stdout);
+    stdout.zeroize();
+    let secrets = parsed.map_err(|_| {
+        ProviderError::new(
+            ProviderErrorKind::Unavailable,
+            "Infisical CLI did not return a JSON array of secretKey/secretValue objects",
+        )
+    })?;
+    let name = reference.segments().last().expect("validated secret name");
+    let mut value = None;
+    for mut secret in secrets {
+        if &secret.secret_key == name && secret.secret_value != "*not found*" && value.is_none() {
+            value = Some(std::mem::take(&mut secret.secret_value));
+        }
+        secret.secret_value.zeroize();
+    }
+    value.ok_or_else(|| {
+        ProviderError::new(
+            ProviderErrorKind::NotFound,
+            "Infisical secret was not found",
+        )
+    })
+}
 
 pub struct Cli {
     spec: &'static CliSpec,
@@ -181,6 +221,7 @@ impl Cli {
                 )
             })?;
         if output.status.success() {
+            output.stderr.zeroize();
             let text = String::from_utf8(std::mem::take(&mut output.stdout));
             let mut text = text.map_err(|e| {
                 let mut bytes = e.into_bytes();
@@ -201,8 +242,7 @@ impl Cli {
         }
 
         output.stdout.zeroize();
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let lower = stderr.to_ascii_lowercase();
+        let mut lower = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
         let kind = if lower.contains("unauthorized")
             || lower.contains("not signed in")
             || lower.contains("not logged in")
@@ -211,9 +251,15 @@ impl Cli {
             || lower.contains("permission denied")
             || lower.contains("forbidden")
             || lower.contains("session expired")
+            || lower.contains("session has expired")
+            || lower.contains("must be logged in")
+            || lower.contains("unable to authenticate")
+            || lower.contains("you must provide a token")
+            || lower.contains("invalid service token")
         {
             ProviderErrorKind::Unauthorized
         } else if lower.contains("not found")
+            || lower.contains("could not find requested secret")
             || lower.contains("doesn't exist")
             || lower.contains("does not exist")
             || lower.contains("unknown secret")
@@ -229,22 +275,34 @@ impl Cli {
             ProviderErrorKind::Unavailable
         };
 
-        let message = if stderr.is_empty() {
-            format!(
+        output.stderr.zeroize();
+        lower.zeroize();
+        // Vendor errors can echo tokens or secret values, even on the first
+        // line. Report only our classification, never any captured output.
+        let authentication = match self.spec.scheme {
+            Scheme::Op => "run `op signin` or check its credentials and permissions",
+            Scheme::Bws => "check BWS_ACCESS_TOKEN and its permissions",
+            Scheme::Doppler => "run `doppler login` or check its credentials and permissions",
+            Scheme::Infisical => "run `infisical login` or check its credentials and permissions",
+            _ => "check its credentials and permissions",
+        };
+        let message = match kind {
+            ProviderErrorKind::Unauthorized => format!(
+                "{} CLI is not authenticated or access was denied; {authentication}",
+                self.spec.name
+            ),
+            ProviderErrorKind::NotFound => format!(
+                "{} secret was not found; check the reference",
+                self.spec.name
+            ),
+            ProviderErrorKind::RateLimited => {
+                format!("{} CLI was rate limited; try again later", self.spec.name)
+            }
+            _ => format!(
                 "{} CLI exited with code {:?}",
                 self.spec.binary,
                 output.status.code()
-            )
-        } else {
-            // First line only, bounded: enough to diagnose, never a dump.
-            let line: String = stderr
-                .lines()
-                .next()
-                .unwrap_or("")
-                .chars()
-                .take(200)
-                .collect();
-            format!("{} CLI failed: {line}", self.spec.name)
+            ),
         };
         Err(ProviderError::new(kind, message))
     }

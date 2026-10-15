@@ -48,9 +48,11 @@ pub enum Scheme {
     Op,
     /// Bitwarden Secrets Manager via the `bws` CLI.
     Bws,
-    /// Doppler via the `doppler` CLI.
+    /// Doppler via the `doppler` CLI: `doppler://<project>/<config>/<NAME>`.
     Doppler,
-    /// Infisical via the `infisical` CLI.
+    /// Infisical via the `infisical` CLI:
+    /// `infisical://<project-id>/<environment>/[<folder>/...]<NAME>`.
+    /// The environment is its slug; omitted folders select the root `/`.
     Infisical,
 }
 

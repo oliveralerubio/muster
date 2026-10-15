@@ -234,6 +234,7 @@ El mismo producto sirve a dos públicos:
   - Sincronización periódica con systemd en Linux/WSL, launchd en macOS y fallback manual.
 - **Doctor**
   - Revisa binarios, versiones, permisos de archivos sensibles, estado del repo, bóveda, adaptadores, desajustes y validez de claves cuando el proveedor lo permite.
+  - `doctor --check-keys` consulta de forma opcional la validez, caducidad y límite de gasto de `OPENROUTER_API_KEY`; `--offline` omite esta consulta. Sin la opción no se consultan APIs de claves. Alcance y auditoría de red: [docs/security/network.md](security/network.md).
   - Cada problema trae una solución sugerida.
   - Nunca hace reparaciones destructivas sin confirmación.
 - **Interfaz web de administración**
