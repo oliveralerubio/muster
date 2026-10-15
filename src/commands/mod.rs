@@ -6,6 +6,7 @@ pub mod group;
 pub mod import;
 pub mod init;
 pub mod machine;
+pub mod mcp_server;
 pub mod member;
 pub mod plan;
 pub mod profile;
