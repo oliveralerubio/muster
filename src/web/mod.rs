@@ -597,8 +597,14 @@ fn cli_line(spec: &CommandSpec, params: &[(String, Value)], flags: Flags) -> Str
             Value::Bool(false) => {}
             Value::Array(items) => {
                 for item in items {
-                    words.push(flag.clone());
-                    words.push(shell_quote(&scalar(item)));
+                    let text = scalar(item);
+                    if text.starts_with('-') {
+                        // `--args -y` reads `-y` as a flag: attach the value.
+                        words.push(format!("{flag}={}", shell_quote(&text)));
+                    } else {
+                        words.push(flag.clone());
+                        words.push(shell_quote(&text));
+                    }
                 }
             }
             other if p.positional => words.push(shell_quote(&scalar(other))),
@@ -780,5 +786,15 @@ mod tests {
     fn shell_quoting_keeps_plain_words_and_quotes_the_rest() {
         assert_eq!(shell_quote("native://app/api"), "native://app/api");
         assert_eq!(shell_quote("it's x"), r"'it'\''s x'");
+    }
+
+    #[test]
+    fn cli_line_attaches_hyphen_leading_list_values_with_equals() {
+        // `muster mcp-server add --args -y` would parse `-y` as a flag; the
+        // CLI-equivalent line must use `--args=-y` for such values.
+        let args = Value::Array(vec![Value::from("-y"), Value::from("server-name")]);
+        let params = vec![("args".to_owned(), args)];
+        let cli = cli_line(&crate::commands::mcp_server::ADD, &params, Flags::default());
+        assert_eq!(cli, "muster mcp-server add --args=-y --args server-name");
     }
 }

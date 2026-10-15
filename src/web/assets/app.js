@@ -438,12 +438,29 @@ $("#secret-form").addEventListener("submit", async (event) => {
 // Profile editing: a dialog with the profile TOML, a dry-run diff preview and
 // a confirmed save. Secret references pass through verbatim; values are never
 // resolved or sent anywhere else. Save stays disabled until the exact current
-// text has been previewed; any edit disables it again until a re-preview.
+// payload has been previewed; any edit disables it again until a re-preview,
+// and a preview response that arrives after the form moved on is ignored.
 const profileDialog = $("#profile-edit");
 let profileEditing = null;
 
+// The payload the dialog would act on, and a token identifying it exactly.
+function profileBody(dryRun) {
+  return {
+    name: $("#profile-name").value.trim(),
+    toml: $("#profile-toml").value,
+    ...(dryRun ? { dry_run: true } : { confirm: true }),
+  };
+}
+function profileToken() {
+  const body = profileBody(false);
+  return JSON.stringify({ name: body.name, toml: body.toml });
+}
+// Token of the last successful preview; anything else keeps Save disabled.
+let profilePreviewToken = null;
+
 async function openProfileEdit(name) {
   profileEditing = name;
+  profilePreviewToken = null;
   $("#profile-form").reset();
   $("#profile-diff").hidden = true;
   $("#profile-diff").textContent = "";
@@ -478,11 +495,18 @@ function showDiff(pre, data) {
 }
 
 $("#profile-preview").addEventListener("click", async () => {
-  const body = { name: $("#profile-name").value.trim(), toml: $("#profile-toml").value, dry_run: true };
-  const data = await api("profile/set", body);
+  const token = profileToken();
+  const data = await api("profile/set", profileBody(true));
+  // The form changed while the request was inflight: the response describes a
+  // payload nobody previewed, so ignore it and keep Save disabled.
+  if (profileToken() !== token) {
+    $("#profile-save").disabled = true;
+    return;
+  }
   const problem = showDiff($("#profile-diff"), data);
   if (problem) $("#profile-error").textContent = problem;
   // Save unlocks only after a successful preview of the exact current payload.
+  profilePreviewToken = problem ? null : token;
   $("#profile-save").disabled = Boolean(problem);
 });
 
@@ -496,11 +520,17 @@ profileDialog.addEventListener("close", () => $("#profile-form").reset());
 $("#profile-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   if ($("#profile-save").disabled) return;
-  const name = $("#profile-name").value.trim();
-  const toml = $("#profile-toml").value;
-  if (!confirm(`Save profile ${name}?`)) return;
-  const data = await api("profile/set", { name, toml, confirm: true });
+  // Belt and braces: only the exact previewed payload may be acted on.
+  if (profileToken() !== profilePreviewToken) {
+    $("#profile-save").disabled = true;
+    $("#profile-error").textContent = "The form changed since the preview. Preview the diff again.";
+    return;
+  }
+  const body = profileBody(false);
+  if (!confirm(`Save profile ${body.name}?`)) return;
+  const data = await api("profile/set", body);
   if (data.ok) {
+    profilePreviewToken = null;
     profileDialog.close();
     await show("profiles");
   } else {
@@ -508,13 +538,31 @@ $("#profile-form").addEventListener("submit", async (event) => {
   }
 });
 
-// MCP server form: structured fields for what the CLI accepts as KEY=VALUE
-// lists. List entries are one per line: a comma can be part of a value, so
-// splitting on commas would corrupt args and KEY=VALUE entries. Values that
+// MCP server form: list fields hold JSON arrays, what the API itself accepts
+// as KEY=VALUE lists. JSON keeps every value verbatim: " padded ", "" and
+// commas survive the edit → preview → save round trip unchanged. Values that
 // look like secret material must be references (e.g. native://group/name);
 // they are stored verbatim and resolved only at apply time.
-function lines(value) {
-  return value.split("\n").map((part) => part.trim()).filter(Boolean);
+function jsonList(text, label) {
+  if (!text.trim()) return [];
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error(`${label} must be a JSON array of strings, e.g. ["arg1", "arg2"].`);
+  }
+  if (!Array.isArray(parsed) || parsed.some((item) => typeof item !== "string")) {
+    throw new Error(`${label} must be a JSON array of strings.`);
+  }
+  return parsed;
+}
+
+function jsonPairs(text, label) {
+  const list = jsonList(text, label);
+  if (list.some((entry) => !entry.includes("=") || entry.startsWith("="))) {
+    throw new Error(`${label} entries must be KEY=VALUE strings.`);
+  }
+  return list;
 }
 
 function field(id, label, placeholder) {
@@ -532,9 +580,9 @@ function mcpForm() {
     field("mcp-name", "Name", "docs"),
     field("mcp-command", "Command (stdio)", "npx"),
     field("mcp-url", "URL (remote)", "https://example.com/mcp"),
-    fieldArea("mcp-args", "Args (one per line)", "-y\nserver-name"),
-    fieldArea("mcp-env", "Env KEY=reference (one per line)", "API_KEY=native://app/api-key"),
-    fieldArea("mcp-header", "Headers KEY=reference (one per line)", "Authorization=native://app/token"),
+    fieldArea("mcp-args", "Args (JSON array)", '["-y", "server-name"]'),
+    fieldArea("mcp-env", "Env KEY=reference (JSON array)", '["API_KEY=native://app/api-key"]'),
+    fieldArea("mcp-header", "Headers KEY=reference (JSON array)", '["Authorization=native://app/token"]'),
   ];
   const save = button("Save", saveMcp, "primary");
   save.id = "mcp-save";
@@ -550,18 +598,27 @@ function mcpForm() {
   return [el("h2", {}, "Add or replace an MCP server"), row];
 }
 
-function mcpBody(dryRun) {
+function mcpPayload() {
   const command = $("#mcp-command").value.trim();
   const url = $("#mcp-url").value.trim();
   return {
     name: $("#mcp-name").value.trim(),
     command: command || undefined,
     url: url || undefined,
-    args: lines($("#mcp-args").value),
-    env: lines($("#mcp-env").value),
-    header: lines($("#mcp-header").value),
-    ...(dryRun ? { dry_run: true } : { confirm: true }),
+    args: jsonList($("#mcp-args").value, "Args"),
+    env: jsonPairs($("#mcp-env").value, "Env"),
+    header: jsonPairs($("#mcp-header").value, "Headers"),
   };
+}
+// Token of the form's exact current payload; null when the list fields do not
+// parse, so unparseable values can never match a preview.
+let mcpPreviewToken = null;
+function mcpToken() {
+  try {
+    return JSON.stringify(mcpPayload());
+  } catch {
+    return null;
+  }
 }
 
 // Values that look like secret material must stay references; Muster stores
@@ -575,16 +632,48 @@ function looksLikeSecretValue(body) {
 }
 
 async function previewMcp() {
-  const data = await api("mcp-server/add", mcpBody(true));
+  let payload;
+  try {
+    payload = mcpPayload();
+  } catch (err) {
+    $("#mcp-diff").hidden = true;
+    $("#mcp-diff").textContent = "";
+    $("#mcp-error").textContent = err.message;
+    mcpPreviewToken = null;
+    $("#mcp-save").disabled = true;
+    return;
+  }
+  const token = JSON.stringify(payload);
+  const data = await api("mcp-server/add", Object.assign({ dry_run: true }, payload));
+  // The form changed while the request was inflight: the response describes a
+  // payload nobody previewed, so ignore it and keep Save disabled.
+  if (mcpToken() !== token) {
+    $("#mcp-save").disabled = true;
+    return;
+  }
   const problem = showDiff($("#mcp-diff"), data);
   $("#mcp-error").textContent = problem || "";
   // Save unlocks only after a successful preview of the exact current values.
+  mcpPreviewToken = problem ? null : token;
   $("#mcp-save").disabled = Boolean(problem);
 }
 
 async function saveMcp() {
   if ($("#mcp-save").disabled) return;
-  const body = mcpBody(false);
+  let body;
+  try {
+    body = mcpPayload();
+  } catch (err) {
+    $("#mcp-save").disabled = true;
+    $("#mcp-error").textContent = err.message;
+    return;
+  }
+  // Belt and braces: only the exact previewed payload may be acted on.
+  if (JSON.stringify(body) !== mcpPreviewToken) {
+    $("#mcp-save").disabled = true;
+    $("#mcp-error").textContent = "The form changed since the preview. Preview the diff again.";
+    return;
+  }
   if (!body.name) {
     $("#mcp-error").textContent = "A server name is required.";
     return;
@@ -593,8 +682,9 @@ async function saveMcp() {
     && !confirm("Some values look like secret values, not references (e.g. native://group/name). "
       + "Muster stores them verbatim and only resolves references at apply time. Save anyway?")) return;
   if (!confirm(`Save MCP server ${body.name}?`)) return;
-  const data = await api("mcp-server/add", body);
+  const data = await api("mcp-server/add", Object.assign({ confirm: true }, body));
   if (data.ok) {
+    mcpPreviewToken = null;
     $("#mcp-error").textContent = "";
     await show("profiles");
   } else {
@@ -604,13 +694,21 @@ async function saveMcp() {
 
 function openMcpEdit(server) {
   const s = server.server || {};
-  // One entry per line: lossless for args and KEY=VALUE values with commas.
+  // JSON arrays fill the fields verbatim: " padded ", "" and commas survive.
   $("#mcp-name").value = server.name || "";
   $("#mcp-command").value = s.command || "";
   $("#mcp-url").value = s.url || "";
-  $("#mcp-args").value = (s.args || []).join("\n");
-  $("#mcp-env").value = Object.entries(s.env || {}).map(([k, v]) => `${k}=${v}`).join("\n");
-  $("#mcp-header").value = Object.entries(s.headers || {}).map(([k, v]) => `${k}=${v}`).join("\n");
+  $("#mcp-args").value = JSON.stringify(s.args || [], null, 2);
+  $("#mcp-env").value = JSON.stringify(
+    Object.entries(s.env || {}).map(([k, v]) => `${k}=${v}`), null, 2);
+  $("#mcp-header").value = JSON.stringify(
+    Object.entries(s.headers || {}).map(([k, v]) => `${k}=${v}`), null, 2);
+  // Any earlier preview was for other values: clear its state and lock Save.
+  $("#mcp-error").textContent = "";
+  mcpPreviewToken = null;
+  $("#mcp-diff").hidden = true;
+  $("#mcp-diff").textContent = "";
+  $("#mcp-save").disabled = true;
   $("#mcp-name").focus();
 }
 

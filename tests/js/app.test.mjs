@@ -4,9 +4,10 @@
 // It loads src/web/assets/app.js in a `vm` sandbox with a minimal DOM stub
 // seeded from index.html, then drives the profile dialog and the MCP form:
 //   - Save is enabled only after a successful preview of the exact current
-//     payload, and any edit disables it again (QA round-1 finding 4).
-//   - List entries are one per line, so values containing commas survive the
-//     edit → preview → save round trip losslessly (QA round-1 finding 5).
+//     payload; any edit disables it again, stale preview responses are ignored,
+//     and Save re-checks the payload before acting (QA round-2 finding 1).
+//   - List fields hold JSON arrays, so " padded ", "" and commas survive the
+//     edit → preview → save round trip losslessly (QA round-2 finding 3).
 
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -40,6 +41,8 @@ class FakeElement {
   setAttribute(name, v) {
     this.attributes[name] = String(v);
     if (name === "id") this.id = String(v);
+    // Reflect hidden like a real element: views render <pre hidden>.
+    if (name === "hidden") this.hidden = String(v) !== "false";
   }
   getAttribute(name) {
     return this.attributes[name] ?? null;
@@ -215,6 +218,9 @@ await flush();
 const lastCall = () => calls[calls.length - 1];
 const baseline = () => calls.length;
 const callSince = (mark, path) => calls.slice(mark).find((c) => c.path === path);
+// Views re-render: the newest matching button is the one in the live DOM.
+const liveButton = (label) => allElements
+  .filter((el) => el.tagName === "BUTTON" && el.children[0] === label).at(-1);
 
 // --- tests --------------------------------------------------------------------
 
@@ -252,10 +258,38 @@ async function testProfileSaveIsGatedOnPreview() {
   need("profile-preview").fire("click", { preventDefault() {} });
   await flush();
   assert.equal(save.disabled, true, "a failed preview keeps Save disabled");
+
+  // A preview response that arrives after the form moved on is ignored: no
+  // diff, Save stays disabled (QA round-2 finding 1).
+  let releaseStale;
+  setResponder(() => new Promise((resolve) => {
+    releaseStale = () => resolve({ ok: true, result: { diff: "+stale\n" }, diagnostics: [] });
+  }));
+  need("profile-preview").fire("click", { preventDefault() {} });
+  await flush();
+  need("profile-toml").value = '[agents.models]\nclaude = "opus"\n'; // inflight edit
+  releaseStale();
+  await flush();
+  assert.equal(save.disabled, true, "a stale preview response keeps Save disabled");
+  assert.equal(need("profile-diff").hidden, true, "a stale response must not render a diff");
+
+  // Save re-checks the payload even if the input events were bypassed by a
+  // programmatic change: nothing may be acted on that was not previewed.
+  setResponder(() => ({ ok: true, result: { diff: "+x\n" }, diagnostics: [] }));
+  need("profile-preview").fire("click", { preventDefault() {} });
+  await flush();
+  assert.equal(save.disabled, false);
+  need("profile-toml").value = "[agents.models]\n"; // no input event fired
+  const guardMark = baseline();
+  need("profile-form").fire("submit", { preventDefault() {} });
+  await flush();
+  assert.equal(save.disabled, true, "save re-checks the previewed payload");
+  assert.ok(!callSince(guardMark, "profile/set"), "an unpreviewed payload must not be posted");
+  assert.notEqual(need("profile-error").textContent, "", "the guard explains why save was blocked");
   setResponder();
 }
 
-async function testMcpFormUsesOneEntryPerLine() {
+async function testMcpFormUsesJsonArrayValues() {
   // Render the profiles view so the MCP form exists.
   tabs.find((t) => t.dataset.view === "profiles").fire("click");
   await flush();
@@ -263,27 +297,24 @@ async function testMcpFormUsesOneEntryPerLine() {
   const save = need("mcp-save");
   assert.equal(save.disabled, true, "MCP Save must start disabled before any preview");
 
-  // Comma-containing values, one entry per line (QA finding 5): the payload
-  // must keep them verbatim instead of splitting on commas.
+  // JSON array values (QA round-2 finding 3): whitespace, empty strings and
+  // commas must survive verbatim instead of being trimmed or split.
   need("mcp-name").value = "context";
   need("mcp-command").value = "npx";
-  need("mcp-args").value = "-y\n--cache=/tmp/a,b\nserver-name";
-  need("mcp-env").value = "MSG=hello, world\nAPI_KEY=native://app/api-key";
-  need("mcp-header").value = "Authorization=native://app/token";
+  need("mcp-args").value = '["-y", "--cache=/tmp/a,b", " padded ", ""]';
+  need("mcp-env").value = '["MSG=hello, world", "API_KEY=native://app/api-key"]';
+  need("mcp-header").value = '["Authorization=native://app/token"]';
 
   setResponder(() => ({ ok: true, result: { diff: "+command = \"npx\"\n" }, diagnostics: [] }));
-  const previewButtons = allElements.filter(
-    (el) => el.tagName === "BUTTON" && el.children[0] === "Preview diff",
-  );
-  assert.equal(previewButtons.length, 1, "the MCP form has one Preview diff button");
+  assert.ok(liveButton("Preview diff"), "the MCP form has a Preview diff button");
   const mark = baseline();
-  previewButtons[0].fire("click");
+  liveButton("Preview diff").fire("click");
   await flush();
 
   const previewCall = callSince(mark, "mcp-server/add");
   assert.ok(previewCall, "the preview posts mcp-server/add");
   assert.equal(previewCall.body.dry_run, true);
-  assert.deepEqual(previewCall.body.args, ["-y", "--cache=/tmp/a,b", "server-name"]);
+  assert.deepEqual(previewCall.body.args, ["-y", "--cache=/tmp/a,b", " padded ", ""]);
   assert.deepEqual(previewCall.body.env, ["MSG=hello, world", "API_KEY=native://app/api-key"]);
   assert.deepEqual(previewCall.body.header, ["Authorization=native://app/token"]);
   assert.equal(save.disabled, false, "a successful preview enables Save");
@@ -291,29 +322,49 @@ async function testMcpFormUsesOneEntryPerLine() {
   need("mcp-command").fire("input");
   assert.equal(save.disabled, true, "an edit after preview disables Save");
 
-  // Saving sends confirm and the same lossless arrays.
-  previewButtons[0].fire("click");
+  // Unparsable list values block the preview, clear the old diff and keep
+  // Save disabled.
+  need("mcp-args").value = "-y";
+  liveButton("Preview diff").fire("click");
   await flush();
-  const saved = baseline();
-  save.fire("click", { preventDefault() {} });
-  await flush();
-  const saveCall = callSince(saved, "mcp-server/add");
-  assert.ok(saveCall, "saving posts mcp-server/add");
-  assert.equal(saveCall.body.confirm, true);
-  assert.deepEqual(saveCall.body.args, ["-y", "--cache=/tmp/a,b", "server-name"]);
-  assert.deepEqual(saveCall.body.env, ["MSG=hello, world", "API_KEY=native://app/api-key"]);
+  assert.equal(save.disabled, true, "unparsable JSON keeps Save disabled");
+  assert.ok(need("mcp-error").textContent.includes("JSON array"), "the parse error is shown");
+  assert.equal(need("mcp-diff").hidden, true, "a failed parse clears the old diff");
+  setResponder();
 }
 
-async function testEditFillsOneEntryPerLineAndPreviewGuardsSave() {
-  // The profiles view re-rendered after the save above; the server list now
-  // has one Edit button wired to openMcpEdit.
+async function testMcpPreviewIgnoresStaleResponse() {
+  tabs.find((t) => t.dataset.view === "profiles").fire("click");
+  await flush();
+  const save = need("mcp-save");
+
+  need("mcp-name").value = "context";
+  need("mcp-args").value = '["-y"]';
+  let releaseStale;
+  setResponder(() => new Promise((resolve) => {
+    releaseStale = () => resolve({ ok: true, result: { diff: "+stale\n" }, diagnostics: [] });
+  }));
+  liveButton("Preview diff").fire("click");
+  await flush();
+  need("mcp-args").value = '["-y", "other"]'; // inflight edit
+  releaseStale();
+  await flush();
+  assert.equal(save.disabled, true, "a stale preview response keeps Save disabled");
+  assert.equal(need("mcp-diff").hidden, true, "a stale response must not render a diff");
+  setResponder();
+}
+
+async function testMcpEditClearsPreviewAndGuardsSave() {
+  // The profiles view re-rendered; the server list has one Edit button wired
+  // to openMcpEdit. Its values include the awkward ones, so the fill →
+  // preview → save round trip must be lossless.
   const servers = [
     {
       name: "context",
       transport: "stdio",
       server: {
         command: "npx",
-        args: ["-y", "--cache=/tmp/a,b"],
+        args: ["-y", " padded ", ""],
         env: { MSG: "hello, world" },
         headers: {},
       },
@@ -328,21 +379,55 @@ async function testEditFillsOneEntryPerLineAndPreviewGuardsSave() {
   tabs.find((t) => t.dataset.view === "profiles").fire("click");
   await flush();
 
-  const edit = allElements.filter((el) => el.tagName === "BUTTON" && el.children[0] === "Edit");
-  assert.ok(edit.length >= 1, "the MCP server row has an Edit button");
-  edit[edit.length - 1].fire("click");
+  const save = need("mcp-save");
 
-  // Filling the form is lossless: commas stay inside their entries.
-  assert.equal(need("mcp-args").value, "-y\n--cache=/tmp/a,b");
-  assert.equal(need("mcp-env").value, "MSG=hello, world");
-  assert.equal(need("mcp-save").disabled, true, "opening an edit does not enable Save");
+  // Preview first: Save enabled and the diff visible.
+  need("mcp-name").value = "context";
+  need("mcp-command").value = "npx";
+  need("mcp-args").value = '["-y", " padded ", ""]';
+  need("mcp-env").value = '["MSG=hello, world"]';
+  liveButton("Preview diff").fire("click");
+  await flush();
+  assert.equal(save.disabled, false);
+  assert.equal(need("mcp-diff").hidden, false);
+
+  // Opening an edit clears the earlier preview state and locks Save (QA
+  // round-2 finding 2), and the fill keeps every value verbatim.
+  const edit = allElements.filter((el) => el.tagName === "BUTTON" && el.children[0] === "Edit").at(-1);
+  edit.fire("click");
+  assert.equal(need("mcp-args").value, JSON.stringify(["-y", " padded ", ""], null, 2));
+  assert.equal(need("mcp-env").value, JSON.stringify(["MSG=hello, world"], null, 2));
+  assert.equal(save.disabled, true, "opening an edit locks Save");
+  assert.equal(need("mcp-diff").hidden, true, "opening an edit clears the diff");
+  assert.equal(need("mcp-error").textContent, "", "opening an edit clears the error");
+
+  // A locked Save must not post anything.
+  const lockedMark = baseline();
+  save.fire("click", { preventDefault() {} });
+  await flush();
+  assert.ok(!callSince(lockedMark, "mcp-server/add"), "a locked Save must not post");
+
+  // Re-preview the filled values, then save round-trips them exactly.
+  setResponder(() => ({ ok: true, result: { diff: "+args\n" }, diagnostics: [] }));
+  liveButton("Preview diff").fire("click");
+  await flush();
+  assert.equal(save.disabled, false, "the filled values preview cleanly");
+  const savedMark = baseline();
+  save.fire("click", { preventDefault() {} });
+  await flush();
+  const saveCall = callSince(savedMark, "mcp-server/add");
+  assert.ok(saveCall, "saving posts mcp-server/add");
+  assert.equal(saveCall.body.confirm, true);
+  assert.deepEqual(saveCall.body.args, ["-y", " padded ", ""]);
+  assert.deepEqual(saveCall.body.env, ["MSG=hello, world"]);
   setResponder();
 }
 
 const tests = {
   testProfileSaveIsGatedOnPreview,
-  testMcpFormUsesOneEntryPerLine,
-  testEditFillsOneEntryPerLineAndPreviewGuardsSave,
+  testMcpFormUsesJsonArrayValues,
+  testMcpPreviewIgnoresStaleResponse,
+  testMcpEditClearsPreviewAndGuardsSave,
 };
 
 let failed = 0;

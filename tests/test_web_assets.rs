@@ -1,6 +1,8 @@
 //! The web panel's JavaScript is regression-tested in Node (see
-//! `tests/js/app.test.mjs`): Save gating on preview (QA round-1 finding 4)
-//! and the one-entry-per-line list encoding (QA round-1 finding 5).
+//! `tests/js/app.test.mjs`): Save gating on preview including stale-response
+//! and payload double-check guards (QA round-2 finding 1), clearing preview
+//! state when an edit opens (QA round-2 finding 2), and lossless JSON-array
+//! list values (QA round-2 finding 3).
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -31,8 +33,9 @@ fn web_panel_javascript_passes_its_node_suite() {
     );
     assert!(
         stdout.contains("ok testProfileSaveIsGatedOnPreview")
-            && stdout.contains("ok testMcpFormUsesOneEntryPerLine")
-            && stdout.contains("ok testEditFillsOneEntryPerLineAndPreviewGuardsSave"),
+            && stdout.contains("ok testMcpFormUsesJsonArrayValues")
+            && stdout.contains("ok testMcpPreviewIgnoresStaleResponse")
+            && stdout.contains("ok testMcpEditClearsPreviewAndGuardsSave"),
         "the suite must actually run its tests:\n{stdout}{stderr}"
     );
 }
