@@ -111,6 +111,23 @@ impl Ui {
     fn authorized(&mut self, path: &str) -> (u16, String, String) {
         self.request("GET", &format!("{path}?token={}", self.token), None, None)
     }
+
+    /// Consume the one-time token and return the session cookie for later calls.
+    fn session(&mut self) -> String {
+        let (_, headers, _) = self.authorized("/");
+        headers
+            .lines()
+            .find(|line| line.to_ascii_lowercase().starts_with("set-cookie:"))
+            .expect("session cookie")
+            .split_once(':')
+            .unwrap()
+            .1
+            .trim()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string()
+    }
 }
 
 impl Drop for Ui {
@@ -209,19 +226,7 @@ fn ui_secret_reveal_requires_confirmation_and_is_recorded() {
         .assert()
         .success();
     let mut ui = Ui::start(&env);
-    let (_, headers, _) = ui.authorized("/");
-    let cookie = headers
-        .lines()
-        .find(|line| line.to_ascii_lowercase().starts_with("set-cookie:"))
-        .unwrap()
-        .split_once(':')
-        .unwrap()
-        .1
-        .trim()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string();
+    let cookie = ui.session();
     let (status, _, body) = ui.request(
         "POST",
         "/api/secret/reveal",
@@ -247,6 +252,129 @@ fn ui_secret_reveal_requires_confirmation_and_is_recorded() {
         history.contains("reveal") || history.contains("secret"),
         "reveal must appear in history"
     );
+}
+
+#[test]
+fn web_reject_routes_remove_pending_requests_with_session_cookie() {
+    let owner = support::MusterEnv::new();
+    let joiner = support::MusterEnv::new();
+    owner
+        .run(&["--yes", "init", "--machine", "owner-laptop"])
+        .assert()
+        .success();
+    let config = owner.config_dir();
+    let config_str = config.to_str().unwrap();
+    // A pending machine enrollment request, written through the shared repo.
+    joiner
+        .run(&[
+            "--format",
+            "json",
+            "--config",
+            config_str,
+            "enroll",
+            "--name",
+            "web-laptop",
+        ])
+        .assert()
+        .success();
+    // A pending member invitation.
+    owner
+        .run(&[
+            "--format", "json", "--config", config_str, "member", "add", "webbie",
+        ])
+        .assert()
+        .success();
+    assert!(config.join("enroll/web-laptop.toml").exists());
+
+    let mut ui = Ui::start(&owner);
+    let cookie = ui.session();
+
+    // Without confirm the write is refused.
+    let (status, _, _) = ui.request(
+        "POST",
+        "/api/member/reject",
+        Some(&cookie),
+        Some(r#"{"name":"webbie"}"#),
+    );
+    assert_eq!(status, 400);
+    let (status, _, body) = ui.request(
+        "POST",
+        "/api/member/reject",
+        Some(&cookie),
+        Some(r#"{"name":"webbie","confirm":true}"#),
+    );
+    assert_eq!(status, 200);
+    let response: Value = serde_json::from_str(&body).expect("member reject JSON");
+    assert_eq!(response["result"]["rejected"], "webbie", "{response}");
+    assert_eq!(response["result"]["kind"], "member", "{response}");
+    assert!(
+        response["cli"].as_str().unwrap().contains("member reject"),
+        "{response}"
+    );
+
+    let (status, _, body) = ui.request(
+        "POST",
+        "/api/reject",
+        Some(&cookie),
+        Some(r#"{"name":"web-laptop","confirm":true}"#),
+    );
+    assert_eq!(status, 200);
+    let response: Value = serde_json::from_str(&body).expect("machine reject JSON");
+    assert_eq!(response["result"]["rejected"], "web-laptop", "{response}");
+    assert_eq!(response["result"]["kind"], "machine", "{response}");
+    assert!(
+        response["cli"].as_str().unwrap().contains("muster reject"),
+        "{response}"
+    );
+    assert!(!config.join("enroll/web-laptop.toml").exists());
+
+    let (_, members) = owner.run_json(&["--format", "json", "member", "list"]);
+    assert!(
+        !members.raw.to_string().contains("webbie"),
+        "{}",
+        members.raw
+    );
+}
+
+#[test]
+fn ui_machines_api_lists_pending_enrollment_requests_for_the_panel() {
+    let owner = support::MusterEnv::new();
+    let joiner = support::MusterEnv::new();
+    owner
+        .run(&["--yes", "init", "--machine", "owner-laptop"])
+        .assert()
+        .success();
+    let config = owner.config_dir();
+    let config_str = config.to_str().unwrap();
+    joiner
+        .run(&[
+            "--format",
+            "json",
+            "--config",
+            config_str,
+            "enroll",
+            "--name",
+            "ui-pending-laptop",
+        ])
+        .assert()
+        .success();
+
+    let mut ui = Ui::start(&owner);
+    let cookie = ui.session();
+    let (status, _, body) = ui.request("GET", "/api/machines", Some(&cookie), None);
+    assert_eq!(status, 200);
+    let api: Value = serde_json::from_str(&body).expect("machines API JSON");
+    let pending = api["result"]["pending"]
+        .as_array()
+        .expect("the machines route must serve a pending array");
+    let entry = pending
+        .iter()
+        .find(|p| p["name"] == "ui-pending-laptop")
+        .expect("the pending machine request must be served to the UI");
+    assert_eq!(entry["approvals_received"], 0, "{entry}");
+    assert_eq!(entry["approvals_required"], 1, "{entry}");
+    assert!(entry["platform"].as_str().is_some(), "{entry}");
+    assert!(entry["version"].as_str().is_some(), "{entry}");
 }
 
 #[test]
@@ -418,5 +546,384 @@ fn web_secret_writes_reject_stdin_and_oversize_bodies() {
     assert_eq!(
         ui.request("GET", "/api/secret/add", Some(&cookie), None).0,
         405
+    );
+}
+
+// Shared helpers for the edit-route tests below.
+fn ui_session_cookie(ui: &mut Ui) -> String {
+    let (_, headers, _) = ui.authorized("/");
+    headers
+        .lines()
+        .find(|line| line.to_ascii_lowercase().starts_with("set-cookie:"))
+        .unwrap()
+        .split_once(':')
+        .unwrap()
+        .1
+        .trim()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string()
+}
+
+fn ui_post(ui: &mut Ui, cookie: &str, path: &str, body: &Value) -> (u16, Value) {
+    let (status, _, content) = ui.request("POST", path, Some(cookie), Some(&body.to_string()));
+    let json: Value = serde_json::from_str(&content).unwrap_or(Value::Null);
+    (status, json)
+}
+
+#[test]
+fn web_profile_edit_previews_diff_then_saves_and_removes() {
+    let env = support::MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    let mut ui = Ui::start(&env);
+    let cookie = ui_session_cookie(&mut ui);
+    let manifest = || std::fs::read_to_string(env.config_dir().join("muster.toml")).unwrap();
+    let profile_toml = "[agents.models]\nclaude = \"sonnet\"\n\n[mcp.docs]\nurl = \"https://docs.example/mcp\"\n[mcp.docs.headers]\nAuthorization = \"native://app/docs-token\"\n";
+
+    // Unknown profile: the show route answers 400 until it exists.
+    assert_eq!(
+        ui.request(
+            "GET",
+            "/api/profile?name=dev&toml=true",
+            Some(&cookie),
+            None
+        )
+        .0,
+        400
+    );
+
+    // Preview: dry run returns a diff and writes nothing.
+    let before = manifest();
+    let (status, preview) = ui_post(
+        &mut ui,
+        &cookie,
+        "/api/profile/set",
+        &serde_json::json!({"name": "dev", "toml": profile_toml, "dry_run": true}),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(preview["ok"], true, "{preview}");
+    assert!(preview["result"]["diff"]
+        .as_str()
+        .unwrap()
+        .contains("+[agents.models]"));
+    assert!(preview["cli"]
+        .as_str()
+        .unwrap()
+        .contains("muster profile set dev"));
+    assert!(preview["cli"].as_str().unwrap().contains("--dry-run"));
+    assert_eq!(manifest(), before, "preview must not write");
+
+    // Saving needs confirm: true, like the CLI needs --yes.
+    let (status, refused) = ui_post(
+        &mut ui,
+        &cookie,
+        "/api/profile/set",
+        &serde_json::json!({"name": "dev", "toml": profile_toml}),
+    );
+    assert_eq!(status, 400, "{refused}");
+    assert_eq!(manifest(), before, "unconfirmed save must not write");
+
+    // Save: applies after confirmation.
+    let (status, saved) = ui_post(
+        &mut ui,
+        &cookie,
+        "/api/profile/set",
+        &serde_json::json!({"name": "dev", "toml": profile_toml, "confirm": true}),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(saved["ok"], true, "{saved}");
+    let after = manifest();
+    assert!(after.contains("[profiles.dev"), "{after}");
+    // Secret references are stored as references, verbatim.
+    assert!(after.contains("native://app/docs-token"), "{after}");
+
+    // The edit form loads the profile back as TOML.
+    let (status, _, shown) = ui.request(
+        "GET",
+        "/api/profile?name=dev&toml=true",
+        Some(&cookie),
+        None,
+    );
+    assert_eq!(status, 200);
+    let shown: Value = serde_json::from_str(&shown).unwrap();
+    assert!(shown["result"]["toml"].as_str().unwrap().contains("sonnet"));
+    let (_, _, list) = ui.request("GET", "/api/profiles", Some(&cookie), None);
+    assert!(list.contains("dev"));
+
+    // Missing parameters are usage errors (exit 2 → 400).
+    let (status, _) = ui_post(
+        &mut ui,
+        &cookie,
+        "/api/profile/set",
+        &serde_json::json!({"toml": "x = 1\n"}),
+    );
+    assert_eq!(status, 400);
+
+    // Removal needs the confirmation flag, like the CLI needs --yes.
+    let (status, _) = ui_post(
+        &mut ui,
+        &cookie,
+        "/api/profile/rm",
+        &serde_json::json!({"name": "dev"}),
+    );
+    assert_eq!(status, 400);
+    let (status, removed) = ui_post(
+        &mut ui,
+        &cookie,
+        "/api/profile/rm",
+        &serde_json::json!({"name": "dev", "confirm": true}),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(removed["result"]["removed"], "dev");
+    assert!(!manifest().contains("[profiles.dev"));
+}
+
+#[test]
+fn web_mcp_server_routes_add_list_and_rm() {
+    let env = support::MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    let mut ui = Ui::start(&env);
+    let cookie = ui_session_cookie(&mut ui);
+    let manifest = || std::fs::read_to_string(env.config_dir().join("muster.toml")).unwrap();
+
+    let (status, _, empty) = ui.request("GET", "/api/mcp-servers", Some(&cookie), None);
+    assert_eq!(status, 200);
+    let empty: Value = serde_json::from_str(&empty).unwrap();
+    assert_eq!(empty["result"]["servers"].as_array().unwrap().len(), 0);
+
+    // Preview first: a dry run with a diff and no write.
+    let before = manifest();
+    let (status, preview) = ui_post(
+        &mut ui,
+        &cookie,
+        "/api/mcp-server/add",
+        &serde_json::json!({"name": "context", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-context"], "env": ["API_KEY=native://app/api-key"], "dry_run": true}),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(preview["ok"], true, "{preview}");
+    assert!(preview["result"]["diff"]
+        .as_str()
+        .unwrap()
+        .contains("+command = \"npx\""));
+    assert_eq!(manifest(), before, "preview must not write");
+
+    // Saving needs confirm: true, like the CLI needs --yes.
+    let (status, refused) = ui_post(
+        &mut ui,
+        &cookie,
+        "/api/mcp-server/add",
+        &serde_json::json!({"name": "context", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-context"], "env": ["API_KEY=native://app/api-key"]}),
+    );
+    assert_eq!(status, 400, "{refused}");
+    assert_eq!(manifest(), before, "unconfirmed save must not write");
+
+    let (status, saved) = ui_post(
+        &mut ui,
+        &cookie,
+        "/api/mcp-server/add",
+        &serde_json::json!({"name": "context", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-context"], "env": ["API_KEY=native://app/api-key"], "confirm": true}),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(saved["ok"], true, "{saved}");
+    assert!(saved["cli"]
+        .as_str()
+        .unwrap()
+        .contains("muster mcp-server add context"));
+    let after = manifest();
+    assert!(after.contains("[mcp.context]"), "{after}");
+    assert!(
+        after.contains("API_KEY = \"native://app/api-key\""),
+        "{after}"
+    );
+
+    let (status, _, listed) = ui.request("GET", "/api/mcp-servers", Some(&cookie), None);
+    assert_eq!(status, 200);
+    assert!(listed.contains("context"));
+    assert!(listed.contains("stdio"));
+
+    // Wrong method and invalid server definitions fail cleanly.
+    assert_eq!(
+        ui.request("GET", "/api/mcp-server/add", Some(&cookie), None)
+            .0,
+        405
+    );
+    let (status, _) = ui_post(
+        &mut ui,
+        &cookie,
+        "/api/mcp-server/add",
+        &serde_json::json!({"name": "broken", "confirm": true}),
+    );
+    assert_eq!(status, 422, "neither command nor url is a config error");
+
+    // Removal mirrors the CLI: confirm required, then gone.
+    let (status, _) = ui_post(
+        &mut ui,
+        &cookie,
+        "/api/mcp-server/rm",
+        &serde_json::json!({"name": "context"}),
+    );
+    assert_eq!(status, 400);
+    let (status, removed) = ui_post(
+        &mut ui,
+        &cookie,
+        "/api/mcp-server/rm",
+        &serde_json::json!({"name": "context", "confirm": true}),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(removed["result"]["removed"], "context");
+    assert!(!manifest().contains("[mcp.context]"));
+}
+
+#[test]
+fn web_schedule_routes_report_enable_and_disable() {
+    let env = support::MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    let mut ui = Ui::start(&env);
+    let cookie = ui_session_cookie(&mut ui);
+
+    let (status, _, status_body) = ui.request("GET", "/api/schedule", Some(&cookie), None);
+    assert_eq!(status, 200);
+    let status_json: Value = serde_json::from_str(&status_body).unwrap();
+    assert_eq!(status_json["result"]["enabled"], false);
+
+    // The manual backend is deterministic in tests (no systemd or launchd).
+    // Applying needs confirm, like the CLI needs --yes.
+    let (status, refused) = ui_post(
+        &mut ui,
+        &cookie,
+        "/api/schedule/enable",
+        &serde_json::json!({"interval": 30, "backend": "manual"}),
+    );
+    assert_eq!(status, 400, "{refused}");
+    let (status, enabled) = ui_post(
+        &mut ui,
+        &cookie,
+        "/api/schedule/enable",
+        &serde_json::json!({"interval": 30, "backend": "manual", "confirm": true}),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(enabled["ok"], true, "{enabled}");
+    assert_eq!(enabled["result"]["backend"], "manual");
+    assert!(enabled["cli"]
+        .as_str()
+        .unwrap()
+        .contains("muster schedule enable"));
+
+    let (status, disabled) = ui_post(
+        &mut ui,
+        &cookie,
+        "/api/schedule/disable",
+        &serde_json::json!({"confirm": true}),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(disabled["ok"], true, "{disabled}");
+    let (_, _, status_body) = ui.request("GET", "/api/schedule", Some(&cookie), None);
+    let status_json: Value = serde_json::from_str(&status_body).unwrap();
+    assert_eq!(status_json["result"]["enabled"], false);
+}
+
+#[test]
+fn web_profile_set_rejects_from_file_in_both_spellings() {
+    let env = support::MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    let mut ui = Ui::start(&env);
+    let cookie = ui_session_cookie(&mut ui);
+    let manifest = || std::fs::read_to_string(env.config_dir().join("muster.toml")).unwrap();
+    let before = manifest();
+
+    // A local file an attacker would like the panel to read for them.
+    let outside = env.path().join("outside.toml");
+    std::fs::write(&outside, "[agents]\nenabled = [\"claude\"]\n").unwrap();
+
+    // The route takes inline `toml` text only: both `from-file` and the
+    // normalized `from_file` spelling are unknown parameters (400), whatever
+    // the body's `confirm` says, and the file is never read.
+    for key in ["from-file", "from_file"] {
+        let body = serde_json::json!({
+            "name": "dev",
+            key: outside.to_str().unwrap(),
+            "confirm": true,
+        });
+        let (status, reply) = ui_post(&mut ui, &cookie, "/api/profile/set", &body);
+        assert_eq!(status, 400, "{key}: {reply}");
+        assert!(
+            !reply.to_string().contains("claude"),
+            "{key} leaked file content: {reply}"
+        );
+        assert_eq!(manifest(), before, "{key} must not write");
+    }
+
+    // The same file through the CLI keeps working.
+    let (out, set) = env.run_json(&[
+        "--format",
+        "json",
+        "--yes",
+        "profile",
+        "set",
+        "dev",
+        "--from-file",
+        outside.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "{}", set.raw);
+    assert!(manifest().contains("[profiles.dev"), "{}", manifest());
+}
+
+#[test]
+fn web_mcp_server_edit_of_unchanged_values_round_trips_to_an_empty_diff() {
+    let env = support::MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    let mut ui = Ui::start(&env);
+    let cookie = ui_session_cookie(&mut ui);
+    let manifest = || std::fs::read_to_string(env.config_dir().join("muster.toml")).unwrap();
+
+    // Values that comma-splitting used to corrupt.
+    let body = serde_json::json!({
+        "name": "context",
+        "command": "npx",
+        "args": ["-y", "--cache=/tmp/a,b", "@modelcontextprotocol/server-context"],
+        "env": ["MSG=hello, world", "API_KEY=native://app/api-key"],
+        "confirm": true,
+    });
+    let (status, saved) = ui_post(&mut ui, &cookie, "/api/mcp-server/add", &body);
+    assert_eq!(status, 200, "{saved}");
+    let stored = manifest();
+
+    // The edit form loads the server back (what the panel puts in the form).
+    let (status, _, listed) = ui.request("GET", "/api/mcp-servers", Some(&cookie), None);
+    assert_eq!(status, 200);
+    let listed: Value = serde_json::from_str(&listed).unwrap();
+    let server = &listed["result"]["servers"][0];
+    assert_eq!(server["name"], "context");
+    assert_eq!(server["server"]["env"]["MSG"], "hello, world");
+    assert_eq!(server["server"]["args"][1], "--cache=/tmp/a,b");
+
+    // Re-adding exactly the shown values (the edit→save flow) must be a
+    // no-op: an empty diff and a byte-identical manifest.
+    let again = serde_json::json!({
+        "name": server["name"],
+        "command": server["server"]["command"],
+        "args": server["server"]["args"],
+        "env": server["server"]["env"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| format!("{k}={}", v.as_str().unwrap()))
+            .collect::<Vec<_>>(),
+        "dry_run": true,
+    });
+    let (status, preview) = ui_post(&mut ui, &cookie, "/api/mcp-server/add", &again);
+    assert_eq!(status, 200, "{preview}");
+    assert_eq!(preview["ok"], true, "{preview}");
+    assert_eq!(preview["result"]["diff"], "", "unchanged edit → empty diff");
+    let mut apply = again;
+    apply["dry_run"] = Value::Bool(false);
+    apply["confirm"] = Value::Bool(true);
+    let (status, applied) = ui_post(&mut ui, &cookie, "/api/mcp-server/add", &apply);
+    assert_eq!(status, 200, "{applied}");
+    assert_eq!(
+        manifest(),
+        stored,
+        "saving an unchanged server must not touch the manifest"
     );
 }

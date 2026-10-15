@@ -49,6 +49,15 @@ function table(headers, rows) {
     el("tbody", {}, rows.map((row) => el("tr", {}, row.map((cell) => el("td", {}, cell))))));
 }
 
+// Diff rendering shared by the plan preview and every edit preview.
+function diffPre(diff) {
+  return el("pre", { class: "diff" }, diff || "(no changes)");
+}
+
+function failMessage(data) {
+  return (data.diagnostics || []).map((d) => d.message).join("\n") || data.error || "failed";
+}
+
 function button(label, onclick, cls) {
   return el("button", { type: "button", class: cls || "", onclick }, label);
 }
@@ -70,15 +79,25 @@ function render(title, actions, ...blocks) {
 const views = {
   async dashboard() {
     const data = await api("status");
+    const schedule = await api("schedule");
     const r = data.result || {};
     const machines = r.machines || [];
     const pending = (r.pending && r.pending.members) || [];
     const drift = r.drift || {};
     const driftCount = (drift.members || []).length + (drift.machines || []).length;
+    const s = schedule.result || {};
+    const interval = el("input", { type: "number", min: "1", value: "60", "aria-label": "Minutes between syncs" });
     render("Dashboard (fleet panel)", [button("Sync now", () => act("Pull, plan and apply now?", "sync"), "primary")],
       el("h2", {}, "Last sync"),
       el("p", {}, r.sync ? `${r.sync.ts} · ${r.sync.result}` : "Never"),
       table(["Machines", "Pending members", "Drift"], [[machines.length, pending.length, driftCount]]),
+      el("h2", {}, "Periodic sync"),
+      el("p", {}, s.enabled ? `Enabled via ${s.backend}.` : "Not scheduled on this machine."),
+      el("div", { class: "skill-form" },
+        interval,
+        button("Enable", () => act(`Enable periodic sync every ${interval.value} minute(s)?`, "schedule/enable", { interval: Number(interval.value) || undefined })),
+        s.enabled ? button("Disable", () => act("Disable periodic sync?", "schedule/disable"), "danger") : ""),
+      diagnostics(schedule),
       el("h2", {}, "Fleet"),
       table(["Name", "Platform", "Version", "Status", "Last sync"],
         machines.map((m) => [m.name, m.platform || "", m.version || "", m.status, m.last_sync || "never"])),
@@ -94,12 +113,28 @@ const views = {
 
   async machines() {
     const data = await api("machines");
-    const machines = (data.result && data.result.machines) || [];
+    const r = data.result || {};
+    const machines = r.machines || [];
+    const pending = r.pending || [];
+    const quorum = (p) => {
+      const approvals = p.approvals || [];
+      if (p.approvals_required === undefined) return "";
+      return `${approvals.length}/${p.approvals_required}`
+        + (approvals.length ? ` (${approvals.join(", ")})` : "");
+    };
     render("Machines", [],
+      el("h2", {}, "Enrolled"),
       table(["Name", "Platform", "Role", "Profile", "Agents", "Last sync", ""],
         machines.map((m) => [m.name, m.platform || "", m.role || "", m.profile || "",
           (m.agents || []).join(", "), m.last_sync || "never",
           m.is_current ? "this machine" : button("Remove", () => act(`Remove machine ${m.name}?`, "machine/rm", { name: m.name }))])),
+      el("h2", {}, "Pending enrollment requests"),
+      table(["Name", "Platform", "Version", "Agents", "Approvals", ""],
+        pending.map((p) => [p.name, p.platform || "", p.version || "",
+          (p.agents || []).join(", "), quorum(p),
+          el("span", { class: "actions" },
+            button("Approve", () => act(`Approve enrollment of machine ${p.name}?`, "approve", { name: p.name })),
+            button("Reject", () => act(`Reject the enrollment request of machine ${p.name}? Its recorded approvals are discarded.`, "reject", { name: p.name }), "danger"))])),
       diagnostics(data));
   },
 
@@ -108,7 +143,11 @@ const views = {
     const groups = await api("groups");
     const memberRows = ((members.result && members.result.members) || []).map((m) => [
       m.name, m.role, m.status, (m.groups || []).join(", "), m.profile || "",
-      m.status === "pending" ? button("Approve", () => act(`Approve member ${m.name}?`, "member/approve", { name: m.name })) : "",
+      m.status === "pending"
+        ? el("span", { class: "actions" },
+            button("Approve", () => act(`Approve member ${m.name}?`, "member/approve", { name: m.name })),
+            button("Reject", () => act(`Reject member ${m.name}? Their invitation and recorded approvals are discarded.`, "member/reject", { name: m.name }), "danger"))
+        : "",
     ]);
     const groupRows = ((groups.result && groups.result.groups) || []).map((g) => [
       g.name || g.group || "", JSON.stringify(g.readers || {}), g.profile || "",
@@ -191,19 +230,57 @@ const views = {
   },
 
   async profiles() {
-    const data = await api("plan");
-    const r = data.result || {};
-    const blocks = (r.agents || []).map((agent) => [
+    const [planData, listData, mcpData] = await Promise.all([api("plan"), api("profiles"), api("mcp-servers")]);
+    const plan = planData.result || {};
+    const profiles = (listData.result && listData.result.profiles) || [];
+    const servers = (mcpData.result && mcpData.result.servers) || [];
+    const usage = (u) => {
+      const used = u || {};
+      const parts = [];
+      if (used.groups && used.groups.length) parts.push(`groups: ${used.groups.join(", ")}`);
+      if (used.members && used.members.length) parts.push(`members: ${used.members.join(", ")}`);
+      if (used.machines && used.machines.length) parts.push(`machines: ${used.machines.join(", ")}`);
+      return parts.join("; ") || "unused";
+    };
+    const planBlocks = (plan.agents || []).map((agent) => [
       el("h2", {}, `${agent.id} (${agent.status})`),
       table(["File", "Action", "Drift", "Diff"], (agent.files || []).map((f) => [
         f.path, f.action, f.drift ? "yes" : "no",
-        f.diff ? el("pre", {}, f.diff) : (f.private ? "private (redacted)" : ""),
+        f.diff ? diffPre(f.diff) : (f.private ? "private (redacted)" : ""),
       ])),
     ]);
     render("Profiles & diff preview", [
-      button("Apply (sync)", () => act("Apply this plan now?", "sync"), "primary"),
+      button("New profile", () => openProfileEdit(null), "primary"),
+      button("Apply (sync)", () => act("Apply this plan now?", "sync")),
       button("Refresh", () => show("profiles")),
-    ], el("p", {}, `${r.changes || 0} change(s) planned for ${r.target || "global"}.`), blocks, diagnostics(data));
+    ],
+      el("p", {}, "Agent profiles and MCP servers declared in muster.toml. Every edit shows its diff before saving."),
+      el("h2", {}, "Agent profiles"),
+      table(["Name", "Assigned to", ""], profiles.map((p) => [
+        p.name, usage(p.used_by),
+        el("span", { class: "actions" },
+          button("Edit", () => openProfileEdit(p.name)),
+          button("Remove", () => act(`Remove profile ${p.name}?`, "profile/rm", { name: p.name }), "danger")),
+      ])),
+      diagnostics(listData),
+      el("h2", {}, "MCP servers"),
+      table(["Name", "Transport", "Target", "Env / headers", ""], servers.map((s) => {
+        const server = s.server || {};
+        const settings = Object.entries(server.env || {}).map(([k, v]) => `${k}=${v}`)
+          .concat(Object.entries(server.headers || {}).map(([k, v]) => `${k}=${v}`));
+        return [s.name, s.transport, server.command || server.url || "", settings.join(", "),
+          el("span", { class: "actions" },
+            button("Edit", () => openMcpEdit(s)),
+            button("Remove", () => act(`Remove MCP server ${s.name}?`, "mcp-server/rm", { name: s.name }), "danger"))];
+      })),
+      mcpForm(),
+      el("pre", { id: "mcp-diff", hidden: true }, ""),
+      el("p", { id: "mcp-error", class: "form-error", role: "alert" }),
+      diagnostics(mcpData),
+      el("h2", {}, "Plan preview"),
+      el("p", {}, `${plan.changes || 0} change(s) planned for ${plan.target || "global"}.`),
+      planBlocks,
+      diagnostics(planData));
   },
 
   async history() {
@@ -377,5 +454,282 @@ $("#secret-form").addEventListener("submit", async (event) => {
     $("#secret-save").disabled = false;
   }
 });
+
+// Profile editing: a dialog with the profile TOML, a dry-run diff preview and
+// a confirmed save. Secret references pass through verbatim; values are never
+// resolved or sent anywhere else. Save stays disabled until the exact current
+// payload has been previewed; any edit disables it again until a re-preview,
+// and a preview response that arrives after the form moved on is ignored.
+const profileDialog = $("#profile-edit");
+let profileEditing = null;
+
+// The payload the dialog would act on, and a token identifying it exactly.
+function profileBody(dryRun) {
+  return {
+    name: $("#profile-name").value.trim(),
+    toml: $("#profile-toml").value,
+    ...(dryRun ? { dry_run: true } : { confirm: true }),
+  };
+}
+function profileToken() {
+  const body = profileBody(false);
+  return JSON.stringify({ name: body.name, toml: body.toml });
+}
+// Token of the last successful preview; anything else keeps Save disabled.
+let profilePreviewToken = null;
+
+async function openProfileEdit(name) {
+  profileEditing = name;
+  profilePreviewToken = null;
+  $("#profile-form").reset();
+  $("#profile-diff").hidden = true;
+  $("#profile-diff").textContent = "";
+  $("#profile-error").textContent = "";
+  $("#profile-save").disabled = true;
+  $("#profile-name").value = name || "";
+  $("#profile-name").readOnly = Boolean(name);
+  $("#profile-edit-title").textContent = name ? `Edit profile ${name}` : "New profile";
+  if (name) {
+    const data = await api(`profile?name=${encodeURIComponent(name)}&toml=true`);
+    if (!data.ok) {
+      $("#profile-error").textContent = failMessage(data);
+      profileDialog.showModal();
+      return;
+    }
+    $("#profile-toml").value = (data.result && data.result.toml) || "";
+  }
+  profileDialog.showModal();
+}
+
+// Shared by profile and MCP previews: run the command with dry_run and show
+// the returned diff.
+function showDiff(pre, data) {
+  if (!data.ok) {
+    pre.hidden = true;
+    pre.textContent = "";
+    return failMessage(data);
+  }
+  pre.textContent = (data.result && data.result.diff) || "(no changes)";
+  pre.hidden = false;
+  return null;
+}
+
+$("#profile-preview").addEventListener("click", async () => {
+  const token = profileToken();
+  const data = await api("profile/set", profileBody(true));
+  // The form changed while the request was inflight: the response describes a
+  // payload nobody previewed, so ignore it and keep Save disabled.
+  if (profileToken() !== token) {
+    $("#profile-save").disabled = true;
+    return;
+  }
+  const problem = showDiff($("#profile-diff"), data);
+  if (problem) $("#profile-error").textContent = problem;
+  // Save unlocks only after a successful preview of the exact current payload.
+  profilePreviewToken = problem ? null : token;
+  $("#profile-save").disabled = Boolean(problem);
+});
+
+// Any edit after a preview invalidates it: Save is disabled until re-previewed.
+for (const id of ["profile-name", "profile-toml"]) {
+  $("#" + id).addEventListener("input", () => { $("#profile-save").disabled = true; });
+}
+
+$("#profile-cancel").addEventListener("click", () => profileDialog.close());
+profileDialog.addEventListener("close", () => $("#profile-form").reset());
+$("#profile-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if ($("#profile-save").disabled) return;
+  // Belt and braces: only the exact previewed payload may be acted on.
+  if (profileToken() !== profilePreviewToken) {
+    $("#profile-save").disabled = true;
+    $("#profile-error").textContent = "The form changed since the preview. Preview the diff again.";
+    return;
+  }
+  const body = profileBody(false);
+  if (!confirm(`Save profile ${body.name}?`)) return;
+  const data = await api("profile/set", body);
+  if (data.ok) {
+    profilePreviewToken = null;
+    profileDialog.close();
+    await show("profiles");
+  } else {
+    $("#profile-error").textContent = failMessage(data);
+  }
+});
+
+// MCP server form: list fields hold JSON arrays, what the API itself accepts
+// as KEY=VALUE lists. JSON keeps every value verbatim: " padded ", "" and
+// commas survive the edit → preview → save round trip unchanged. Values that
+// look like secret material must be references (e.g. native://group/name);
+// they are stored verbatim and resolved only at apply time.
+function jsonList(text, label) {
+  if (!text.trim()) return [];
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error(`${label} must be a JSON array of strings, e.g. ["arg1", "arg2"].`);
+  }
+  if (!Array.isArray(parsed) || parsed.some((item) => typeof item !== "string")) {
+    throw new Error(`${label} must be a JSON array of strings.`);
+  }
+  return parsed;
+}
+
+function jsonPairs(text, label) {
+  const list = jsonList(text, label);
+  if (list.some((entry) => !entry.includes("=") || entry.startsWith("="))) {
+    throw new Error(`${label} entries must be KEY=VALUE strings.`);
+  }
+  return list;
+}
+
+function field(id, label, placeholder) {
+  return el("label", { class: "field" }, label + " ",
+    el("input", { id, type: "text", placeholder, "aria-label": label }));
+}
+
+function fieldArea(id, label, placeholder) {
+  return el("label", { class: "field" }, label + " ",
+    el("textarea", { id, rows: 2, spellcheck: "false", placeholder, "aria-label": label }));
+}
+
+function mcpForm() {
+  const boxes = [
+    field("mcp-name", "Name", "docs"),
+    field("mcp-command", "Command (stdio)", "npx"),
+    field("mcp-url", "URL (remote)", "https://example.com/mcp"),
+    fieldArea("mcp-args", "Args (JSON array)", '["-y", "server-name"]'),
+    fieldArea("mcp-env", "Env KEY=reference (JSON array)", '["API_KEY=native://app/api-key"]'),
+    fieldArea("mcp-header", "Headers KEY=reference (JSON array)", '["Authorization=native://app/token"]'),
+  ];
+  const save = button("Save", saveMcp, "primary");
+  save.id = "mcp-save";
+  // Like the profile dialog: Save stays disabled until the exact current
+  // values have been previewed, and any edit disables it again.
+  save.disabled = true;
+  for (const box of boxes) {
+    box.querySelector("input, textarea").addEventListener("input", () => { save.disabled = true; });
+  }
+  const row = el("div", { class: "skill-form" }, boxes,
+    button("Preview diff", previewMcp),
+    save);
+  return [el("h2", {}, "Add or replace an MCP server"), row];
+}
+
+function mcpPayload() {
+  const command = $("#mcp-command").value.trim();
+  const url = $("#mcp-url").value.trim();
+  return {
+    name: $("#mcp-name").value.trim(),
+    command: command || undefined,
+    url: url || undefined,
+    args: jsonList($("#mcp-args").value, "Args"),
+    env: jsonPairs($("#mcp-env").value, "Env"),
+    header: jsonPairs($("#mcp-header").value, "Headers"),
+  };
+}
+// Token of the form's exact current payload; null when the list fields do not
+// parse, so unparseable values can never match a preview.
+let mcpPreviewToken = null;
+function mcpToken() {
+  try {
+    return JSON.stringify(mcpPayload());
+  } catch {
+    return null;
+  }
+}
+
+// Values that look like secret material must stay references; Muster stores
+// exactly what is typed, so a raw value would end up in the manifest.
+function looksLikeSecretValue(body) {
+  return [...body.env, ...body.header].some((entry) => {
+    const [key, value] = entry.split("=");
+    return /token|secret|password|credential|api[_-]?key/i.test(key || "")
+      && value && !value.includes("://");
+  });
+}
+
+async function previewMcp() {
+  let payload;
+  try {
+    payload = mcpPayload();
+  } catch (err) {
+    $("#mcp-diff").hidden = true;
+    $("#mcp-diff").textContent = "";
+    $("#mcp-error").textContent = err.message;
+    mcpPreviewToken = null;
+    $("#mcp-save").disabled = true;
+    return;
+  }
+  const token = JSON.stringify(payload);
+  const data = await api("mcp-server/add", Object.assign({ dry_run: true }, payload));
+  // The form changed while the request was inflight: the response describes a
+  // payload nobody previewed, so ignore it and keep Save disabled.
+  if (mcpToken() !== token) {
+    $("#mcp-save").disabled = true;
+    return;
+  }
+  const problem = showDiff($("#mcp-diff"), data);
+  $("#mcp-error").textContent = problem || "";
+  // Save unlocks only after a successful preview of the exact current values.
+  mcpPreviewToken = problem ? null : token;
+  $("#mcp-save").disabled = Boolean(problem);
+}
+
+async function saveMcp() {
+  if ($("#mcp-save").disabled) return;
+  let body;
+  try {
+    body = mcpPayload();
+  } catch (err) {
+    $("#mcp-save").disabled = true;
+    $("#mcp-error").textContent = err.message;
+    return;
+  }
+  // Belt and braces: only the exact previewed payload may be acted on.
+  if (JSON.stringify(body) !== mcpPreviewToken) {
+    $("#mcp-save").disabled = true;
+    $("#mcp-error").textContent = "The form changed since the preview. Preview the diff again.";
+    return;
+  }
+  if (!body.name) {
+    $("#mcp-error").textContent = "A server name is required.";
+    return;
+  }
+  if (looksLikeSecretValue(body)
+    && !confirm("Some values look like secret values, not references (e.g. native://group/name). "
+      + "Muster stores them verbatim and only resolves references at apply time. Save anyway?")) return;
+  if (!confirm(`Save MCP server ${body.name}?`)) return;
+  const data = await api("mcp-server/add", Object.assign({ confirm: true }, body));
+  if (data.ok) {
+    mcpPreviewToken = null;
+    $("#mcp-error").textContent = "";
+    await show("profiles");
+  } else {
+    $("#mcp-error").textContent = failMessage(data);
+  }
+}
+
+function openMcpEdit(server) {
+  const s = server.server || {};
+  // JSON arrays fill the fields verbatim: " padded ", "" and commas survive.
+  $("#mcp-name").value = server.name || "";
+  $("#mcp-command").value = s.command || "";
+  $("#mcp-url").value = s.url || "";
+  $("#mcp-args").value = JSON.stringify(s.args || [], null, 2);
+  $("#mcp-env").value = JSON.stringify(
+    Object.entries(s.env || {}).map(([k, v]) => `${k}=${v}`), null, 2);
+  $("#mcp-header").value = JSON.stringify(
+    Object.entries(s.headers || {}).map(([k, v]) => `${k}=${v}`), null, 2);
+  // Any earlier preview was for other values: clear its state and lock Save.
+  $("#mcp-error").textContent = "";
+  mcpPreviewToken = null;
+  $("#mcp-diff").hidden = true;
+  $("#mcp-diff").textContent = "";
+  $("#mcp-save").disabled = true;
+  $("#mcp-name").focus();
+}
 
 show("dashboard");

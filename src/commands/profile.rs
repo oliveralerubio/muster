@@ -7,6 +7,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::context::Context;
+use crate::engine::diff::unified;
 use crate::errors::MusterError;
 use crate::machine;
 use crate::manifest::{Manifest, Profile};
@@ -32,21 +33,37 @@ pub const LIST: CommandSpec = CommandSpec {
 pub const SHOW: CommandSpec = CommandSpec {
     name: "profile.show",
     about: "Show one configuration profile and where it is assigned",
-    params: &[NAME],
+    params: &[
+        NAME,
+        ParamSpec {
+            name: "toml",
+            about: "Also render the profile as TOML (the `profile set --toml` form)",
+            kind: ParamKind::Bool,
+            required: false,
+            positional: false,
+        },
+    ],
     mutating: false,
     handler: show,
 };
 
 pub const SET: CommandSpec = CommandSpec {
     name: "profile.set",
-    about: "Create or replace a profile from a TOML file",
+    about: "Create or replace a profile from a TOML file or inline text",
     params: &[
         NAME,
         ParamSpec {
             name: "from-file",
             about: "TOML file with the profile's [agents] and/or [mcp] tables",
             kind: ParamKind::String,
-            required: true,
+            required: false,
+            positional: false,
+        },
+        ParamSpec {
+            name: "toml",
+            about: "Profile as inline TOML text (instead of --from-file)",
+            kind: ParamKind::String,
+            required: false,
             positional: false,
         },
     ],
@@ -144,31 +161,72 @@ fn show(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         .profiles
         .get(&name)
         .ok_or_else(|| not_found(&name))?;
-    Ok(json!({
+    let mut result = json!({
         "name": name,
         "profile": profile,
         "used_by": Usage::of(&manifest, &name),
-    }))
+    });
+    if params.get_bool("toml") {
+        result["toml"] = Value::from(profile_toml(profile));
+    }
+    Ok(result)
+}
+
+/// The profile as TOML text, exactly what `profile set --toml` accepts.
+fn profile_toml(profile: &Profile) -> String {
+    toml::to_string_pretty(profile).unwrap_or_default()
+}
+
+/// Diff of the profile body (the `[profiles.<name>]` tables of `muster.toml`).
+fn profile_diff(old: Option<&Profile>, new: &Profile) -> String {
+    unified(
+        &old.map(profile_toml).unwrap_or_default(),
+        &profile_toml(new),
+        "/muster.toml",
+        false,
+    )
 }
 
 fn set(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let name = profile_name(params)?;
-    let path = params
-        .get_string("from-file")
-        .ok_or_else(|| MusterError::Usage("--from-file is required".into()))?;
+    let file = params.get_string("from-file");
+    let inline = params.get_string("toml");
+    let (text, path) = match (file, inline) {
+        (Some(_), Some(_)) => {
+            return Err(MusterError::Usage(
+                "use either --from-file or --toml, not both".into(),
+            ))
+        }
+        (Some(path), None) => {
+            let text = std::fs::read_to_string(path)
+                .map_err(|e| MusterError::Usage(format!("cannot read {path}: {e}")))?;
+            (text, Some(path.to_owned()))
+        }
+        (None, Some(text)) => (text.to_owned(), None),
+        (None, None) => {
+            return Err(MusterError::Usage(
+                "provide the profile as --from-file PATH or --toml TEXT".into(),
+            ))
+        }
+    };
     let mut manifest = Manifest::load(&ctx.config_dir)?;
     let actor = actor(ctx, &manifest)?;
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| MusterError::Usage(format!("cannot read {path}: {e}")))?;
-    let profile: Profile = toml::from_str(&text).map_err(|e| MusterError::InvalidConfig {
-        message: format!("invalid profile: {}", e.message()),
-        path: Some(path.to_string()),
-    })?;
+    let invalid = |message: String, path: Option<String>| MusterError::InvalidConfig {
+        message,
+        path: path.or(Some(format!(
+            "{}: profiles.{name}",
+            crate::manifest::FILE_NAME
+        ))),
+    };
+    let profile: Profile = toml::from_str(&text)
+        .map_err(|e| invalid(format!("invalid profile: {}", e.message()), path.clone()))?;
 
-    let result = json!({ "name": name, "profile": profile });
+    let diff = profile_diff(manifest.profiles.get(&name), &profile);
+    let result = json!({ "name": name, "profile": profile, "diff": diff });
     if ctx.dry_run {
         return Ok(result);
     }
+    ctx.confirm(&format!("Set profile '{name}'?"))?;
     manifest.profiles.insert(name.clone(), profile);
     manifest.save(&ctx.config_dir)?;
     commit(

@@ -14,7 +14,7 @@
 //! redacts every value as `<redacted:REF>` and hides removed lines of files
 //! that hold secrets.
 
-mod diff;
+pub(crate) mod diff;
 pub mod dotfiles;
 pub mod layer;
 mod ownership;

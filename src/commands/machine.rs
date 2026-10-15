@@ -104,9 +104,32 @@ fn list(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
         }));
     }
 
+    // Pending enrollment requests waiting for approval (or rejection).
+    let approvals_required = manifest.required_approvals() as usize;
+    let pending: Vec<Value> = EnrollmentRequest::pending(&ctx.config_dir)?
+        .into_iter()
+        .map(|req| {
+            json!({
+                "name": req.name,
+                "recipient": req.recipient,
+                "platform": req.platform,
+                "version": req.muster_version,
+                "agents": req.agents,
+                "created_at": req.created_at,
+                "approvals": req.approvals,
+                "approvals_received": req.approvals.len(),
+                "approvals_required": approvals_required,
+                "role": req.role,
+                "profile": req.profile,
+                "member": req.member,
+            })
+        })
+        .collect();
+
     Ok(json!({
         "config_path": ctx.config_dir,
         "machines": machines,
+        "pending": pending,
     }))
 }
 

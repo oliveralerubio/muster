@@ -45,6 +45,14 @@ pub const APPROVE: CommandSpec = CommandSpec {
     handler: approve,
 };
 
+pub const REJECT: CommandSpec = CommandSpec {
+    name: "member.reject",
+    about: "Reject a pending member and discard their recorded approvals",
+    params: &[NAME],
+    mutating: true,
+    handler: reject,
+};
+
 pub const LIST: CommandSpec = CommandSpec {
     name: "member.list",
     about: "List team members, roles, status and machines",
@@ -241,6 +249,45 @@ fn approve(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let groups = team::rekey(&mut vault, &manifest, &identity)?;
     team::commit(ctx, &actor, &format!("feat(team): approve member {name}"))?;
     Ok(result(groups))
+}
+
+/// Reject a pending invitation: the member entry goes away together with any
+/// approvals recorded on it while the team quorum was pending. Nothing is
+/// revoked and the vault is not re-encrypted.
+fn reject(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
+    let name = name(params)?;
+    let mut manifest = Manifest::load(&ctx.config_dir)?;
+    let actor = team::admin(&manifest, &ctx.state_dir)?;
+    let approvals = {
+        let member = existing(&mut manifest, &name)?;
+        if member.status != MemberStatus::Pending {
+            return Err(MusterError::Usage(format!(
+                "member '{name}' is not pending"
+            )));
+        }
+        member.approvals.clone()
+    };
+    ctx.confirm(&format!(
+        "Reject member '{name}'? Their invitation and recorded approvals are discarded."
+    ))?;
+    let result = |dry_run: bool| {
+        let mut value = json!({
+            "rejected": name,
+            "kind": "member",
+            "approvals_discarded": approvals,
+        });
+        if dry_run {
+            value["dry_run"] = Value::Bool(true);
+        }
+        value
+    };
+    if ctx.dry_run {
+        return Ok(result(true));
+    }
+    manifest.members.remove(&name);
+    manifest.save(&ctx.config_dir)?;
+    team::commit(ctx, &actor, &format!("feat(team): reject member {name}"))?;
+    Ok(result(false))
 }
 
 fn list(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
