@@ -13,7 +13,7 @@ function el(tag, attrs, ...children) {
     if (k === "onclick") node.addEventListener("click", v);
     else node.setAttribute(k, v);
   }
-  for (const child of children.flat()) {
+  for (const child of children.flat(Infinity)) {
     if (child === null || child === undefined) continue;
     node.append(child instanceof Node ? child : String(child));
   }
@@ -72,14 +72,15 @@ async function act(question, path, body) {
 
 function render(title, actions, ...blocks) {
   $("#title").textContent = title;
-  actionsEl.replaceChildren(...actions);
-  viewEl.replaceChildren(...blocks.flat().filter(Boolean));
+  actionsEl.replaceChildren(...actions.flat(Infinity).filter(Boolean));
+  viewEl.replaceChildren(...blocks.flat(Infinity).filter(Boolean));
 }
 
 const views = {
-  async dashboard() {
+  async dashboard(token) {
     const data = await api("status");
     const schedule = await api("schedule");
+    if (token !== undefined && token !== navToken) return;
     const r = data.result || {};
     const machines = r.machines || [];
     const pending = (r.pending && r.pending.members) || [];
@@ -111,8 +112,9 @@ const views = {
       diagnostics(data));
   },
 
-  async machines() {
+  async machines(token) {
     const data = await api("machines");
+    if (token !== undefined && token !== navToken) return;
     const r = data.result || {};
     const machines = r.machines || [];
     const pending = r.pending || [];
@@ -138,9 +140,10 @@ const views = {
       diagnostics(data));
   },
 
-  async team() {
+  async team(token) {
     const members = await api("members");
     const groups = await api("groups");
+    if (token !== undefined && token !== navToken) return;
     const memberRows = ((members.result && members.result.members) || []).map((m) => [
       m.name, m.role, m.status, (m.groups || []).join(", "), m.profile || "",
       m.status === "pending"
@@ -158,8 +161,9 @@ const views = {
       diagnostics(members), diagnostics(groups));
   },
 
-  async secrets() {
+  async secrets(token) {
     const data = await api("secrets");
+    if (token !== undefined && token !== navToken) return;
     const secrets = Array.isArray(data.result) ? data.result : [];
     render("Secrets", [button("New secret", () => openSecretEdit(), "primary")],
       el("p", {}, "Metadata only. Revealing a value needs explicit confirmation and is recorded."),
@@ -171,8 +175,9 @@ const views = {
       diagnostics(data));
   },
 
-  async skills() {
+  async skills(token) {
     const data = await api("skills");
+    if (token !== undefined && token !== navToken) return;
     const r = data.result || {};
     const skills = r.skills || [];
     updateSkillsDot(r);
@@ -229,8 +234,9 @@ const views = {
       diagnostics(data));
   },
 
-  async profiles() {
+  async profiles(token) {
     const [planData, listData, mcpData] = await Promise.all([api("plan"), api("profiles"), api("mcp-servers")]);
+    if (token !== undefined && token !== navToken) return;
     const plan = planData.result || {};
     const profiles = (listData.result && listData.result.profiles) || [];
     const servers = (mcpData.result && mcpData.result.servers) || [];
@@ -242,7 +248,7 @@ const views = {
       if (used.machines && used.machines.length) parts.push(`machines: ${used.machines.join(", ")}`);
       return parts.join("; ") || "unused";
     };
-    const planBlocks = (plan.agents || []).map((agent) => [
+    const planBlocks = (plan.agents || []).flatMap((agent) => [
       el("h2", {}, `${agent.id} (${agent.status})`),
       table(["File", "Action", "Drift", "Diff"], (agent.files || []).map((f) => [
         f.path, f.action, f.drift ? "yes" : "no",
@@ -283,8 +289,9 @@ const views = {
       diagnostics(planData));
   },
 
-  async history() {
+  async history(token) {
     const data = await api("history");
+    if (token !== undefined && token !== navToken) return;
     const r = data.result || {};
     const generations = (r.generations || []).slice().reverse();
     render("History & generations", [],
@@ -298,8 +305,9 @@ const views = {
       diagnostics(data));
   },
 
-  async doctor() {
+  async doctor(token) {
     const data = await api("doctor");
+    if (token !== undefined && token !== navToken) return;
     const r = data.result || {};
     render("Doctor", [button("Apply safe fixes", () => act("Run doctor --fix?", "doctor", { fix: true }), "primary")],
       el("p", {}, r.healthy ? "Healthy." : "Problems found."),
@@ -347,18 +355,24 @@ function updateAll() {
 api("skills").then((data) => updateSkillsDot(data.result)).catch(() => {});
 
 let current = "dashboard";
+// Navigation token: guards against tab-switch races where slow inflight
+// fetches from an earlier view resolve after the user navigated elsewhere.
+let navToken = 0;
 const tabs = Array.from(document.querySelectorAll("#nav [role=tab]"));
 
 async function show(name) {
   current = name;
+  const token = ++navToken;
   for (const tab of tabs) {
     const selected = tab.dataset.view === name;
     tab.setAttribute("aria-selected", String(selected));
     tab.tabIndex = selected ? 0 : -1;
   }
   try {
-    await views[name]();
+    await views[name](token);
+    if (token !== navToken) return;
   } catch (err) {
+    if (token !== navToken) return;
     render(name, [], el("p", {}, "Failed to load: " + err.message));
   }
 }
