@@ -122,6 +122,10 @@ const ROUTES: &[Route] = &[
     post("schedule/enable", "schedule.enable"),
     post("schedule/disable", "schedule.disable"),
 ];
+/// Reference schemes the panel may reveal. `env://` is excluded: it would read
+/// the panel process's own environment.
+const REVEAL_SCHEMES: &[&str] = &["native", "op", "bws", "doppler", "infisical"];
+
 /// Body keys that map to global flags rather than command parameters.
 const CONFIRM: &str = "confirm";
 const DRY_RUN: &str = "dry_run";
@@ -430,7 +434,15 @@ impl Ui {
     fn reveal(&mut self, body: Map<String, Value>) -> Reply {
         let spec = registry::find("secret.get").expect("secret.get is registered");
         let name = body.get("name").and_then(Value::as_str).unwrap_or_default();
-        let reference = if name.contains("://") {
+        let reference = if let Some((scheme, _)) = name.split_once("://") {
+            if !REVEAL_SCHEMES.contains(&scheme) {
+                let params = vec![("reference".to_owned(), Value::from(name))];
+                let err = MusterError::Usage(format!(
+                    "the panel cannot reveal '{scheme}://' references; allowed: {}",
+                    REVEAL_SCHEMES.join(", ")
+                ));
+                return self.failure(spec, &cli_line(spec, &params, Flags::default()), err);
+            }
             name.to_owned()
         } else {
             format!("native://{name}")

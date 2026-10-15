@@ -189,6 +189,85 @@ fn last_commit_message(env: &MusterEnv) -> String {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn manifest_rejects_unsafe_skill_refs() {
+    for git_ref in [
+        "--upload-pack=other",
+        "feature branch",
+        "main\n",
+        "main\t",
+        "main\u{7f}",
+        "main\u{a0}",
+    ] {
+        let text = format!(
+            "version = 1\n[agents.skills]\nsource = \"skills\"\n[[agents.skills.remote]]\nname = \"upstream\"\nurl = \"https://example.com/skills.git\"\nref = {}\n",
+            toml::Value::String(git_ref.into())
+        );
+        let err = muster::manifest::Manifest::parse(&text, "muster.toml").unwrap_err();
+        assert_eq!(err.exit_code(), 3);
+        assert!(err.to_string().contains("ref"));
+    }
+}
+
+#[test]
+fn add_remote_rejects_unsafe_refs_before_fetching() {
+    let env = initialized();
+    let up = Upstream::new();
+    let before = read(&env.config_dir().join("muster.toml"));
+    for git_ref in [
+        "--upload-pack=other",
+        "feature branch",
+        "main\n",
+        "main\t",
+        "main\u{7f}",
+        "main\u{a0}",
+    ] {
+        let (code, envelope) = fails(
+            &env,
+            &[
+                "skill",
+                "add",
+                "--url",
+                &up.url(),
+                &format!("--ref={git_ref}"),
+                "--path",
+                "skills",
+            ],
+        );
+        assert_eq!(code, 2, "{}", envelope.raw);
+        assert!(envelope.raw.to_string().contains("ref"));
+    }
+    assert_eq!(read(&env.config_dir().join("muster.toml")), before);
+    assert!(!env.path().join(".cache/muster/skill-sources").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn add_remote_rejects_symlinked_skills_root_outside_checkout() {
+    let env = initialized();
+    let up = Upstream::new();
+    let outside = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(outside.path().join("evil")).unwrap();
+    std::fs::write(outside.path().join("evil/SKILL.md"), XLSX).unwrap();
+    std::os::unix::fs::symlink(outside.path(), up.path().join("linked")).unwrap();
+    up.commit("add symlink");
+    let (_, envelope) = fails(
+        &env,
+        &["skill", "add", "--url", &up.url(), "--path", "linked"],
+    );
+    assert!(envelope.raw.to_string().contains("outside the checkout"));
+}
+
+#[test]
+fn shallow_fetch_does_not_interpret_ref_as_option() {
+    let up = Upstream::new();
+    let cache = tempfile::TempDir::new().unwrap();
+    let dest = cache.path().join("checkout");
+    muster::git::shallow_fetch(&up.url(), Some("main"), &dest).unwrap();
+    muster::git::shallow_fetch(&up.url(), Some("main"), &dest).unwrap();
+    assert!(muster::git::shallow_fetch(&up.url(), Some("--dry-run"), &dest).is_err());
+}
+
+#[test]
 fn add_local_scaffolds_skill_md_and_locks_it() {
     let env = initialized();
     let result = ok(

@@ -100,9 +100,32 @@ impl Checkout {
         }
     }
 
+    /// `skills_root`, canonicalized and required to stay inside the checkout
+    /// (a symlinked `path` must not lead outside it).
+    pub fn contained_skills_root(&self, remote: &SkillRemote) -> Result<PathBuf, MusterError> {
+        let root = self.skills_root(remote)?;
+        let missing = |e: std::io::Error| {
+            MusterError::Operational(format!(
+                "source '{}' has no skills directory {}: {e}",
+                remote.name,
+                remote.path.as_deref().unwrap_or(".")
+            ))
+        };
+        let canonical = std::fs::canonicalize(&root).map_err(missing)?;
+        let base = std::fs::canonicalize(&self.dir).map_err(missing)?;
+        if !canonical.starts_with(&base) {
+            return Err(MusterError::Operational(format!(
+                "source '{}': path {} resolves outside the checkout",
+                remote.name,
+                remote.path.as_deref().unwrap_or(".")
+            )));
+        }
+        Ok(canonical)
+    }
+
     /// Skill names available under the source's `path` (directories with a SKILL.md).
     pub fn skill_names(&self, remote: &SkillRemote) -> Result<Vec<String>, MusterError> {
-        let root = self.skills_root(remote)?;
+        let root = self.contained_skills_root(remote)?;
         let entries = std::fs::read_dir(&root).map_err(|e| {
             MusterError::Operational(format!(
                 "source '{}' has no skills directory {}: {e}",

@@ -52,10 +52,15 @@ pub struct SkillsConfig {
 pub struct SkillRemote {
     /// Source id, recorded as the `origin` of its skills in `skills.lock`.
     pub name: String,
-    /// Any git URL (`https://`, `ssh`, `file://`).
+    /// Git source over HTTPS, SSH or a local file URL/path.
     pub url: String,
     /// Branch or tag to follow. Default: the remote's default branch.
-    #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "ref",
+        deserialize_with = "deserialize_git_ref",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub git_ref: Option<String>,
     /// Subdirectory of the repository holding one directory per skill.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -63,6 +68,30 @@ pub struct SkillRemote {
     /// Only these skills are vendored. Empty: every skill under `path`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub include: Vec<String>,
+}
+
+pub fn validate_git_ref(reference: &str) -> Result<(), String> {
+    if reference.starts_with('-')
+        || reference
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace())
+    {
+        return Err(
+            "skill source ref must not start with '-' or contain whitespace or control characters"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn deserialize_git_ref<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let reference = Option::<String>::deserialize(deserializer)?;
+    if let Some(reference) = &reference {
+        validate_git_ref(reference).map_err(serde::de::Error::custom)?;
+    }
+    Ok(reference)
 }
 
 /// `[agents.subagents]`: a directory of the config repository holding one

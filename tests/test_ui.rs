@@ -276,6 +276,22 @@ fn ui_secret_reveal_requires_confirmation_and_is_recorded() {
 }
 
 #[test]
+fn ui_secret_reveal_rejects_env_scheme() {
+    let env = support::MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    let mut ui = Ui::start(&env);
+    let cookie = ui.session();
+    let (status, _, body) = ui.request(
+        "POST",
+        "/api/secret/reveal",
+        Some(&cookie),
+        Some(r#"{"name":"env://PATH","confirm":true}"#),
+    );
+    assert_eq!(status, 400);
+    assert!(body.contains("cannot reveal"));
+}
+
+#[test]
 fn web_reject_routes_remove_pending_requests_with_session_cookie() {
     let owner = support::MusterEnv::new();
     let joiner = support::MusterEnv::new();
