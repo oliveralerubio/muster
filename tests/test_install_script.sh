@@ -7,6 +7,9 @@
 # Usage: bash tests/test_install_script.sh
 set -euo pipefail
 
+# Hermetic even with ambient MUSTER_* in the environment.
+unset MUSTER_VERSION MUSTER_INSTALL_DIR MUSTER_REPO
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INSTALL_SH="$REPO_ROOT/install.sh"
 
@@ -307,6 +310,21 @@ assert_contains "wget resolves the latest tag via Location header" "$(cat "$requ
     "releases/download/v0.1.0/muster-v0.1.0-x86_64-unknown-linux-gnu.tar.gz"
 installed_marker="$("$dest/muster" 2>/dev/null || true)"
 assert_eq "wget-installed binary works" "$installed_marker" "muster-fixture-x86_64-unknown-linux-gnu"
+
+echo "# wget latest version resolution"
+
+# Same wget-only PATH, but with MUSTER_VERSION unset: install.sh must resolve
+# the latest release through the /releases/latest redirect.
+dest="$WORK/dest5b"
+RUN_INSTALL_PATH="$wget_only" run_install sh MOCK_UNAME_S=Linux MOCK_UNAME_M=x86_64 \
+    MUSTER_INSTALL_DIR="$dest"
+assert_eq "install via wget without MUSTER_VERSION exits 0" "$status" "0"
+assert_contains "wget without MUSTER_VERSION requests /releases/latest" "$(cat "$requests")" \
+    "releases/latest"
+assert_contains "wget latest resolution downloads the v0.1.0 asset" "$(cat "$requests")" \
+    "releases/download/v0.1.0/muster-v0.1.0-x86_64-unknown-linux-gnu.tar.gz"
+installed_marker="$([[ -e "$dest/muster" ]] && "$dest/muster" 2>/dev/null || true)"
+assert_eq "wget latest-installed binary works" "$installed_marker" "muster-fixture-x86_64-unknown-linux-gnu"
 
 echo "# PATH advice"
 
