@@ -227,7 +227,7 @@ fn approve(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         None => Identity::load(&ctx.state_dir)?,
     };
     let mut vault = Vault::open(&ctx.config_dir)?;
-    let changes = team::pending_rekeys(&vault, &manifest)?;
+    let changes = team::pending_rekeys(ctx, &vault, &before, &manifest)?;
     team::check_can_rekey(&vault, &changes, &identity)?;
     let result = |groups: Vec<String>| {
         json!({
@@ -246,7 +246,7 @@ fn approve(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     }
     existing(&mut manifest, &name)?.approvals = approvals.clone();
     manifest.save(&ctx.config_dir)?;
-    let groups = team::rekey(&mut vault, &manifest, &identity)?;
+    let groups = team::rekey(&mut vault, &changes, &identity)?;
     team::commit(ctx, &actor, &format!("feat(team): approve member {name}"))?;
     Ok(result(groups))
 }
@@ -370,6 +370,7 @@ fn rm(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let name = name(params)?;
     let mut manifest = Manifest::load(&ctx.config_dir)?;
     let actor = team::admin(&manifest, &ctx.state_dir)?;
+    let before = manifest.clone();
     if actor.member == name {
         return Err(MusterError::Usage(
             "you cannot revoke yourself; ask another admin".into(),
@@ -399,7 +400,7 @@ fn rm(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let identity = team::unlock(ctx, params, &manifest)?;
     let mut vault = Vault::open(&ctx.config_dir)?;
     let exposed = team::exposed_secrets(&vault, &revoked_recipients)?;
-    let changes = team::pending_rekeys(&vault, &manifest)?;
+    let changes = team::pending_rekeys(ctx, &vault, &before, &manifest)?;
     team::check_can_rekey(&vault, &changes, &identity)?;
     let result = |groups: Vec<String>| {
         json!({
@@ -414,7 +415,7 @@ fn rm(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         return Ok(result(changes.into_iter().map(|(g, _)| g).collect()));
     }
     manifest.save(&ctx.config_dir)?;
-    let groups = team::rekey(&mut vault, &manifest, &identity)?;
+    let groups = team::rekey(&mut vault, &changes, &identity)?;
     for machine in &member.machines {
         EnrollmentRequest::remove(&ctx.config_dir, machine)?;
     }

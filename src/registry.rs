@@ -121,6 +121,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     crate::commands::group::LIST,
     crate::commands::group::GRANT,
     crate::commands::group::REVOKE,
+    crate::commands::group::REKEY,
     crate::commands::profile::LIST,
     crate::commands::profile::SHOW,
     crate::commands::profile::SET,

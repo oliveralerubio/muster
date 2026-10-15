@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use crate::context::Context;
 use crate::errors::MusterError;
 use crate::machine;
-use crate::manifest::{Group, Manifest};
+use crate::manifest::{Group, Manifest, Readers};
 use crate::output::{Diagnostic, Severity};
 use crate::registry::{CommandSpec, ParamKind, ParamSpec, Params};
 use crate::team::{self, RECOVERY_KEY_PARAM, RECOVERY_KEY_STDIN_PARAM, ROTATION_ADVICE};
@@ -87,6 +87,14 @@ pub const REVOKE: CommandSpec = CommandSpec {
     handler: revoke,
 };
 
+pub const REKEY: CommandSpec = CommandSpec {
+    name: "group.rekey",
+    about: "Review and apply manual reader drift for one secret group",
+    params: &[GROUP, RECOVERY_KEY_PARAM, RECOVERY_KEY_STDIN_PARAM],
+    mutating: true,
+    handler: rekey,
+};
+
 fn group_name(params: &Params) -> Result<String, MusterError> {
     let name = params
         .get_string("group")
@@ -143,7 +151,7 @@ fn create(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
 
     let identity = team::unlock(ctx, params, &manifest)?;
     let mut vault = Vault::open(&ctx.config_dir)?;
-    let changes = team::pending_rekeys(&vault, &manifest)?;
+    let changes = team::pending_rekeys(ctx, &vault, &before, &manifest)?;
     team::check_can_rekey(&vault, &changes, &identity)?;
     let result = json!({
         "group": name,
@@ -155,7 +163,7 @@ fn create(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         return Ok(result);
     }
     manifest.save(&ctx.config_dir)?;
-    team::rekey(&mut vault, &manifest, &identity)?;
+    team::rekey(&mut vault, &changes, &identity)?;
     team::commit(ctx, &actor, &format!("feat(team): create group {name}"))?;
     Ok(result)
 }
@@ -179,7 +187,7 @@ fn grant(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
 
     let identity = team::unlock(ctx, params, &manifest)?;
     let mut vault = Vault::open(&ctx.config_dir)?;
-    let changes = team::pending_rekeys(&vault, &manifest)?;
+    let changes = team::pending_rekeys(ctx, &vault, &before, &manifest)?;
     team::check_can_rekey(&vault, &changes, &identity)?;
     let result = |groups: Vec<String>| {
         json!({
@@ -192,7 +200,7 @@ fn grant(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         return Ok(result(changes.into_iter().map(|(g, _)| g).collect()));
     }
     manifest.save(&ctx.config_dir)?;
-    let groups = team::rekey(&mut vault, &manifest, &identity)?;
+    let groups = team::rekey(&mut vault, &changes, &identity)?;
     team::commit(
         ctx,
         &actor,
@@ -208,6 +216,7 @@ fn revoke(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         .ok_or_else(|| MusterError::Usage("reader is required".into()))?;
     let mut manifest = Manifest::load(&ctx.config_dir)?;
     let actor = team::admin(&manifest, &ctx.state_dir)?;
+    let before = manifest.clone();
     let group = manifest
         .groups
         .get_mut(&name)
@@ -235,7 +244,7 @@ fn revoke(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let identity = team::unlock(ctx, params, &manifest)?;
     let mut vault = Vault::open(&ctx.config_dir)?;
     let exposed = team::exposed_secrets(&vault, &revoked_recipients)?;
-    let changes = team::pending_rekeys(&vault, &manifest)?;
+    let changes = team::pending_rekeys(ctx, &vault, &before, &manifest)?;
     team::check_can_rekey(&vault, &changes, &identity)?;
     let result = |groups: Vec<String>| {
         json!({
@@ -250,7 +259,7 @@ fn revoke(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         return Ok(result(changes.into_iter().map(|(g, _)| g).collect()));
     }
     manifest.save(&ctx.config_dir)?;
-    let groups = team::rekey(&mut vault, &manifest, &identity)?;
+    let groups = team::rekey(&mut vault, &changes, &identity)?;
     team::commit(
         ctx,
         &actor,
@@ -267,6 +276,48 @@ fn revoke(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         ));
     }
     Ok(result(groups))
+}
+
+fn rekey(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
+    let name = group_name(params)?;
+    let manifest = Manifest::load(&ctx.config_dir)?;
+    let actor = team::admin(&manifest, &ctx.state_dir)?;
+    let mut vault = Vault::open(&ctx.config_dir)?;
+    let current = vault.readers(&name)?;
+    let desired = team::group_recipients(&manifest, &name);
+    let gains: Vec<_> = desired.iter().filter(|r| !current.contains(r)).cloned().collect();
+    let losses: Vec<_> = current.iter().filter(|r| !desired.contains(r)).cloned().collect();
+    let changes = if gains.is_empty() && losses.is_empty() {
+        Vec::new()
+    } else {
+        vec![(name.clone(), desired.clone())]
+    };
+    team::warn_reader_drift(ctx, &vault, &manifest, &changes)?;
+    let result = json!({
+        "group": name,
+        "gains_access": gains,
+        "loses_access": losses,
+        "reencrypted_groups": changes.iter().map(|(g, _)| g.clone()).collect::<Vec<_>>(),
+    });
+    if ctx.dry_run {
+        return Ok(result);
+    }
+
+    // Compare the proposed readers to the vault, so manual config edits cannot
+    // bypass the same self-grant rule enforced by `group grant`.
+    let mut before = manifest.clone();
+    before.groups.insert(name.clone(), Group {
+        readers: Readers { recipients: current.clone(), ..Readers::default() },
+        ..Group::default()
+    });
+    team::check_self_grant(ctx, &before, &manifest, &actor)?;
+    ctx.confirm(&format!("Apply reader drift: {}?", team::reader_diff(&manifest, &name, &current, &desired)))?;
+    let identity = team::unlock(ctx, params, &manifest)?;
+    team::rekey(&mut vault, &changes, &identity)?;
+    if !changes.is_empty() {
+        team::commit(ctx, &actor, &format!("feat(team): rekey group {name}"))?;
+    }
+    Ok(result)
 }
 
 fn list(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
