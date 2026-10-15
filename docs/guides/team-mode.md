@@ -10,8 +10,8 @@ El **Modo Equipo** extiende las capacidades individuales de Muster para flotas c
 
 * **Repositorio Git Compartido:** Todo el estado canónico (manifiesto `muster.toml`, solicitudes de alta pendientes en `enroll/`, bóveda cifrada en `vault/`, perfiles y agentes) se versiona en un repositorio Git alojado en la infraestructura que elija el equipo (GitHub, GitLab, Gitea o un servidor SSH propio).
 * **Almacén Distribuido y Cifrado con age:** Los secretos se dividen en **grupos de secretos** (`secret groups`). Cada grupo se almacena en el repositorio en formato cifrado con age (`vault/<grupo>.age`) junto a sus metadatos en texto plano (`vault/<grupo>.meta.json`), los cuales describen las claves almacenadas sin desvelar nunca sus valores.
-* **Aislamiento Criptográfico Local:** Cada máquina enrolada posee su propio par de claves criptográficas age (`x25519`). La clave privada reside exclusivamente en el almacenamiento local del dispositivo (`~/.local/share/muster/identity` en Linux o su ruta equivalente según XDG/macOS). **La clave privada nunca sale de la máquina**, ni se envía por Git ni se comparte con otros miembros.
-* **Gobernanza con Quórum Multi-Administrador:** Las altas de nuevas máquinas y la aceptación de nuevos miembros en el equipo pueden requerir la aprobación de múltiples administradores (`[team] required_approvals = N`). Cada aprobación parcial se asienta con auditoría criptográfica y firma de actor (`Muster-Actor: <admin>`) en el historial de Git.
+* **Aislamiento Criptográfico Local:** Cada máquina enrolada posee su propio par de claves criptográficas age (`x25519`). La clave privada reside exclusivamente en el almacenamiento local del dispositivo (`~/.local/state/muster/identity.txt` en Linux o su ruta equivalente según XDG/macOS). **La clave privada nunca sale de la máquina**, ni se envía por Git ni se comparte con otros miembros.
+* **Gobernanza con Quórum Multi-Administrador:** Las altas de nuevas máquinas y la aceptación de nuevos miembros en el equipo pueden requerir la aprobación de múltiples administradores (`[team] required_approvals = N`). Cada aprobación parcial se asienta con registro de auditoría y trailer de actor (`Muster-Actor: <admin>`) en el historial de Git.
 * **Clave de Recuperación Fuera de Línea (*Recovery Key*):** Generada una única vez al inicializar el repositorio (`muster init`), es destinataria de todos los grupos del almacén y actúa como mecanismo de emergencia (*break-glass*) capaz de cumplir quórums de forma atómica en caso de inaccesibilidad de administradores.
 
 ---
@@ -43,7 +43,7 @@ muster init --machine admin-laptop --yes
 ```
 
 Este comando genera:
-1. La identidad local de la máquina (`~/.local/share/muster/identity`).
+1. La identidad local de la máquina (`~/.local/state/muster/identity.txt`).
 2. El manifiesto base `muster.toml`.
 3. La **clave de recuperación fuera de línea (*recovery key*)**.
 
@@ -178,7 +178,7 @@ Si una solicitud de máquina o invitación de miembro no es autorizada o fue emi
 ```sh
 muster reject alice-laptop --yes
 ```
-*(O conceptualmente `muster machine reject`)*.
+El comando de primer nivel `muster reject <máquina>` rechaza altas de máquinas pendientes. Para miembros, se usa el subcomando `muster member reject <miembro>`.
 
 #### Rechazar un Miembro Pendiente:
 ```sh
@@ -260,7 +260,7 @@ Muster incluye una consola web local (`muster ui`) que expone todas las acciones
 ## 4. Buenas Prácticas y Reglas de Seguridad
 
 ### 1. Custodia de Claves Privadas
-* Las claves privadas (`~/.local/share/muster/identity`) residen con permisos `0600` en el dispositivo local.
+* Las claves privadas (`~/.local/state/muster/identity.txt`) residen con permisos `0600` en el dispositivo local.
 * Nunca realice copias de seguridad de la carpeta de identidad local en el repositorio Git. Muster incluye patrones en `.gitignore` para prevenir inclusiones accidentales.
 
 ### 2. Regla contra la Auto-Concesión (*Self-Grant Prevention*)
