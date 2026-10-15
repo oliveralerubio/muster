@@ -16,6 +16,14 @@ Three equivalent interfaces:
 | Web UI | `muster ui` | Admins managing machines, members, groups and secrets |
 | Agents | `muster mcp`, `--format json` | AI agents operating Muster with scoped permissions |
 
+## Install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/oliveralerubio/muster/main/install.sh | sh
+```
+
+The script detects your OS and architecture (Linux and macOS, x86_64 and aarch64), downloads the release tarball, verifies its SHA-256 checksum, and installs the binary to `~/.local/bin`. Override the defaults with `MUSTER_VERSION` (tag, e.g. `v0.1.0`), `MUSTER_INSTALL_DIR` and `MUSTER_REPO`. If the directory is not on your `PATH`, the script tells you how to add it.
+
 ## Agent Skills
 
 Declare a skills folder in `muster.toml` (`[agents.skills] source = "skills"`), one subfolder per skill with a `SKILL.md` (YAML frontmatter with `name` and `description`) plus any extra files. Muster installs every file, byte for byte, for all four agents:
