@@ -115,7 +115,7 @@ const views = {
           (p.agents || []).join(", "), quorum(p),
           el("span", { class: "actions" },
             button("Approve", () => act(`Approve enrollment of machine ${p.name}?`, "approve", { name: p.name })),
-            button("Reject", () => act(`Reject the enrollment request of machine ${p.name}? Its recorded approvals are discarded.", "reject", { name: p.name }), "danger"))])),
+            button("Reject", () => act(`Reject the enrollment request of machine ${p.name}? Its recorded approvals are discarded.`, "reject", { name: p.name }), "danger"))])),
       diagnostics(data));
   },
 
