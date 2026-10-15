@@ -8,7 +8,7 @@
 set -euo pipefail
 
 # Hermetic even with ambient MUSTER_* in the environment.
-unset MUSTER_VERSION MUSTER_INSTALL_DIR MUSTER_REPO
+unset MUSTER_VERSION MUSTER_INSTALL_DIR MUSTER_REPO MUSTER_INSTALL_SKIP_MAIN
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INSTALL_SH="$REPO_ROOT/install.sh"

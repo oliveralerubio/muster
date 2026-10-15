@@ -71,6 +71,10 @@ jobs:
     name: Publish release
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
 
@@ -94,6 +98,14 @@ jobs:
           cd dist
           sha256sum muster-*.tar.gz DEPENDENCY-INVENTORY.txt > SHA256SUMS
           cat SHA256SUMS
+
+      - name: Sign release provenance
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+            dist/DEPENDENCY-INVENTORY.txt
 
       - name: Publish
         uses: softprops/action-gh-release@v2
