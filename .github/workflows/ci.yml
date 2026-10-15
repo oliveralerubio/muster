@@ -9,17 +9,19 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   test:
-    name: test (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+    name: test
+    # Self-hosted omarchy runner by default. Set the repo variable CI_RUNNER
+    # (JSON array of labels, e.g. ["ubuntu-latest"]) to switch to hosted runners.
+    runs-on: ${{ fromJSON(vars.CI_RUNNER || '["self-hosted","fast-runner"]') }}
     steps:
       - uses: actions/checkout@v4
 
@@ -30,8 +32,6 @@ jobs:
 
       - name: Cache cargo dependencies
         uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.os }}
 
       - name: Format
         run: cargo fmt --all -- --check
@@ -43,12 +43,8 @@ jobs:
         run: cargo test --all-targets
 
   install-script:
-    name: install.sh (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+    name: install.sh
+    runs-on: ${{ fromJSON(vars.CI_RUNNER || '["self-hosted","fast-runner"]') }}
     steps:
       - uses: actions/checkout@v4
 
@@ -57,7 +53,7 @@ jobs:
 
   gitleaks:
     name: gitleaks
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNER || '["self-hosted","fast-runner"]') }}
     permissions:
       contents: read
       pull-requests: read
