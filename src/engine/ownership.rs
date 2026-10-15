@@ -8,7 +8,8 @@
 
 use serde_json::Value;
 
-use crate::adapters::{strip_markdown_block, FileFormat};
+use crate::adapters::{strip_markdown_block, yaml, FileFormat};
+use yaml_rust2::Yaml;
 
 const BLOCK: &str = "block";
 /// Owned key of a whole-file (managed dotfile) record.
@@ -31,6 +32,24 @@ pub fn owned_keys(format: FileFormat, rendered: &str) -> Vec<Vec<String>> {
                 })
                 .collect(),
             _ => Vec::new(),
+        },
+        FileFormat::Yaml => match yaml::mapping(rendered, "YAML") {
+            Ok(map) => map
+                .iter()
+                .flat_map(|(k, v)| {
+                    let Some(k) = k.as_str() else {
+                        return Vec::new();
+                    };
+                    match v {
+                        Yaml::Hash(children) => children
+                            .keys()
+                            .filter_map(|c| c.as_str().map(|c| vec![k.into(), c.into()]))
+                            .collect(),
+                        _ => vec![vec![k.into()]],
+                    }
+                })
+                .collect(),
+            Err(_) => Vec::new(),
         },
         FileFormat::Toml => match rendered.parse::<toml_edit::DocumentMut>() {
             Ok(doc) => doc
@@ -71,6 +90,33 @@ pub fn prune(format: FileFormat, text: &str, keys: &[Vec<String>]) -> String {
             let mut out = serde_json::to_string_pretty(&Value::Object(map)).expect("JSON");
             out.push('\n');
             out
+        }
+        FileFormat::Yaml => {
+            let Ok(mut map) = yaml::mapping(text, "YAML") else {
+                return text.to_string();
+            };
+            let mut changed = false;
+            for key in keys {
+                match key.as_slice() {
+                    [k] => {
+                        changed |= map.remove(&yaml::key(k)).is_some();
+                    }
+                    [k, child] => {
+                        if let Some(Yaml::Hash(children)) = map.get_mut(&yaml::key(k)) {
+                            changed |= children.remove(&yaml::key(child)).is_some();
+                            if children.is_empty() {
+                                map.remove(&yaml::key(k));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if changed {
+                yaml::merge(text, map)
+            } else {
+                text.to_string()
+            }
         }
         FileFormat::Toml => {
             let Ok(mut doc) = text.parse::<toml_edit::DocumentMut>() else {
@@ -124,12 +170,23 @@ pub fn is_empty(format: FileFormat, text: &str) -> bool {
             Ok(v) => json_empty(&v),
             Err(_) => text.trim().is_empty(),
         },
+        FileFormat::Yaml => match yaml::mapping(text, "YAML") {
+            Ok(map) => yaml_empty(&Yaml::Hash(map)),
+            Err(_) => text.trim().is_empty(),
+        },
         FileFormat::Toml => match text.parse::<toml_edit::DocumentMut>() {
             Ok(doc) => doc
                 .iter()
                 .all(|(_, item)| item.as_table_like().is_some_and(|t| t.is_empty())),
             Err(_) => text.trim().is_empty(),
         },
+    }
+}
+
+fn yaml_empty(v: &Yaml) -> bool {
+    match v {
+        Yaml::Hash(map) => map.values().all(yaml_empty),
+        _ => false,
     }
 }
 

@@ -44,6 +44,9 @@ fn run(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
             "platform": m.platform,
             "version": m.muster_version,
             "agents": m.agents,
+            "experimental_agents": m.agents.iter().filter(|id| {
+                crate::adapters::find(id).is_some_and(|a| a.experimental)
+            }).collect::<Vec<_>>(),
             "last_sync": m.last_sync,
             "status": status,
             "is_current": is_current,

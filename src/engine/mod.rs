@@ -360,7 +360,17 @@ fn plan_adapter(
         files.push((file, path, before, text));
     }
 
-    let rendered = adapter.render(desired, &current)?;
+    let mut rendered = adapter.render(desired, &current)?;
+    if matches!(target, Target::Project(_))
+        && adapter.id == "hermes"
+        && (!desired.mcp.is_empty() || desired.agents.models.contains_key(adapter.id))
+    {
+        rendered.diagnostics.push(Diagnostic::new(
+            Severity::Warning,
+            "unsupported_feature",
+            "Hermes Agent MCP servers and model settings are user-scoped only; skipped for this project",
+        ).with_path(adapter.id));
+    }
     let mut entries = Vec::new();
     for (file, path, before, pruned) in files {
         let record = ours(&path);

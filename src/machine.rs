@@ -67,11 +67,11 @@ pub fn save_name(state_dir: &Path, name: &str) -> Result<(), MusterError> {
         .map_err(|e| MusterError::Operational(format!("{}: {e}", path.display())))
 }
 
-/// Ids of the stable agents whose CLI is found as an executable on `PATH`.
+/// Ids of the available agents whose CLI is found as an executable on `PATH`.
 pub fn detect_agents() -> Vec<String> {
     crate::adapters::ADAPTERS
         .iter()
-        .filter(|a| !a.experimental && a.available())
+        .filter(|a| a.available())
         .filter(|a| find_executable(a.binary).is_some())
         .map(|a| a.id.to_string())
         .collect()
