@@ -1174,6 +1174,22 @@ fn read_subagent(
         ));
         return None;
     };
+    let has_unsupported_control = |s: &str| {
+        s.chars()
+            .any(|c| c.is_ascii_control() && c != '\n' && c != '\r' && c != '\t')
+    };
+    if has_unsupported_control(&description)
+        || scalar("model")
+            .as_deref()
+            .is_some_and(has_unsupported_control)
+    {
+        ctx.diag(subagent_invalid(
+            stem,
+            path,
+            "frontmatter contains unsupported control characters",
+        ));
+        return None;
+    }
     // The name becomes a file name under every agents directory: confine it
     // to the source directory by requiring the installed shape and an exact
     // match with the file stem.

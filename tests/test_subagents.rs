@@ -547,6 +547,16 @@ fn malformed_yaml_warns_and_is_skipped() {
         "---\nname: badtab\ndescription:\n\t- tab indentation is invalid YAML\n---\nbody\n",
     )
     .expect("write badtab");
+    std::fs::write(
+        source.join("badctrl.md"),
+        "---\nname: badctrl\ndescription: \"before\\u0007after\"\n---\nbody\n",
+    )
+    .expect("write badctrl");
+    std::fs::write(
+        source.join("badmodel.md"),
+        "---\nname: badmodel\ndescription: fine\nmodel: \"m\\u001bx\"\n---\nbody\n",
+    )
+    .expect("write badmodel");
 
     let (output, envelope) = env.run_json(&[
         "agents",
@@ -564,7 +574,7 @@ fn malformed_yaml_warns_and_is_skipped() {
         .filter(|d| d["code"] == "subagent_invalid")
         .filter_map(|d| d["message"].as_str())
         .collect();
-    for stem in ["badflow", "badtab"] {
+    for stem in ["badflow", "badtab", "badctrl", "badmodel"] {
         assert_eq!(
             hits.iter().filter(|m| m.contains(stem)).count(),
             1,
@@ -574,6 +584,8 @@ fn malformed_yaml_warns_and_is_skipped() {
     let agents = user_agents_dir(&env, "antigravity");
     assert!(!agents.join("badflow.md").exists());
     assert!(!agents.join("badtab.md").exists());
+    assert!(!agents.join("badctrl.md").exists());
+    assert!(!agents.join("badmodel.md").exists());
     assert!(
         agents.join("review.md").is_file(),
         "valid files still install"
