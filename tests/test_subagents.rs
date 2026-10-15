@@ -733,10 +733,14 @@ Prompt with: colons, #hash and 'quotes'.
 ";
 
 /// Split and parse the frontmatter of a generated OpenCode agent file.
-fn parse_opencode_frontmatter(contents: &str) -> serde_yaml_ng::Value {
+fn parse_opencode_frontmatter(contents: &str) -> yaml_rust2::Yaml {
     let body = contents.strip_prefix("---\n").expect("opening ---");
     let end = body.find("\n---").expect("closing ---");
-    serde_yaml_ng::from_str(&body[..end]).expect("generated frontmatter must be valid YAML")
+    yaml_rust2::YamlLoader::load_from_str(&body[..end])
+        .expect("generated frontmatter must be valid YAML")
+        .into_iter()
+        .next()
+        .expect("generated frontmatter must have a document")
 }
 
 #[test]

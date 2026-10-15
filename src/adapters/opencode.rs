@@ -13,7 +13,8 @@
 //!   skipped with a warning; generated frontmatter is serialized as YAML.
 
 use serde_json::{Map, Value};
-use serde_yaml_ng::{Mapping, Value as Yaml};
+use yaml_rust2::yaml::Hash;
+use yaml_rust2::{Yaml, YamlEmitter};
 
 use super::{
     child_object, json_object, json_text, markdown_block, push_skills, resolve_mcp_map, transport,
@@ -131,28 +132,36 @@ fn render(desired: &Desired, current: &Current, plan: &mut RenderPlan) -> Result
     );
     for subagent in desired.subagents.values() {
         warn_untranslated(subagent, plan);
-        // Serialize with serde_yaml_ng so any description or model (quotes,
+        // Serialize with yaml-rust2 so any description or model (quotes,
         // colons, multi-line block scalars) stays valid YAML.
-        let mut frontmatter = Mapping::new();
+        let mut frontmatter = Hash::new();
         frontmatter.insert(
-            Yaml::from("description"),
-            Yaml::from(subagent.description.as_str()),
+            Yaml::String("description".into()),
+            Yaml::String(subagent.description.clone()),
         );
-        frontmatter.insert(Yaml::from("mode"), Yaml::from("subagent"));
+        frontmatter.insert(Yaml::String("mode".into()), Yaml::String("subagent".into()));
         if let Some(model) = &subagent.model {
-            frontmatter.insert(Yaml::from("model"), Yaml::from(model.as_str()));
+            frontmatter.insert(Yaml::String("model".into()), Yaml::String(model.clone()));
         }
-        let yaml = serde_yaml_ng::to_string(&frontmatter).map_err(|e| {
-            MusterError::Operational(format!(
-                "cannot render OpenCode agent `{}`: {e}",
-                subagent.name
-            ))
-        })?;
+        let mut rendered = String::new();
+        {
+            let mut emitter = YamlEmitter::new(&mut rendered);
+            emitter.multiline_strings(true);
+            emitter.dump(&Yaml::Hash(frontmatter)).map_err(|e| {
+                MusterError::Operational(format!(
+                    "cannot render OpenCode agent `{}`: {e}",
+                    subagent.name
+                ))
+            })?;
+        }
+        // `YamlEmitter` writes its own `---` document marker (and no trailing
+        // newline); the file provides both.
+        let yaml = rendered.strip_prefix("---\n").unwrap_or(&rendered);
         plan.tree.push(super::RenderedTreeFile {
             base: Base::XdgConfig,
             path: format!("{AGENTS_DIR}/{}.md", subagent.name),
             project: Some(format!("{PROJECT_AGENTS_DIR}/{}.md", subagent.name)),
-            contents: format!("---\n{yaml}---\n\n{}\n", subagent.body.trim()),
+            contents: format!("---\n{yaml}\n---\n\n{}\n", subagent.body.trim()),
         });
     }
     Ok(())

@@ -25,7 +25,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use serde_json::{json, Value};
-use serde_yaml_ng::{Mapping, Value as Yaml};
+use yaml_rust2::yaml::Hash;
+use yaml_rust2::{Yaml, YamlLoader};
 
 use crate::adapters::config::{AgentsConfig, McpServer, Transport};
 use crate::adapters::{self, Adapter, Base, Capability, Current, Desired, FileFormat, ManagedFile};
@@ -1229,11 +1230,12 @@ fn is_valid_agent_name(name: &str) -> bool {
 
 /// Trimmed scalar text for a frontmatter key: strings verbatim, numbers and
 /// booleans as written. `None` when the key is absent, empty or not a scalar.
-fn yaml_scalar(frontmatter: &Mapping, key: &str) -> Option<String> {
-    let text = match frontmatter.get(Yaml::String(key.into()))? {
+fn yaml_scalar(frontmatter: &Hash, key: &str) -> Option<String> {
+    let text = match frontmatter.get(&Yaml::String(key.into()))? {
         Yaml::String(text) => text.clone(),
-        Yaml::Number(number) => number.to_string(),
-        Yaml::Bool(flag) => flag.to_string(),
+        Yaml::Integer(number) => number.to_string(),
+        Yaml::Real(number) => number.clone(),
+        Yaml::Boolean(flag) => flag.to_string(),
         _ => return None,
     };
     let text = text.trim().to_owned();
@@ -1242,8 +1244,8 @@ fn yaml_scalar(frontmatter: &Mapping, key: &str) -> Option<String> {
 
 /// `tools` in string (`Read, Grep`) or list form; an error means the field
 /// is neither, which invalidates the subagent.
-fn yaml_tools(frontmatter: &Mapping) -> Result<Vec<String>, String> {
-    match frontmatter.get(Yaml::String("tools".into())) {
+fn yaml_tools(frontmatter: &Hash) -> Result<Vec<String>, String> {
+    match frontmatter.get(&Yaml::String("tools".into())) {
         None | Some(Yaml::Null) => Ok(Vec::new()),
         Some(Yaml::String(raw)) => Ok(raw
             .split(',')
@@ -1251,7 +1253,7 @@ fn yaml_tools(frontmatter: &Mapping) -> Result<Vec<String>, String> {
             .filter(|t| !t.is_empty())
             .map(str::to_owned)
             .collect()),
-        Some(Yaml::Sequence(items)) => {
+        Some(Yaml::Array(items)) => {
             let mut tools = Vec::new();
             for item in items {
                 match yaml_scalar_item(item) {
@@ -1291,12 +1293,12 @@ enum ParsedFrontmatter {
     /// A block is present but is not a YAML mapping (or fails to parse).
     Invalid(String),
     /// The parsed frontmatter mapping and the Markdown body after it.
-    Ok(Mapping, String),
+    Ok(Hash, String),
 }
 
 /// Split YAML frontmatter from the Markdown body: the frontmatter is the
 /// mapping between the opening `---` and the closing `---`, parsed with
-/// `serde_yaml_ng` (so block scalars, lists and quoting work); the body is
+/// `yaml-rust2` (so block scalars, lists and quoting work); the body is
 /// everything after it. `Missing` when there is no frontmatter block.
 fn parse_frontmatter(text: &str) -> ParsedFrontmatter {
     let trimmed = text.trim_start();
@@ -1317,10 +1319,13 @@ fn parse_frontmatter(text: &str) -> ParsedFrontmatter {
         .strip_prefix('\n')
         .unwrap_or(&body[4..])
         .to_owned();
-    match serde_yaml_ng::from_str::<Yaml>(block) {
-        Ok(Yaml::Mapping(frontmatter)) => ParsedFrontmatter::Ok(frontmatter, body),
-        Ok(Yaml::Null) => ParsedFrontmatter::Ok(Mapping::new(), body),
-        Ok(_) => ParsedFrontmatter::Invalid("expected a YAML mapping".into()),
+    match YamlLoader::load_from_str(block) {
+        Ok(docs) if docs.len() <= 1 => match docs.into_iter().next().unwrap_or(Yaml::Null) {
+            Yaml::Hash(frontmatter) => ParsedFrontmatter::Ok(frontmatter, body),
+            Yaml::Null => ParsedFrontmatter::Ok(Hash::new(), body),
+            _ => ParsedFrontmatter::Invalid("expected a YAML mapping".into()),
+        },
+        Ok(_) => ParsedFrontmatter::Invalid("expected a single YAML document".into()),
         Err(e) => ParsedFrontmatter::Invalid(e.to_string()),
     }
 }
@@ -1429,14 +1434,45 @@ fn is_valid_skill(
     true
 }
 
-/// True when the content has a YAML frontmatter mapping with non-empty
-/// `name` and `description` scalars (same parser as subagents).
 fn has_valid_frontmatter(content: &str) -> bool {
-    match parse_frontmatter(content) {
-        ParsedFrontmatter::Ok(frontmatter, _) => {
-            yaml_scalar(&frontmatter, "name").is_some()
-                && yaml_scalar(&frontmatter, "description").is_some()
-        }
-        ParsedFrontmatter::Missing | ParsedFrontmatter::Invalid(_) => false,
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with("---") {
+        return false;
     }
+    let after_start = &trimmed[3..];
+    let after_newline = if let Some(rest) = after_start.strip_prefix("\r\n") {
+        rest
+    } else if let Some(rest) = after_start.strip_prefix('\n') {
+        rest
+    } else {
+        return false;
+    };
+
+    let Some(end_idx) = after_newline.find("\n---") else {
+        return false;
+    };
+    let fm_block = &after_newline[..end_idx];
+
+    let mut has_name = false;
+    let mut has_desc = false;
+
+    for line in fm_block.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((key, val)) = line.split_once(':') {
+            let key = key.trim();
+            let val = val.trim().trim_matches(|c| c == '\'' || c == '"').trim();
+            if !val.is_empty() {
+                if key == "name" {
+                    has_name = true;
+                } else if key == "description" {
+                    has_desc = true;
+                }
+            }
+        }
+    }
+
+    has_name && has_desc
 }
