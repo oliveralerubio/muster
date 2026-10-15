@@ -9,17 +9,21 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   test:
-    name: test (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+    name: test
+    if: vars.CI_RUNNER != '' && vars.CI_RUNNER != 'none'
+    # CI_RUNNER is maintained by scripts/ci-runner-select.sh (omarchy if online,
+    # else ubuntu-latest if hosted minutes work, else "none" = skip).
+    # Unset or empty also skips: jobs only run when the selector has decided.
+    runs-on: ${{ fromJSON(vars.CI_RUNNER || '["ubuntu-latest"]') }}
     steps:
       - uses: actions/checkout@v4
 
@@ -30,8 +34,6 @@ jobs:
 
       - name: Cache cargo dependencies
         uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.os }}
 
       - name: Format
         run: cargo fmt --all -- --check
@@ -43,21 +45,22 @@ jobs:
         run: cargo test --all-targets
 
   install-script:
-    name: install.sh (${{ matrix.os }})
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+    name: scripts
+    if: vars.CI_RUNNER != '' && vars.CI_RUNNER != 'none'
+    runs-on: ${{ fromJSON(vars.CI_RUNNER || '["ubuntu-latest"]') }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Test install.sh
         run: bash tests/test_install_script.sh
 
+      - name: Test ci-runner-select.sh
+        run: bash tests/test_ci_runner_select.sh
+
   gitleaks:
     name: gitleaks
-    runs-on: ubuntu-latest
+    if: vars.CI_RUNNER != '' && vars.CI_RUNNER != 'none'
+    runs-on: ${{ fromJSON(vars.CI_RUNNER || '["ubuntu-latest"]') }}
     permissions:
       contents: read
       pull-requests: read

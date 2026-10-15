@@ -1,0 +1,14 @@
+name: Hosted runner probe
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  probe:
+    name: probe
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - run: echo ok
