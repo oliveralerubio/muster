@@ -74,3 +74,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITLEAKS_ENABLE_COMMENTS: "false"
+          # The action downloads to $TMPDIR/gitleaks.tmp; on the shared
+          # self-hosted runner a leftover file there breaks every later run.
+          TMPDIR: ${{ runner.temp }}
