@@ -380,9 +380,14 @@ pub fn warn_reader_drift(
                 Diagnostic::new(
                     Severity::Warning,
                     "reader_drift",
-                    format!("Pending reader drift, not applied: {}", reader_diff(manifest, &group, &current, &desired)),
+                    format!(
+                        "Pending reader drift, not applied: {}",
+                        reader_diff(manifest, &group, &current, &desired)
+                    ),
                 )
-                .with_suggestion(format!("Review with `muster group rekey {group} --dry-run`")),
+                .with_suggestion(format!(
+                    "Review with `muster group rekey {group} --dry-run`"
+                )),
             );
         }
     }
@@ -390,22 +395,41 @@ pub fn warn_reader_drift(
 }
 
 /// Describe access changes using public recipients and their known machines.
-pub fn reader_diff(manifest: &Manifest, group: &str, current: &[String], desired: &[String]) -> String {
+pub fn reader_diff(
+    manifest: &Manifest,
+    group: &str,
+    current: &[String],
+    desired: &[String],
+) -> String {
     let describe = |from: &[String], to: &[String]| {
         let recipients: BTreeSet<_> = to.iter().filter(|r| !from.contains(r)).collect();
-        let labels: Vec<_> = recipients.into_iter().map(|r| {
-            let machines: Vec<_> = manifest.machines.iter()
-                .filter(|(_, m)| &m.recipient == r)
-                .map(|(name, _)| name.as_str()).collect();
-            if machines.is_empty() {
-                r.to_string()
-            } else {
-                format!("{r} (machines: {})", machines.join(", "))
-            }
-        }).collect();
-        if labels.is_empty() { "none".to_string() } else { labels.join(", ") }
+        let labels: Vec<_> = recipients
+            .into_iter()
+            .map(|r| {
+                let machines: Vec<_> = manifest
+                    .machines
+                    .iter()
+                    .filter(|(_, m)| &m.recipient == r)
+                    .map(|(name, _)| name.as_str())
+                    .collect();
+                if machines.is_empty() {
+                    r.to_string()
+                } else {
+                    format!("{r} (machines: {})", machines.join(", "))
+                }
+            })
+            .collect();
+        if labels.is_empty() {
+            "none".to_string()
+        } else {
+            labels.join(", ")
+        }
     };
-    format!("group '{group}': gain access: {}; lose access: {}", describe(current, desired), describe(desired, current))
+    format!(
+        "group '{group}': gain access: {}; lose access: {}",
+        describe(current, desired),
+        describe(desired, current)
+    )
 }
 
 /// Re-encrypt exactly the planned groups. Checks that `identity` reads all of

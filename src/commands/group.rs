@@ -285,8 +285,16 @@ fn rekey(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let mut vault = Vault::open(&ctx.config_dir)?;
     let current = vault.readers(&name)?;
     let desired = team::group_recipients(&manifest, &name);
-    let gains: Vec<_> = desired.iter().filter(|r| !current.contains(r)).cloned().collect();
-    let losses: Vec<_> = current.iter().filter(|r| !desired.contains(r)).cloned().collect();
+    let gains: Vec<_> = desired
+        .iter()
+        .filter(|r| !current.contains(r))
+        .cloned()
+        .collect();
+    let losses: Vec<_> = current
+        .iter()
+        .filter(|r| !desired.contains(r))
+        .cloned()
+        .collect();
     let changes = if gains.is_empty() && losses.is_empty() {
         Vec::new()
     } else {
@@ -306,12 +314,21 @@ fn rekey(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     // Compare the proposed readers to the vault, so manual config edits cannot
     // bypass the same self-grant rule enforced by `group grant`.
     let mut before = manifest.clone();
-    before.groups.insert(name.clone(), Group {
-        readers: Readers { recipients: current.clone(), ..Readers::default() },
-        ..Group::default()
-    });
+    before.groups.insert(
+        name.clone(),
+        Group {
+            readers: Readers {
+                recipients: current.clone(),
+                ..Readers::default()
+            },
+            ..Group::default()
+        },
+    );
     team::check_self_grant(ctx, &before, &manifest, &actor)?;
-    ctx.confirm(&format!("Apply reader drift: {}?", team::reader_diff(&manifest, &name, &current, &desired)))?;
+    ctx.confirm(&format!(
+        "Apply reader drift: {}?",
+        team::reader_diff(&manifest, &name, &current, &desired)
+    ))?;
     let identity = team::unlock(ctx, params, &manifest)?;
     team::rekey(&mut vault, &changes, &identity)?;
     if !changes.is_empty() {

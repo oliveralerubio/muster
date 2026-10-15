@@ -787,23 +787,46 @@ fn creating_a_group_preserves_unrelated_reader_drift() {
     let owner = MusterEnv::new();
     init(&owner);
     let config = owner.config_dir();
-    ok(&owner, &config, &["group", "create", "prod", "--reader", "owner"]);
+    ok(
+        &owner,
+        &config,
+        &["group", "create", "prod", "--reader", "owner"],
+    );
     add_secret(&owner, &config, "prod/token", "test-value");
     let ciphertext = std::fs::read(config.join("vault/prod.age")).unwrap();
     let metadata = std::fs::read(config.join("vault/prod.meta.json")).unwrap();
     let extra = muster::identity::Identity::generate().recipient();
     let mut manifest = muster::manifest::Manifest::load(&config).unwrap();
-    manifest.groups.get_mut("prod").unwrap().readers.recipients.push(extra.clone());
+    manifest
+        .groups
+        .get_mut("prod")
+        .unwrap()
+        .readers
+        .recipients
+        .push(extra.clone());
     manifest.save(&config).unwrap();
 
     let (out, envelope) = on(&owner, &config, &["group", "create", "unrelated"]);
     assert!(out.status.success(), "{}", envelope.raw);
-    assert!(std::fs::read(config.join("vault/prod.age")).unwrap() == ciphertext,
-        "an unrelated command must not re-encrypt prod");
-    assert_eq!(std::fs::read(config.join("vault/prod.meta.json")).unwrap(), metadata);
-    assert_eq!(envelope.result()["reencrypted_groups"], serde_json::json!([]));
-    let warning = envelope.diagnostics().as_array().unwrap().iter()
-        .find(|d| d["code"] == "reader_drift").expect("reader drift must warn");
+    assert!(
+        std::fs::read(config.join("vault/prod.age")).unwrap() == ciphertext,
+        "an unrelated command must not re-encrypt prod"
+    );
+    assert_eq!(
+        std::fs::read(config.join("vault/prod.meta.json")).unwrap(),
+        metadata
+    );
+    assert_eq!(
+        envelope.result()["reencrypted_groups"],
+        serde_json::json!([])
+    );
+    let warning = envelope
+        .diagnostics()
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["code"] == "reader_drift")
+        .expect("reader drift must warn");
     assert_eq!(warning["severity"], "warning");
     let message = warning["message"].as_str().unwrap();
     assert!(message.contains("prod") && message.contains(&extra) && message.contains("gain"));
@@ -818,7 +841,11 @@ fn explicit_group_rekey_previews_access_and_requires_confirmation() {
     add_member(&owner, "bob", "member");
     join(&owner, &bob, "bob-laptop", "bob");
     for group in ["prod", "other"] {
-        ok(&owner, &config, &["group", "create", group, "--reader", "owner"]);
+        ok(
+            &owner,
+            &config,
+            &["group", "create", group, "--reader", "owner"],
+        );
         add_secret(&owner, &config, &format!("{group}/token"), "test-value");
     }
     let prod = std::fs::read(config.join("vault/prod.age")).unwrap();
@@ -829,21 +856,32 @@ fn explicit_group_rekey_previews_access_and_requires_confirmation() {
     let readers = &mut manifest.groups.get_mut("prod").unwrap().readers;
     readers.members.clear();
     readers.machines.push("bob-laptop".into());
-    manifest.groups.get_mut("other").unwrap().readers.recipients
+    manifest
+        .groups
+        .get_mut("other")
+        .unwrap()
+        .readers
+        .recipients
         .push(muster::identity::Identity::generate().recipient());
     manifest.save(&config).unwrap();
     let config_before = std::fs::read(config.join("muster.toml")).unwrap();
 
     let preview = ok(&owner, &config, &["group", "rekey", "prod", "--dry-run"]);
     assert_eq!(preview["gains_access"], serde_json::json!([bob_recipient]));
-    assert_eq!(preview["loses_access"], serde_json::json!([owner_recipient]));
+    assert_eq!(
+        preview["loses_access"],
+        serde_json::json!([owner_recipient])
+    );
     assert_eq!(preview["reencrypted_groups"], serde_json::json!(["prod"]));
     let (out, refused) = on(&owner, &config, &["group", "rekey", "prod"]);
     assert_eq!(out.status.code(), Some(2), "{}", refused.raw);
     let message = refused.raw.to_string();
     assert!(message.contains("bob-laptop") && message.contains("owner-laptop"));
     assert!(std::fs::read(config.join("vault/prod.age")).unwrap() == prod);
-    assert_eq!(std::fs::read(config.join("muster.toml")).unwrap(), config_before);
+    assert_eq!(
+        std::fs::read(config.join("muster.toml")).unwrap(),
+        config_before
+    );
 
     let result = ok(&owner, &config, &["group", "rekey", "prod", "--yes"]);
     assert_eq!(result["gains_access"], preview["gains_access"]);
