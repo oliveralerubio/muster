@@ -14,6 +14,8 @@ struct Ui {
 
 impl Ui {
     fn start(env: &support::MusterEnv) -> Self {
+        // Doctor probes agents on PATH; use only this simulated machine's executables.
+        env.link_system_exe("git");
         let mut command = Command::new(assert_cmd::cargo::cargo_bin("muster"));
         command
             .args(["ui", "--no-open", "--port", "0"])
@@ -22,14 +24,7 @@ impl Ui {
             .env("XDG_STATE_HOME", env.home.path().join(".local/state"))
             .env("XDG_DATA_HOME", env.home.path().join(".local/share"))
             .env("XDG_CACHE_HOME", env.home.path().join(".cache"))
-            .env(
-                "PATH",
-                format!(
-                    "{}:{}",
-                    env.bin.display(),
-                    std::env::var("PATH").unwrap_or_default()
-                ),
-            )
+            .env("PATH", &env.bin)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -214,6 +209,32 @@ fn ui_status_api_matches_cli_status() {
     assert_eq!(status, 200);
     let api: Value = serde_json::from_str(&body).expect("status API JSON");
     assert_eq!(api["result"].clone(), cli.result().clone());
+}
+
+#[test]
+fn ui_doctor_uses_only_the_simulated_machine_path() {
+    let env = support::MusterEnv::new();
+    env.link_system_exe("git");
+    env.fake_exe("claude", "echo '2.1.0 (Claude Code)'");
+    env.run_isolated(&["--yes", "init"]).assert().success();
+
+    let mut ui = Ui::start(&env);
+    let (status, _, body) = ui.authorized("/api/doctor");
+    assert_eq!(status, 200);
+    let api: Value = serde_json::from_str(&body).expect("doctor API JSON");
+    let diagnostics = api["diagnostics"].as_array().unwrap();
+    for agent in ["codex", "opencode", "antigravity"] {
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d["code"] == "missing_binary" && d["path"] == agent),
+            "{agent} is absent from the simulated machine"
+        );
+    }
+    assert!(!diagnostics
+        .iter()
+        .any(|d| d["code"] == "missing_binary" && d["path"] == "claude"));
+    assert_eq!(api["ok"], true);
 }
 
 #[test]
