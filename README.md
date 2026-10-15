@@ -29,16 +29,7 @@ warning, never silently lost.
 
 ## Agent Skills
 
-Declare a skills folder in `muster.toml` (`[agents.skills] source = "skills"`), one subfolder per skill with a `SKILL.md` (YAML frontmatter with `name` and `description`) plus any extra files. Muster installs every file, byte for byte, for all four agents:
-
-| Agent | User scope | Project scope |
-|---|---|---|
-| Claude Code | `~/.claude/skills/<skill>/` | `.claude/skills/<skill>/` |
-| Codex | `~/.agents/skills/<skill>/` | `.agents/skills/<skill>/` |
-| OpenCode | `$XDG_CONFIG_HOME/opencode/skills/<skill>/` | `.opencode/skills/<skill>/` |
-| Antigravity CLI | `~/.gemini/antigravity-cli/skills/<skill>/` | `.agents/skills/<skill>/` |
-
-Project scope comes from `<project>/.muster/muster.toml`. Codex and Antigravity share `.agents/skills` in a project. Skills removed from the source are deleted on the next apply; skills you add by hand are left alone. A skill without `SKILL.md` or without `name`/`description` is skipped with a `skill_invalid` warning.
+Declare a skills folder in `muster.toml` (`[agents.skills] source = "skills"`), one subfolder per skill with a `SKILL.md` (YAML frontmatter with `name` and `description`) plus any extra files. Muster installs every file, byte for byte, into the skill folders listed in the table above. A skill without `SKILL.md` or without `name`/`description` is skipped with a `skill_invalid` warning.
 
 ### Skill lifecycle (own and subscribed skills)
 
@@ -60,15 +51,18 @@ include = ["pdf"]                          # optional: only these skills
 
 | Command | What it does |
 |---|---|
-| `muster skill list [--json]` | List every skill with origin, version, last update and status. Fully offline (outputs JSON with `--format json`). |
-| `muster skill add <name|git-url> [--ref <ref>] [--only <dir>]` | Scaffold an own skill (`skills/<name>/SKILL.md`) or subscribe to a repository with `--url <git-url>` (`--path` / `--only` selects a directory, `--include` selects skills). |
-| `muster skill check [name] [--json]` | Query upstream repositories for updates, deprecations and removals (outputs JSON with `--format json`). |
-| `muster skill update [name] [--all] [--force]` | Apply upstream changes; shows which files are added, changed or removed (`--force` overwrites local modifications). |
-| `muster skill rm <name> [--detach] [--yes]` | Delete a skill, or with `--detach` keep a subscribed skill as your own (stops tracking upstream). |
+| `muster skill list` | List every skill with origin, version, last update and status. Offline. |
+| `muster skill add <name> [--description <text>]` | Scaffold an own skill at `skills/<name>/SKILL.md`. |
+| `muster skill add --url <git-url> [--ref <ref>] [--path <dir>] [--include <skill>]` | Subscribe to a Git repository of skills and vendor them. |
+| `muster skill check [name]` | Query upstream repositories for updates, deprecations and removals. |
+| `muster skill update [name] [--all] [--force]` | Apply upstream changes, showing files added, changed or removed (`--force` overwrites local edits). |
+| `muster skill rm <name> [--detach]` | Delete a skill, or with `--detach` keep a subscribed skill as your own. |
+
+Every command accepts `--format json`, `--dry-run` and `--yes`.
 
 Statuses: `local`, `up_to_date`, `update_available`, `deprecated` (upstream `SKILL.md` has `deprecated: true` or `deprecated: "<reason>"`), `upstream_removed`, `unknown` (not checked yet, or the source could not be reached). Nothing is applied or deleted on its own: updates need `muster skill update`, and a skill removed upstream stays until you run `muster skill rm` (with or without `--detach`). A skill edited by hand shows `modified` and `update` refuses to overwrite it without `--force`. In a team, only admins add, update or remove skills; members can list and check.
 
-The web admin panel (`muster ui`) includes a **Skills** tab showing installed skills, upstream status, and an attention indicator when updates are available, offering one-click checking and updates with preview diffs.
+The web admin panel (`muster ui`) includes a **Skills** tab showing installed skills, upstream status, and an attention indicator when updates are available, with buttons to check sources and update a skill.
 
 ## Subagents
 
@@ -95,7 +89,7 @@ Linux, WSL2 and macOS. Native Windows is not supported.
 curl -fsSL https://raw.githubusercontent.com/oliveralerubio/muster/main/install.sh | bash
 ```
 
-The script is available and tested in CI (.github/workflows/ci.yml). It detects
+The script is tested in CI. It detects
 your OS and architecture (Linux and macOS, x86_64 and aarch64), downloads the
 release tarball, verifies the tarball's SHA-256 checksum against `SHA256SUMS`,
 and installs the binary to `~/.local/bin`, telling you how to extend your `PATH`
@@ -103,6 +97,9 @@ if the directory is not on it.
 
 Override defaults with optional environment variables:
 - `MUSTER_VERSION`: release tag to install, e.g. `v0.1.0` or `0.1.0` (default: latest published release).
+
+No release has been published yet, so until the first tagged release the script
+has nothing to download; build from source in the meantime.
 - `MUSTER_INSTALL_DIR`: directory where the executable will be placed (default: `~/.local/bin`).
 - `MUSTER_REPO`: GitHub repository to download from (default: `oliveralerubio/muster`).
 
