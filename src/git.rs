@@ -124,14 +124,28 @@ pub fn pull(dir: &Path) -> Result<Pulled, MusterError> {
     Ok(Pulled::Updated)
 }
 
+/// Transports git may use for skill sources: https, ssh and local files only.
+const SOURCE_TRANSPORT: [&str; 8] = [
+    "-c",
+    "protocol.allow=never",
+    "-c",
+    "protocol.https.allow=always",
+    "-c",
+    "protocol.ssh.allow=always",
+    "-c",
+    "protocol.file.allow=user",
+];
+
 /// Shallow copy of `url` at `git_ref` (default: the remote HEAD) in `dest`:
 /// `git clone --depth 1` the first time, then `git fetch --depth 1` and a
 /// forced checkout of `FETCH_HEAD`. Returns the checked-out commit.
 pub fn shallow_fetch(url: &str, git_ref: Option<&str>, dest: &Path) -> Result<String, MusterError> {
     if is_repo(dest) {
-        check(dest, &["remote", "set-url", REMOTE, url])?;
+        check(dest, &["remote", "set-url", "--", REMOTE, url])?;
         let target = git_ref.unwrap_or("HEAD");
-        check(dest, &["fetch", "--quiet", "--depth", "1", REMOTE, target])?;
+        let mut args = SOURCE_TRANSPORT.to_vec();
+        args.extend(["fetch", "--quiet", "--depth", "1", "--", REMOTE, target]);
+        check(dest, &args)?;
         check(dest, &["checkout", "--quiet", "--force", "FETCH_HEAD"])?;
     } else {
         if dest.exists() {
@@ -142,7 +156,8 @@ pub fn shallow_fetch(url: &str, git_ref: Option<&str>, dest: &Path) -> Result<St
         std::fs::create_dir_all(parent)
             .map_err(|e| MusterError::Operational(format!("{}: {e}", parent.display())))?;
         let dest_text = dest.to_string_lossy();
-        let mut args = vec!["clone", "--quiet", "--depth", "1"];
+        let mut args = SOURCE_TRANSPORT.to_vec();
+        args.extend(["clone", "--quiet", "--depth", "1"]);
         if let Some(r) = git_ref {
             args.extend(["--branch", r]);
         }

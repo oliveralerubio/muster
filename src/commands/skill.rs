@@ -310,7 +310,7 @@ fn read_upstream(
     remote: &SkillRemote,
     name: &str,
 ) -> Result<Option<UpstreamSkill>, MusterError> {
-    let dir = checkout.skills_root(remote)?.join(name);
+    let dir = checkout.contained_skills_root(remote)?.join(name);
     let Ok(skill_md) = std::fs::read_to_string(dir.join("SKILL.md")) else {
         return Ok(None);
     };
@@ -684,6 +684,9 @@ fn add_remote(
         path,
         include,
     };
+    if let Some(reference) = &remote.git_ref {
+        crate::adapters::config::validate_git_ref(reference).map_err(MusterError::Usage)?;
+    }
 
     let checkout = fetcher.fetch(&remote)?;
     let available = checkout.skill_names(&remote)?;
