@@ -260,7 +260,7 @@ Comandos de primer nivel:
 |---|---|
 | `init` | Crear repo, identidad y bóveda |
 | `import` | Traer configuración desde BWS o chezmoi |
-| `enroll` / `approve` / `revoke` | Altas y bajas de máquinas |
+| `enroll` / `approve` / `reject` / `revoke` | Altas y bajas de máquinas (`reject` descarta una solicitud de alta pendiente, sin revocar) |
 | `machine` | Gestionar máquinas |
 | `member` / `group` | Gestionar miembros y grupos (equipos) |
 | `secret` | Gestionar secretos |

@@ -10,6 +10,7 @@ pub mod member;
 pub mod plan;
 pub mod profile;
 pub mod proposal;
+pub mod reject;
 pub mod revoke;
 pub mod schedule;
 pub mod schema;

@@ -75,4 +75,31 @@ impl EnrollmentRequest {
         }
         Ok(())
     }
+
+    /// Every pending enrollment request in `<config_dir>/enroll/*.toml`,
+    /// ordered by name. A missing directory means there are none.
+    pub fn pending(config_dir: &Path) -> Result<Vec<Self>, MusterError> {
+        let dir = config_dir.join(ENROLL_DIR);
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(MusterError::Operational(format!("{}: {e}", dir.display()))),
+        };
+        let mut requests = Vec::new();
+        for entry in entries {
+            let path = entry
+                .map_err(|e| MusterError::Operational(format!("{}: {e}", dir.display())))?
+                .path();
+            if path.extension().is_some_and(|ext| ext == "toml") {
+                let name = path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or_default()
+                    .to_owned();
+                requests.push(Self::load(config_dir, &name)?);
+            }
+        }
+        requests.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(requests)
+    }
 }

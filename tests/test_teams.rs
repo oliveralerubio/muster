@@ -143,6 +143,123 @@ fn member_invitation_remains_pending_until_admin_approval() {
 }
 
 #[test]
+fn member_reject_removes_a_pending_invitation_and_non_admins_are_refused() {
+    let owner = MusterEnv::new();
+    let alice = MusterEnv::new();
+    init(&owner);
+    let config = owner.config_dir();
+    add_member(&owner, "alice", "member");
+    join(&owner, &alice, "alice-laptop", "alice");
+    ok(
+        &owner,
+        &config,
+        &["member", "add", "bob", "--role", "member"],
+    );
+
+    // A plain member cannot reject invitations.
+    denied(&alice, &config, &["member", "reject", "bob", "--yes"]);
+
+    let rejected = ok(&owner, &config, &["member", "reject", "bob", "--yes"]);
+    assert_eq!(rejected["rejected"], "bob", "{rejected}");
+    assert_eq!(rejected["kind"], "member", "{rejected}");
+    let members = ok(&owner, &config, &["member", "list"]);
+    assert!(
+        !members["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["name"] == "bob"),
+        "{members}"
+    );
+    let log = std::process::Command::new("git")
+        .args(["-C", config.to_str().unwrap(), "log", "--format=%B"])
+        .output()
+        .unwrap();
+    let log = String::from_utf8_lossy(&log.stdout);
+    assert!(
+        log.contains("reject member bob") && log.contains("Muster-Actor"),
+        "{log}"
+    );
+
+    // Reject is not revoke: the invitation can be issued again from scratch.
+    ok(
+        &owner,
+        &config,
+        &["member", "add", "bob", "--role", "member"],
+    );
+    let manifest = std::fs::read_to_string(config.join("muster.toml")).unwrap();
+    let bob_section = manifest
+        .split("[members.bob]")
+        .nth(1)
+        .unwrap_or_else(|| panic!("bob must be invited again: {manifest}"));
+    let bob_section = &bob_section[..bob_section.find("\n[").unwrap_or(bob_section.len())];
+    assert!(!bob_section.contains("approvals"), "{manifest}");
+
+    // Active and unknown names are not pending requests.
+    let (out, envelope) = on(&owner, &config, &["member", "reject", "alice", "--yes"]);
+    assert_eq!(out.status.code(), Some(2), "{}", envelope.raw);
+    let (out, envelope) = on(&owner, &config, &["member", "reject", "ghost", "--yes"]);
+    assert_eq!(out.status.code(), Some(2), "{}", envelope.raw);
+}
+
+#[test]
+fn member_reject_cleans_partial_quorum_approvals() {
+    let owner = MusterEnv::new();
+    let second_admin = MusterEnv::new();
+    init(&owner);
+    let config = owner.config_dir();
+    ok(
+        &owner,
+        &config,
+        &["member", "add", "admin-two", "--role", "admin"],
+    );
+    ok(
+        &owner,
+        &config,
+        &["member", "approve", "admin-two", "--yes"],
+    );
+    join(&owner, &second_admin, "admin-two-laptop", "admin-two");
+
+    let manifest = std::fs::read_to_string(config.join("muster.toml")).unwrap();
+    std::fs::write(
+        config.join("muster.toml"),
+        format!("{manifest}\n[team]\nrequired_approvals = 2\n"),
+    )
+    .unwrap();
+
+    ok(
+        &owner,
+        &config,
+        &["member", "add", "charlie", "--role", "member"],
+    );
+    let first = ok(&owner, &config, &["member", "approve", "charlie", "--yes"]);
+    assert_eq!(first["status"], "pending", "{first}");
+    assert_eq!(first["approvals_received"], 1, "{first}");
+    let manifest = std::fs::read_to_string(config.join("muster.toml")).unwrap();
+    assert!(
+        manifest.contains("approvals"),
+        "approval stored: {manifest}"
+    );
+
+    let rejected = ok(&owner, &config, &["member", "reject", "charlie", "--yes"]);
+    assert_eq!(rejected["rejected"], "charlie", "{rejected}");
+    let members = ok(&owner, &config, &["member", "list"]);
+    assert!(!members.to_string().contains("charlie"), "{members}");
+    let manifest = std::fs::read_to_string(config.join("muster.toml")).unwrap();
+    assert!(!manifest.contains("[members.charlie]"), "{manifest}");
+
+    // The discarded approvals are gone: a fresh invitation starts from zero.
+    ok(
+        &owner,
+        &config,
+        &["member", "add", "charlie", "--role", "member"],
+    );
+    let again = ok(&owner, &config, &["member", "approve", "charlie", "--yes"]);
+    assert_eq!(again["status"], "pending", "{again}");
+    assert_eq!(again["approvals_received"], 1, "{again}");
+}
+
+#[test]
 fn group_readers_control_decryption_with_real_age_identities() {
     let owner = MusterEnv::new();
     let alice = MusterEnv::new();

@@ -111,6 +111,23 @@ impl Ui {
     fn authorized(&mut self, path: &str) -> (u16, String, String) {
         self.request("GET", &format!("{path}?token={}", self.token), None, None)
     }
+
+    /// Consume the one-time token and return the session cookie for later calls.
+    fn session(&mut self) -> String {
+        let (_, headers, _) = self.authorized("/");
+        headers
+            .lines()
+            .find(|line| line.to_ascii_lowercase().starts_with("set-cookie:"))
+            .expect("session cookie")
+            .split_once(':')
+            .unwrap()
+            .1
+            .trim()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string()
+    }
 }
 
 impl Drop for Ui {
@@ -209,19 +226,7 @@ fn ui_secret_reveal_requires_confirmation_and_is_recorded() {
         .assert()
         .success();
     let mut ui = Ui::start(&env);
-    let (_, headers, _) = ui.authorized("/");
-    let cookie = headers
-        .lines()
-        .find(|line| line.to_ascii_lowercase().starts_with("set-cookie:"))
-        .unwrap()
-        .split_once(':')
-        .unwrap()
-        .1
-        .trim()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string();
+    let cookie = ui.session();
     let (status, _, body) = ui.request(
         "POST",
         "/api/secret/reveal",
@@ -247,6 +252,129 @@ fn ui_secret_reveal_requires_confirmation_and_is_recorded() {
         history.contains("reveal") || history.contains("secret"),
         "reveal must appear in history"
     );
+}
+
+#[test]
+fn web_reject_routes_remove_pending_requests_with_session_cookie() {
+    let owner = support::MusterEnv::new();
+    let joiner = support::MusterEnv::new();
+    owner
+        .run(&["--yes", "init", "--machine", "owner-laptop"])
+        .assert()
+        .success();
+    let config = owner.config_dir();
+    let config_str = config.to_str().unwrap();
+    // A pending machine enrollment request, written through the shared repo.
+    joiner
+        .run(&[
+            "--format",
+            "json",
+            "--config",
+            config_str,
+            "enroll",
+            "--name",
+            "web-laptop",
+        ])
+        .assert()
+        .success();
+    // A pending member invitation.
+    owner
+        .run(&[
+            "--format", "json", "--config", config_str, "member", "add", "webbie",
+        ])
+        .assert()
+        .success();
+    assert!(config.join("enroll/web-laptop.toml").exists());
+
+    let mut ui = Ui::start(&owner);
+    let cookie = ui.session();
+
+    // Without confirm the write is refused.
+    let (status, _, _) = ui.request(
+        "POST",
+        "/api/member/reject",
+        Some(&cookie),
+        Some(r#"{"name":"webbie"}"#),
+    );
+    assert_eq!(status, 400);
+    let (status, _, body) = ui.request(
+        "POST",
+        "/api/member/reject",
+        Some(&cookie),
+        Some(r#"{"name":"webbie","confirm":true}"#),
+    );
+    assert_eq!(status, 200);
+    let response: Value = serde_json::from_str(&body).expect("member reject JSON");
+    assert_eq!(response["result"]["rejected"], "webbie", "{response}");
+    assert_eq!(response["result"]["kind"], "member", "{response}");
+    assert!(
+        response["cli"].as_str().unwrap().contains("member reject"),
+        "{response}"
+    );
+
+    let (status, _, body) = ui.request(
+        "POST",
+        "/api/reject",
+        Some(&cookie),
+        Some(r#"{"name":"web-laptop","confirm":true}"#),
+    );
+    assert_eq!(status, 200);
+    let response: Value = serde_json::from_str(&body).expect("machine reject JSON");
+    assert_eq!(response["result"]["rejected"], "web-laptop", "{response}");
+    assert_eq!(response["result"]["kind"], "machine", "{response}");
+    assert!(
+        response["cli"].as_str().unwrap().contains("muster reject"),
+        "{response}"
+    );
+    assert!(!config.join("enroll/web-laptop.toml").exists());
+
+    let (_, members) = owner.run_json(&["--format", "json", "member", "list"]);
+    assert!(
+        !members.raw.to_string().contains("webbie"),
+        "{}",
+        members.raw
+    );
+}
+
+#[test]
+fn ui_machines_api_lists_pending_enrollment_requests_for_the_panel() {
+    let owner = support::MusterEnv::new();
+    let joiner = support::MusterEnv::new();
+    owner
+        .run(&["--yes", "init", "--machine", "owner-laptop"])
+        .assert()
+        .success();
+    let config = owner.config_dir();
+    let config_str = config.to_str().unwrap();
+    joiner
+        .run(&[
+            "--format",
+            "json",
+            "--config",
+            config_str,
+            "enroll",
+            "--name",
+            "ui-pending-laptop",
+        ])
+        .assert()
+        .success();
+
+    let mut ui = Ui::start(&owner);
+    let cookie = ui.session();
+    let (status, _, body) = ui.request("GET", "/api/machines", Some(&cookie), None);
+    assert_eq!(status, 200);
+    let api: Value = serde_json::from_str(&body).expect("machines API JSON");
+    let pending = api["result"]["pending"]
+        .as_array()
+        .expect("the machines route must serve a pending array");
+    let entry = pending
+        .iter()
+        .find(|p| p["name"] == "ui-pending-laptop")
+        .expect("the pending machine request must be served to the UI");
+    assert_eq!(entry["approvals_received"], 0, "{entry}");
+    assert_eq!(entry["approvals_required"], 1, "{entry}");
+    assert!(entry["platform"].as_str().is_some(), "{entry}");
+    assert!(entry["version"].as_str().is_some(), "{entry}");
 }
 
 #[test]
