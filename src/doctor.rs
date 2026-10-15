@@ -2,8 +2,9 @@
 //! with `code`, `message`, `severity`, optional `path` and a `suggestion`.
 //!
 //! Checks (in result order): `git`, `config`, `permissions`, `agents`,
-//! `repo`, `vault`, `adapters` (render health + drift, via the engine) and
-//! `keys` (secret references through `Provider::check`/`resolve`). A check
+//! `repo`, `vault`, `adapters` (render health + drift, via the engine),
+//! `keys` (secret references through `Provider::check`/`resolve`) and
+//! `api_keys` (opt-in provider metadata, skipped with `--offline`). A check
 //! whose prerequisites are missing is `skipped`.
 //!
 //! `--fix` applies non-destructive repairs (chmod) right away. Destructive
@@ -28,6 +29,8 @@ use crate::providers::Providers;
 use crate::secrets::{self, Scheme, SecretRef};
 use crate::vault::Vault;
 
+mod api_keys;
+
 /// Diagnostic codes owned by the `keys` check; the engine reports the same
 /// failures while planning, so they are dropped from `adapters`.
 const KEY_CODES: &[&str] = &[
@@ -49,7 +52,12 @@ const KEY_CODES: &[&str] = &[
 /// ```
 /// Diagnostics go to the envelope. Any error diagnostic marks the run failed
 /// (`ok: false`, exit 1) while keeping this result.
-pub fn run(ctx: &mut Context, fix: bool) -> Result<Value, MusterError> {
+pub fn run(
+    ctx: &mut Context,
+    fix: bool,
+    check_keys: bool,
+    offline: bool,
+) -> Result<Value, MusterError> {
     let mut checkup = examine(ctx);
     let mut fixes: Vec<Value> = checkup
         .repairs
@@ -74,6 +82,8 @@ pub fn run(ctx: &mut Context, fix: bool) -> Result<Value, MusterError> {
         checkup = examine(ctx);
     }
 
+    // Run the optional network check once, even when repairs re-examine local state.
+    checkup.checks.push(api_keys::check(check_keys, offline));
     let diagnostics = checkup.diagnostics();
     let count = |s: Severity| diagnostics.iter().filter(|d| d.severity == s).count();
     let errors = count(Severity::Error);
