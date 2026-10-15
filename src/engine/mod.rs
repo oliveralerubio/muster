@@ -1165,6 +1165,34 @@ fn read_subagent(
         }
         ParsedFrontmatter::Ok(frontmatter, body) => (frontmatter, body),
     };
+    // Check the raw (untrimmed) values first: `yaml_scalar` trims, and the
+    // trimmed edges would hide leading/trailing controls (VT, FF, NUL, DEL)
+    // from this check while the translating adapters still emit them.
+    let has_unsupported_control = |s: &str| {
+        s.chars()
+            .any(|c| c.is_ascii_control() && c != '\n' && c != '\r' && c != '\t')
+    };
+    let raw_scalar = |key: &str| yaml_raw_scalar(&frontmatter, key);
+    let mut raw_values: Vec<String> = ["name", "description", "model"]
+        .into_iter()
+        .filter_map(raw_scalar)
+        .collect();
+    // Raw `tools` entries: a string form value or each list item; a field
+    // that is neither is reported by `yaml_tools` below.
+    if let Some(entries) = yaml_raw_tools(&frontmatter) {
+        raw_values.extend(entries);
+    }
+    if raw_values
+        .iter()
+        .any(|value| has_unsupported_control(value))
+    {
+        ctx.diag(subagent_invalid(
+            stem,
+            path,
+            "frontmatter contains unsupported control characters",
+        ));
+        return None;
+    }
     let scalar = |key: &str| yaml_scalar(&frontmatter, key);
     let (Some(subagent_name), Some(description)) = (scalar("name"), scalar("description")) else {
         ctx.diag(subagent_invalid(
@@ -1174,22 +1202,6 @@ fn read_subagent(
         ));
         return None;
     };
-    let has_unsupported_control = |s: &str| {
-        s.chars()
-            .any(|c| c.is_ascii_control() && c != '\n' && c != '\r' && c != '\t')
-    };
-    if has_unsupported_control(&description)
-        || scalar("model")
-            .as_deref()
-            .is_some_and(has_unsupported_control)
-    {
-        ctx.diag(subagent_invalid(
-            stem,
-            path,
-            "frontmatter contains unsupported control characters",
-        ));
-        return None;
-    }
     // The name becomes a file name under every agents directory: confine it
     // to the source directory by requiring the installed shape and an exact
     // match with the file stem.
@@ -1244,18 +1256,43 @@ fn is_valid_agent_name(name: &str) -> bool {
         && !name.contains("..")
 }
 
+/// Raw scalar text for a frontmatter key: strings verbatim (untrimmed),
+/// numbers and booleans as written. `None` when the key is absent or not a
+/// scalar.
+fn yaml_raw_scalar(frontmatter: &Hash, key: &str) -> Option<String> {
+    match frontmatter.get(&Yaml::String(key.into()))? {
+        Yaml::String(text) => Some(text.clone()),
+        Yaml::Integer(number) => Some(number.to_string()),
+        Yaml::Real(number) => Some(number.clone()),
+        Yaml::Boolean(flag) => Some(flag.to_string()),
+        _ => None,
+    }
+}
+
 /// Trimmed scalar text for a frontmatter key: strings verbatim, numbers and
 /// booleans as written. `None` when the key is absent, empty or not a scalar.
 fn yaml_scalar(frontmatter: &Hash, key: &str) -> Option<String> {
-    let text = match frontmatter.get(&Yaml::String(key.into()))? {
-        Yaml::String(text) => text.clone(),
-        Yaml::Integer(number) => number.to_string(),
-        Yaml::Real(number) => number.clone(),
-        Yaml::Boolean(flag) => flag.to_string(),
-        _ => return None,
-    };
+    let text = yaml_raw_scalar(frontmatter, key)?;
     let text = text.trim().to_owned();
     (!text.is_empty()).then_some(text)
+}
+
+/// Raw (untrimmed) `tools` values in string or list form for the raw control
+/// check: the whole string, or each list item. `None` when the field is
+/// neither, which `yaml_tools` reports as an error.
+fn yaml_raw_tools(frontmatter: &Hash) -> Option<Vec<String>> {
+    match frontmatter.get(&Yaml::String("tools".into())) {
+        None | Some(Yaml::Null) => Some(Vec::new()),
+        Some(Yaml::String(raw)) => Some(vec![raw.clone()]),
+        Some(Yaml::Array(items)) => items
+            .iter()
+            .map(|item| match item {
+                Yaml::String(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect(),
+        Some(_) => None,
+    }
 }
 
 /// `tools` in string (`Read, Grep`) or list form; an error means the field

@@ -557,6 +557,32 @@ fn malformed_yaml_warns_and_is_skipped() {
         "---\nname: badmodel\ndescription: fine\nmodel: \"m\\u001bx\"\n---\nbody\n",
     )
     .expect("write badmodel");
+    // Leading and trailing controls: `yaml_scalar` used to trim them away
+    // before the control check, so these installed without a warning. VT and
+    // FF are ASCII whitespace (`trim` removes them); NUL and DEL are not.
+    let edge_controls: [(&str, &str, &str); 8] = [
+        ("edgevt.md", "description", "\\u000btext"),
+        ("edgeff.md", "description", "text\\u000c"),
+        ("edgenul.md", "description", "\\u0000x"),
+        ("edgedel.md", "description", "x\\u007f"),
+        ("edgemodelvt.md", "model", "\\u000btext"),
+        ("edgemodelff.md", "model", "text\\u000c"),
+        ("edgemodelnul.md", "model", "\\u0000x"),
+        ("edgemodeldel.md", "model", "x\\u007f"),
+    ];
+    for (stem, field, value) in edge_controls {
+        let name = stem.trim_end_matches(".md");
+        let frontmatter = if field == "description" {
+            format!("name: {name}\ndescription: \"{value}\"\nmodel: gpt-6-luna")
+        } else {
+            format!("name: {name}\ndescription: fine\nmodel: \"{value}\"")
+        };
+        std::fs::write(
+            source.join(stem),
+            format!("---\n{frontmatter}\n---\nbody\n"),
+        )
+        .expect("write edge-control case");
+    }
 
     let (output, envelope) = env.run_json(&[
         "agents",
@@ -574,7 +600,20 @@ fn malformed_yaml_warns_and_is_skipped() {
         .filter(|d| d["code"] == "subagent_invalid")
         .filter_map(|d| d["message"].as_str())
         .collect();
-    for stem in ["badflow", "badtab", "badctrl", "badmodel"] {
+    for stem in [
+        "badflow",
+        "badtab",
+        "badctrl",
+        "badmodel",
+        "edgevt",
+        "edgeff",
+        "edgenul",
+        "edgedel",
+        "edgemodelvt",
+        "edgemodelff",
+        "edgemodelnul",
+        "edgemodeldel",
+    ] {
         assert_eq!(
             hits.iter().filter(|m| m.contains(stem)).count(),
             1,
@@ -582,10 +621,22 @@ fn malformed_yaml_warns_and_is_skipped() {
         );
     }
     let agents = user_agents_dir(&env, "antigravity");
-    assert!(!agents.join("badflow.md").exists());
-    assert!(!agents.join("badtab.md").exists());
-    assert!(!agents.join("badctrl.md").exists());
-    assert!(!agents.join("badmodel.md").exists());
+    for stem in [
+        "badflow",
+        "badtab",
+        "badctrl",
+        "badmodel",
+        "edgevt",
+        "edgeff",
+        "edgenul",
+        "edgedel",
+        "edgemodelvt",
+        "edgemodelff",
+        "edgemodelnul",
+        "edgemodeldel",
+    ] {
+        assert!(!agents.join(format!("{stem}.md")).exists());
+    }
     assert!(
         agents.join("review.md").is_file(),
         "valid files still install"
@@ -798,4 +849,45 @@ fn generated_frontmatter_parses_back_for_codex_and_opencode() {
             .and_then(toml::Value::as_str),
         Some("\nPrompt with: colons, #hash and 'quotes'.\n")
     );
+}
+
+const TAB_MULTILINE_MD: &str =
+    "---\nname: tabby\ndescription: \"Reviews\\tcode.\\nSecond line.\"\n---\n\nReview carefully.\n";
+
+/// Tabs and newlines are the allowed control characters: a valid subagent
+/// whose description carries both must install, and the generated OpenCode
+/// frontmatter must still parse back as YAML with the same text.
+#[test]
+fn opencode_description_with_tab_and_newline_parses_back_as_yaml() {
+    let env = MusterEnv::new();
+    let config = env.config_dir();
+    seed_manifest(&config, &["opencode"]);
+    std::fs::write(config.join("subagents/tabby.md"), TAB_MULTILINE_MD).expect("write tabby");
+
+    let (output, envelope) = env.run_json(&["agents", "apply", "--yes", "--format", "json"]);
+    assert!(
+        output.status.success(),
+        "apply must exit 0: {}",
+        envelope.raw
+    );
+    assert!(envelope.ok(), "{}", envelope.raw);
+    assert!(
+        !envelope
+            .diagnostics()
+            .as_array()
+            .expect("diagnostics")
+            .iter()
+            .any(|d| d["code"] == "subagent_invalid"),
+        "tab and newline are allowed: {:?}",
+        envelope.diagnostics()
+    );
+
+    let frontmatter =
+        parse_opencode_frontmatter(&read(&user_agents_dir(&env, "opencode").join("tabby.md")));
+    assert_eq!(
+        frontmatter["description"].as_str(),
+        Some("Reviews\tcode.\nSecond line."),
+        "description with tab and newline must round-trip"
+    );
+    assert_eq!(frontmatter["mode"].as_str(), Some("subagent"));
 }
