@@ -927,3 +927,28 @@ fn web_mcp_server_edit_of_unchanged_values_round_trips_to_an_empty_diff() {
         "saving an unchanged server must not touch the manifest"
     );
 }
+
+#[test]
+fn ui_frontend_assets_render_deep_flatten_and_navigation_guard() {
+    let env = support::MusterEnv::new();
+    let mut ui = Ui::start(&env);
+    let cookie = ui_session_cookie(&mut ui);
+    let (status, _, js) = ui.request("GET", "/app.js", Some(&cookie), None);
+    assert_eq!(status, 200);
+    assert!(
+        js.contains(".flat(Infinity)"),
+        "render() must deeply flatten blocks with flat(Infinity) so nested arrays do not stringify as [object ...]"
+    );
+    assert!(
+        js.contains("flatMap"),
+        "profiles() must build planBlocks flat"
+    );
+    assert!(
+        js.contains("navToken"),
+        "app.js must track navigation token to guard against tab-switch races"
+    );
+    assert!(
+        js.contains("token !== navToken"),
+        "show() and view renderers must guard with token !== navToken before rendering"
+    );
+}
