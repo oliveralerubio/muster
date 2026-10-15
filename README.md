@@ -4,7 +4,7 @@
 
 Muster keeps the configuration of your AI coding agents identical across every
 machine you own (and every member of your team): instructions, MCP servers,
-models, permissions, hooks, Agent Skills and the secrets they need, all in one
+models, permissions, hooks, Agent Skills, subagents and the secrets they need, all in one
 Git repository you control. Each machine decrypts secrets with its own key; no
 accounts, no third-party servers. Git is the only required dependency (`curl`
 is needed only when you let Muster download an agent CLI for you).
@@ -17,15 +17,28 @@ warning, never silently lost.
 
 | Agent | Binary | Capabilities | Skills — user scope | Skills — project scope |
 |---|---|---|---|---|
-| Claude Code | `claude` | instructions, MCP (stdio + remote), models, permissions, hooks, skills | `~/.claude/skills/<skill>/` | `.claude/skills/<skill>/` |
-| Codex | `codex` | instructions, MCP (stdio + remote), models, skills | `~/.agents/skills/<skill>/` | `.agents/skills/<skill>/` |
-| OpenCode | `opencode` | instructions, MCP (stdio + remote), models, skills | `$XDG_CONFIG_HOME/opencode/skills/<skill>/` | `.opencode/skills/<skill>/` |
-| Antigravity CLI | `agy` | instructions, MCP (stdio + remote), skills | `~/.gemini/antigravity-cli/skills/<skill>/` | `.agents/skills/<skill>/` |
+| Claude Code | `claude` | instructions, MCP (stdio + remote), models, permissions, hooks, skills, subagents | `~/.claude/skills/<skill>/` | `.claude/skills/<skill>/` |
+| Codex | `codex` | instructions, MCP (stdio + remote), models, skills, subagents | `~/.agents/skills/<skill>/` | `.agents/skills/<skill>/` |
+| OpenCode | `opencode` | instructions, MCP (stdio + remote), models, skills, subagents | `$XDG_CONFIG_HOME/opencode/skills/<skill>/` | `.opencode/skills/<skill>/` |
+| Antigravity CLI | `agy` | instructions, MCP (stdio + remote), skills, subagents | `~/.gemini/antigravity-cli/skills/<skill>/` | `.agents/skills/<skill>/` |
 
 - Instructions are written once in `AGENTS.md`; each agent gets its native copy (Claude Code's `CLAUDE.md` imports it through a managed block).
 - MCP servers, models, permissions and hooks are merged into the agent's own config files, rewriting only the keys Muster manages.
 - Project scope comes from `<project>/.muster/muster.toml`. Codex and Antigravity share `.agents/skills` in a project; the file is written once.
 - Skills removed from the source are deleted on the next apply; skills you add by hand are left alone.
+
+## Subagents
+
+Declare a subagents folder in `muster.toml` (`[agents.subagents] source = "subagents"`), one Markdown file per subagent (`<name>.md`) with YAML frontmatter (`name` and `description` required, optional `tools` and `model`) and the body as the system prompt. The frontmatter is parsed as YAML (block scalars, quoted strings and list-form `tools` all work). `name` must match `[a-z0-9][a-z0-9._-]*` (no `/`, `\`, `..` or leading dot) and equal the file stem. Muster installs the file byte for byte where that is the agent's native format, and translates it where it differs:
+
+| Agent | User scope | Project scope |
+|---|---|---|
+| Claude Code | `~/.claude/agents/<name>.md` | `.claude/agents/<name>.md` |
+| Codex | `~/.codex/agents/<name>.toml` | `.codex/agents/<name>.toml` |
+| OpenCode | `$XDG_CONFIG_HOME/opencode/agents/<name>.md` | `.opencode/agents/<name>.md` |
+| Antigravity CLI | `~/.gemini/antigravity-cli/agents/<name>.md` | `.agents/agents/<name>.md` |
+
+Codex gets a TOML custom-agent file (`developer_instructions`); OpenCode gets a Markdown agent file with `mode: subagent` (the file name is the agent name); generated frontmatter is serialized as proper YAML/TOML, so descriptions with colons, quotes or line breaks stay valid. Fields a target cannot express (`tools`, and any other non-canonical frontmatter key, for Codex and OpenCode) are skipped with a `subagent_field_untranslated` warning. Subagents removed from the source are deleted on the next apply; files you add by hand are left alone. A file without valid frontmatter (missing fields or malformed YAML) is skipped with a `subagent_invalid` warning.
 
 ## Platforms
 

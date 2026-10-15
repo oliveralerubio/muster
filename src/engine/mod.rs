@@ -25,6 +25,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use serde_json::{json, Value};
+use yaml_rust2::yaml::Hash;
+use yaml_rust2::{Yaml, YamlLoader};
 
 use crate::adapters::config::{AgentsConfig, McpServer, Transport};
 use crate::adapters::{self, Adapter, Base, Capability, Current, Desired, FileFormat, ManagedFile};
@@ -152,6 +154,7 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
     };
     let instructions = read_instructions(ctx, &merged)?;
     let skills = read_skills(ctx, &merged)?;
+    let subagents = read_subagents(ctx, &merged)?;
     let secrets = resolve_secrets(ctx, &merged.mcp);
     // Grants come only from the config repo's manifest: a project's own
     // `.muster/muster.toml` cannot grant itself secrets.
@@ -167,6 +170,7 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
         secrets: &secrets,
         access: &access,
         skills: &skills,
+        subagents: &subagents,
     };
 
     let roots = Roots::from_env()?;
@@ -1090,6 +1094,294 @@ fn read_optional(path: &Path) -> Result<Option<String>, MusterError> {
     }
 }
 
+/// Every declared subagent under `[agents.subagents] source`: one Markdown
+/// file per subagent (`<name>.md`), validated frontmatter, keyed by file stem.
+fn read_subagents(
+    ctx: &mut Context,
+    merged: &layer::Merged,
+) -> Result<adapters::Subagents, MusterError> {
+    let mut subagents = adapters::Subagents::new();
+    let Some(dir) = merged.subagents_path()? else {
+        return Ok(subagents);
+    };
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            ctx.diag(
+                Diagnostic::new(
+                    Severity::Warning,
+                    "subagents_missing",
+                    format!(
+                        "subagents source {} does not exist; subagents were not installed",
+                        dir.display()
+                    ),
+                )
+                .with_path(dir.display().to_string()),
+            );
+            return Ok(subagents);
+        }
+        Err(e) => return Err(io_error(&dir, e)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|e| io_error(&dir, e))?;
+        let path = entry.path();
+        if !entry.file_type().map_err(|e| io_error(&path, e))?.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_stem().and_then(|s| s.to_str()).map(str::to_owned) else {
+            continue;
+        };
+        if path.extension().and_then(|e| e.to_str()) != Some("md") || name.starts_with('.') {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path).map_err(|e| io_error(&path, e))?;
+        if let Some(subagent) = read_subagent(ctx, &name, &path, &source) {
+            subagents.insert(name, subagent);
+        }
+    }
+    Ok(subagents)
+}
+
+/// Parse and validate one canonical subagent file; `None` (with a
+/// `subagent_invalid` warning) when it must be skipped.
+fn read_subagent(
+    ctx: &mut Context,
+    stem: &str,
+    path: &Path,
+    source: &str,
+) -> Option<adapters::Subagent> {
+    let (frontmatter, body) = match parse_frontmatter(source) {
+        ParsedFrontmatter::Missing => {
+            ctx.diag(subagent_invalid(stem, path, "no YAML frontmatter"));
+            return None;
+        }
+        ParsedFrontmatter::Invalid(why) => {
+            ctx.diag(subagent_invalid(
+                stem,
+                path,
+                &format!("invalid YAML frontmatter: {why}"),
+            ));
+            return None;
+        }
+        ParsedFrontmatter::Ok(frontmatter, body) => (frontmatter, body),
+    };
+    // Check the raw (untrimmed) values first: `yaml_scalar` trims, and the
+    // trimmed edges would hide leading/trailing controls (VT, FF, NUL, DEL)
+    // from this check while the translating adapters still emit them.
+    let has_unsupported_control = |s: &str| {
+        s.chars()
+            .any(|c| c.is_ascii_control() && c != '\n' && c != '\r' && c != '\t')
+    };
+    let raw_scalar = |key: &str| yaml_raw_scalar(&frontmatter, key);
+    let mut raw_values: Vec<String> = ["name", "description", "model"]
+        .into_iter()
+        .filter_map(raw_scalar)
+        .collect();
+    // Raw `tools` entries: a string form value or each list item; a field
+    // that is neither is reported by `yaml_tools` below.
+    if let Some(entries) = yaml_raw_tools(&frontmatter) {
+        raw_values.extend(entries);
+    }
+    if raw_values
+        .iter()
+        .any(|value| has_unsupported_control(value))
+    {
+        ctx.diag(subagent_invalid(
+            stem,
+            path,
+            "frontmatter contains unsupported control characters",
+        ));
+        return None;
+    }
+    let scalar = |key: &str| yaml_scalar(&frontmatter, key);
+    let (Some(subagent_name), Some(description)) = (scalar("name"), scalar("description")) else {
+        ctx.diag(subagent_invalid(
+            stem,
+            path,
+            "frontmatter must have non-empty `name` and `description`",
+        ));
+        return None;
+    };
+    // The name becomes a file name under every agents directory: confine it
+    // to the source directory by requiring the installed shape and an exact
+    // match with the file stem.
+    if !is_valid_agent_name(&subagent_name) || subagent_name != stem {
+        ctx.diag(subagent_invalid(
+            stem,
+            path,
+            &format!(
+                "frontmatter `name` `{subagent_name}` is invalid: names must match \
+                 `[a-z0-9][a-z0-9._-]*` (no `/`, `\\`, `..` or leading dot) and equal the file stem"
+            ),
+        ));
+        return None;
+    }
+    let tools = match yaml_tools(&frontmatter) {
+        Ok(tools) => tools,
+        Err(why) => {
+            ctx.diag(subagent_invalid(stem, path, &why));
+            return None;
+        }
+    };
+    // Everything the canonical format does not define is reported by the
+    // translating adapters (the byte-exact ones install the whole file).
+    let extra_fields = frontmatter
+        .keys()
+        .filter_map(|key| key.as_str().map(str::to_owned))
+        .filter(|key| !matches!(key.as_str(), "name" | "description" | "tools" | "model"))
+        .collect();
+    Some(adapters::Subagent {
+        name: subagent_name,
+        description,
+        tools,
+        model: scalar("model"),
+        extra_fields,
+        body,
+        source: source.to_owned(),
+    })
+}
+
+/// A subagent name is also its installed file name: lowercase letters and
+/// digits first, then lowercase letters, digits, dots, underscores or
+/// hyphens. `/`, `\` and any `..` are rejected so a frontmatter name can
+/// never escape the agents directory.
+fn is_valid_agent_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_lowercase() || first.is_ascii_digit() => {}
+        _ => return false,
+    }
+    name.chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
+        && !name.contains("..")
+}
+
+/// Raw scalar text for a frontmatter key: strings verbatim (untrimmed),
+/// numbers and booleans as written. `None` when the key is absent or not a
+/// scalar.
+fn yaml_raw_scalar(frontmatter: &Hash, key: &str) -> Option<String> {
+    match frontmatter.get(&Yaml::String(key.into()))? {
+        Yaml::String(text) => Some(text.clone()),
+        Yaml::Integer(number) => Some(number.to_string()),
+        Yaml::Real(number) => Some(number.clone()),
+        Yaml::Boolean(flag) => Some(flag.to_string()),
+        _ => None,
+    }
+}
+
+/// Trimmed scalar text for a frontmatter key: strings verbatim, numbers and
+/// booleans as written. `None` when the key is absent, empty or not a scalar.
+fn yaml_scalar(frontmatter: &Hash, key: &str) -> Option<String> {
+    let text = yaml_raw_scalar(frontmatter, key)?;
+    let text = text.trim().to_owned();
+    (!text.is_empty()).then_some(text)
+}
+
+/// Raw (untrimmed) `tools` values in string or list form for the raw control
+/// check: the whole string, or each list item. `None` when the field is
+/// neither, which `yaml_tools` reports as an error.
+fn yaml_raw_tools(frontmatter: &Hash) -> Option<Vec<String>> {
+    match frontmatter.get(&Yaml::String("tools".into())) {
+        None | Some(Yaml::Null) => Some(Vec::new()),
+        Some(Yaml::String(raw)) => Some(vec![raw.clone()]),
+        Some(Yaml::Array(items)) => items
+            .iter()
+            .map(|item| match item {
+                Yaml::String(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect(),
+        Some(_) => None,
+    }
+}
+
+/// `tools` in string (`Read, Grep`) or list form; an error means the field
+/// is neither, which invalidates the subagent.
+fn yaml_tools(frontmatter: &Hash) -> Result<Vec<String>, String> {
+    match frontmatter.get(&Yaml::String("tools".into())) {
+        None | Some(Yaml::Null) => Ok(Vec::new()),
+        Some(Yaml::String(raw)) => Ok(raw
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_owned)
+            .collect()),
+        Some(Yaml::Array(items)) => {
+            let mut tools = Vec::new();
+            for item in items {
+                match yaml_scalar_item(item) {
+                    Some(tool) => tools.push(tool),
+                    None => return Err("`tools` must be a list of strings".into()),
+                }
+            }
+            Ok(tools)
+        }
+        Some(_) => Err("`tools` must be a string or a list of strings".into()),
+    }
+}
+
+fn yaml_scalar_item(item: &Yaml) -> Option<String> {
+    match item {
+        Yaml::String(text) => {
+            let text = text.trim().to_owned();
+            (!text.is_empty()).then_some(text)
+        }
+        _ => None,
+    }
+}
+
+fn subagent_invalid(name: &str, path: &Path, why: &str) -> Diagnostic {
+    Diagnostic::new(
+        Severity::Warning,
+        "subagent_invalid",
+        format!("subagent `{name}`: {why}; skipped"),
+    )
+    .with_path(path.display().to_string())
+}
+
+/// Frontmatter outcome for a Markdown source file.
+enum ParsedFrontmatter {
+    /// No `---` block at the start of the file.
+    Missing,
+    /// A block is present but is not a YAML mapping (or fails to parse).
+    Invalid(String),
+    /// The parsed frontmatter mapping and the Markdown body after it.
+    Ok(Hash, String),
+}
+
+/// Split YAML frontmatter from the Markdown body: the frontmatter is the
+/// mapping between the opening `---` and the closing `---`, parsed with
+/// `yaml-rust2` (so block scalars, lists and quoting work); the body is
+/// everything after it. `Missing` when there is no frontmatter block.
+fn parse_frontmatter(text: &str) -> ParsedFrontmatter {
+    let trimmed = text.trim_start();
+    let Some(rest) = trimmed.strip_prefix("---") else {
+        return ParsedFrontmatter::Missing;
+    };
+    let Some(rest) = rest
+        .strip_prefix('\n')
+        .or_else(|| rest.strip_prefix("\r\n"))
+    else {
+        return ParsedFrontmatter::Missing;
+    };
+    let Some(end) = rest.find("\n---") else {
+        return ParsedFrontmatter::Missing;
+    };
+    let (block, body) = rest.split_at(end);
+    let body = body[4..]
+        .strip_prefix('\n')
+        .unwrap_or(&body[4..])
+        .to_owned();
+    match YamlLoader::load_from_str(block) {
+        Ok(docs) if docs.len() <= 1 => match docs.into_iter().next().unwrap_or(Yaml::Null) {
+            Yaml::Hash(frontmatter) => ParsedFrontmatter::Ok(frontmatter, body),
+            Yaml::Null => ParsedFrontmatter::Ok(Hash::new(), body),
+            _ => ParsedFrontmatter::Invalid("expected a YAML mapping".into()),
+        },
+        Ok(_) => ParsedFrontmatter::Invalid("expected a single YAML document".into()),
+        Err(e) => ParsedFrontmatter::Invalid(e.to_string()),
+    }
+}
 /// Write via a sibling temp file + rename, keeping the existing file mode, or
 /// forcing 0600 when `private` (the file holds resolved secrets). `executable`
 /// adds the execute bits (0755, or 0700 when private).

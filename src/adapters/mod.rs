@@ -77,6 +77,7 @@ pub enum Capability {
     Permissions,
     Hooks,
     Skills,
+    Subagents,
 }
 
 impl Capability {
@@ -89,6 +90,7 @@ impl Capability {
             Self::Permissions => "permissions",
             Self::Hooks => "hooks",
             Self::Skills => "skills",
+            Self::Subagents => "subagents",
         }
     }
 }
@@ -110,10 +112,36 @@ pub struct Desired<'a> {
     /// Agent Skills read from `[agents.skills]`: skill name -> file path
     /// relative to the skill directory (`SKILL.md`, `refs/x.md`) -> contents.
     pub skills: &'a Skills,
+    /// Custom subagents read from `[agents.subagents]`: file stem -> subagent.
+    pub subagents: &'a Subagents,
 }
 
 /// Skill name -> relative file path -> contents.
 pub type Skills = BTreeMap<String, BTreeMap<String, String>>;
+
+/// One canonical subagent: `<source>/<name>.md`, YAML frontmatter with
+/// `name`/`description` (required) and `tools`/`model` (optional), Markdown
+/// body as the system prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Subagent {
+    pub name: String,
+    pub description: String,
+    pub tools: Vec<String>,
+    pub model: Option<String>,
+    /// Frontmatter keys beyond the canonical `name`/`description`/`tools`/
+    /// `model`; adapters that rewrite the file (Codex, OpenCode) cannot
+    /// carry them over and warn `subagent_field_untranslated` (the adapters
+    /// that install the file byte-exact preserve them silently).
+    pub extra_fields: Vec<String>,
+    /// Markdown after the frontmatter (the system prompt).
+    pub body: String,
+    /// The whole source file, installed byte-exact by adapters whose native
+    /// format matches the canonical one.
+    pub source: String,
+}
+
+/// Subagent name (file stem) -> subagent.
+pub type Subagents = BTreeMap<String, Subagent>;
 
 impl Desired<'_> {
     /// Features this configuration uses (drives "not supported" diagnostics).
@@ -150,6 +178,9 @@ impl Desired<'_> {
         }
         if !self.skills.is_empty() {
             used.push(Capability::Skills);
+        }
+        if !self.subagents.is_empty() {
+            used.push(Capability::Subagents);
         }
         used
     }
@@ -305,6 +336,48 @@ fn push_skills(
             });
         }
     }
+}
+
+/// One whole file per subagent, installed byte-exact (adapters whose native
+/// subagent format matches the canonical Markdown one): `<global_dir>/<name>.md`
+/// under `base`, `<project_dir>/<name>.md` under a project root.
+fn push_subagents_raw(
+    desired: &Desired,
+    base: Base,
+    global_dir: &str,
+    project_dir: &str,
+    plan: &mut RenderPlan,
+) {
+    for subagent in desired.subagents.values() {
+        plan.tree.push(RenderedTreeFile {
+            base,
+            path: format!("{global_dir}/{}.md", subagent.name),
+            project: Some(format!("{project_dir}/{}.md", subagent.name)),
+            contents: subagent.source.clone(),
+        });
+    }
+}
+
+/// US 24: warn once per subagent about a canonical field this adapter cannot
+/// translate. Diagnostic, never an error; the rest of the file is written.
+fn untranslated_field(
+    adapter: &Adapter,
+    subagent: &str,
+    field: &str,
+    why: &str,
+    plan: &mut RenderPlan,
+) {
+    plan.diagnostics.push(
+        Diagnostic::new(
+            Severity::Warning,
+            "subagent_field_untranslated",
+            format!(
+                "{}: subagent `{subagent}` field `{field}`: {why}; not written for this agent",
+                adapter.name
+            ),
+        )
+        .with_path(format!("{}.md", subagent)),
+    );
 }
 
 /// `map` with secret references replaced by their resolved values. A

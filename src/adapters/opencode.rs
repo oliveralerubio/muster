@@ -5,13 +5,21 @@
 //! - `AGENTS.md`: canonical instructions.
 //! - `skills/<skill>/...` (project `.opencode/skills/`): Agent Skills declared
 //!   in `[agents.skills]`.
+//! - `agents/<name>.md` (project `.opencode/agents/`): custom subagents
+//!   declared in `[agents.subagents]`, translated to OpenCode's Markdown
+//!   agent files (`mode: subagent`; the file name is the agent name).
+//!   Fields with no equivalent (`tools` — OpenCode gates tools with
+//!   `permission`, not a list — and any non-canonical frontmatter key) are
+//!   skipped with a warning; generated frontmatter is serialized as YAML.
 
 use serde_json::{Map, Value};
+use yaml_rust2::yaml::Hash;
+use yaml_rust2::{Yaml, YamlEmitter};
 
 use super::{
     child_object, json_object, json_text, markdown_block, push_skills, resolve_mcp_map, transport,
-    Adapter, Base, Capability, Current, Desired, FileFormat, ManagedFile, RenderPlan, RenderedFile,
-    Scope, Transport,
+    untranslated_field, Adapter, Base, Capability, Current, Desired, FileFormat, ManagedFile,
+    RenderPlan, RenderedFile, Scope, Transport,
 };
 use crate::errors::MusterError;
 
@@ -36,6 +44,9 @@ const INSTRUCTIONS: ManagedFile = ManagedFile {
 const SKILLS_DIR: &str = "opencode/skills";
 const PROJECT_SKILLS_DIR: &str = ".opencode/skills";
 
+const AGENTS_DIR: &str = "opencode/agents";
+const PROJECT_AGENTS_DIR: &str = ".opencode/agents";
+
 const SCHEMA_URL: &str = "https://opencode.ai/config.json";
 
 pub static ADAPTER: Adapter = Adapter {
@@ -51,6 +62,7 @@ pub static ADAPTER: Adapter = Adapter {
         Capability::McpRemote,
         Capability::Models,
         Capability::Skills,
+        Capability::Subagents,
     ],
     files: &[CONFIG, INSTRUCTIONS],
     render: Some(render),
@@ -118,7 +130,65 @@ fn render(desired: &Desired, current: &Current, plan: &mut RenderPlan) -> Result
         PROJECT_SKILLS_DIR,
         plan,
     );
+    for subagent in desired.subagents.values() {
+        warn_untranslated(subagent, plan);
+        // Serialize with yaml-rust2 so any description or model (quotes,
+        // colons, multi-line block scalars) stays valid YAML.
+        let mut frontmatter = Hash::new();
+        frontmatter.insert(
+            Yaml::String("description".into()),
+            Yaml::String(subagent.description.clone()),
+        );
+        frontmatter.insert(Yaml::String("mode".into()), Yaml::String("subagent".into()));
+        if let Some(model) = &subagent.model {
+            frontmatter.insert(Yaml::String("model".into()), Yaml::String(model.clone()));
+        }
+        let mut rendered = String::new();
+        {
+            let mut emitter = YamlEmitter::new(&mut rendered);
+            emitter.multiline_strings(true);
+            emitter.dump(&Yaml::Hash(frontmatter)).map_err(|e| {
+                MusterError::Operational(format!(
+                    "cannot render OpenCode agent `{}`: {e}",
+                    subagent.name
+                ))
+            })?;
+        }
+        // `YamlEmitter` writes its own `---` document marker (and no trailing
+        // newline); the file provides both.
+        let yaml = rendered.strip_prefix("---\n").unwrap_or(&rendered);
+        plan.tree.push(super::RenderedTreeFile {
+            base: Base::XdgConfig,
+            path: format!("{AGENTS_DIR}/{}.md", subagent.name),
+            project: Some(format!("{PROJECT_AGENTS_DIR}/{}.md", subagent.name)),
+            contents: format!("---\n{yaml}\n---\n\n{}\n", subagent.body.trim()),
+        });
+    }
     Ok(())
+}
+
+/// Fields the canonical format defines that this adapter cannot carry over:
+/// `tools` (OpenCode gates tools with `permission`, not a list) and any
+/// non-canonical frontmatter key.
+fn warn_untranslated(subagent: &super::Subagent, plan: &mut RenderPlan) {
+    if !subagent.tools.is_empty() {
+        untranslated_field(
+            &ADAPTER,
+            &subagent.name,
+            "tools",
+            "OpenCode agents gate tools with `permission`, not a tool list",
+            plan,
+        );
+    }
+    for field in &subagent.extra_fields {
+        untranslated_field(
+            &ADAPTER,
+            &subagent.name,
+            field,
+            "no equivalent in OpenCode agent files",
+            plan,
+        );
+    }
 }
 
 fn string_map(map: std::collections::BTreeMap<String, String>) -> Value {

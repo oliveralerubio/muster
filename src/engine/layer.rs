@@ -82,6 +82,9 @@ pub struct Merged {
     /// Directory the skills source resolves against (the layer that declared
     /// `[agents.skills]`, else the first layer).
     pub skills_dir: PathBuf,
+    /// Directory the subagents source resolves against (the layer that
+    /// declared `[agents.subagents]`, else the first layer).
+    pub subagents_dir: PathBuf,
 }
 
 /// Layers rendered into `machine`'s user-scope files, lowest precedence
@@ -177,6 +180,7 @@ pub fn merge(layers: &[Layer]) -> Merged {
     let mut mcp = BTreeMap::new();
     let mut instructions_dir = layers.first().map(|l| l.dir.clone()).unwrap_or_default();
     let mut skills_dir = instructions_dir.clone();
+    let mut subagents_dir = instructions_dir.clone();
     for layer in layers {
         let over = &layer.agents;
         if over.enabled.is_some() {
@@ -190,6 +194,10 @@ pub fn merge(layers: &[Layer]) -> Merged {
             agents.skills = over.skills.clone();
             skills_dir = layer.dir.clone();
         }
+        if over.subagents.is_some() {
+            agents.subagents = over.subagents.clone();
+            subagents_dir = layer.dir.clone();
+        }
         if over.permissions.is_some() {
             agents.permissions = over.permissions.clone();
         }
@@ -202,6 +210,7 @@ pub fn merge(layers: &[Layer]) -> Merged {
         mcp,
         instructions_dir,
         skills_dir,
+        subagents_dir,
     }
 }
 
@@ -219,6 +228,17 @@ impl Merged {
         match &self.agents.skills {
             Some(skills) => Ok(Some(
                 self.skills_dir.join(inside_repo(&skills.source, "skills")?),
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// Path of the subagents directory, when `[agents.subagents]` is declared.
+    pub fn subagents_path(&self) -> Result<Option<PathBuf>, MusterError> {
+        match &self.agents.subagents {
+            Some(subagents) => Ok(Some(
+                self.subagents_dir
+                    .join(inside_repo(&subagents.source, "subagents")?),
             )),
             None => Ok(None),
         }
