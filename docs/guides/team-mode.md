@@ -272,6 +272,8 @@ Muster implementa protecciones estrictas a nivel de lógica de dominio:
 * Un mismo administrador no puede emitir dos aprobaciones para la misma solicitud. Si lo intenta, el sistema responde con el error `already_approved_by_caller` (código de salida 5).
 
 ### 4. Gobernanza en el Repositorio Remoto Git
+El acceso de escritura al repo de configuración es de confianza. Los cambios manuales de lectores nunca se aplican implícitamente: los comandos administrativos solo aplican sus propios cambios y emiten `reader_drift` para los pendientes, indicando quién gana o pierde acceso. Revise `muster group rekey <grupo> --dry-run` y aplique el cambio deliberadamente con `muster group rekey <grupo> --yes` o confirmación interactiva.
+
 * **Protección de Ramas:** Se recomienda configurar reglas de protección en la rama principal (`main`) en GitHub/GitLab, exigiendo Pull Requests y revisión por pares para cambios manuales en `muster.toml`.
 * **Auditoría de Commits:** Muster añade automáticamente un trailer a cada confirmación de Git indicando el autor de la operación:
   ```git

@@ -215,7 +215,7 @@ fn assign(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let (role, profile) = (entry.role.clone(), entry.profile.clone());
 
     let mut vault = Vault::open(&ctx.config_dir)?;
-    let changes = team::pending_rekeys(&vault, &manifest)?;
+    let changes = team::pending_rekeys(ctx, &vault, &before, &manifest)?;
     let identity = if changes.is_empty() {
         None
     } else {
@@ -239,7 +239,7 @@ fn assign(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
 
     manifest.save(&ctx.config_dir)?;
     if let Some(identity) = identity {
-        team::rekey(&mut vault, &manifest, &identity)?;
+        team::rekey(&mut vault, &changes, &identity)?;
     }
     let summary = format!("chore(fleet): update machine {name}");
     match &actor {

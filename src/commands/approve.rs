@@ -177,7 +177,7 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
 
     // Check every changed group can be re-encrypted before writing anything.
     let mut vault = Vault::open(&ctx.config_dir)?;
-    let changes = team::pending_rekeys(&vault, &manifest)?;
+    let changes = team::pending_rekeys(ctx, &vault, &before, &manifest)?;
     for (group, _) in &changes {
         if !vault
             .readers(group)?
@@ -203,7 +203,7 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     }
 
     manifest.save(&ctx.config_dir)?;
-    let reencrypted_groups = team::rekey(&mut vault, &manifest, &approver_identity)?;
+    let reencrypted_groups = team::rekey(&mut vault, &changes, &approver_identity)?;
 
     EnrollmentRequest::remove(&ctx.config_dir, name)?;
 
