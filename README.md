@@ -27,6 +27,43 @@ warning, never silently lost.
 - Project scope comes from `<project>/.muster/muster.toml`. Codex and Antigravity share `.agents/skills` in a project; the file is written once.
 - Skills removed from the source are deleted on the next apply; skills you add by hand are left alone.
 
+## Agent Skills
+
+Declare a skills folder in `muster.toml` (`[agents.skills] source = "skills"`), one subfolder per skill with a `SKILL.md` (YAML frontmatter with `name` and `description`) plus any extra files. Muster installs every file, byte for byte, into the skill folders listed in the table above. A skill without `SKILL.md` or without `name`/`description` is skipped with a `skill_invalid` warning.
+
+### Skill lifecycle (own and subscribed skills)
+
+Write your own skills in the config repo, or subscribe to an external Git repository of skills. Subscribed skills are copied (vendored) into the skills folder under `skills/<name>/`, so every machine gets them through the normal sync, even offline.
+
+```toml
+[agents.skills]
+source = "skills"
+
+[[agents.skills.remote]]
+name = "anthropic"                         # source id
+url = "https://github.com/org/skills"      # any git URL
+ref = "main"                               # optional branch or tag
+path = "skills"                            # optional folder inside the repo
+include = ["pdf"]                          # optional: only these skills
+```
+
+`skills.lock` (next to `muster.toml`, committed to Git) records for each skill its `origin` (`local` or the source id), upstream `commit`, `content_hash` (`sha256:` over its files), `version` (from `SKILL.md` frontmatter) and `updated_at`.
+
+| Command | What it does |
+|---|---|
+| `muster skill list` | List every skill with origin, version, last update and status. Offline. |
+| `muster skill add <name> [--description <text>]` | Scaffold an own skill at `skills/<name>/SKILL.md`. |
+| `muster skill add --url <git-url> [--ref <ref>] [--path <dir>] [--include <skill>]` | Subscribe to a Git repository of skills and vendor them. |
+| `muster skill check [name]` | Query upstream repositories for updates, deprecations and removals. |
+| `muster skill update [name] [--all] [--force]` | Apply upstream changes, showing files added, changed or removed (`--force` overwrites local edits). |
+| `muster skill rm <name> [--detach]` | Delete a skill, or with `--detach` keep a subscribed skill as your own. |
+
+Every command accepts `--format json`, `--dry-run` and `--yes`.
+
+Statuses: `local`, `up_to_date`, `update_available`, `deprecated` (upstream `SKILL.md` has `deprecated: true` or `deprecated: "<reason>"`), `upstream_removed`, `unknown` (not checked yet, or the source could not be reached). Nothing is applied or deleted on its own: updates need `muster skill update`, and a skill removed upstream stays until you run `muster skill rm` (with or without `--detach`). A skill edited by hand shows `modified` and `update` refuses to overwrite it without `--force`. In a team, only admins add, update or remove skills; members can list and check.
+
+The web admin panel (`muster ui`) includes a **Skills** tab showing installed skills, upstream status, and an attention indicator when updates are available, with buttons to check sources and update a skill.
+
 ## Subagents
 
 Declare a subagents folder in `muster.toml` (`[agents.subagents] source = "subagents"`), one Markdown file per subagent (`<name>.md`) with YAML frontmatter (`name` and `description` required, optional `tools` and `model`) and the body as the system prompt. The frontmatter is parsed as YAML (block scalars, quoted strings and list-form `tools` all work). `name` must match `[a-z0-9][a-z0-9._-]*` (no `/`, `\`, `..` or leading dot) and equal the file stem. Muster installs the file byte for byte where that is the agent's native format, and translates it where it differs:
@@ -49,17 +86,22 @@ Linux, WSL2 and macOS. Native Windows is not supported.
 **Option 1 — install script (recommended):**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/oliveralerubio/muster/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/oliveralerubio/muster/main/install.sh | bash
 ```
 
-The script detects your OS and architecture (Linux and macOS, x86_64 and
-aarch64), downloads the release tarball, verifies the tarball's SHA-256
-checksum, and installs the binary to `~/.local/bin`, telling you how to extend
-your `PATH` if the directory is not on it. Override the defaults with
-environment variables: `MUSTER_VERSION` (release tag, e.g. `v0.1.0`),
-`MUSTER_INSTALL_DIR` and `MUSTER_REPO` (GitHub repository to download from).
-The installer is being added in the release-CI pull request and arrives with
-the first tagged release; until then, build from source.
+The script is tested in CI. It detects
+your OS and architecture (Linux and macOS, x86_64 and aarch64), downloads the
+release tarball, verifies the tarball's SHA-256 checksum against `SHA256SUMS`,
+and installs the binary to `~/.local/bin`, telling you how to extend your `PATH`
+if the directory is not on it.
+
+Override defaults with optional environment variables:
+- `MUSTER_VERSION`: release tag to install, e.g. `v0.1.0` or `0.1.0` (default: latest published release).
+
+No release has been published yet, so until the first tagged release the script
+has nothing to download; build from source in the meantime.
+- `MUSTER_INSTALL_DIR`: directory where the executable will be placed (default: `~/.local/bin`).
+- `MUSTER_REPO`: GitHub repository to download from (default: `oliveralerubio/muster`).
 
 **Option 2 — from source with Cargo:**
 
