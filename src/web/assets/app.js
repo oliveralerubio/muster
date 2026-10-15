@@ -94,12 +94,28 @@ const views = {
 
   async machines() {
     const data = await api("machines");
-    const machines = (data.result && data.result.machines) || [];
+    const r = data.result || {};
+    const machines = r.machines || [];
+    const pending = r.pending || [];
+    const quorum = (p) => {
+      const approvals = p.approvals || [];
+      if (p.approvals_required === undefined) return "";
+      return `${approvals.length}/${p.approvals_required}`
+        + (approvals.length ? ` (${approvals.join(", ")})` : "");
+    };
     render("Machines", [],
+      el("h2", {}, "Enrolled"),
       table(["Name", "Platform", "Role", "Profile", "Agents", "Last sync", ""],
         machines.map((m) => [m.name, m.platform || "", m.role || "", m.profile || "",
           (m.agents || []).join(", "), m.last_sync || "never",
           m.is_current ? "this machine" : button("Remove", () => act(`Remove machine ${m.name}?`, "machine/rm", { name: m.name }))])),
+      el("h2", {}, "Pending enrollment requests"),
+      table(["Name", "Platform", "Version", "Agents", "Approvals", ""],
+        pending.map((p) => [p.name, p.platform || "", p.version || "",
+          (p.agents || []).join(", "), quorum(p),
+          el("span", { class: "actions" },
+            button("Approve", () => act(`Approve enrollment of machine ${p.name}?`, "approve", { name: p.name })),
+            button("Reject", () => act(`Reject the enrollment request of machine ${p.name}? Its recorded approvals are discarded.", "reject", { name: p.name }), "danger"))])),
       diagnostics(data));
   },
 
@@ -108,7 +124,11 @@ const views = {
     const groups = await api("groups");
     const memberRows = ((members.result && members.result.members) || []).map((m) => [
       m.name, m.role, m.status, (m.groups || []).join(", "), m.profile || "",
-      m.status === "pending" ? button("Approve", () => act(`Approve member ${m.name}?`, "member/approve", { name: m.name })) : "",
+      m.status === "pending"
+        ? el("span", { class: "actions" },
+            button("Approve", () => act(`Approve member ${m.name}?`, "member/approve", { name: m.name })),
+            button("Reject", () => act(`Reject member ${m.name}? Their invitation and recorded approvals are discarded.`, "member/reject", { name: m.name }), "danger"))
+        : "",
     ]);
     const groupRows = ((groups.result && groups.result.groups) || []).map((g) => [
       g.name || g.group || "", JSON.stringify(g.readers || {}), g.profile || "",
