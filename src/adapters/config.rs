@@ -28,6 +28,9 @@ pub struct AgentsConfig {
     /// Agent Skills installed from the config repository.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skills: Option<SkillsConfig>,
+    /// Custom subagents installed from the config repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagents: Option<SubagentsConfig>,
 }
 
 /// `[agents.skills]`: a directory of the config repository holding one
@@ -60,6 +63,16 @@ pub struct SkillRemote {
     /// Only these skills are vendored. Empty: every skill under `path`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub include: Vec<String>,
+}
+
+/// `[agents.subagents]`: a directory of the config repository holding one
+/// Markdown file per subagent (`<source>/<name>.md`, YAML frontmatter with
+/// `name` and `description`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SubagentsConfig {
+    /// Path of the subagents directory, relative to the config repository.
+    pub source: String,
 }
 
 /// `[agents.instructions]`.

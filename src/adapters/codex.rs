@@ -6,17 +6,25 @@
 //! - `~/.codex/AGENTS.md`: canonical instructions.
 //! - `~/.agents/skills/<skill>/...` (project `.agents/skills/`, shared with
 //!   Antigravity): Agent Skills declared in `[agents.skills]`.
+//! - `~/.codex/agents/<name>.toml` (project `.codex/agents/`): custom
+//!   subagents declared in `[agents.subagents]`, translated to Codex's TOML
+//!   custom-agent files. Fields with no equivalent (`tools` — Codex custom
+//!   agents cannot restrict tools — and any non-canonical frontmatter key)
+//!   are skipped with a warning.
 
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, Value};
 
 use super::{
-    markdown_block, push_skills, resolve_mcp_map, transport, Adapter, Base, Capability, Current,
-    Desired, FileFormat, ManagedFile, RenderPlan, RenderedFile, Scope, Transport,
+    markdown_block, push_skills, resolve_mcp_map, transport, untranslated_field, Adapter, Base,
+    Capability, Current, Desired, FileFormat, ManagedFile, RenderPlan, RenderedFile, Scope,
+    Transport,
 };
 use crate::errors::MusterError;
 
 /// Cross-agent skills directory, the same in `$HOME` and in a project.
 const SKILLS_DIR: &str = ".agents/skills";
+/// Custom subagents directory, the same in `$HOME` and in a project.
+const AGENTS_DIR: &str = ".codex/agents";
 
 const CONFIG: ManagedFile = ManagedFile {
     base: Base::Home,
@@ -49,6 +57,7 @@ pub static ADAPTER: Adapter = Adapter {
         Capability::McpRemote,
         Capability::Models,
         Capability::Skills,
+        Capability::Subagents,
     ],
     files: &[CONFIG, INSTRUCTIONS],
     render: Some(render),
@@ -58,6 +67,39 @@ fn render(desired: &Desired, current: &Current, plan: &mut RenderPlan) -> Result
     render_config(desired, current.get(CONFIG.path), plan)?;
     render_instructions(desired, current.get(INSTRUCTIONS.path), plan);
     push_skills(desired, Base::Home, SKILLS_DIR, SKILLS_DIR, plan);
+    for subagent in desired.subagents.values() {
+        if !subagent.tools.is_empty() {
+            untranslated_field(
+                &ADAPTER,
+                &subagent.name,
+                "tools",
+                "Codex custom agents cannot restrict tools",
+                plan,
+            );
+        }
+        for field in &subagent.extra_fields {
+            untranslated_field(
+                &ADAPTER,
+                &subagent.name,
+                field,
+                "no equivalent in Codex custom-agent files",
+                plan,
+            );
+        }
+        let mut doc = DocumentMut::new();
+        doc["name"] = toml_edit::value(subagent.name.clone());
+        doc["description"] = toml_edit::value(subagent.description.clone());
+        if let Some(model) = &subagent.model {
+            doc["model"] = toml_edit::value(model.clone());
+        }
+        doc["developer_instructions"] = toml_edit::value(subagent.body.clone());
+        plan.tree.push(super::RenderedTreeFile {
+            base: Base::Home,
+            path: format!("{AGENTS_DIR}/{}.toml", subagent.name),
+            project: Some(format!("{AGENTS_DIR}/{}.toml", subagent.name)),
+            contents: doc.to_string(),
+        });
+    }
     Ok(())
 }
 

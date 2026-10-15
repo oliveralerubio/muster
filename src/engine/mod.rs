@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use serde_json::{json, Value};
+use serde_yaml_ng::{Mapping, Value as Yaml};
 
 use crate::adapters::config::{AgentsConfig, McpServer, Transport};
 use crate::adapters::{self, Adapter, Base, Capability, Current, Desired, FileFormat, ManagedFile};
@@ -152,6 +153,7 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
     };
     let instructions = read_instructions(ctx, &merged)?;
     let skills = read_skills(ctx, &merged)?;
+    let subagents = read_subagents(ctx, &merged)?;
     let secrets = resolve_secrets(ctx, &merged.mcp);
     // Grants come only from the config repo's manifest: a project's own
     // `.muster/muster.toml` cannot grant itself secrets.
@@ -167,6 +169,7 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
         secrets: &secrets,
         access: &access,
         skills: &skills,
+        subagents: &subagents,
     };
 
     let roots = Roots::from_env()?;
@@ -1090,6 +1093,237 @@ fn read_optional(path: &Path) -> Result<Option<String>, MusterError> {
     }
 }
 
+/// Every declared subagent under `[agents.subagents] source`: one Markdown
+/// file per subagent (`<name>.md`), validated frontmatter, keyed by file stem.
+fn read_subagents(
+    ctx: &mut Context,
+    merged: &layer::Merged,
+) -> Result<adapters::Subagents, MusterError> {
+    let mut subagents = adapters::Subagents::new();
+    let Some(dir) = merged.subagents_path()? else {
+        return Ok(subagents);
+    };
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            ctx.diag(
+                Diagnostic::new(
+                    Severity::Warning,
+                    "subagents_missing",
+                    format!(
+                        "subagents source {} does not exist; subagents were not installed",
+                        dir.display()
+                    ),
+                )
+                .with_path(dir.display().to_string()),
+            );
+            return Ok(subagents);
+        }
+        Err(e) => return Err(io_error(&dir, e)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|e| io_error(&dir, e))?;
+        let path = entry.path();
+        if !entry.file_type().map_err(|e| io_error(&path, e))?.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_stem().and_then(|s| s.to_str()).map(str::to_owned) else {
+            continue;
+        };
+        if path.extension().and_then(|e| e.to_str()) != Some("md") || name.starts_with('.') {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path).map_err(|e| io_error(&path, e))?;
+        if let Some(subagent) = read_subagent(ctx, &name, &path, &source) {
+            subagents.insert(name, subagent);
+        }
+    }
+    Ok(subagents)
+}
+
+/// Parse and validate one canonical subagent file; `None` (with a
+/// `subagent_invalid` warning) when it must be skipped.
+fn read_subagent(
+    ctx: &mut Context,
+    stem: &str,
+    path: &Path,
+    source: &str,
+) -> Option<adapters::Subagent> {
+    let (frontmatter, body) = match parse_frontmatter(source) {
+        ParsedFrontmatter::Missing => {
+            ctx.diag(subagent_invalid(stem, path, "no YAML frontmatter"));
+            return None;
+        }
+        ParsedFrontmatter::Invalid(why) => {
+            ctx.diag(subagent_invalid(
+                stem,
+                path,
+                &format!("invalid YAML frontmatter: {why}"),
+            ));
+            return None;
+        }
+        ParsedFrontmatter::Ok(frontmatter, body) => (frontmatter, body),
+    };
+    let scalar = |key: &str| yaml_scalar(&frontmatter, key);
+    let (Some(subagent_name), Some(description)) = (scalar("name"), scalar("description")) else {
+        ctx.diag(subagent_invalid(
+            stem,
+            path,
+            "frontmatter must have non-empty `name` and `description`",
+        ));
+        return None;
+    };
+    // The name becomes a file name under every agents directory: confine it
+    // to the source directory by requiring the installed shape and an exact
+    // match with the file stem.
+    if !is_valid_agent_name(&subagent_name) || subagent_name != stem {
+        ctx.diag(subagent_invalid(
+            stem,
+            path,
+            &format!(
+                "frontmatter `name` `{subagent_name}` is invalid: names must match \
+                 `[a-z0-9][a-z0-9._-]*` (no `/`, `\\`, `..` or leading dot) and equal the file stem"
+            ),
+        ));
+        return None;
+    }
+    let tools = match yaml_tools(&frontmatter) {
+        Ok(tools) => tools,
+        Err(why) => {
+            ctx.diag(subagent_invalid(stem, path, &why));
+            return None;
+        }
+    };
+    // Everything the canonical format does not define is reported by the
+    // translating adapters (the byte-exact ones install the whole file).
+    let extra_fields = frontmatter
+        .keys()
+        .filter_map(|key| key.as_str().map(str::to_owned))
+        .filter(|key| !matches!(key.as_str(), "name" | "description" | "tools" | "model"))
+        .collect();
+    Some(adapters::Subagent {
+        name: subagent_name,
+        description,
+        tools,
+        model: scalar("model"),
+        extra_fields,
+        body,
+        source: source.to_owned(),
+    })
+}
+
+/// A subagent name is also its installed file name: lowercase letters and
+/// digits first, then lowercase letters, digits, dots, underscores or
+/// hyphens. `/`, `\` and any `..` are rejected so a frontmatter name can
+/// never escape the agents directory.
+fn is_valid_agent_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_lowercase() || first.is_ascii_digit() => {}
+        _ => return false,
+    }
+    name.chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
+        && !name.contains("..")
+}
+
+/// Trimmed scalar text for a frontmatter key: strings verbatim, numbers and
+/// booleans as written. `None` when the key is absent, empty or not a scalar.
+fn yaml_scalar(frontmatter: &Mapping, key: &str) -> Option<String> {
+    let text = match frontmatter.get(Yaml::String(key.into()))? {
+        Yaml::String(text) => text.clone(),
+        Yaml::Number(number) => number.to_string(),
+        Yaml::Bool(flag) => flag.to_string(),
+        _ => return None,
+    };
+    let text = text.trim().to_owned();
+    (!text.is_empty()).then_some(text)
+}
+
+/// `tools` in string (`Read, Grep`) or list form; an error means the field
+/// is neither, which invalidates the subagent.
+fn yaml_tools(frontmatter: &Mapping) -> Result<Vec<String>, String> {
+    match frontmatter.get(Yaml::String("tools".into())) {
+        None | Some(Yaml::Null) => Ok(Vec::new()),
+        Some(Yaml::String(raw)) => Ok(raw
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_owned)
+            .collect()),
+        Some(Yaml::Sequence(items)) => {
+            let mut tools = Vec::new();
+            for item in items {
+                match yaml_scalar_item(item) {
+                    Some(tool) => tools.push(tool),
+                    None => return Err("`tools` must be a list of strings".into()),
+                }
+            }
+            Ok(tools)
+        }
+        Some(_) => Err("`tools` must be a string or a list of strings".into()),
+    }
+}
+
+fn yaml_scalar_item(item: &Yaml) -> Option<String> {
+    match item {
+        Yaml::String(text) => {
+            let text = text.trim().to_owned();
+            (!text.is_empty()).then_some(text)
+        }
+        _ => None,
+    }
+}
+
+fn subagent_invalid(name: &str, path: &Path, why: &str) -> Diagnostic {
+    Diagnostic::new(
+        Severity::Warning,
+        "subagent_invalid",
+        format!("subagent `{name}`: {why}; skipped"),
+    )
+    .with_path(path.display().to_string())
+}
+
+/// Frontmatter outcome for a Markdown source file.
+enum ParsedFrontmatter {
+    /// No `---` block at the start of the file.
+    Missing,
+    /// A block is present but is not a YAML mapping (or fails to parse).
+    Invalid(String),
+    /// The parsed frontmatter mapping and the Markdown body after it.
+    Ok(Mapping, String),
+}
+
+/// Split YAML frontmatter from the Markdown body: the frontmatter is the
+/// mapping between the opening `---` and the closing `---`, parsed with
+/// `serde_yaml_ng` (so block scalars, lists and quoting work); the body is
+/// everything after it. `Missing` when there is no frontmatter block.
+fn parse_frontmatter(text: &str) -> ParsedFrontmatter {
+    let trimmed = text.trim_start();
+    let Some(rest) = trimmed.strip_prefix("---") else {
+        return ParsedFrontmatter::Missing;
+    };
+    let Some(rest) = rest
+        .strip_prefix('\n')
+        .or_else(|| rest.strip_prefix("\r\n"))
+    else {
+        return ParsedFrontmatter::Missing;
+    };
+    let Some(end) = rest.find("\n---") else {
+        return ParsedFrontmatter::Missing;
+    };
+    let (block, body) = rest.split_at(end);
+    let body = body[4..]
+        .strip_prefix('\n')
+        .unwrap_or(&body[4..])
+        .to_owned();
+    match serde_yaml_ng::from_str::<Yaml>(block) {
+        Ok(Yaml::Mapping(frontmatter)) => ParsedFrontmatter::Ok(frontmatter, body),
+        Ok(Yaml::Null) => ParsedFrontmatter::Ok(Mapping::new(), body),
+        Ok(_) => ParsedFrontmatter::Invalid("expected a YAML mapping".into()),
+        Err(e) => ParsedFrontmatter::Invalid(e.to_string()),
+    }
+}
 /// Write via a sibling temp file + rename, keeping the existing file mode, or
 /// forcing 0600 when `private` (the file holds resolved secrets). `executable`
 /// adds the execute bits (0755, or 0700 when private).
@@ -1195,45 +1429,14 @@ fn is_valid_skill(
     true
 }
 
+/// True when the content has a YAML frontmatter mapping with non-empty
+/// `name` and `description` scalars (same parser as subagents).
 fn has_valid_frontmatter(content: &str) -> bool {
-    let trimmed = content.trim_start();
-    if !trimmed.starts_with("---") {
-        return false;
-    }
-    let after_start = &trimmed[3..];
-    let after_newline = if let Some(rest) = after_start.strip_prefix("\r\n") {
-        rest
-    } else if let Some(rest) = after_start.strip_prefix('\n') {
-        rest
-    } else {
-        return false;
-    };
-
-    let Some(end_idx) = after_newline.find("\n---") else {
-        return false;
-    };
-    let fm_block = &after_newline[..end_idx];
-
-    let mut has_name = false;
-    let mut has_desc = false;
-
-    for line in fm_block.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
+    match parse_frontmatter(content) {
+        ParsedFrontmatter::Ok(frontmatter, _) => {
+            yaml_scalar(&frontmatter, "name").is_some()
+                && yaml_scalar(&frontmatter, "description").is_some()
         }
-        if let Some((key, val)) = line.split_once(':') {
-            let key = key.trim();
-            let val = val.trim().trim_matches(|c| c == '\'' || c == '"').trim();
-            if !val.is_empty() {
-                if key == "name" {
-                    has_name = true;
-                } else if key == "description" {
-                    has_desc = true;
-                }
-            }
-        }
+        ParsedFrontmatter::Missing | ParsedFrontmatter::Invalid(_) => false,
     }
-
-    has_name && has_desc
 }

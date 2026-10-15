@@ -193,6 +193,14 @@ El mismo producto sirve a dos públicos:
     | Antigravity CLI | `~/.gemini/antigravity-cli/skills/<skill>/` | `.agents/skills/<skill>/` |
 
     Codex y Antigravity comparten `.agents/skills` en proyecto; el archivo se escribe una sola vez.
+  - **Subagentes** (`[agents.subagents] source = "subagents"`, una carpeta del repo de configuración con un archivo Markdown por subagente, `<source>/<nombre>.md`, frontmatter YAML con `name` y `description` obligatorios y `tools`/`model` opcionales; el cuerpo es el system prompt): los cuatro agentes los soportan. El frontmatter se parsea como YAML (block scalars, cadenas entrecomilladas y `tools` en lista funcionan); `name` debe cumplir `[a-z0-9][a-z0-9._-]*` (sin `/`, `\\`, `..` ni punto inicial) e igual al nombre del archivo. Muster instala el archivo tal cual donde el formato nativo es el canónico (Claude Code, Antigravity CLI) y lo traduce donde difiere (Codex lo pide como TOML con `developer_instructions`; OpenCode exige `mode: subagent` y toma el nombre del archivo); el frontmatter generado se serializa como YAML/TOML válido. Los campos sin equivalente (`tools` y cualquier clave no canónica, en Codex y OpenCode) se omiten con el aviso `subagent_field_untranslated`; un subagente sin frontmatter válido (campos ausentes o YAML malformado) se omite con `subagent_invalid`. Quitar un subagente de la fuente lo borra en el siguiente apply y los archivos que el usuario añade a mano no se tocan. Rutas:
+
+    | Agente | Usuario | Proyecto |
+    |---|---|---|
+    | Claude Code | `~/.claude/agents/<name>.md` | `.claude/agents/<name>.md` |
+    | Codex | `~/.codex/agents/<name>.toml` | `.codex/agents/<name>.toml` |
+    | OpenCode | `$XDG_CONFIG_HOME/opencode/agents/<name>.md` | `.opencode/agents/<name>.md` |
+    | Antigravity CLI | `~/.gemini/antigravity-cli/agents/<name>.md` | `.agents/agents/<name>.md` |
   - **Ciclo de vida de skills** (`muster skill`): skills propias (en el repo de configuración, bajo `[agents.skills] source`) y suscritas desde repositorios git externos (`[[agents.skills.remote]]` con `name`, `url`, `ref`, `path`, `include` opcionales). Las externas se copian (vendoring) en la carpeta de skills, así que el motor y los adaptadores no cambian y todas las máquinas las reciben por la sincronización git normal.
     - `skills.lock` (TOML, junto a `muster.toml`, versionado): por skill `name`, `origin` (`local` o id de la fuente), `commit` (externas), `content_hash` (`sha256:` sobre rutas relativas ordenadas y contenido normalizado a LF), `version` (frontmatter de `SKILL.md`) y `updated_at` (RFC 3339).
     - Estados: `local`, `up_to_date`, `update_available`, `deprecated` (frontmatter upstream `deprecated: true` o `deprecated: "<motivo>"`; gana a `update_available`), `upstream_removed`, `unknown` (sin comprobar o fuente inalcanzable; se conserva el último estado conocido). La última comprobación se guarda por máquina en `<state>/skills-status.json` (no versionado).

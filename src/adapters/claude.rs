@@ -7,17 +7,21 @@
 //! - `~/.claude/AGENTS.md` + `~/.claude/CLAUDE.md` (managed block `@AGENTS.md`).
 //! - `~/.claude/skills/<skill>/...` (project `.claude/skills/`): Agent Skills
 //!   declared in `[agents.skills]`, one whole file per skill file.
+//! - `~/.claude/agents/<name>.md` (project `.claude/agents/`): custom
+//!   subagents declared in `[agents.subagents]`, byte-exact (the canonical
+//!   format is Claude Code's native subagent format).
 
 use serde_json::{Map, Value};
 
 use super::{
     child_object, json_object, json_text, markdown_block, pascal_case, push_skills,
-    resolve_mcp_map, transport, Adapter, Base, Capability, Current, Desired, FileFormat,
-    ManagedFile, RenderPlan, RenderedFile, Scope, Transport,
+    push_subagents_raw, resolve_mcp_map, transport, Adapter, Base, Capability, Current, Desired,
+    FileFormat, ManagedFile, RenderPlan, RenderedFile, Scope, Transport,
 };
 use crate::errors::MusterError;
 
 const SKILLS_DIR: &str = ".claude/skills";
+const AGENTS_DIR: &str = ".claude/agents";
 
 const SETTINGS: ManagedFile = ManagedFile {
     base: Base::Home,
@@ -70,6 +74,7 @@ pub static ADAPTER: Adapter = Adapter {
         Capability::Permissions,
         Capability::Hooks,
         Capability::Skills,
+        Capability::Subagents,
     ],
     files: &[SETTINGS, MCP, INSTRUCTIONS, AGENTS_COPY],
     render: Some(render),
@@ -80,6 +85,7 @@ fn render(desired: &Desired, current: &Current, plan: &mut RenderPlan) -> Result
     render_mcp(desired, current.get(MCP.path), plan)?;
     render_instructions(desired, current, plan);
     push_skills(desired, Base::Home, SKILLS_DIR, SKILLS_DIR, plan);
+    push_subagents_raw(desired, Base::Home, AGENTS_DIR, AGENTS_DIR, plan);
     Ok(())
 }
 

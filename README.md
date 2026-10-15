@@ -29,6 +29,19 @@ Declare a skills folder in `muster.toml` (`[agents.skills] source = "skills"`), 
 
 Project scope comes from `<project>/.muster/muster.toml`. Codex and Antigravity share `.agents/skills` in a project. Skills removed from the source are deleted on the next apply; skills you add by hand are left alone. A skill without `SKILL.md` or without `name`/`description` is skipped with a `skill_invalid` warning.
 
+## Subagents
+
+Declare a subagents folder in `muster.toml` (`[agents.subagents] source = "subagents"`), one Markdown file per subagent (`<name>.md`) with YAML frontmatter (`name` and `description` required, optional `tools` and `model`) and the body as the system prompt. The frontmatter is parsed as YAML (block scalars, quoted strings and list-form `tools` all work). `name` must match `[a-z0-9][a-z0-9._-]*` (no `/`, `\`, `..` or leading dot) and equal the file stem. Muster installs the file byte for byte where that is the agent's native format, and translates it where it differs:
+
+| Agent | User scope | Project scope |
+|---|---|---|
+| Claude Code | `~/.claude/agents/<name>.md` | `.claude/agents/<name>.md` |
+| Codex | `~/.codex/agents/<name>.toml` | `.codex/agents/<name>.toml` |
+| OpenCode | `$XDG_CONFIG_HOME/opencode/agents/<name>.md` | `.opencode/agents/<name>.md` |
+| Antigravity CLI | `~/.gemini/antigravity-cli/agents/<name>.md` | `.agents/agents/<name>.md` |
+
+Codex gets a TOML custom-agent file (`developer_instructions`); OpenCode gets a Markdown agent file with `mode: subagent` (the file name is the agent name); generated frontmatter is serialized as proper YAML/TOML, so descriptions with colons, quotes or line breaks stay valid. Fields a target cannot express (`tools`, and any other non-canonical frontmatter key, for Codex and OpenCode) are skipped with a `subagent_field_untranslated` warning. Subagents removed from the source are deleted on the next apply; files you add by hand are left alone. A file without valid frontmatter (missing fields or malformed YAML) is skipped with a `subagent_invalid` warning.
+
 ### Skill lifecycle (own and subscribed skills)
 
 Write your own skills in the config repo, or subscribe to a git repository of skills. Subscribed skills are copied into the skills folder, so every machine gets them through the normal sync, even offline.
