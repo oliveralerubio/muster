@@ -12,7 +12,10 @@ pub mod antigravity;
 pub mod claude;
 pub mod codex;
 pub mod config;
+pub mod hermes;
 pub mod opencode;
+pub mod pi;
+pub(crate) mod yaml;
 
 use std::collections::BTreeMap;
 
@@ -46,6 +49,7 @@ pub enum Scope {
 pub enum FileFormat {
     Json,
     Toml,
+    Yaml,
     Markdown,
     /// Whole file owned by Muster (managed dotfiles).
     Text,
@@ -292,6 +296,8 @@ pub static ADAPTERS: &[&Adapter] = &[
     &codex::ADAPTER,
     &opencode::ADAPTER,
     &antigravity::ADAPTER,
+    &pi::ADAPTER,
+    &hermes::ADAPTER,
 ];
 
 pub fn find(id: &str) -> Option<&'static Adapter> {

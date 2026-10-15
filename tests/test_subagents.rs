@@ -308,16 +308,16 @@ fn invalid_subagent_warns_and_is_skipped() {
 }
 
 // ---------------------------------------------------------------------------
-// 5. Capability declaration: every adapter supports subagents
+// 5. Capability declaration: every stable adapter supports subagents
 // ---------------------------------------------------------------------------
 
 #[test]
-fn every_adapter_declares_subagents_without_unsupported_warning() {
+fn every_stable_adapter_declares_subagents_without_unsupported_warning() {
     let env = MusterEnv::new();
     let (output, envelope) = env.run_json(&["agents", "--format", "json"]);
     assert!(output.status.success(), "agents must succeed");
     let adapters = envelope.result()["agents"].as_array().expect("adapters");
-    for adapter in adapters {
+    for adapter in adapters.iter().filter(|a| a["experimental"] != true) {
         let capabilities: Vec<&str> = adapter["capabilities"]
             .as_array()
             .expect("capabilities list")
