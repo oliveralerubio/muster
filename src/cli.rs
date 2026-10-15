@@ -171,6 +171,9 @@ fn with_params(cmd: Command, spec: &'static CommandSpec) -> Command {
             ParamKind::String => arg,
             ParamKind::Bool => arg.action(ArgAction::SetTrue),
             ParamKind::Int => arg.value_parser(clap::value_parser!(i64)),
+            // List values that look like flags themselves (MCP `--args -y`)
+            // need the `--args=-y` form: `allow_hyphen_values` would swallow
+            // following global flags (`--args --dry-run`, `--args --yes`).
             ParamKind::List => arg.action(ArgAction::Append),
         })
     })

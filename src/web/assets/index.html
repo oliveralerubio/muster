@@ -61,6 +61,22 @@
       <p id="secret-error" role="alert"></p>
     </form>
   </dialog>
+
+  <dialog id="profile-edit">
+    <form id="profile-form">
+      <h2 id="profile-edit-title">New profile</h2>
+      <p><label>Name <input id="profile-name" required autocomplete="off" pattern="[a-z0-9-]+" title="Lowercase letters, digits and '-'"></label></p>
+      <p><label for="profile-toml">Profile (TOML: [agents] and/or [mcp] tables)</label>
+        <textarea id="profile-toml" rows="10" spellcheck="false" required></textarea></p>
+      <div class="actions">
+        <button type="button" id="profile-preview">Preview diff</button>
+        <button id="profile-save" type="submit" class="primary" disabled>Save</button>
+        <button id="profile-cancel" type="button">Cancel</button>
+      </div>
+      <pre id="profile-diff" hidden></pre>
+      <p id="profile-error" role="alert"></p>
+    </form>
+  </dialog>
   <script src="/app.js"></script>
 </body>
 </html>

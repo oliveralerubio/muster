@@ -18,7 +18,7 @@ fn sync_records_last_result_and_status_exposes_it() {
 fn hourly_systemd_install_and_uninstall_use_fake_control_tool() {
     let env = support::MusterEnv::new();
     env.fake_exe("systemctl", "exit 0");
-    env.run(&["schedule", "enable", "--backend", "systemd"])
+    env.run(&["schedule", "enable", "--backend", "systemd", "--yes"])
         .assert()
         .success();
     let dir = env.path().join(".config/systemd/user");

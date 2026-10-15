@@ -229,6 +229,7 @@ fn profile_set_show_list_and_rm_manage_profiles_admin_only_in_team_mode() {
             "dev",
             "--from-file",
             file.to_str().unwrap(),
+            "--yes",
         ],
     );
     assert_eq!(set["name"], "dev");
@@ -413,6 +414,21 @@ fn schedule_enable_writes_a_systemd_user_timer_and_disable_removes_it() {
     assert_eq!(dry["backend"], "systemd");
     assert!(!units.join("muster-sync.timer").exists());
 
+    // Applying needs --yes; without it nothing is installed.
+    fails(
+        &env,
+        &[
+            "schedule",
+            "enable",
+            "--backend",
+            "systemd",
+            "--interval",
+            "30",
+        ],
+        2,
+    );
+    assert!(!units.join("muster-sync.timer").exists());
+
     let enabled = ok(
         &env,
         &[
@@ -422,6 +438,7 @@ fn schedule_enable_writes_a_systemd_user_timer_and_disable_removes_it() {
             "systemd",
             "--interval",
             "30",
+            "--yes",
         ],
     );
     assert_eq!(enabled["enabled"], true, "{enabled}");
@@ -472,6 +489,7 @@ fn schedule_enable_writes_a_launchd_agent_plist() {
             "launchd",
             "--interval",
             "15",
+            "--yes",
         ],
     );
     assert_eq!(result["backend"], "launchd");
@@ -491,7 +509,7 @@ fn schedule_without_systemd_or_launchd_falls_back_to_manual_instructions() {
     let env = MusterEnv::new();
     init(&env);
     env.link_system_exe("git");
-    let mut cmd = env.run_isolated(&["--format", "json", "schedule", "enable"]);
+    let mut cmd = env.run_isolated(&["--format", "json", "schedule", "enable", "--yes"]);
     cmd.env("PATH", &env.bin);
     let (out, envelope) = support::json(cmd);
     assert!(out.status.success(), "{}", envelope.raw);
@@ -525,7 +543,10 @@ fn uninstall_removes_state_and_units_leaving_agent_files_in_place() {
     assert!(claude_md.is_file());
     assert!(agents_md.is_file());
 
-    ok(&env, &["schedule", "enable", "--backend", "systemd"]);
+    ok(
+        &env,
+        &["schedule", "enable", "--backend", "systemd", "--yes"],
+    );
     let timer = env.path().join(".config/systemd/user/muster-sync.timer");
     assert!(timer.is_file());
 

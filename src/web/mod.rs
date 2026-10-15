@@ -9,6 +9,9 @@
 //!   its command through `cli::execute`, exactly like the CLI, and returns the
 //!   envelope plus `cli`, the equivalent command line. Reads are GET, changes
 //!   POST; confirmations need `{"confirm": true}` (the CLI's `--yes`).
+//!   Profile and MCP-server edits post the same TOML text and KEY=VALUE lists
+//!   the CLI accepts; the command stores them verbatim, so secret references
+//!   stay references and no secret value ever needs to be sent.
 //! - `POST /api/secret/reveal {"name", "confirm": true}` is the only path that
 //!   returns a secret value, and it is recorded in the local history first.
 //! - `POST /api/secret/add|rotate` accepts `path`, `value` and `confirm: true`.
@@ -43,7 +46,8 @@ struct Route {
     path: &'static str,
     command: &'static str,
     post: bool,
-    /// Parameters this route does not accept (e.g. `doctor --fix` on GET).
+    /// Parameters this route does not accept (e.g. `doctor --fix` on GET, or
+    /// `profile set --from-file`, which must never read local files).
     hidden: &'static [&'static str],
 }
 
@@ -71,9 +75,12 @@ const ROUTES: &[Route] = &[
     get("members", "member.list"),
     get("groups", "group.list"),
     get("profiles", "profile.list"),
+    get("profile", "profile.show"),
     get("secrets", "secret.list"),
     get("plan", "plan"),
     get("proposals", "proposal.list"),
+    get("mcp-servers", "mcp-server.list"),
+    get("schedule", "schedule.status"),
     Route {
         hidden: &["fix"],
         ..get("doctor", "doctor")
@@ -93,6 +100,15 @@ const ROUTES: &[Route] = &[
     post("group/create", "group.create"),
     post("group/grant", "group.grant"),
     post("group/revoke", "group.revoke"),
+    // `--from-file` would let a POST read arbitrary local files; the panel
+    // edits profiles only through the inline `--toml` text.
+    Route {
+        hidden: &["from-file"],
+        ..post("profile/set", "profile.set")
+    },
+    post("profile/rm", "profile.rm"),
+    post("mcp-server/add", "mcp-server.add"),
+    post("mcp-server/rm", "mcp-server.rm"),
     post("secret/rm", "secret.rm"),
     post("proposal/create", "proposal.create"),
     post("proposal/accept", "proposal.accept"),
@@ -101,6 +117,8 @@ const ROUTES: &[Route] = &[
     post("skills/add", "skill.add"),
     post("skills/update", "skill.update"),
     post("skills/rm", "skill.rm"),
+    post("schedule/enable", "schedule.enable"),
+    post("schedule/disable", "schedule.disable"),
 ];
 /// Body keys that map to global flags rather than command parameters.
 const CONFIRM: &str = "confirm";

@@ -159,6 +159,13 @@ fn enable(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let command = sync_command(ctx)?;
     let units = Units::locate()?;
 
+    // A dry run only previews the units; installing them needs `--yes`.
+    if !ctx.dry_run {
+        ctx.confirm(&format!(
+            "Schedule `muster sync` every {minutes} minute(s)?"
+        ))?;
+    }
+
     let files: Vec<(PathBuf, String)> = match backend {
         Backend::Manual => {
             ctx.diag(
