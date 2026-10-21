@@ -57,8 +57,12 @@ The per-agent translator (Claude Code, Codex, OpenCode, Antigravity CLI) that re
 _Avoid_: plugin, driver
 
 **Capability**:
-A canonical feature an adapter may support: instructions, stdio MCP servers, remote MCP servers, models, permissions, hooks, skills. Configuration using a capability an adapter lacks is applied only where supported, with an `unsupported_feature` warning.
+A canonical feature an adapter may support: instructions, stdio MCP servers, remote MCP servers, models, permissions, hooks, skills, subagents, AI providers (`providers`). Configuration using a capability an adapter lacks is applied only where supported, with an `unsupported_feature` warning.
 _Avoid_: feature flag
+
+**AI provider**:
+A named model endpoint in `[providers.<id>]`, with a kind, optional base URL, default model and secret key reference. An agent selects an AI provider through `[agents.providers]`. This is distinct from a secret provider (the backend that resolves secret references).
+_Avoid_: "provider" unqualified when it could mean a secret provider
 
 **Profile**:
 A named configuration profile assigned to members, groups or machines; the fixed precedence is team → group → member → machine → project.

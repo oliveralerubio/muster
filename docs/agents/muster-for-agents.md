@@ -59,6 +59,7 @@ The MCP server runs over stdio using newline-delimited JSON-RPC 2.0.
 | `status` | `status` | Fleet machines, sync state, local machine identity | No |
 | `doctor` | `doctor` | Machine health, binary versions, permissions (`fix` is hidden) | No |
 | `plan` | `plan` | Desired vs. current state diff (secrets redacted) | No |
+| `provider_list` | `provider.list` | AI endpoint settings, key references and receiving agents | No |
 | `secret_list_meta` | `secret.list` | Secret metadata, groups, readers, allowed agents (never secret values) | No |
 | `propose_change` | `proposal.create` | Stashes a proposed config change and returns its plan | Proposal only |
 | `secret_reveal` | `secret.get --reveal` | Reveals an explicitly allowlisted secret reference | Read-only |
@@ -126,3 +127,44 @@ When an agent needs to adjust Muster configuration (e.g. adding an MCP server, t
    - Human inspects: `muster proposal list` or checks the plan.
    - Human accepts: `muster proposal accept <id>` (copies files into config repo and creates git commit).
    - Human syncs: `muster sync` (runs standard plan and interactive approval for new hooks/MCP servers).
+
+
+## AI providers
+
+`muster provider list --format json` reports named AI endpoints and key
+references, never resolved values. Configure `[providers.<id>]` with `kind`,
+optional `base_url`, `default_model`, and a secret reference `key`; select it
+with `muster provider use <id> --agent <agent> --yes`. Add `--clear` to unset
+the base selection. Profile fields override individually and `plan --explain`
+shows their sources. A per-agent model wins over the provider default.
+
+Use `provider add ... --value-stdin` with a `native://` key to vault a piped
+value. Do not use `--value` in scripts; it can leak through shell history and
+process arguments. Keys written to native agent configs are plaintext there,
+even though the repository vault remains encrypted. For Codex `env://` keys,
+export the referenced variable in Codex's own environment too.
+
+**Subscription logins are one command per agent per machine.** Run
+`muster provider login claude --yes` or `muster provider login codex --yes`
+in that machine's terminal. Muster runs native status/login commands, never
+copies OAuth tokens or reads `auth.json`, `.credentials.json` or Keychain.
+This is not a zero-setup login sync. The panel does not offer an interactive
+login route; it directs users to their terminal.
+
+MCP exposes `provider_list`, but not `provider_add`, `provider_rm`,
+`provider_use` or `provider_login`. Propose endpoint/selection edits to
+`muster.toml` with `propose_change`; a person reviews and accepts them before
+normal sync. This preserves the existing mutation policy, not accidental
+surface parity. The web panel offers list/add/remove/use routes with its
+normal session and confirmation requirements.
+
+`muster import cuartel <directory> --dry-run --format json` detects native
+`.claude/settings.json`, `.codex/config.toml` and
+`.config/opencode/opencode.json` endpoints. `import chezmoi` detects their
+normalized source-tree equivalents. Both propose `[providers]` entries with
+placeholder `env://MUSTER_IMPORTED_<ID>_KEY` references instead of copying key
+values; fill these references and configure `allow`, then select receiving
+agents. Native login stores are not imported. `doctor --offline` checks local
+availability and subscription login; `doctor --check-keys` opts into online key
+checks. Codex `wire_api = "chat"` for OpenAI-compatible kinds is an assumption
+not documented by installed CLI help; Anthropic and Google kinds are skipped.

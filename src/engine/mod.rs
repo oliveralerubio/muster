@@ -148,8 +148,8 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
                 path: Some(format!("{}: mcp.{name}", manifest::FILE_NAME)),
             })?;
     }
-    for (agent, id) in &merged.agents.providers {
-        if crate::adapters::find(agent).is_none() || !merged.providers.contains_key(id) {
+    for (agent, id) in &merged.agents.ai_providers {
+        if crate::adapters::find(agent).is_none() || !merged.ai_providers.contains_key(id) {
             return Err(MusterError::InvalidConfig {
                 message: format!("unknown agent or provider in agents.providers.{agent}"),
                 path: Some(manifest::FILE_NAME.into()),
@@ -164,13 +164,13 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
     let skills = read_skills(ctx, &merged)?;
     let subagents = read_subagents(ctx, &merged)?;
     let mut secrets = resolve_secrets(ctx, &merged.mcp);
-    let mut providers = Providers::new(&ctx.config_dir, &ctx.state_dir);
-    for provider in merged.providers.values() {
-        if let Some(reference) = &provider.key {
+    let mut secret_providers = Providers::new(&ctx.config_dir, &ctx.state_dir);
+    for ai_provider in merged.ai_providers.values() {
+        if let Some(reference) = &ai_provider.key {
             if !secrets.contains_key(reference) {
                 // The adapter reports an unresolved reference without exposing
                 // provider CLI output (which may include sensitive values).
-                if let Ok(value) = providers.resolve(reference) {
+                if let Ok(value) = secret_providers.resolve(reference) {
                     secrets.insert(reference.clone(), value);
                 }
             }
@@ -185,7 +185,7 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
     let access = crate::secrets::SecretAccess::new(manifest.secrets.clone(), project);
     let desired = Desired {
         agents: &merged.agents,
-        providers: &merged.providers,
+        ai_providers: &merged.ai_providers,
         mcp: &merged.mcp,
         instructions: instructions.as_deref(),
         secrets: &secrets,
@@ -987,7 +987,7 @@ fn resolve_secrets(
     ctx: &mut Context,
     mcp: &BTreeMap<String, McpServer>,
 ) -> BTreeMap<String, SecretValue> {
-    let mut providers = Providers::new(&ctx.config_dir, &ctx.state_dir);
+    let mut secret_providers = Providers::new(&ctx.config_dir, &ctx.state_dir);
     let mut resolved = BTreeMap::new();
     let mut failed = BTreeSet::new();
     for (name, server) in mcp {
@@ -998,7 +998,7 @@ fn resolve_secrets(
             {
                 continue;
             }
-            match providers.resolve(value) {
+            match secret_providers.resolve(value) {
                 Ok(secret) => {
                     resolved.insert(value.clone(), secret);
                 }

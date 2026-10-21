@@ -78,7 +78,7 @@ pub enum Capability {
     McpStdio,
     McpRemote,
     Models,
-    Providers,
+    AiProviders,
     Permissions,
     Hooks,
     Skills,
@@ -92,7 +92,7 @@ impl Capability {
             Self::McpStdio => "stdio MCP servers",
             Self::McpRemote => "remote MCP servers",
             Self::Models => "models",
-            Self::Providers => "providers",
+            Self::AiProviders => "providers",
             Self::Permissions => "permissions",
             Self::Hooks => "hooks",
             Self::Skills => "skills",
@@ -108,7 +108,7 @@ impl Capability {
 #[derive(Debug, Clone, Copy)]
 pub struct Desired<'a> {
     pub agents: &'a AgentsConfig,
-    pub providers: &'a BTreeMap<String, config::Provider>,
+    pub ai_providers: &'a BTreeMap<String, config::AiProvider>,
     pub mcp: &'a BTreeMap<String, McpServer>,
     /// Contents of the canonical AGENTS.md, when declared and present.
     pub instructions: Option<&'a str>,
@@ -174,8 +174,8 @@ impl Desired<'_> {
         {
             used.push(Capability::McpRemote);
         }
-        if !self.agents.providers.is_empty() {
-            used.push(Capability::Providers);
+        if !self.agents.ai_providers.is_empty() {
+            used.push(Capability::AiProviders);
         }
         if !self.agents.models.is_empty() {
             used.push(Capability::Models);
@@ -260,6 +260,19 @@ impl Adapter {
         self.render.is_some()
     }
 
+    pub fn supports(&self, capability: Capability) -> bool {
+        self.capabilities.contains(&capability)
+    }
+
+    pub(crate) fn supports_ai_provider(&self, kind: config::AiProviderKind) -> bool {
+        self.supports(Capability::AiProviders)
+            && !(self.id == "codex"
+                && matches!(
+                    kind,
+                    config::AiProviderKind::Anthropic | config::AiProviderKind::Google
+                ))
+    }
+
     pub fn file(&self, path: &str) -> &'static ManagedFile {
         self.files
             .iter()
@@ -276,7 +289,10 @@ impl Adapter {
         })?;
         let mut plan = RenderPlan::default();
         for feature in desired.features() {
-            if !self.capabilities.contains(&feature) {
+            if !self.supports(feature)
+                && (feature != Capability::AiProviders
+                    || desired.agents.ai_providers.contains_key(self.id))
+            {
                 plan.diagnostics.push(
                     Diagnostic::new(
                         Severity::Warning,
@@ -536,15 +552,39 @@ fn pascal_case(snake: &str) -> String {
         .collect()
 }
 
+/// Authorized AI endpoint shared by the native renderers. Never log this view.
+struct ResolvedAiProvider<'a> {
+    id: &'a str,
+    kind: config::AiProviderKind,
+    base_url: Option<&'a str>,
+    key: Option<&'a SecretValue>,
+    env_key: Option<&'a str>,
+    default_model: Option<&'a str>,
+}
+
 /// The selected endpoint, after enforcing per-agent secret access. A missing
 /// credential skips the entire endpoint rather than accidentally using old auth.
-fn selected_provider<'a>(
+fn selected_ai_provider<'a>(
     desired: &'a Desired<'_>,
     adapter: &Adapter,
     plan: &mut RenderPlan,
-) -> Option<(&'a str, &'a config::Provider)> {
-    let id = desired.agents.providers.get(adapter.id)?;
-    let provider = desired.providers.get(id)?;
+) -> Option<ResolvedAiProvider<'a>> {
+    let id = desired.agents.ai_providers.get(adapter.id)?;
+    let provider = desired.ai_providers.get(id)?;
+    if !adapter.supports_ai_provider(provider.kind) {
+        plan.diagnostics.push(
+            Diagnostic::new(
+                Severity::Warning,
+                "provider_kind_unsupported",
+                format!(
+                    "{} cannot render provider `{id}` with this kind",
+                    adapter.name
+                ),
+            )
+            .with_path(format!("providers.{id}")),
+        );
+        return None;
+    }
     if let Some(reference) = &provider.key {
         let code = if !desired.access.allows(adapter.id, reference) {
             Some("secret_not_allowed_for_agent")
@@ -568,7 +608,20 @@ fn selected_provider<'a>(
             return None;
         }
     }
-    Some((id, provider))
+    Some(ResolvedAiProvider {
+        id,
+        kind: provider.kind,
+        base_url: provider.base_url.as_deref(),
+        key: provider
+            .key
+            .as_ref()
+            .and_then(|key| desired.secrets.get(key)),
+        env_key: provider
+            .key
+            .as_deref()
+            .and_then(|key| key.strip_prefix("env://")),
+        default_model: provider.default_model.as_deref(),
+    })
 }
 
 #[cfg(test)]

@@ -33,7 +33,7 @@ const INVALID_PARAMS: i64 = -32602;
 
 pub const SPEC: CommandSpec = CommandSpec {
     name: "mcp",
-    about: "Run the MCP server over stdio (tools: status, doctor, plan, secret_list_meta, propose_change, secret_reveal)",
+    about: "Run the MCP server over stdio (tools: status, doctor, plan, provider_list, secret_list_meta, propose_change, secret_reveal)",
     params: &[],
     mutating: false,
     handler: not_a_handler,

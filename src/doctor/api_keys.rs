@@ -245,32 +245,28 @@ pub(super) fn check_declared(ctx: &crate::context::Context, enabled: bool, offli
     let Ok(manifest) = crate::manifest::Manifest::load(&ctx.config_dir) else {
         return Check::skipped("provider_api_keys");
     };
-    let merged = crate::engine::layer::merge(&crate::engine::layer::global_layers(
-        &ctx.config_dir,
-        &manifest,
-        crate::machine::load_name(&ctx.state_dir).as_deref(),
-    ));
+    let merged = crate::engine::layer::global_merge(&ctx.config_dir, &ctx.state_dir, &manifest);
     let mut secrets = crate::providers::Providers::new(&ctx.config_dir, &ctx.state_dir);
     let mut diagnostics = Vec::new();
-    for (id, provider) in &merged.providers {
-        let Some(reference) = &provider.key else {
+    for (id, ai_provider) in &merged.ai_providers {
+        let Some(reference) = &ai_provider.key else {
             continue;
         };
-        use crate::adapters::config::ProviderKind;
-        let (base, endpoint, header_name, bearer) = match provider.kind {
-            ProviderKind::Openai => (
+        use crate::adapters::config::AiProviderKind;
+        let (base, endpoint, header_name, bearer) = match ai_provider.kind {
+            AiProviderKind::Openai => (
                 "https://api.openai.com/v1",
                 "https://api.openai.com/v1/models",
                 "Authorization",
                 "Bearer ",
             ),
-            ProviderKind::Anthropic => (
+            AiProviderKind::Anthropic => (
                 "https://api.anthropic.com",
                 "https://api.anthropic.com/v1/models",
                 "x-api-key",
                 "",
             ),
-            ProviderKind::Google => (
+            AiProviderKind::Google => (
                 "https://generativelanguage.googleapis.com/v1beta",
                 "https://generativelanguage.googleapis.com/v1beta/models",
                 "x-goog-api-key",
@@ -278,7 +274,7 @@ pub(super) fn check_declared(ctx: &crate::context::Context, enabled: bool, offli
             ),
             _ => continue,
         };
-        if provider
+        if ai_provider
             .base_url
             .as_ref()
             .is_some_and(|url| url.trim_end_matches('/') != base)
@@ -305,7 +301,7 @@ pub(super) fn check_declared(ctx: &crate::context::Context, enabled: bool, offli
             continue;
         }
         let mut header = format!("header = \"{header_name}: {bearer}{}\"\n", key.expose());
-        if provider.kind == ProviderKind::Anthropic {
+        if ai_provider.kind == AiProviderKind::Anthropic {
             header.push_str("header = \"anthropic-version: 2023-06-01\"\n");
         }
         let response = request(&SecretValue::new(header), endpoint, false, true);

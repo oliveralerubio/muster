@@ -1,7 +1,7 @@
 //! Named AI endpoints. Manifest output contains references, never credentials.
 use serde_json::{json, Value};
 
-use crate::adapters::config::Provider;
+use crate::adapters::config::AiProvider;
 use crate::context::Context;
 use crate::errors::MusterError;
 use crate::manifest::Manifest;
@@ -11,7 +11,7 @@ use crate::team;
 
 const ID: ParamSpec = ParamSpec {
     name: "id",
-    about: "Provider id (or adapter id for login)",
+    about: "AI provider id (or adapter id for login)",
     kind: ParamKind::String,
     required: true,
     positional: true,
@@ -43,7 +43,7 @@ pub const ADD: CommandSpec = CommandSpec {
             "anthropic, openai, openai-compatible, ollama or google",
             true,
         ),
-        option("base-url", "Provider endpoint", false),
+        option("base-url", "AI provider endpoint", false),
         option("default-model", "Default model", false),
         option("key", "Secret reference (never a plaintext key)", false),
         option(
@@ -103,19 +103,15 @@ fn commit(
 }
 fn list(ctx: &mut Context, _: &Params) -> Result<Value, MusterError> {
     let manifest = Manifest::load(&ctx.config_dir)?;
-    let merged = crate::engine::layer::merge(&crate::engine::layer::global_layers(
-        &ctx.config_dir,
-        &manifest,
-        crate::machine::load_name(&ctx.state_dir).as_deref(),
-    ));
+    let merged = crate::engine::layer::global_merge(&ctx.config_dir, &ctx.state_dir, &manifest);
     let access = crate::secrets::SecretAccess::new(manifest.secrets.clone(), None);
-    let providers: Vec<_> = merged
-        .providers
+    let ai_providers: Vec<_> = merged
+        .ai_providers
         .iter()
         .map(|(id, provider)| {
             let selected_agents: Vec<_> = merged
                 .agents
-                .providers
+                .ai_providers
                 .iter()
                 .filter(|(agent, selected)| {
                     *selected == id
@@ -130,14 +126,12 @@ fn list(ctx: &mut Context, _: &Params) -> Result<Value, MusterError> {
             let agents: Vec<_> = selected_agents
                 .iter()
                 .filter(|agent| {
-                    crate::adapters::find(agent).is_some_and(|adapter| {
-                        adapter
-                            .capabilities
-                            .contains(&crate::adapters::Capability::Providers)
-                    }) && provider
-                        .key
-                        .as_ref()
-                        .is_none_or(|key| access.allows(agent, key))
+                    crate::adapters::find(agent)
+                        .is_some_and(|adapter| adapter.supports_ai_provider(provider.kind))
+                        && provider
+                            .key
+                            .as_ref()
+                            .is_none_or(|key| access.allows(agent, key))
                 })
                 .collect();
             let mut entry = serde_json::to_value(provider).expect("provider JSON");
@@ -147,11 +141,11 @@ fn list(ctx: &mut Context, _: &Params) -> Result<Value, MusterError> {
             entry
         })
         .collect();
-    Ok(json!({ "providers": providers }))
+    Ok(json!({ "providers": ai_providers }))
 }
 fn add(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let id = id(params)?;
-    let provider: Provider = serde_json::from_value(json!({
+    let provider: AiProvider = serde_json::from_value(json!({
         "kind": params.get_string("kind"),
         "base_url": params.get_string("base-url"),
         "default_model": params.get_string("default-model"),
@@ -197,6 +191,8 @@ fn add(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         secret_params.set("path", json!(reference.segments().join("/")));
         secret_params.set("allow", json!(params.get_list("allow")));
         let value = if let Some(value) = params.get_string("value") {
+            ctx.diag(crate::output::Diagnostic::new(crate::output::Severity::Warning,
+                "secret_in_argv", "--value may be visible in shell history and process arguments; prefer --value-stdin"));
             SecretValue::new(value.to_owned())
         } else {
             ctx.read_secret_stdin()?
@@ -205,7 +201,7 @@ fn add(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         // secret.add may have added an access policy; do not overwrite it.
         manifest = Manifest::load(&ctx.config_dir)?;
     }
-    manifest.providers.insert(id.clone(), provider);
+    manifest.ai_providers.insert(id.clone(), provider);
     manifest.save(&ctx.config_dir)?;
     commit(ctx, actor.as_ref(), &format!("feat(provider): set {id}"))?;
     Ok(result)
@@ -214,27 +210,30 @@ fn rm(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let id = id(params)?;
     let mut manifest = Manifest::load(&ctx.config_dir)?;
     let actor = actor(ctx, &manifest)?;
-    if manifest.providers.remove(&id).is_none() {
+    if manifest.ai_providers.remove(&id).is_none() {
         return Err(MusterError::Usage(format!(
             "provider '{id}' is not declared"
         )));
     }
     if let Some(agents) = &mut manifest.agents {
-        agents.providers.retain(|_, selected| selected != &id);
+        agents.ai_providers.retain(|_, selected| selected != &id);
     }
     // A profile may still declare its own endpoint with this id. Preserve
     // those selections, but never leave references to an endpoint just removed.
     if !manifest
         .profiles
         .values()
-        .any(|profile| profile.providers.contains_key(&id))
+        .any(|profile| profile.ai_providers.contains_key(&id))
     {
         for profile in manifest.profiles.values_mut() {
             if let Some(agents) = &mut profile.agents {
-                agents.providers.retain(|_, selected| selected != &id);
+                agents.ai_providers.retain(|_, selected| selected != &id);
             }
         }
     }
+    let text = toml::to_string(&manifest)
+        .map_err(|_| MusterError::Operational("cannot serialize manifest".into()))?;
+    Manifest::parse(&text, crate::manifest::FILE_NAME)?;
     let result = json!({ "removed": id });
     if ctx.dry_run {
         return Ok(result);
@@ -277,20 +276,16 @@ pub(crate) fn logged_in(binary: &std::path::Path, args: &[&str]) -> bool {
 fn login(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let id = id(params)?;
     let manifest = Manifest::load(&ctx.config_dir)?;
-    let merged = crate::engine::layer::merge(&crate::engine::layer::global_layers(
-        &ctx.config_dir,
-        &manifest,
-        crate::machine::load_name(&ctx.state_dir).as_deref(),
-    ));
+    let merged = crate::engine::layer::global_merge(&ctx.config_dir, &ctx.state_dir, &manifest);
     let agent = if crate::adapters::find(&id).is_some() {
         id.as_str()
     } else {
-        if !merged.providers.contains_key(&id) {
+        if !merged.ai_providers.contains_key(&id) {
             return Err(MusterError::Usage("unknown provider or agent".into()));
         }
         let agents: Vec<_> = merged
             .agents
-            .providers
+            .ai_providers
             .iter()
             .filter(|(_, selected)| *selected == &id)
             .map(|(agent, _)| agent.as_str())
@@ -335,4 +330,57 @@ fn login(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         ));
     }
     Ok(json!({"agent": agent, "status": "logged_in"}))
+}
+
+pub const USE: CommandSpec = CommandSpec {
+    name: "provider.use",
+    about: "Select or clear an AI provider for one agent",
+    params: &[
+        ID,
+        option("agent", "Agent id", true),
+        ParamSpec {
+            name: "clear",
+            about: "Clear this agent's selection",
+            kind: ParamKind::Bool,
+            required: false,
+            positional: false,
+        },
+    ],
+    mutating: true,
+    handler: use_provider,
+};
+
+fn use_provider(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
+    let id = id(params)?;
+    let agent = params
+        .get_string("agent")
+        .ok_or_else(|| MusterError::Usage("--agent required".into()))?;
+    if crate::adapters::find(agent).is_none() {
+        return Err(MusterError::Usage("unknown agent".into()));
+    }
+    let mut manifest = Manifest::load(&ctx.config_dir)?;
+    let actor = actor(ctx, &manifest)?;
+    let merged = crate::engine::layer::global_merge(&ctx.config_dir, &ctx.state_dir, &manifest);
+    if !merged.ai_providers.contains_key(&id) {
+        return Err(MusterError::Usage("unknown provider".into()));
+    }
+    let clear = params.get_bool("clear");
+    let agents = manifest.agents.get_or_insert_with(Default::default);
+    if clear {
+        agents.ai_providers.remove(agent);
+    } else {
+        agents.ai_providers.insert(agent.to_owned(), id.clone());
+    }
+    let result = json!({"agent": agent, "provider": if clear { None } else { Some(&id) }});
+    if ctx.dry_run {
+        return Ok(result);
+    }
+    ctx.confirm(&format!("Change AI provider selection for '{agent}'?"))?;
+    manifest.save(&ctx.config_dir)?;
+    commit(
+        ctx,
+        actor.as_ref(),
+        &format!("feat(provider): select for {agent}"),
+    )?;
+    Ok(result)
 }

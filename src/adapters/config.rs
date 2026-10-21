@@ -21,7 +21,8 @@ pub struct AgentsConfig {
     pub models: BTreeMap<String, String>,
     /// Selected provider id per adapter.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub providers: BTreeMap<String, String>,
+    #[serde(rename = "providers")]
+    pub ai_providers: BTreeMap<String, String>,
     /// Tool permission rules (Claude Code syntax).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permissions: Option<Permissions>,
@@ -184,8 +185,8 @@ impl McpServer {
 /// A named AI endpoint. Credentials must remain secret references here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct Provider {
-    pub kind: ProviderKind,
+pub struct AiProvider {
+    pub kind: AiProviderKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -194,9 +195,59 @@ pub struct Provider {
     pub key: Option<String>,
 }
 
+/// Field-wise profile override. Only a first declaration needs `kind`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AiProviderOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<AiProviderKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+}
+
+impl From<AiProvider> for AiProviderOverride {
+    fn from(provider: AiProvider) -> Self {
+        Self {
+            kind: Some(provider.kind),
+            base_url: provider.base_url,
+            default_model: provider.default_model,
+            key: provider.key,
+        }
+    }
+}
+
+impl AiProviderOverride {
+    pub fn merge_into(&self, current: &mut AiProvider) {
+        if let Some(kind) = self.kind {
+            current.kind = kind;
+        }
+        if self.base_url.is_some() {
+            current.base_url = self.base_url.clone();
+        }
+        if self.default_model.is_some() {
+            current.default_model = self.default_model.clone();
+        }
+        if self.key.is_some() {
+            current.key = self.key.clone();
+        }
+    }
+    pub fn declared(&self) -> Option<AiProvider> {
+        Some(AiProvider {
+            kind: self.kind?,
+            base_url: self.base_url.clone(),
+            default_model: self.default_model.clone(),
+            key: self.key.clone(),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
-pub enum ProviderKind {
+pub enum AiProviderKind {
     Anthropic,
     Openai,
     OpenaiCompatible,

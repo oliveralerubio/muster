@@ -32,7 +32,8 @@ fn web_panel_javascript_passes_its_node_suite() {
         output.status
     );
     assert!(
-        stdout.contains("ok testProfileSaveIsGatedOnPreview")
+        stdout.contains("ok testProvidersViewListsReferencesAndAddsAndRemoves")
+            && stdout.contains("ok testProfileSaveIsGatedOnPreview")
             && stdout.contains("ok testMcpFormUsesJsonArrayValues")
             && stdout.contains("ok testMcpPreviewIgnoresStaleResponse")
             && stdout.contains("ok testMcpEditClearsPreviewAndGuardsSave"),

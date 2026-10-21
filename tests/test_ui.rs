@@ -989,3 +989,53 @@ fn ui_frontend_assets_render_deep_flatten_and_navigation_guard() {
         "show() and view renderers must guard with token !== navToken before rendering"
     );
 }
+
+#[test]
+fn web_provider_routes_add_select_list_remove_but_do_not_launch_login() {
+    let env = support::MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    let mut ui = Ui::start(&env);
+    let cookie = ui_session_cookie(&mut ui);
+    let (status, added) = ui_post(
+        &mut ui,
+        &cookie,
+        "/api/provider/add",
+        &serde_json::json!({"id":"gateway","kind":"anthropic","base-url":"https://example.invalid","default-model":"example","key":"env://EXAMPLE_KEY","confirm":true}),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(added["ok"], true);
+    let (status, selected) = ui_post(
+        &mut ui,
+        &cookie,
+        "/api/provider/use",
+        &serde_json::json!({"id":"gateway","agent":"claude","confirm":true}),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(selected["result"]["agent"], "claude");
+    let (status, _, listed) = ui.request("GET", "/api/providers", Some(&cookie), None);
+    assert_eq!(status, 200);
+    let listed: Value = serde_json::from_str(&listed).unwrap();
+    assert_eq!(listed["result"]["providers"][0]["key"], "env://EXAMPLE_KEY");
+    assert_eq!(
+        listed["result"]["providers"][0]["selected_agents"],
+        serde_json::json!(["claude"])
+    );
+    let (status, _) = ui_post(
+        &mut ui,
+        &cookie,
+        "/api/provider/login",
+        &serde_json::json!({"id":"claude","confirm":true}),
+    );
+    assert_eq!(status, 404);
+    let (status, removed) = ui_post(
+        &mut ui,
+        &cookie,
+        "/api/provider/rm",
+        &serde_json::json!({"id":"gateway","confirm":true}),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(removed["result"]["removed"], "gateway");
+    let (_, _, listed) = ui.request("GET", "/api/providers", Some(&cookie), None);
+    let listed: Value = serde_json::from_str(&listed).unwrap();
+    assert_eq!(listed["result"]["providers"], serde_json::json!([]));
+}

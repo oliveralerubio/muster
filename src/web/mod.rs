@@ -76,8 +76,12 @@ const ROUTES: &[Route] = &[
     get("groups", "group.list"),
     get("profiles", "profile.list"),
     get("providers", "provider.list"),
-    post("provider/add", "provider.add"),
+    Route {
+        hidden: &["value-stdin"],
+        ..post("provider/add", "provider.add")
+    },
     post("provider/rm", "provider.rm"),
+    post("provider/use", "provider.use"),
     get("profile", "profile.show"),
     get("secrets", "secret.list"),
     get("plan", "plan"),

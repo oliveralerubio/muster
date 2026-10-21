@@ -112,6 +112,41 @@ const views = {
       diagnostics(data));
   },
 
+  async providers(token) {
+    const data = await api("providers");
+    if (token !== undefined && token !== navToken) return;
+    const providers = (data.result || {}).providers || [];
+    const field = (id, label, attrs) => {
+      const input = el("input", Object.assign({ id, type: "text", autocomplete: "off" }, attrs || {}));
+      return [el("label", { for: id }, label), input];
+    };
+    const kind = el("select", { id: "provider-kind" },
+      ["anthropic", "openai", "openai-compatible", "ollama", "google"].map((value) => el("option", { value }, value)));
+    const form = el("form", { id: "provider-form", class: "skill-form" },
+      field("provider-id", "ID", { required: "", pattern: "[a-z0-9-]+" }),
+      el("label", { for: "provider-kind" }, "Kind"), kind,
+      field("provider-url", "Base URL", { type: "url" }),
+      field("provider-model", "Default model"),
+      field("provider-key", "Key reference (not a key value)", { placeholder: "native://app/key or env://VARIABLE" }),
+      el("button", { type: "submit", class: "primary" }, "Add provider"));
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const body = { id: $("#provider-id").value.trim(), kind: kind.value };
+      for (const [name, id] of [["base-url", "provider-url"], ["default-model", "provider-model"], ["key", "provider-key"]]) {
+        const value = $("#" + id).value.trim();
+        if (value) body[name] = value;
+      }
+      await act("Add or replace this AI provider?", "provider/add", body);
+    });
+    render("AI providers", [],
+      table(["ID", "Kind", "Base URL", "Default model", "Key reference", "Receiving agents", ""],
+        providers.map((p) => [p.id, p.kind, p.base_url || "", p.default_model || "", p.key || "", (p.agents || []).join(", "),
+          button("Remove", () => act(`Remove provider ${p.id}?`, "provider/rm", { id: p.id }), "danger")])),
+      el("h2", {}, "Add provider"), form,
+      el("p", {}, "Subscription logins stay on this machine. Run muster provider login claude or muster provider login codex in your terminal."),
+      diagnostics(data));
+  },
+
   async machines(token) {
     const data = await api("machines");
     if (token !== undefined && token !== navToken) return;

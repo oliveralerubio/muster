@@ -103,7 +103,7 @@ claude = 'gateway'
 codex = 'gateway'
 opencode = 'gateway'
 [providers.gateway]
-kind = 'anthropic'
+kind = 'openai-compatible'
 key = 'env://MUSTER_PROVIDER_TEST_KEY'
 [secrets.'env://MUSTER_PROVIDER_TEST_KEY']
 allow = ['claude', 'codex']
@@ -579,4 +579,454 @@ fn provider_list_distinguishes_selected_agents_from_allowed_capable_receivers() 
         envelope.result()["providers"][0]["selected_agents"],
         serde_json::json!(["antigravity", "claude", "codex"])
     );
+}
+
+#[test]
+fn provider_use_selects_and_clears_agent_without_removing_endpoint() {
+    let env = MusterEnv::new();
+    seed(
+        &env,
+        "version = 1\n[agents]\nenabled = ['claude']\n[providers.gateway]\nkind = 'anthropic'\n",
+    );
+    let (_, selected) = env.run_json(&[
+        "provider", "use", "gateway", "--agent", "claude", "--yes", "--format", "json",
+    ]);
+    assert!(selected.ok());
+    let (_, list) = env.run_json(&["provider", "list", "--format", "json"]);
+    assert_eq!(
+        list.result()["providers"][0]["selected_agents"],
+        serde_json::json!(["claude"])
+    );
+    env.run(&[
+        "provider", "use", "gateway", "--agent", "claude", "--clear", "--yes",
+    ])
+    .assert()
+    .success();
+    let (_, list) = env.run_json(&["provider", "list", "--format", "json"]);
+    assert_eq!(
+        list.result()["providers"][0]["selected_agents"],
+        serde_json::json!([])
+    );
+}
+
+#[test]
+fn provider_profile_merges_fields_and_explains_each_source() {
+    let env = MusterEnv::new();
+    env.run(&["init", "--machine", "laptop", "--yes"])
+        .assert()
+        .success();
+    let path = env.config_dir().join("muster.toml");
+    let mut config = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace("[machines.laptop]", "[machines.laptop]\nprofile = 'work'");
+    config.push_str("\n[agents]\nenabled = ['claude']\n[agents.providers]\nclaude = 'gateway'\n[providers.gateway]\nkind = 'anthropic'\nbase_url = 'https://example.invalid'\ndefault_model = 'team'\n[profiles.work.providers.gateway]\ndefault_model = 'machine'\n");
+    std::fs::write(path, config).unwrap();
+    env.run(&["agents", "apply", "--yes"]).assert().success();
+    let settings: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(env.path().join(".claude/settings.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        settings["env"]["ANTHROPIC_BASE_URL"],
+        "https://example.invalid"
+    );
+    assert_eq!(settings["model"], "machine");
+    let (_, plan) = env.run_json(&["plan", "--explain", "--format", "json"]);
+    assert_eq!(
+        plan.result()["explain"]["providers"]["gateway"]["kind"]["layer"],
+        "team"
+    );
+    assert_eq!(
+        plan.result()["explain"]["providers"]["gateway"]["base_url"]["layer"],
+        "team"
+    );
+    assert_eq!(
+        plan.result()["explain"]["providers"]["gateway"]["default_model"]["layer"],
+        "machine"
+    );
+}
+
+#[test]
+fn provider_capability_warning_only_targets_selected_agents() {
+    let env = MusterEnv::new();
+    seed(&env, "version = 1\n[agents]\nenabled = ['claude', 'antigravity']\n[agents.providers]\nclaude = 'gateway'\n[providers.gateway]\nkind = 'anthropic'\n");
+    let (_, plan) = env.run_json(&["plan", "--format", "json"]);
+    assert!(!plan
+        .diagnostics()
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|d| d["code"] == "unsupported_feature"
+            && d["message"].as_str().unwrap_or("").contains("providers")));
+}
+
+#[test]
+fn codex_provider_wire_api_and_unsupported_kinds() {
+    for kind in [
+        "openai",
+        "openai-compatible",
+        "ollama",
+        "anthropic",
+        "google",
+    ] {
+        let env = MusterEnv::new();
+        seed(&env, &format!("version = 1\n[agents]\nenabled = ['codex']\n[agents.providers]\ncodex = 'gateway'\n[providers.gateway]\nkind = '{kind}'\nbase_url = 'https://example.invalid/v1'\n"));
+        let (_, plan) = env.run_json(&["agents", "apply", "--yes", "--format", "json"]);
+        let unsupported = ["anthropic", "google"].contains(&kind);
+        assert_eq!(
+            plan.diagnostics()
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|d| d["code"] == "provider_kind_unsupported"),
+            unsupported
+        );
+        let path = env.path().join(".codex/config.toml");
+        if unsupported {
+            assert!(
+                !path.exists()
+                    || !std::fs::read_to_string(path)
+                        .unwrap()
+                        .contains("model_provider")
+            );
+        } else {
+            let config: toml::Value =
+                toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(
+                config["model_providers"]["gateway"]["wire_api"].as_str(),
+                Some("chat")
+            );
+        }
+    }
+}
+
+#[test]
+fn doctor_login_warning_requires_matching_subscription_kind_and_agent() {
+    for (agent, kind, expected) in [
+        ("claude", "anthropic", true),
+        ("codex", "openai", true),
+        ("claude", "google", false),
+        ("codex", "anthropic", false),
+        ("claude", "openai-compatible", false),
+    ] {
+        let env = MusterEnv::new();
+        env.fake_exe(agent, "exit 1");
+        seed(&env, &format!("version = 1\n[agents]\nenabled = ['{agent}']\n[agents.providers]\n{agent} = 'gateway'\n[providers.gateway]\nkind = '{kind}'\n"));
+        let (_, doctor) = env.run_json(&["doctor", "--offline", "--format", "json"]);
+        assert_eq!(
+            doctor
+                .diagnostics()
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|d| d["code"] == "provider_login_required"),
+            expected,
+            "{agent}/{kind}"
+        );
+    }
+}
+
+#[test]
+fn provider_add_value_stdin_vaults_without_echo_and_value_warns() {
+    let env = MusterEnv::new();
+    env.run(&["init", "--machine", "laptop", "--yes"])
+        .assert()
+        .success();
+    let out = env
+        .run(&[
+            "provider",
+            "add",
+            "gateway",
+            "--kind",
+            "anthropic",
+            "--key",
+            "native://app/endpoint",
+            "--value-stdin",
+            "--allow",
+            "claude",
+            "--yes",
+            "--format",
+            "json",
+        ])
+        .write_stdin("provider-stdin-test-value\n")
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("provider-stdin-test-value"));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("provider-stdin-test-value"));
+    assert!(
+        !std::fs::read_to_string(env.config_dir().join("muster.toml"))
+            .unwrap()
+            .contains("provider-stdin-test-value")
+    );
+    env.run(&["provider", "use", "gateway", "--agent", "claude", "--yes"])
+        .assert()
+        .success();
+    env.run(&["agents", "apply", "--yes"]).assert().success();
+    let settings: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(env.path().join(".claude/settings.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        settings["env"]["ANTHROPIC_AUTH_TOKEN"],
+        "provider-stdin-test-value"
+    );
+    let (_, out) = env.run_json(&[
+        "provider",
+        "add",
+        "gateway",
+        "--kind",
+        "anthropic",
+        "--key",
+        "native://app/argv",
+        "--value",
+        "provider-argv-test-value",
+        "--yes",
+        "--format",
+        "json",
+    ]);
+    assert!(out
+        .diagnostics()
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|d| d["code"] == "secret_in_argv"));
+}
+
+#[test]
+fn unattended_sync_applies_provider_changes_without_approval() {
+    let env = MusterEnv::new();
+    env.run(&["init", "--machine", "laptop", "--yes"])
+        .assert()
+        .success();
+    let path = env.config_dir().join("muster.toml");
+    let mut config = std::fs::read_to_string(&path).unwrap();
+    config.push_str("\n[agents]\nenabled = ['claude']\n[agents.providers]\nclaude = 'gateway'\n[providers.gateway]\nkind = 'anthropic'\nbase_url = 'https://first.invalid'\ndefault_model = 'first'\n");
+    std::fs::write(&path, &config).unwrap();
+    env.run(&["sync", "--format", "json"]).assert().success();
+    std::fs::write(
+        &path,
+        config
+            .replace("https://first.invalid", "https://second.invalid")
+            .replace("default_model = 'first'", "default_model = 'second'"),
+    )
+    .unwrap();
+    env.run(&["sync", "--format", "json"]).assert().success();
+    let settings: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(env.path().join(".claude/settings.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        settings["env"]["ANTHROPIC_BASE_URL"],
+        "https://second.invalid"
+    );
+    assert_eq!(settings["model"], "second");
+}
+
+#[test]
+fn importers_propose_native_ai_providers_without_copying_keys() {
+    for (file, contents, id, kind, url, model, reference) in [
+        (".claude/settings.json", r#"{"env":{"ANTHROPIC_BASE_URL":"https://claude.invalid","ANTHROPIC_AUTH_TOKEN":"imported-test-secret"},"model":"claude-model"}"#, "claude", "anthropic", "https://claude.invalid", "claude-model", "env://MUSTER_IMPORTED_CLAUDE_KEY"),
+        (".codex/config.toml", "model_provider = 'gateway'\nmodel = 'codex-model'\n[model_providers.gateway]\nname = 'Gateway'\nbase_url = 'https://codex.invalid'\nexperimental_bearer_token = 'imported-test-secret'\n", "gateway", "openai-compatible", "https://codex.invalid", "codex-model", "env://MUSTER_IMPORTED_GATEWAY_KEY"),
+        (".config/opencode/opencode.json", r#"{"provider":{"gateway":{"npm":"@ai-sdk/google","options":{"baseURL":"https://google.invalid","apiKey":"imported-test-secret"}}},"model":"gateway/google-model"}"#, "gateway", "google", "https://google.invalid", "google-model", "env://MUSTER_IMPORTED_GATEWAY_KEY"),
+    ] {
+        let env = MusterEnv::new();
+        seed(&env, "version = 1\n");
+        let source = env.path().join("existing");
+        let path = source.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+        let out = env.run(&["import", "cuartel", source.to_str().unwrap(), "--dry-run", "--format", "json"]).assert().success().get_output().clone();
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("imported-test-secret"));
+        assert!(!String::from_utf8_lossy(&out.stderr).contains("imported-test-secret"));
+        let out: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(out["result"]["providers"][id]["kind"], kind);
+        assert_eq!(out["result"]["providers"][id]["base_url"], url);
+        assert_eq!(out["result"]["providers"][id]["default_model"], model);
+        assert_eq!(out["result"]["providers"][id]["key"], reference);
+        assert_eq!(std::fs::read_to_string(env.config_dir().join("muster.toml")).unwrap(), "version = 1\n");
+        env.run(&["import", "cuartel", source.to_str().unwrap(), "--yes"]).assert().success();
+        let manifest = std::fs::read_to_string(env.config_dir().join("muster.toml")).unwrap();
+        assert!(!manifest.contains("imported-test-secret"));
+        let manifest: toml::Value = toml::from_str(&manifest).unwrap();
+        assert_eq!(manifest["providers"][id]["key"].as_str(), Some(reference));
+    }
+}
+
+#[test]
+fn mcp_provider_mutations_follow_the_propose_change_policy() {
+    let env = MusterEnv::new();
+    seed(&env, "version = 1\n");
+    let messages = concat!(
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"1\"}}}\n",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n"
+    );
+    let out = env
+        .run(&["mcp"])
+        .write_stdin(messages)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let response: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out).lines().last().unwrap()).unwrap();
+    let names: Vec<_> = response["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names.len(), 7);
+    assert!(names.contains(&"provider_list"));
+    assert!(names.contains(&"propose_change"));
+    for name in [
+        "provider_add",
+        "provider_rm",
+        "provider_use",
+        "provider_login",
+    ] {
+        assert!(!names.contains(&name));
+    }
+    let manifest = "version = 1\n[providers.gateway]\nkind = 'anthropic'\n[agents.providers]\nclaude = 'gateway'\n";
+    let (_, proposal) = env.run_json(&[
+        "proposal",
+        "create",
+        "--path",
+        "muster.toml",
+        "--contents",
+        manifest,
+        "--format",
+        "json",
+    ]);
+    assert!(proposal.ok());
+    assert_eq!(
+        std::fs::read_to_string(env.config_dir().join("muster.toml")).unwrap(),
+        "version = 1\n"
+    );
+}
+
+#[test]
+fn chezmoi_provider_import_does_not_store_the_secret_bearing_native_file() {
+    let env = MusterEnv::new();
+    seed(&env, "version = 1\n");
+    let source = env.path().join("chezmoi");
+    std::fs::create_dir_all(source.join("dot_claude")).unwrap();
+    std::fs::write(source.join("dot_claude/settings.json"), r#"{"env":{"ANTHROPIC_BASE_URL":"https://example.invalid","ANTHROPIC_AUTH_TOKEN":"chezmoi-test-only-value"}}"#).unwrap();
+    let out = env
+        .run(&[
+            "import",
+            "chezmoi",
+            source.to_str().unwrap(),
+            "--yes",
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("chezmoi-test-only-value"));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("chezmoi-test-only-value"));
+    let manifest = std::fs::read_to_string(env.config_dir().join("muster.toml")).unwrap();
+    assert!(!manifest.contains("chezmoi-test-only-value"));
+    let manifest: toml::Value = toml::from_str(&manifest).unwrap();
+    assert_eq!(
+        manifest["providers"]["claude"]["key"].as_str(),
+        Some("env://MUSTER_IMPORTED_CLAUDE_KEY")
+    );
+    assert!(!env
+        .config_dir()
+        .join("files/.claude/settings.json")
+        .exists());
+}
+
+#[test]
+fn provider_rm_refuses_to_orphan_an_inherited_profile_declaration() {
+    let env = MusterEnv::new();
+    env.run(&["init", "--machine", "laptop", "--yes"])
+        .assert()
+        .success();
+    let path = env.config_dir().join("muster.toml");
+    let mut config = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace("[machines.laptop]", "[machines.laptop]\nprofile = 'work'");
+    config.push_str("\n[providers.gateway]\nkind = 'anthropic'\n[profiles.work.providers.gateway]\ndefault_model = 'machine'\n");
+    std::fs::write(&path, &config).unwrap();
+    env.run(&["provider", "rm", "gateway", "--yes", "--format", "json"])
+        .assert()
+        .code(3);
+    assert_eq!(std::fs::read_to_string(path).unwrap(), config);
+}
+
+#[test]
+fn chezmoi_import_excludes_oauth_credential_stores() {
+    let env = MusterEnv::new();
+    seed(&env, "version = 1\n");
+    let source = env.path().join("chezmoi");
+    for file in [
+        "dot_codex/auth.json",
+        "dot_claude/dot_credentials.json",
+        "dot_local/share/opencode/auth.json",
+    ] {
+        let path = source.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, r#"{"oauth":"oauth-test-only-value"}"#).unwrap();
+    }
+    let out = env
+        .run(&[
+            "import",
+            "chezmoi",
+            source.to_str().unwrap(),
+            "--yes",
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let out: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(out["result"]["files"], serde_json::json!([]));
+    assert_eq!(out["result"]["skipped"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        std::fs::read_to_string(env.config_dir().join("muster.toml")).unwrap(),
+        "version = 1\n"
+    );
+}
+
+#[test]
+fn codex_incompatible_provider_is_not_a_receiving_agent_even_with_key_access() {
+    let env = MusterEnv::new();
+    seed(&env, "version = 1\n[agents]\nenabled = ['codex']\n[agents.providers]\ncodex = 'gateway'\n[providers.gateway]\nkind = 'anthropic'\nkey = 'env://MUSTER_PROVIDER_ABSENT'\n[secrets.'env://MUSTER_PROVIDER_ABSENT']\nallow = ['codex']\n");
+    let (_, list) = env.run_json(&["provider", "list", "--format", "json"]);
+    assert_eq!(
+        list.result()["providers"][0]["agents"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        list.result()["providers"][0]["selected_agents"],
+        serde_json::json!(["codex"])
+    );
+    let (_, plan) = env.run_json(&["plan", "--format", "json"]);
+    assert!(plan
+        .diagnostics()
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|d| d["code"] == "provider_kind_unsupported"));
+}
+
+#[test]
+fn profile_provider_first_declaration_requires_kind_even_before_assignment() {
+    let env = MusterEnv::new();
+    seed(
+        &env,
+        "version = 1\n[profiles.work.providers.gateway]\ndefault_model = 'example'\n",
+    );
+    env.run(&["provider", "list", "--format", "json"])
+        .assert()
+        .code(3);
 }
