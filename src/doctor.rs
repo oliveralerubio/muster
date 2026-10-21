@@ -84,6 +84,9 @@ pub fn run(
 
     // Run the optional network check once, even when repairs re-examine local state.
     checkup.checks.push(api_keys::check(check_keys, offline));
+    checkup
+        .checks
+        .push(api_keys::check_declared(ctx, check_keys, offline));
     let diagnostics = checkup.diagnostics();
     let count = |s: Severity| diagnostics.iter().filter(|d| d.severity == s).count();
     let errors = count(Severity::Error);
@@ -247,6 +250,10 @@ fn examine(ctx: &mut Context) -> Checkup {
     checks.push(match &manifest {
         Some(m) => check_keys(ctx, m),
         None => Check::skipped("keys"),
+    });
+    checks.push(match &manifest {
+        Some(m) => check_providers(ctx, m),
+        None => Check::skipped("providers"),
     });
     Checkup {
         checks,
@@ -773,6 +780,75 @@ fn key_suggestion(code: &str, provider: &str, binary: Option<&str>) -> String {
         }
         _ => "fix the secret reference in muster.toml".into(),
     }
+}
+
+/// Resolve each configured endpoint on this machine, without retaining values
+/// or reporting external secret CLI output. Network validation is separate.
+fn check_providers(ctx: &Context, manifest: &Manifest) -> Check {
+    let merged = layer::merge(&layer::global_layers(
+        &ctx.config_dir,
+        manifest,
+        machine::load_name(&ctx.state_dir).as_deref(),
+    ));
+    let mut providers = Providers::new(&ctx.config_dir, &ctx.state_dir);
+    let mut diagnostics = Vec::new();
+    for (id, provider) in &merged.providers {
+        if let Some(reference) = &provider.key {
+            if providers.resolve(reference).is_err() {
+                diagnostics.push(
+                    Diagnostic::new(
+                        Severity::Warning,
+                        "secret_reference_unresolved",
+                        format!("provider `{id}` key cannot be resolved on this machine"),
+                    )
+                    .with_path(format!("providers.{id}"))
+                    .with_suggestion("make the referenced secret available on this machine"),
+                );
+            }
+        }
+    }
+    for (agent, id) in &merged.agents.providers {
+        if merged
+            .agents
+            .enabled
+            .as_ref()
+            .is_some_and(|enabled| !enabled.contains(agent))
+        {
+            continue;
+        }
+        let Some(provider) = merged.providers.get(id) else {
+            continue;
+        };
+        if provider.key.is_some() || matches!(provider.kind, adapters::config::ProviderKind::Ollama)
+        {
+            continue;
+        }
+        // A custom keyless endpoint is not a subscription.
+        if provider.base_url.is_some() {
+            continue;
+        }
+        let Some((status, _)) = crate::commands::provider::login_commands(agent) else {
+            continue;
+        };
+        let Some(adapter) = adapters::find(agent) else {
+            continue;
+        };
+        if machine::find_executable(adapter.binary)
+            .is_some_and(|binary| crate::commands::provider::logged_in(&binary, status))
+        {
+            continue;
+        }
+        diagnostics.push(
+            Diagnostic::new(
+                Severity::Warning,
+                "provider_login_required",
+                format!("agent `{agent}` needs a subscription login on this machine"),
+            )
+            .with_path(format!("providers.{id}"))
+            .with_suggestion(format!("run `muster provider login {agent}`")),
+        );
+    }
+    Check::new("providers", diagnostics)
 }
 
 #[cfg(test)]

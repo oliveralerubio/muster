@@ -10,7 +10,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub use crate::adapters::config::{AgentsConfig, McpServer, SkillRemote, SkillsConfig};
+pub use crate::adapters::config::{AgentsConfig, McpServer, Provider, SkillRemote, SkillsConfig};
 use crate::errors::MusterError;
 
 pub const FILE_NAME: &str = "muster.toml";
@@ -48,6 +48,8 @@ pub struct Manifest {
     /// Declared MCP servers (stdio and remote), keyed by server name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mcp: BTreeMap<String, McpServer>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub providers: BTreeMap<String, Provider>,
     /// Managed dotfiles, keyed by target path relative to `$HOME`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub files: BTreeMap<String, ManagedDotfile>,
@@ -235,6 +237,8 @@ pub struct Profile {
     pub agents: Option<AgentsConfig>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mcp: BTreeMap<String, McpServer>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub providers: BTreeMap<String, Provider>,
 }
 
 impl Default for Manifest {
@@ -306,6 +310,7 @@ impl Manifest {
             profiles: BTreeMap::new(),
             agents: None,
             mcp: BTreeMap::new(),
+            providers: BTreeMap::new(),
             files: BTreeMap::new(),
             secrets: BTreeMap::new(),
             mcp_server: None,
@@ -355,6 +360,39 @@ impl Manifest {
             return Err(invalid(format!(
                 "unknown key `{key}` (extension keys must start with `{EXTENSION_PREFIX}`)"
             )));
+        }
+        for providers in std::iter::once(&manifest.providers)
+            .chain(manifest.profiles.values().map(|p| &p.providers))
+        {
+            for (id, provider) in providers {
+                crate::machine::validate_name(id)
+                    .map_err(|_| invalid(format!("invalid provider id `{id}`")))?;
+                if let Some(key) = &provider.key {
+                    crate::secrets::SecretRef::parse(key).map_err(|_| {
+                        invalid(format!(
+                            "providers.{id}.key must be a valid secret reference"
+                        ))
+                    })?;
+                }
+            }
+        }
+        for agents in manifest
+            .agents
+            .iter()
+            .chain(manifest.profiles.values().filter_map(|p| p.agents.as_ref()))
+        {
+            for (agent, id) in &agents.providers {
+                let known = manifest.providers.contains_key(id)
+                    || manifest
+                        .profiles
+                        .values()
+                        .any(|p| p.providers.contains_key(id));
+                if crate::adapters::find(agent).is_none() || !known {
+                    return Err(invalid(format!(
+                        "agents.providers.{agent}: unknown agent or provider id `{id}`"
+                    )));
+                }
+            }
         }
         for (reference, policy) in &manifest.secrets {
             crate::secrets::SecretRef::parse(reference)

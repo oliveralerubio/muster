@@ -58,6 +58,12 @@ struct Tool {
 
 const TOOLS: &[Tool] = &[
     Tool {
+        name: "provider_list",
+        command: "provider.list",
+        hidden: &[],
+        forced: &[],
+    },
+    Tool {
         name: "status",
         command: "status",
         hidden: &[],

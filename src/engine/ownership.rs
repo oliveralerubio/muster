@@ -23,12 +23,20 @@ pub fn owned_keys(format: FileFormat, rendered: &str) -> Vec<Vec<String>> {
         FileFormat::Json => match serde_json::from_str::<Value>(rendered) {
             Ok(Value::Object(map)) => map
                 .iter()
-                .flat_map(|(k, v)| match v {
-                    Value::Object(children) => children
-                        .keys()
-                        .map(|c| vec![k.clone(), c.clone()])
-                        .collect::<Vec<_>>(),
-                    _ => vec![vec![k.clone()]],
+                .flat_map(|(k, v)| {
+                    if k == "provider" {
+                        let mut keys = Vec::new();
+                        json_leaf_keys(v, vec![k.clone()], &mut keys);
+                        keys
+                    } else {
+                        match v {
+                            Value::Object(children) => children
+                                .keys()
+                                .map(|c| vec![k.clone(), c.clone()])
+                                .collect::<Vec<_>>(),
+                            _ => vec![vec![k.clone()]],
+                        }
+                    }
                 })
                 .collect(),
             _ => Vec::new(),
@@ -54,12 +62,20 @@ pub fn owned_keys(format: FileFormat, rendered: &str) -> Vec<Vec<String>> {
         FileFormat::Toml => match rendered.parse::<toml_edit::DocumentMut>() {
             Ok(doc) => doc
                 .iter()
-                .flat_map(|(k, item)| match item.as_table_like() {
-                    Some(t) => t
-                        .iter()
-                        .map(|(c, _)| vec![k.to_string(), c.to_string()])
-                        .collect::<Vec<_>>(),
-                    None => vec![vec![k.to_string()]],
+                .flat_map(|(k, item)| {
+                    if k == "model_providers" {
+                        let mut keys = Vec::new();
+                        toml_leaf_keys(item, vec![k.to_string()], &mut keys);
+                        keys
+                    } else {
+                        match item.as_table_like() {
+                            Some(t) => t
+                                .iter()
+                                .map(|(c, _)| vec![k.to_string(), c.to_string()])
+                                .collect::<Vec<_>>(),
+                            None => vec![vec![k.to_string()]],
+                        }
+                    }
                 })
                 .collect(),
             Err(_) => Vec::new(),
@@ -123,41 +139,67 @@ pub fn prune(format: FileFormat, text: &str, keys: &[Vec<String>]) -> String {
                 return text.to_string();
             };
             for key in keys {
-                match key.as_slice() {
-                    [k] => {
-                        doc.remove(k);
-                    }
-                    [k, child] => {
-                        if let Some(t) = doc.get_mut(k).and_then(|i| i.as_table_like_mut()) {
-                            t.remove(child);
-                            if t.is_empty() {
-                                doc.remove(k);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
+                remove_toml(doc.as_table_mut(), key);
             }
             doc.to_string()
         }
     }
 }
 
-fn remove_json(map: &mut serde_json::Map<String, Value>, key: &[String]) -> bool {
-    match key {
-        [k] => map.remove(k).is_some(),
-        [k, child] => {
-            let Some(Value::Object(children)) = map.get_mut(k) else {
-                return false;
-            };
-            let removed = children.remove(child).is_some();
-            if children.is_empty() {
-                map.remove(k);
-            }
-            removed
+// Provider entries own only the leaves they emit, not the whole endpoint.
+fn json_leaf_keys(value: &Value, prefix: Vec<String>, out: &mut Vec<Vec<String>>) {
+    if let Value::Object(children) = value {
+        for (key, value) in children {
+            let mut path = prefix.clone();
+            path.push(key.clone());
+            json_leaf_keys(value, path, out);
         }
-        _ => false,
+    } else {
+        out.push(prefix);
     }
+}
+
+fn toml_leaf_keys(item: &toml_edit::Item, prefix: Vec<String>, out: &mut Vec<Vec<String>>) {
+    if let Some(table) = item.as_table_like() {
+        for (key, value) in table.iter() {
+            let mut path = prefix.clone();
+            path.push(key.to_string());
+            toml_leaf_keys(value, path, out);
+        }
+    } else {
+        out.push(prefix);
+    }
+}
+
+fn remove_toml(table: &mut dyn toml_edit::TableLike, key: &[String]) {
+    let Some((head, tail)) = key.split_first() else {
+        return;
+    };
+    if tail.is_empty() {
+        table.remove(head);
+    } else if let Some(children) = table.get_mut(head).and_then(|i| i.as_table_like_mut()) {
+        remove_toml(children, tail);
+        if children.is_empty() {
+            table.remove(head);
+        }
+    }
+}
+
+fn remove_json(map: &mut serde_json::Map<String, Value>, key: &[String]) -> bool {
+    let Some((head, tail)) = key.split_first() else {
+        return false;
+    };
+    if tail.is_empty() {
+        return map.remove(head).is_some();
+    }
+    let Some(Value::Object(children)) = map.get_mut(head) else {
+        return false;
+    };
+    let removed = remove_json(children, tail);
+    if children.is_empty() {
+        map.remove(head);
+    }
+    removed
 }
 
 /// True when nothing but empty structure is left (a file Muster created and

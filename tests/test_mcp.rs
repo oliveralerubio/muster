@@ -12,13 +12,14 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use support::MusterEnv;
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
-const EXPECTED_TOOLS: [&str; 6] = [
+const EXPECTED_TOOLS: [&str; 7] = [
     "status",
     "doctor",
     "plan",
     "propose_change",
     "secret_list_meta",
     "secret_reveal",
+    "provider_list",
 ];
 
 /// A live `muster mcp` subprocess bound to an isolated machine environment.

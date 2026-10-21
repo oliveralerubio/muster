@@ -19,6 +19,9 @@ pub struct AgentsConfig {
     /// Model per adapter id (model identifiers are not portable between agents).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub models: BTreeMap<String, String>,
+    /// Selected provider id per adapter.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub providers: BTreeMap<String, String>,
     /// Tool permission rules (Claude Code syntax).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permissions: Option<Permissions>,
@@ -176,4 +179,27 @@ impl McpServer {
             (None, None) => Err("needs either `command` (stdio) or `url` (remote)".into()),
         }
     }
+}
+
+/// A named AI endpoint. Credentials must remain secret references here.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Provider {
+    pub kind: ProviderKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderKind {
+    Anthropic,
+    Openai,
+    OpenaiCompatible,
+    Ollama,
+    Google,
 }

@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::adapters::config::{AgentsConfig, McpServer, DEFAULT_INSTRUCTIONS_SOURCE};
+use crate::adapters::config::{AgentsConfig, McpServer, Provider, DEFAULT_INSTRUCTIONS_SOURCE};
 use crate::errors::MusterError;
 use crate::manifest::{self, Manifest, Profile};
 use crate::team;
@@ -34,6 +34,7 @@ pub struct Layer {
     pub dir: PathBuf,
     pub agents: AgentsConfig,
     pub mcp: BTreeMap<String, McpServer>,
+    pub providers: BTreeMap<String, Provider>,
 }
 
 impl Layer {
@@ -50,6 +51,7 @@ impl Layer {
             dir: dir.to_path_buf(),
             agents: manifest.agents.clone().unwrap_or_default(),
             mcp: manifest.mcp.clone(),
+            providers: manifest.providers.clone(),
         }
     }
 
@@ -67,6 +69,7 @@ impl Layer {
             dir: dir.to_path_buf(),
             agents: p.agents.clone().unwrap_or_default(),
             mcp: p.mcp.clone(),
+            providers: p.providers.clone(),
         }
     }
 }
@@ -76,6 +79,7 @@ impl Layer {
 pub struct Merged {
     pub agents: AgentsConfig,
     pub mcp: BTreeMap<String, McpServer>,
+    pub providers: BTreeMap<String, Provider>,
     /// Directory the instructions source resolves against (the layer that
     /// declared `[agents.instructions]`, else the first layer).
     pub instructions_dir: PathBuf,
@@ -131,6 +135,7 @@ pub fn digest(config_dir: &Path, manifest: &Manifest, machine: &str) -> String {
     let canonical = serde_json::json!({
         "agents": merged.agents,
         "mcp": merged.mcp,
+        "providers": merged.providers,
         "instructions": instructions,
     })
     .to_string();
@@ -142,11 +147,30 @@ pub fn digest(config_dir: &Path, manifest: &Manifest, machine: &str) -> String {
 
 /// `plan --explain`: the fixed precedence and the layers that apply.
 pub fn explain(layers: &[Layer]) -> serde_json::Value {
+    let mut providers = BTreeMap::new();
+    for layer in layers {
+        let source = serde_json::json!({ "layer": layer.kind, "name": layer.name, "profile": layer.profile });
+        for (id, provider) in &layer.providers {
+            let mut fields = BTreeMap::from([("kind", source.clone())]);
+            for (field, present) in [
+                ("base_url", provider.base_url.is_some()),
+                ("default_model", provider.default_model.is_some()),
+                ("key", provider.key.is_some()),
+            ] {
+                if present {
+                    fields.insert(field, source.clone());
+                }
+            }
+            // Provider maps merge by id, not by field: all fields of an
+            // endpoint come from the last layer declaring that endpoint.
+            providers.insert(id, fields);
+        }
+    }
     let layers: Vec<_> = layers
         .iter()
         .map(|l| serde_json::json!({ "layer": l.kind, "name": l.name, "profile": l.profile }))
         .collect();
-    serde_json::json!({ "precedence": PRECEDENCE, "layers": layers })
+    serde_json::json!({ "precedence": PRECEDENCE, "layers": layers, "providers": providers })
 }
 
 /// The project layer. Agents read user-scope and project-scope files
@@ -178,6 +202,7 @@ pub fn project_layers(project: &Path) -> Result<Vec<Layer>, MusterError> {
 pub fn merge(layers: &[Layer]) -> Merged {
     let mut agents = AgentsConfig::default();
     let mut mcp = BTreeMap::new();
+    let mut providers = BTreeMap::new();
     let mut instructions_dir = layers.first().map(|l| l.dir.clone()).unwrap_or_default();
     let mut skills_dir = instructions_dir.clone();
     let mut subagents_dir = instructions_dir.clone();
@@ -202,12 +227,15 @@ pub fn merge(layers: &[Layer]) -> Merged {
             agents.permissions = over.permissions.clone();
         }
         agents.models.extend(over.models.clone());
+        agents.providers.extend(over.providers.clone());
         agents.hooks.extend(over.hooks.clone());
         mcp.extend(layer.mcp.clone());
+        providers.extend(layer.providers.clone());
     }
     Merged {
         agents,
         mcp,
+        providers,
         instructions_dir,
         skills_dir,
         subagents_dir,

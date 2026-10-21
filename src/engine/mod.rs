@@ -148,6 +148,14 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
                 path: Some(format!("{}: mcp.{name}", manifest::FILE_NAME)),
             })?;
     }
+    for (agent, id) in &merged.agents.providers {
+        if crate::adapters::find(agent).is_none() || !merged.providers.contains_key(id) {
+            return Err(MusterError::InvalidConfig {
+                message: format!("unknown agent or provider in agents.providers.{agent}"),
+                path: Some(manifest::FILE_NAME.into()),
+            });
+        }
+    }
     let selected = match options.agent {
         Some(id) => vec![single_adapter(id)?],
         None => enabled_adapters(Some(&merged.agents))?,
@@ -155,7 +163,19 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
     let instructions = read_instructions(ctx, &merged)?;
     let skills = read_skills(ctx, &merged)?;
     let subagents = read_subagents(ctx, &merged)?;
-    let secrets = resolve_secrets(ctx, &merged.mcp);
+    let mut secrets = resolve_secrets(ctx, &merged.mcp);
+    let mut providers = Providers::new(&ctx.config_dir, &ctx.state_dir);
+    for provider in merged.providers.values() {
+        if let Some(reference) = &provider.key {
+            if !secrets.contains_key(reference) {
+                // The adapter reports an unresolved reference without exposing
+                // provider CLI output (which may include sensitive values).
+                if let Ok(value) = providers.resolve(reference) {
+                    secrets.insert(reference.clone(), value);
+                }
+            }
+        }
+    }
     // Grants come only from the config repo's manifest: a project's own
     // `.muster/muster.toml` cannot grant itself secrets.
     let project = match &options.target {
@@ -165,6 +185,7 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
     let access = crate::secrets::SecretAccess::new(manifest.secrets.clone(), project);
     let desired = Desired {
         agents: &merged.agents,
+        providers: &merged.providers,
         mcp: &merged.mcp,
         instructions: instructions.as_deref(),
         secrets: &secrets,

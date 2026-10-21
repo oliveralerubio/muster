@@ -61,6 +61,7 @@ pub static ADAPTER: Adapter = Adapter {
         Capability::McpStdio,
         Capability::McpRemote,
         Capability::Models,
+        Capability::Providers,
         Capability::Skills,
         Capability::Subagents,
     ],
@@ -76,6 +77,28 @@ fn render(desired: &Desired, current: &Current, plan: &mut RenderPlan) -> Result
         fresh.insert("$schema".into(), Value::String(SCHEMA_URL.into()));
         fresh.extend(object);
         object = fresh;
+    }
+
+    if let Some((id, provider)) = super::selected_provider(desired, &ADAPTER, plan) {
+        let providers = child_object(&mut object, "provider");
+        let entry = child_object(providers, id);
+        let npm = match provider.kind {
+            super::config::ProviderKind::Anthropic => "@ai-sdk/anthropic",
+            super::config::ProviderKind::Openai => "@ai-sdk/openai",
+            super::config::ProviderKind::Google => "@ai-sdk/google",
+            _ => "@ai-sdk/openai-compatible",
+        };
+        entry.insert("npm".into(), npm.into());
+        let options = child_object(entry, "options");
+        if let Some(url) = &provider.base_url {
+            options.insert("baseURL".into(), url.clone().into());
+        }
+        if let Some(key) = provider.key.as_ref().and_then(|k| desired.secrets.get(k)) {
+            options.insert("apiKey".into(), key.expose().into());
+        }
+        if let Some(model) = &provider.default_model {
+            object.insert("model".into(), format!("{id}/{model}").into());
+        }
     }
 
     if let Some(model) = desired.agents.models.get("opencode") {

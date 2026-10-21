@@ -78,6 +78,7 @@ pub enum Capability {
     McpStdio,
     McpRemote,
     Models,
+    Providers,
     Permissions,
     Hooks,
     Skills,
@@ -91,6 +92,7 @@ impl Capability {
             Self::McpStdio => "stdio MCP servers",
             Self::McpRemote => "remote MCP servers",
             Self::Models => "models",
+            Self::Providers => "providers",
             Self::Permissions => "permissions",
             Self::Hooks => "hooks",
             Self::Skills => "skills",
@@ -106,6 +108,7 @@ impl Capability {
 #[derive(Debug, Clone, Copy)]
 pub struct Desired<'a> {
     pub agents: &'a AgentsConfig,
+    pub providers: &'a BTreeMap<String, config::Provider>,
     pub mcp: &'a BTreeMap<String, McpServer>,
     /// Contents of the canonical AGENTS.md, when declared and present.
     pub instructions: Option<&'a str>,
@@ -170,6 +173,9 @@ impl Desired<'_> {
             .any(|t| matches!(t, Transport::Remote { .. }))
         {
             used.push(Capability::McpRemote);
+        }
+        if !self.agents.providers.is_empty() {
+            used.push(Capability::Providers);
         }
         if !self.agents.models.is_empty() {
             used.push(Capability::Models);
@@ -528,6 +534,41 @@ fn pascal_case(snake: &str) -> String {
                 .unwrap_or_default()
         })
         .collect()
+}
+
+/// The selected endpoint, after enforcing per-agent secret access. A missing
+/// credential skips the entire endpoint rather than accidentally using old auth.
+fn selected_provider<'a>(
+    desired: &'a Desired<'_>,
+    adapter: &Adapter,
+    plan: &mut RenderPlan,
+) -> Option<(&'a str, &'a config::Provider)> {
+    let id = desired.agents.providers.get(adapter.id)?;
+    let provider = desired.providers.get(id)?;
+    if let Some(reference) = &provider.key {
+        let code = if !desired.access.allows(adapter.id, reference) {
+            Some("secret_not_allowed_for_agent")
+        } else if !desired.secrets.contains_key(reference) {
+            Some("secret_reference_unresolved")
+        } else {
+            None
+        };
+        if let Some(code) = code {
+            plan.diagnostics.push(
+                Diagnostic::new(
+                    Severity::Warning,
+                    code,
+                    format!(
+                        "{}: provider `{id}` skipped: key unavailable or not allowed",
+                        adapter.name
+                    ),
+                )
+                .with_path(format!("providers.{id}")),
+            );
+            return None;
+        }
+    }
+    Some((id, provider))
 }
 
 #[cfg(test)]
