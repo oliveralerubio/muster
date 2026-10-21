@@ -77,10 +77,10 @@ A skill copied from an external Git repository into the config repository's skil
 _Avoid_: downloaded skill, cached skill
 
 **`skills.lock`**:
-The versioned TOML file next to `muster.toml` that pins each skill's `origin` (`local` or the source id), upstream `commit`, `content_hash`, `version` and `updated_at`.
+The versioned TOML file next to `muster.toml` that pins each skill's `origin` (`local` or the source id), upstream `commit`, `content_hash`, `version` and `updated_at`. Apply verifies each skill against this hash; missing or mismatching pins skip the skill and keep its previous copy. Authors explicitly accept own-skill edits with `muster skill pin <name>`.
 
 **Skill status**:
-The last known state of a subscribed skill: `local`, `up_to_date`, `update_available`, `deprecated` (upstream frontmatter marks it deprecated; wins over `update_available`), `upstream_removed`, or `unknown` (never checked, or the source was unreachable at the last `skill check`, which reports `unknown` and keeps the cached last-known status so an offline `skill list` still shows it). Separately, a skill whose files no longer match `skills.lock` is reported with the boolean `modified: true` — a flag, not a lifecycle status; `skill update` refuses to overwrite it without `--force`. Nothing changes status or files without an explicit command.
+The last known state of a subscribed skill: `local`, `up_to_date`, `update_available`, `deprecated` (upstream frontmatter marks it deprecated; wins over `update_available`), `upstream_removed`, or `unknown` (never checked, or the source was unreachable at the last `skill check`, which reports `unknown` and keeps the cached last-known status so an offline `skill list` still shows it). Separately, a skill whose files no longer match `skills.lock` is reported with the boolean `modified: true` — a flag, not a lifecycle status; `skill update` refuses to overwrite it without `--force`. Unreviewed skills (missing pins or changed hashes) are skipped by sync, reported separately in convergence, and keep their previously installed copy; this is not another lifecycle status. Empty directories are ignored. Upstream changes still require an explicit command.
 
 ### Operations
 
@@ -89,7 +89,13 @@ The act of exchanging the config repository with its Git remote and applying the
 _Avoid_: deploy, push (unqualified)
 
 **Schedule**:
-The periodic execution of sync through a systemd user timer (Linux/WSL), a launchd agent (macOS), or manual instructions when neither is available (`muster schedule`). An unattended sync never installs new hooks or MCP servers: it refuses and waits for a person.
+The periodic execution of sync through a systemd user timer (Linux/WSL), a launchd agent (macOS), or manual instructions when neither is available (`muster schedule`). An unattended sync never installs agent binaries, even previously approved versions: it keeps the current binary, applies configuration and verified skills, and records approval needed. New hooks or MCP servers still cause it to refuse and wait for a person.
+
+**Convergence**:
+Whether this machine matches the desired fleet configuration: agent versions against pins, skills verified against `skills.lock`, and pending approvals. CLI status, the web panel and MCP share one report; unsupported agent platforms remain visible as not converged.
+
+**`muster.lock`**:
+The versioned TOML file pinning agent CLI versions. Each agent pin has optional per-platform artifacts with a source URL and SHA-256, and an optional installed binary name; legacy top-level `url`/`sha256` remain a platform-independent fallback. Binaries are verified before atomic replacement.
 
 **Generation**:
 A numbered snapshot in local state of every managed file after an apply. Rollback restores the exact files of a previous generation and records the restoration as a new generation.

@@ -85,71 +85,28 @@ fn convergence(ctx: &mut Context) -> Result<Value, MusterError> {
         },
     )?;
     let planned = plan.to_json(true, false, plan.base_generation());
-    let lock_path = ctx.config_dir.join(crate::installer::LOCK_FILE);
-    let lock = if lock_path
-        .try_exists()
-        .map_err(|e| MusterError::Operational(format!("{}: {e}", lock_path.display())))?
-    {
-        crate::installer::Lock::load(&ctx.config_dir)?
-    } else {
-        crate::installer::Lock::default()
-    };
-    let home = std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .ok_or_else(|| MusterError::Operational("HOME is not set".into()))?;
+    let lock = crate::installer::Lock::load_or_default(&ctx.config_dir)?;
+    let bin_dir = crate::installer::bin_dir()?;
     let platform = machine::platform();
     let mut agents = Vec::new();
     for (id, pin) in lock.agents {
-        let Some(artifact) = pin.resolve_artifact(&platform) else {
-            continue;
-        };
-        let binary = pin
-            .bin
-            .as_deref()
-            .unwrap_or_else(|| crate::adapters::find(&id).map(|a| a.binary).unwrap_or(&id));
-        machine::validate_name(binary)?;
-        let local = home.join(".local/bin").join(binary);
-        let executable = if local.is_file() {
-            Some(local)
-        } else {
-            machine::find_executable(binary)
-        };
-        let installed_version = executable.and_then(|path| {
-            machine::version_output(&path)
-                .ok()
-                .and_then(|text| {
-                    text.split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | ',' | '/'))
-                        .map(|word| word.trim_start_matches('v'))
-                        .find(|word| {
-                            let core = word.split(['-', '+']).next().unwrap_or("");
-                            let parts: Vec<_> = core.split('.').collect();
-                            (2..=3).contains(&parts.len())
-                                && parts
-                                    .iter()
-                                    .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
-                        })
-                        .map(str::to_string)
-                })
-                .or_else(|| {
-                    // If the binary cannot report a version, an exact artifact
-                    // checksum still identifies the installed pin.
-                    std::fs::read(&path)
-                        .ok()
-                        .filter(|bytes| {
-                            crate::hash::sha256_hex(bytes).eq_ignore_ascii_case(&artifact.sha256)
-                        })
-                        .map(|_| pin.version.clone())
-                })
-        });
-        agents.push(json!({"id": id, "installed_version": installed_version, "pinned_version": pin.version}));
+        let artifact = pin.resolve_artifact(&platform);
+        let installed_version = crate::installer::installed_version(&id, &pin, &bin_dir)?;
+        let note = artifact
+            .is_none()
+            .then(|| format!("no artifact for platform {platform}"));
+        agents.push(json!({
+            "id": id, "installed_version": installed_version,
+            "pinned_version": pin.version, "artifact": artifact, "note": note,
+        }));
     }
     let converged = planned["approvals"].as_array().is_some_and(Vec::is_empty)
         && planned["skipped_skills"]
             .as_array()
             .is_some_and(Vec::is_empty)
-        && agents
-            .iter()
-            .all(|agent| agent["installed_version"] == agent["pinned_version"]);
+        && agents.iter().all(|agent| {
+            !agent["artifact"].is_null() && agent["installed_version"] == agent["pinned_version"]
+        });
     Ok(json!({
         "converged": converged,
         "agents": agents,

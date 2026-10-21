@@ -75,9 +75,22 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
             Err(e) if e.to_string().contains("conflict with") => "conflict",
             _ => "error",
         };
+        let pending_approvals = result
+            .as_ref()
+            .ok()
+            .map(|r| r["approvals"].clone())
+            .filter(|value| value.is_array())
+            .unwrap_or_else(|| json!([]));
+        let approval_needed = !ctx.yes
+            && !ctx.is_tty
+            && pending_approvals
+                .as_array()
+                .is_some_and(|items| !items.is_empty());
         let status = json!({
             "ts": time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
             "result": outcome,
+            "approval_needed": approval_needed,
+            "pending_approvals": if approval_needed { pending_approvals } else { json!([]) },
             "applied": result.as_ref().ok().and_then(|r| r["applied"].as_bool()).unwrap_or(false),
         });
         let pending = ctx.state_dir.join("sync-status.json.partial");

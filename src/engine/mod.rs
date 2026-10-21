@@ -350,14 +350,26 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
         .cloned()
         .unwrap_or_default();
     let (mut approvals, approved) = approvals(&selected, &merged, previous);
-    let bin_dir = roots.home.join(".local/bin");
+    let bin_dir = installer::bin_dir()?;
     let installs = agent_installs(ctx, options.agent, &bin_dir)?;
     for (agent, pin) in &installs {
-        if approved.agents.get(agent) != Some(&pin.version) {
+        if approved.agents.get(agent) != Some(&pin.version) || (!ctx.is_tty && !ctx.yes) {
             approvals.push(Approval {
                 kind: "agent",
                 name: agent.clone(),
-                detail: format!("install {} {}", agent, pin.version),
+                detail: {
+                    let old = installer::installed_version(agent, pin, &bin_dir)?;
+                    let artifact = pin
+                        .resolve_artifact(&crate::machine::platform())
+                        .expect("planned installs have a platform artifact");
+                    format!(
+                        "install {agent}: {} -> {}; source {}; sha256 {}",
+                        old.as_deref().unwrap_or("not installed"),
+                        pin.version,
+                        artifact.url,
+                        artifact.sha256
+                    )
+                },
             });
         }
     }
@@ -377,43 +389,33 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
     })
 }
 
-/// Detect installs using local checksums only: planning never downloads or runs
-/// an executable that has not yet passed the approval gate.
+/// Resolve platform artifacts and detect version drift without downloading.
 fn agent_installs(
-    ctx: &Context,
+    ctx: &mut Context,
     selected: Option<&str>,
     bin_dir: &Path,
 ) -> Result<Vec<(String, installer::Pin)>, MusterError> {
-    let lock_path = ctx.config_dir.join(installer::LOCK_FILE);
-    if !lock_path
-        .try_exists()
-        .map_err(|e| io_error(&lock_path, e))?
-    {
-        return Ok(Vec::new());
-    }
-    let lock = installer::Lock::load(&ctx.config_dir)?;
+    let lock = installer::Lock::load_or_default(&ctx.config_dir)?;
     let platform = crate::machine::platform();
     let mut installs = Vec::new();
     for (agent, pin) in lock.agents {
         if selected.is_some_and(|id| id != agent) {
             continue;
         }
-        let Some(artifact) = pin.resolve_artifact(&platform) else {
+        if pin.resolve_artifact(&platform).is_none() {
+            ctx.diag(Diagnostic::new(
+                Severity::Warning,
+                "agent_platform_unsupported",
+                format!(
+                    "agent {agent} {} has no artifact for platform {platform}; not installed",
+                    pin.version
+                ),
+            ));
             continue;
-        };
-        let bin = pin.bin.as_deref().unwrap_or_else(|| {
-            adapters::find(&agent)
-                .map(|adapter| adapter.binary)
-                .unwrap_or(&agent)
-        });
-        crate::machine::validate_name(bin)?;
-        let path = bin_dir.join(bin);
-        let installed = match std::fs::read(&path) {
-            Ok(bytes) => crate::hash::sha256_hex(&bytes).eq_ignore_ascii_case(&artifact.sha256),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-            Err(e) => return Err(io_error(&path, e)),
-        };
-        if !installed {
+        }
+        if installer::installed_version(&agent, &pin, bin_dir)?.as_deref()
+            != Some(pin.version.as_str())
+        {
             installs.push((agent, pin));
         }
     }
@@ -771,7 +773,10 @@ pub fn apply(ctx: &mut Context, mut plan: Plan) -> Result<Value, MusterError> {
     if ctx.dry_run {
         return Ok(plan.to_json(true, false, plan.base_generation()));
     }
-    if !plan.approvals.is_empty() {
+    let unattended = !ctx.is_tty && !ctx.yes;
+    if !plan.approvals.is_empty()
+        && (!unattended || plan.approvals.iter().any(|a| a.kind != "agent"))
+    {
         let list: Vec<String> = plan
             .approvals
             .iter()
@@ -783,12 +788,34 @@ pub fn apply(ctx: &mut Context, mut plan: Plan) -> Result<Value, MusterError> {
         ))?;
     }
 
-    for (agent, pin) in &plan.installs {
-        ctx.progress(&format!("Installing {agent} {}", pin.version));
-        installer::install(agent, pin, &plan.bin_dir, ctx.dry_run)?;
-        plan.approved
-            .agents
-            .insert(agent.clone(), pin.version.clone());
+    if unattended {
+        if !plan.installs.is_empty() {
+            ctx.diag(Diagnostic::new(
+                Severity::Warning,
+                "agent_approval_needed",
+                "agent installs need approval; current binaries were left alone (run sync --yes to approve)",
+            ));
+        }
+        // Configuration and verified skills still converge without installing code.
+        plan.installs.clear();
+    } else {
+        for (agent, pin) in &plan.installs {
+            ctx.progress(&format!("Installing {agent} {}", pin.version));
+            match installer::install(agent, pin, &plan.bin_dir, false) {
+                Ok(_) => {
+                    plan.approved
+                        .agents
+                        .insert(agent.clone(), pin.version.clone());
+                }
+                Err(error) => {
+                    ctx.diag(Diagnostic::error(
+                        "agent_install_failed",
+                        format!("{agent}: {error}"),
+                    ));
+                    ctx.mark_failed();
+                }
+            }
+        }
     }
 
     let key = plan.target.key();
@@ -896,6 +923,12 @@ pub fn generations(state_dir: &std::path::Path) -> Result<Vec<Value>, MusterErro
 /// adopted later are left as they are.
 pub fn rollback(ctx: &mut Context, n: u64) -> Result<Value, MusterError> {
     let wanted = store::load(&ctx.state_dir, n)?;
+    let note = "Rollback restores managed files; agent binaries are not downgraded.";
+    ctx.diag(Diagnostic::new(
+        Severity::Info,
+        "rollback_agents_unchanged",
+        note,
+    ));
     let current = store::latest(&ctx.state_dir)?
         .map(|(_, s)| s)
         .unwrap_or_default();
@@ -943,6 +976,7 @@ pub fn rollback(ctx: &mut Context, n: u64) -> Result<Value, MusterError> {
         return Ok(json!({
             "dry_run": true,
             "rollback_to": n,
+            "note": note,
             "generation": null,
             "files": files_json(&actions),
         }));
@@ -966,6 +1000,7 @@ pub fn rollback(ctx: &mut Context, n: u64) -> Result<Value, MusterError> {
     Ok(json!({
         "dry_run": false,
         "rollback_to": n,
+        "note": note,
         "generation": generation,
         "files": files_json(&actions),
     }))
@@ -1205,6 +1240,9 @@ fn read_skills(
             continue;
         }
         let files = crate::skills::read_skill_files(&entry.path())?;
+        if files.is_empty() {
+            continue;
+        }
         let valid = is_valid_skill(&name, &files, ctx, &entry.path());
         let hash = crate::skills::content_hash(&files);
         let reason = match lock.get(&name) {
@@ -1227,9 +1265,6 @@ fn read_skills(
                 .with_path(entry.path().display().to_string()),
             );
             skipped.push(name);
-            continue;
-        }
-        if files.is_empty() {
             continue;
         }
         if !valid {

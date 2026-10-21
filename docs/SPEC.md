@@ -183,7 +183,7 @@ El mismo producto sirve a dos públicos:
   - Informan de lo que no pueden traducir.
   - Un fallo queda aislado a ese agente.
   - AGENTS.md es el formato canónico de instrucciones. CLAUDE.md se genera o enlaza a partir de él.
-  - **Skills** (`[agents.skills] source = "skills"`, una carpeta por skill con `SKILL.md` y archivos extra): los cuatro agentes las soportan. Muster copia cada archivo tal cual; las skills que se quitan de la fuente se borran en el siguiente apply y las que el usuario añade a mano no se tocan. Una skill sin `SKILL.md` o sin `name`/`description` en el frontmatter se omite con el aviso `skill_invalid`. Rutas:
+  - **Skills** (`[agents.skills] source = "skills"`, una carpeta por skill con `SKILL.md` y archivos extra): los cuatro agentes las soportan. Muster verifica cada skill contra `skills.lock` y copia cada archivo aprobado tal cual; las skills que se quitan de la fuente se borran en el siguiente apply y las que el usuario añade a mano no se tocan. Una skill sin `SKILL.md` o sin `name`/`description` en el frontmatter se omite con el aviso `skill_invalid`. Rutas:
 
     | Agente | Usuario | Proyecto |
     |---|---|---|
@@ -201,10 +201,10 @@ El mismo producto sirve a dos públicos:
     | Codex | `~/.codex/agents/<name>.toml` | `.codex/agents/<name>.toml` |
     | OpenCode | `$XDG_CONFIG_HOME/opencode/agents/<name>.md` | `.opencode/agents/<name>.md` |
     | Antigravity CLI | `~/.gemini/antigravity-cli/agents/<name>.md` | `.agents/agents/<name>.md` |
-  - **Ciclo de vida de skills** (`muster skill`): skills propias (en el repo de configuración, bajo `[agents.skills] source`) y suscritas desde repositorios git externos (`[[agents.skills.remote]]` con `name`, `url`, `ref`, `path`, `include` opcionales). Las externas se copian (vendoring) en la carpeta de skills, así que el motor y los adaptadores no cambian y todas las máquinas las reciben por la sincronización git normal.
-    - `skills.lock` (TOML, junto a `muster.toml`, versionado): por skill `name`, `origin` (`local` o id de la fuente), `commit` (externas), `content_hash` (`sha256:` sobre rutas relativas ordenadas y contenido normalizado a LF), `version` (frontmatter de `SKILL.md`) y `updated_at` (RFC 3339).
+  - **Ciclo de vida de skills** (`muster skill`): skills propias (en el repo de configuración, bajo `[agents.skills] source`) y suscritas desde repositorios git externos (`[[agents.skills.remote]]` con `name`, `url`, `ref`, `path`, `include` opcionales). Las externas se copian (vendoring) en la carpeta de skills, así que los adaptadores reciben los mismos archivos y todas las máquinas las reciben por la sincronización git normal, tras verificarlas localmente contra `skills.lock` sin contactar upstreams.
+    - `skills.lock` (TOML, junto a `muster.toml`, versionado): por skill `name`, `origin` (`local` o id de la fuente), `commit` (externas), `content_hash` (`sha256:` sobre rutas relativas ordenadas y contenido normalizado a LF), `version` (frontmatter de `SKILL.md`) y `updated_at` (RFC 3339). En apply, una skill sin pin o con hash distinto se omite con aviso, conserva la copia anterior y no bloquea el resto; los directorios vacíos se ignoran.
     - Estados: `local`, `up_to_date`, `update_available`, `deprecated` (frontmatter upstream `deprecated: true` o `deprecated: "<motivo>"`; gana a `update_available`), `upstream_removed`, `unknown` (sin comprobar o fuente inalcanzable; se conserva el último estado conocido). La última comprobación se guarda por máquina en `<state>/skills-status.json` (no versionado).
-    - Comandos: `skill list` (sin red), `skill add <nombre>` / `skill add --url`, `skill check [nombre]`, `skill update <nombre>|--all [--force] [--dry-run]` (resumen de archivos añadidos/cambiados/eliminados), `skill rm <nombre> [--detach]`. `update` y `rm` piden confirmación (`--yes`). Nunca se aplica una actualización ni se borra una skill sin orden explícita; una skill editada a mano aparece como `modified` y `update` se niega sin `--force`.
+    - Comandos: `skill list` (sin red), `skill add <nombre>` / `skill add --url`, `skill pin <nombre>` (revisar y fijar los archivos actuales de una skill propia), `skill check [nombre]`, `skill update <nombre>|--all [--force] [--dry-run]` (resumen de archivos añadidos/cambiados/eliminados), `skill rm <nombre> [--detach]`. `update` y `rm` piden confirmación (`--yes`). Nunca se aplica una actualización ni se borra una skill sin orden explícita; una skill editada a mano aparece como `modified` y `update` se niega sin `--force`.
     - En modo equipo solo los administradores añaden, actualizan o quitan skills (commits con `Muster-Actor`); los miembros pueden listar y comprobar.
     - Panel web: pestaña Skills con estado, botón para comprobar repositorios, actualizar (con resumen de archivos), quitar y, para `upstream_removed`, conservar como propia o eliminar; un punto en la pestaña avisa cuando algo requiere atención.
   - **Adaptadores experimentales (opt-in con `[agents] enabled`):** se detectan y aparecen como experimentales en `muster agents` y `status`, pero no se habilitan por defecto.
@@ -221,11 +221,16 @@ El mismo producto sirve a dos públicos:
   - Registra quién es dueño de cada archivo o clave gestionada.
   - Hace copia de seguridad antes de sobrescribir.
   - Crea una generación por cada apply.
-  - Ofrece `rollback` a una generación concreta.
+  - Verifica skills contra `skills.lock` antes de renderizar y conserva las copias anteriores de las omitidas.
+  - Integra las instalaciones de agentes fijados en el mismo apply; un fallo de instalación conserva el binario anterior, no bloquea otros agentes ni la configuración y señala fallo parcial (código 1).
+  - Ofrece `rollback` a una generación concreta, con una nota y un diagnóstico que aclaran que no degrada binarios de agentes.
   - Incluye un importador de repos chezmoi existentes.
 - **Instalador de agentes**
   - Instala y actualiza los CLIs de los agentes a versiones fijas, con checksum verificado, imitando el modelo de lockfile de mise.
-  - Reutiliza el enfoque actual de instalación con verificación de hash.
+  - `muster.lock` fija la versión y los artefactos por plataforma (`url`, `sha256`); el formato anterior con `url`/`sha256` al nivel del agente sigue siendo válido. Una plataforma sin artefacto emite un aviso y sigue visible en convergencia con artefacto nulo.
+  - Detecta primero la versión con `<bin> --version`; solo compara el hash instalado cuando no puede determinar la versión. Una versión ya fijada no se reinstala aunque el hash sea distinto.
+  - La aprobación muestra agente, versión anterior (o no instalado), nueva versión, URL y sha256; se recuerda por agente/versión. Sin TTY ni `--yes` nunca instala binarios (ni versiones antes aprobadas): aplica el resto, conserva los binarios y registra las aprobaciones pendientes. Los gates de hooks y MCP no cambian.
+  - `status` expone una convergencia compartida con web/MCP: versiones instaladas/fijadas, skills omitidas y aprobaciones pendientes.
 - **Transporte de flota**
   - Git es el transporte principal: el usuario elige el remoto.
   - SSH se conserva para el alta asistida y para la sincronización entre máquinas existente, como transporte opcional.
@@ -284,6 +289,7 @@ Comandos de primer nivel:
 | `secret` | Gestionar secretos |
 | `profile` | Gestionar perfiles de agentes |
 | `agents` | Listar agentes y adaptadores |
+| `skill pin <nombre>` | Registrar la revisión de una skill propia en `skills.lock` |
 | `plan` / `sync` | Ver y aplicar cambios |
 | `rollback` | Volver a una generación anterior |
 | `status` | Estado de la flota |
@@ -308,7 +314,7 @@ Opciones globales: `--config`, `--format text|json`, `--yes`, `--dry-run` (en to
 | 5 | Fallo de seguridad o permisos |
 | 130 | Interrumpido |
 
-- **Sin TTY:** no hay prompts; las acciones que requieren confirmación fallan con código 2 si no se pasa `--yes`.
+- **Sin TTY:** no hay prompts; las acciones que requieren confirmación fallan con código 2 si no se pasa `--yes`. Excepción: si solo faltan aprobaciones de binarios de agentes, sync los deja intactos, aplica el resto y registra «approval needed» en `sync-status.json` y en la convergencia de `status`.
 - **Estado local:** vive en el directorio XDG de estado (o su equivalente en macOS), separado del repo de configuración.
 
 ## Testing Decisions

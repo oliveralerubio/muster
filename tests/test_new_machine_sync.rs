@@ -19,6 +19,7 @@ fn ok(env: &MusterEnv, args: &[&str]) -> Value {
 
 /// `muster init --yes`; returns the recovery key.
 fn init(env: &MusterEnv) -> String {
+    env.fake_exe("claude", "#!/bin/sh\nexit 1\n");
     ok(env, &["init", "--yes", "--machine", "laptop"])["recovery_key"]
         .as_str()
         .unwrap()
@@ -291,7 +292,7 @@ fn convergence_checks_reported_version_and_uses_checksum_when_version_is_unknown
 }
 
 #[test]
-fn convergence_ignores_pins_without_an_artifact_for_this_platform() {
+fn convergence_lists_pins_without_an_artifact_for_this_platform() {
     let env = MusterEnv::new();
     init(&env);
     write(&env.config_dir().join("muster.lock"), &format!(
@@ -299,7 +300,128 @@ fn convergence_ignores_pins_without_an_artifact_for_this_platform() {
         "0".repeat(64)
     ));
     let convergence = &ok(&env, &["status"])["convergence"];
-    assert_eq!(convergence["agents"], serde_json::json!([]));
+    assert_eq!(convergence["agents"][0]["id"], "claude");
+    assert_eq!(convergence["agents"][0]["installed_version"], Value::Null);
+    assert_eq!(convergence["agents"][0]["artifact"], Value::Null);
+    assert!(convergence["agents"][0]["note"]
+        .as_str()
+        .unwrap()
+        .contains("no artifact"));
     assert_eq!(convergence["pending_approvals"], serde_json::json!([]));
-    assert_eq!(convergence["converged"], true);
+    assert_eq!(convergence["converged"], false);
+}
+
+#[test]
+fn matching_reported_version_with_different_hash_is_not_replanned_or_downloaded() {
+    let env = MusterEnv::new();
+    init(&env);
+    let path = env.path().join(".local/bin/claude");
+    let script = "#!/bin/sh\necho 'Claude Code (v1.0.0)'\n";
+    write(&path, script);
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write(&env.config_dir().join("muster.lock"), &format!("[agents.claude]\nversion = \"1.0.0\"\nurl = \"file:///must-not-fetch\"\nsha256 = \"{}\"\n", "0".repeat(64)));
+    for args in [&["plan"][..], &["sync", "--yes"][..]] {
+        let result = ok(&env, args);
+        assert_eq!(result["installs"], serde_json::json!([]));
+        assert_eq!(result["approvals"], serde_json::json!([]));
+    }
+    assert_eq!(std::fs::read_to_string(path).unwrap(), script);
+    assert_eq!(ok(&env, &["status"])["convergence"]["converged"], true);
+    assert_eq!(
+        ok(&env, &["agents", "install"])["installed"][0]["action"],
+        "unchanged"
+    );
+}
+
+#[test]
+fn empty_skill_directory_is_ignored_not_skipped_or_unreviewed() {
+    let env = MusterEnv::new();
+    init(&env);
+    own_skill(&env);
+    std::fs::create_dir_all(env.config_dir().join("skills/empty/nested")).unwrap();
+    for args in [&["plan"][..], &["sync"][..], &["status"][..]] {
+        let mut full = vec!["--format", "json"];
+        full.extend_from_slice(args);
+        let (out, envelope) = env.run_json(&full);
+        assert!(out.status.success(), "{}", envelope.raw);
+        assert!(!envelope.raw.to_string().contains("skill_unreviewed"));
+        assert!(!envelope.raw.to_string().contains("skill_invalid"));
+        let report = if args[0] == "status" {
+            &envelope.result()["convergence"]
+        } else {
+            envelope.result()
+        };
+        assert_eq!(report["skipped_skills"], serde_json::json!([]));
+    }
+}
+
+#[test]
+fn rollback_reports_that_agent_binaries_are_not_downgraded() {
+    let env = MusterEnv::new();
+    init(&env);
+    let (url, sha256) = claude_artifact(&env);
+    write(
+        &env.config_dir().join("muster.lock"),
+        &format!("[agents.claude]\nversion = \"1.0.0\"\nurl = {url:?}\nsha256 = {sha256:?}\n"),
+    );
+    let generation = ok(&env, &["sync", "--yes"])["generation"]
+        .as_u64()
+        .unwrap()
+        .to_string();
+    let binary = env.path().join(".local/bin/claude");
+    let newer = "#!/bin/sh\necho claude 2.0.0\n";
+    write(&binary, newer);
+    for dry in [true, false] {
+        let mut args = vec!["--format", "json", "rollback", &generation, "--yes"];
+        if dry {
+            args.push("--dry-run");
+        }
+        let (out, envelope) = env.run_json(&args);
+        assert!(out.status.success(), "{}", envelope.raw);
+        assert!(envelope.result()["note"]
+            .as_str()
+            .unwrap()
+            .contains("agent binaries are not downgraded"));
+        assert!(envelope.raw["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["code"] == "rollback_agents_unchanged" && d["severity"] == "info"));
+        assert_eq!(std::fs::read_to_string(&binary).unwrap(), newer);
+    }
+}
+
+#[test]
+fn custom_binary_name_is_shared_by_manual_install_sync_status_and_doctor() {
+    let env = MusterEnv::new();
+    init(&env);
+    write(
+        &env.config_dir().join("muster.toml"),
+        "version = 1\n[agents]\nenabled = [\"claude\"]\n",
+    );
+    let (url, sha256) = claude_artifact(&env);
+    write(&env.config_dir().join("muster.lock"), &format!(
+        "[agents.claude]\nversion = \"1.0.0\"\nbin = \"reviewed-claude\"\nurl = {url:?}\nsha256 = {sha256:?}\n"
+    ));
+    let installed = ok(&env, &["agents", "install"]);
+    assert_eq!(
+        installed["bin_dir"],
+        env.path().join(".local/bin").display().to_string()
+    );
+    assert!(env.path().join(".local/bin/reviewed-claude").is_file());
+    assert!(!env.path().join(".local/bin/claude").exists());
+    assert_eq!(ok(&env, &["sync"])["installs"], serde_json::json!([]));
+    assert_eq!(
+        ok(&env, &["status"])["convergence"]["agents"][0]["installed_version"],
+        "1.0.0"
+    );
+    let (_, doctor) = env.run_json(&["--format", "json", "doctor", "--offline"]);
+    let diagnostics = doctor.raw["diagnostics"].as_array().unwrap();
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|d| d["code"] == "missing_binary" || d["code"] == "version_unknown"),
+        "{}",
+        doctor.raw
+    );
 }

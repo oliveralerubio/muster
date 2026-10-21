@@ -65,6 +65,19 @@ impl Pin {
 }
 
 impl Lock {
+    /// An absent lock is valid when planning configuration-only syncs.
+    pub fn load_or_default(config_dir: &Path) -> Result<Self, MusterError> {
+        let path = config_dir.join(LOCK_FILE);
+        if path
+            .try_exists()
+            .map_err(|e| MusterError::Operational(format!("{}: {e}", path.display())))?
+        {
+            Self::load(config_dir)
+        } else {
+            Ok(Self::default())
+        }
+    }
+
     pub fn load(config_dir: &Path) -> Result<Self, MusterError> {
         let path = config_dir.join(LOCK_FILE);
         let text = std::fs::read_to_string(&path).map_err(|e| {
@@ -142,7 +155,7 @@ pub fn install(
         sha256: expected.clone(),
         action,
     };
-    if std::fs::read(&path).is_ok_and(|bytes| sha256_hex(&bytes) == expected) {
+    if installed_version(agent, pin, bin_dir)?.as_deref() == Some(pin.version.as_str()) {
         return Ok(outcome("unchanged"));
     }
 
@@ -162,12 +175,63 @@ pub fn install(
 
 /// `pin.bin`, else the adapter's executable name (`antigravity` -> `agy`),
 /// else the agent id.
-fn default_bin<'a>(agent: &'a str, pin: &'a Pin) -> &'a str {
+pub fn default_bin<'a>(agent: &'a str, pin: &'a Pin) -> &'a str {
     pin.bin.as_deref().unwrap_or_else(|| {
         crate::adapters::find(agent)
             .map(|a| a.binary)
             .unwrap_or(agent)
     })
+}
+
+/// Shared destination for pinned agent executables.
+pub fn bin_dir() -> Result<PathBuf, MusterError> {
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(|home| PathBuf::from(home).join(".local/bin"))
+        .ok_or_else(|| MusterError::Operational("HOME is not set".into()))
+}
+
+/// Prefer the installed executable's reported version, using its hash only
+/// when no semver-like token can be determined. Never fetches an artifact.
+pub fn installed_version(
+    agent: &str,
+    pin: &Pin,
+    bin_dir: &Path,
+) -> Result<Option<String>, MusterError> {
+    let binary = default_bin(agent, pin);
+    crate::machine::validate_name(binary)?;
+    let local = bin_dir.join(binary);
+    let executable = if local.is_file() {
+        Some(local)
+    } else {
+        crate::machine::find_executable(binary)
+    };
+    let Some(path) = executable else {
+        return Ok(None);
+    };
+    let version = crate::machine::version_output(&path).ok().and_then(|text| {
+        text.split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | ',' | '/'))
+            .map(|word| word.trim_start_matches('v'))
+            .find(|word| {
+                let core = word.split(['-', '+']).next().unwrap_or("");
+                let parts: Vec<_> = core.split('.').collect();
+                (2..=3).contains(&parts.len())
+                    && parts
+                        .iter()
+                        .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+            })
+            .map(str::to_string)
+    });
+    if version.is_some() {
+        return Ok(version);
+    }
+    let artifact = pin.resolve_artifact(&crate::machine::platform());
+    Ok(artifact.and_then(|artifact| {
+        std::fs::read(path)
+            .ok()
+            .filter(|bytes| sha256_hex(bytes).eq_ignore_ascii_case(&artifact.sha256))
+            .map(|_| pin.version.clone())
+    }))
 }
 
 /// `file://` is read directly; `https://` goes through `curl` (exit 4 if missing).

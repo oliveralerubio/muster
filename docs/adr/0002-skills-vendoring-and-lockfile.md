@@ -32,3 +32,18 @@ the `Muster-Actor` trailer, so skills change only through admin commits.
   machine after a routine sync or scheduled update.
 - Skills are reviewed like every other config change: through the config
   repository's Git history and, in teams, admin-gated commits.
+
+## Amendment — 2026-10-22 (#37)
+
+Apply now verifies own and vendored skill files locally against their
+`content_hash` in `skills.lock` before rendering them. A missing pin or a hash
+mismatch skips that skill with a named warning and keeps its previously managed
+copy (or leaves it uninstalled if there was none). Other configuration, secrets
+and verified skills still apply. Empty skill directories are ignored.
+
+This amends the original statement that the engine need not know about the
+lockfile: adapters still receive the same verified files, and sync still never
+contacts skill upstreams. Editing an own skill now requires an explicit
+`muster skill pin <name>` before it can spread; commit the reviewed files and
+`skills.lock` together. `skill add` records the initial pin and `skill update`
+continues to record subscribed skill changes. Deletion remains explicit.
