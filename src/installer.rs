@@ -27,18 +27,41 @@ pub struct Lock {
     pub agents: BTreeMap<String, Pin>,
 }
 
-/// One pinned agent CLI.
+/// One downloadable agent executable and its checksum.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Artifact {
+    pub url: String,
+    pub sha256: String,
+}
+
+/// One pinned agent CLI, with platform-specific artifacts and a legacy fallback.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Pin {
     pub version: String,
-    /// `file://` or `https://` URL of the executable.
-    pub url: String,
-    /// Lowercase hex SHA-256 of the executable.
-    pub sha256: String,
+    /// Legacy `file://` or `https://` URL of the executable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Legacy hex SHA-256 of the executable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
     /// Installed file name (defaults to the adapter's binary, else the agent id).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bin: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub artifacts: BTreeMap<String, Artifact>,
+}
+
+impl Pin {
+    pub fn resolve_artifact(&self, platform: &str) -> Option<Artifact> {
+        self.artifacts.get(platform).cloned().or_else(|| {
+            Some(Artifact {
+                url: self.url.clone()?,
+                sha256: self.sha256.clone()?,
+            })
+        })
+    }
 }
 
 impl Lock {
@@ -60,11 +83,22 @@ impl Lock {
         };
         let lock: Self = toml::from_str(&text).map_err(|e| invalid(e.message().to_string()))?;
         for (agent, pin) in &lock.agents {
-            let hex = pin.sha256.len() == 64 && pin.sha256.bytes().all(|b| b.is_ascii_hexdigit());
-            if !hex {
-                return Err(invalid(format!(
-                    "agents.{agent}.sha256 must be 64 hexadecimal characters"
-                )));
+            let checksums = pin
+                .sha256
+                .iter()
+                .map(|sha256| (format!("agents.{agent}.sha256"), sha256))
+                .chain(pin.artifacts.iter().map(|(platform, artifact)| {
+                    (
+                        format!("agents.{agent}.artifacts.{platform}.sha256"),
+                        &artifact.sha256,
+                    )
+                }));
+            for (field, sha256) in checksums {
+                if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(invalid(format!(
+                        "{field} must be 64 hexadecimal characters"
+                    )));
+                }
             }
             if let Some(bin) = &pin.bin {
                 crate::machine::validate_name(bin)?;
@@ -92,8 +126,15 @@ pub fn install(
     bin_dir: &Path,
     dry_run: bool,
 ) -> Result<Outcome, MusterError> {
+    let platform = crate::machine::platform();
+    let artifact = pin.resolve_artifact(&platform).ok_or_else(|| {
+        MusterError::Operational(format!(
+            "no artifact for platform {platform} for agent {agent} {} in {LOCK_FILE}",
+            pin.version
+        ))
+    })?;
     let path = bin_dir.join(default_bin(agent, pin));
-    let expected = pin.sha256.to_ascii_lowercase();
+    let expected = artifact.sha256.to_ascii_lowercase();
     let outcome = |action| Outcome {
         agent: agent.to_string(),
         version: pin.version.clone(),
@@ -105,12 +146,12 @@ pub fn install(
         return Ok(outcome("unchanged"));
     }
 
-    let bytes = fetch(&pin.url)?;
+    let bytes = fetch(&artifact.url)?;
     let actual = sha256_hex(&bytes);
     if actual != expected {
         return Err(MusterError::Security(format!(
             "checksum mismatch for {agent} {}: {LOCK_FILE} pins sha256 {expected}, the download from {} has {actual}; nothing was installed",
-            pin.version, pin.url
+            pin.version, artifact.url
         )));
     }
     if !dry_run {

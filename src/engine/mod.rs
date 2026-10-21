@@ -32,6 +32,7 @@ use crate::adapters::config::{AgentsConfig, McpServer, Transport};
 use crate::adapters::{self, Adapter, Base, Capability, Current, Desired, FileFormat, ManagedFile};
 use crate::context::Context;
 use crate::errors::MusterError;
+use crate::installer;
 use crate::manifest::{self, Manifest};
 use crate::output::{Diagnostic, Severity};
 use crate::providers::Providers;
@@ -94,7 +95,7 @@ impl Entry {
     }
 }
 
-/// A hook or MCP server that is new (or changed) since the last approval.
+/// Executable code that is new (or changed) since the last approval.
 struct Approval {
     kind: &'static str,
     name: String,
@@ -108,6 +109,10 @@ pub struct Plan {
     /// Adapter id -> failure message (None = rendered fine).
     agents: BTreeMap<&'static str, Option<String>>,
     approvals: Vec<Approval>,
+    /// Resolved pins needing installation, including previously approved versions.
+    installs: Vec<(String, installer::Pin)>,
+    bin_dir: PathBuf,
+    skipped_skills: Vec<String>,
     /// Approvals for this target once the plan is applied.
     approved: Approved,
     base: Option<(u64, State)>,
@@ -153,7 +158,7 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
         None => enabled_adapters(Some(&merged.agents))?,
     };
     let instructions = read_instructions(ctx, &merged)?;
-    let skills = read_skills(ctx, &merged)?;
+    let (skills, skipped_skills) = read_skills(ctx, &merged)?;
     let subagents = read_subagents(ctx, &merged)?;
     let secrets = resolve_secrets(ctx, &merged.mcp);
     // Grants come only from the config repo's manifest: a project's own
@@ -184,6 +189,66 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
             .filter(|r| r.target == key)
     };
 
+    // Render only a sentinel file for skipped skills to discover their adapter-
+    // specific directories. Keep all previous files there, including files no
+    // longer present in the unverified source, and retain their ownership.
+    let skipped: adapters::Skills = skipped_skills
+        .iter()
+        .map(|name| {
+            (
+                name.clone(),
+                BTreeMap::from([("SKILL.md".into(), String::new())]),
+            )
+        })
+        .collect();
+    let no_subagents = adapters::Subagents::new();
+    let skipped_desired = Desired {
+        skills: &skipped,
+        subagents: &no_subagents,
+        ..desired
+    };
+    let mut protected = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    if !skipped.is_empty() {
+        for adapter in selected
+            .iter()
+            .copied()
+            .chain(records.values().filter_map(|r| adapters::find(&r.agent)))
+        {
+            if !visited.insert(adapter.id) {
+                continue;
+            }
+            let rendered = match adapter.render(&skipped_desired, &Current::new()) {
+                Ok(rendered) => rendered,
+                Err(_) => {
+                    // Keep adapter failures isolated and never prune a skipped
+                    // skill when its adapter cannot determine output paths.
+                    protected.extend(
+                        records
+                            .iter()
+                            .filter(|(_, record)| {
+                                record.agent == adapter.id && record.target == key
+                            })
+                            .map(|(path, _)| PathBuf::from(path)),
+                    );
+                    continue;
+                }
+            };
+            for file in rendered.tree {
+                let path = match &options.target {
+                    Target::Global => roots.base(file.base).join(file.path),
+                    Target::Project(dir) => match file.project {
+                        Some(path) => dir.join(path),
+                        None => continue,
+                    },
+                };
+                if let Some(parent) = path.parent() {
+                    protected.insert(parent.to_path_buf());
+                }
+            }
+        }
+    }
+    let preserve = |path: &Path| protected.iter().any(|dir| path.starts_with(dir));
     let mut entries: BTreeMap<PathBuf, Entry> = BTreeMap::new();
     let mut agents = BTreeMap::new();
     for adapter in &selected {
@@ -202,6 +267,7 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
                     if record.target != key
                         || record.agent != adapter.id
                         || entries.contains_key(&path)
+                        || preserve(&path)
                     {
                         continue;
                     }
@@ -237,6 +303,7 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
             let path = PathBuf::from(path);
             if record.target != key
                 || entries.contains_key(&path)
+                || preserve(&path)
                 || selected.iter().any(|a| a.id == record.agent)
             {
                 continue;
@@ -282,18 +349,75 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
         .and_then(|(_, s)| s.approved.get(&key))
         .cloned()
         .unwrap_or_default();
-    let (approvals, approved) = approvals(&selected, &merged, previous);
+    let (mut approvals, approved) = approvals(&selected, &merged, previous);
+    let bin_dir = roots.home.join(".local/bin");
+    let installs = agent_installs(ctx, options.agent, &bin_dir)?;
+    for (agent, pin) in &installs {
+        if approved.agents.get(agent) != Some(&pin.version) {
+            approvals.push(Approval {
+                kind: "agent",
+                name: agent.clone(),
+                detail: format!("install {} {}", agent, pin.version),
+            });
+        }
+    }
 
     Ok(Plan {
         target: options.target.clone(),
         entries: entries.into_values().collect(),
         agents,
         approvals,
+        installs,
+        bin_dir,
+        skipped_skills,
         approved,
         base,
         secrets,
         layers,
     })
+}
+
+/// Detect installs using local checksums only: planning never downloads or runs
+/// an executable that has not yet passed the approval gate.
+fn agent_installs(
+    ctx: &Context,
+    selected: Option<&str>,
+    bin_dir: &Path,
+) -> Result<Vec<(String, installer::Pin)>, MusterError> {
+    let lock_path = ctx.config_dir.join(installer::LOCK_FILE);
+    if !lock_path
+        .try_exists()
+        .map_err(|e| io_error(&lock_path, e))?
+    {
+        return Ok(Vec::new());
+    }
+    let lock = installer::Lock::load(&ctx.config_dir)?;
+    let platform = crate::machine::platform();
+    let mut installs = Vec::new();
+    for (agent, pin) in lock.agents {
+        if selected.is_some_and(|id| id != agent) {
+            continue;
+        }
+        let Some(artifact) = pin.resolve_artifact(&platform) else {
+            continue;
+        };
+        let bin = pin.bin.as_deref().unwrap_or_else(|| {
+            adapters::find(&agent)
+                .map(|adapter| adapter.binary)
+                .unwrap_or(&agent)
+        });
+        crate::machine::validate_name(bin)?;
+        let path = bin_dir.join(bin);
+        let installed = match std::fs::read(&path) {
+            Ok(bytes) => crate::hash::sha256_hex(&bytes).eq_ignore_ascii_case(&artifact.sha256),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(io_error(&path, e)),
+        };
+        if !installed {
+            installs.push((agent, pin));
+        }
+    }
+    Ok(installs)
 }
 
 type Ours<'r> = dyn Fn(&Path) -> Option<&'r Record> + 'r;
@@ -537,7 +661,7 @@ fn approvals(
 
 impl Plan {
     pub fn has_changes(&self) -> bool {
-        self.entries.iter().any(|e| e.action() != Action::Unchanged)
+        !self.installs.is_empty() || self.entries.iter().any(|e| e.action() != Action::Unchanged)
     }
 
     /// JSON for CLI/MCP/web. Secret values are always redacted.
@@ -602,10 +726,17 @@ impl Plan {
             "dry_run": dry_run,
             "applied": applied,
             "generation": generation,
-            "changes": self.entries.iter().filter(|e| e.action() != Action::Unchanged).count(),
+            "changes": self.entries.iter().filter(|e| e.action() != Action::Unchanged).count()
+                + self.installs.len(),
+            "installs": self.installs.iter().map(|(agent, pin)| json!({
+                "agent": agent,
+                "version": pin.version,
+                "action": "install",
+            })).collect::<Vec<_>>(),
             "agents": agents,
             "files": files,
             "approvals": approvals,
+            "skipped_skills": self.skipped_skills,
         })
     }
 
@@ -650,6 +781,14 @@ pub fn apply(ctx: &mut Context, mut plan: Plan) -> Result<Value, MusterError> {
             "Install new or changed code that runs on this machine: {}",
             list.join(", ")
         ))?;
+    }
+
+    for (agent, pin) in &plan.installs {
+        ctx.progress(&format!("Installing {agent} {}", pin.version));
+        installer::install(agent, pin, &plan.bin_dir, ctx.dry_run)?;
+        plan.approved
+            .agents
+            .insert(agent.clone(), pin.version.clone());
     }
 
     let key = plan.target.key();
@@ -1028,10 +1167,15 @@ fn read_instructions(
 
 /// Files of every skill under `[agents.skills] source`: one subdirectory per
 /// skill, regular files only (any depth), keyed by `/`-separated relative path.
-fn read_skills(ctx: &mut Context, merged: &layer::Merged) -> Result<adapters::Skills, MusterError> {
+fn read_skills(
+    ctx: &mut Context,
+    merged: &layer::Merged,
+) -> Result<(adapters::Skills, Vec<String>), MusterError> {
     let mut skills = adapters::Skills::new();
+    let mut skipped = Vec::new();
+    let lock = crate::skills::lock::SkillsLock::load(&ctx.config_dir)?;
     let Some(dir) = merged.skills_path()? else {
-        return Ok(skills);
+        return Ok((skills, skipped));
     };
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
@@ -1047,7 +1191,7 @@ fn read_skills(ctx: &mut Context, merged: &layer::Merged) -> Result<adapters::Sk
                 )
                 .with_path(dir.display().to_string()),
             );
-            return Ok(skills);
+            return Ok((skills, skipped));
         }
         Err(e) => return Err(io_error(&dir, e)),
     };
@@ -1060,40 +1204,41 @@ fn read_skills(ctx: &mut Context, merged: &layer::Merged) -> Result<adapters::Sk
         if !file_type.is_dir() || name.starts_with('.') {
             continue;
         }
-        let mut files = BTreeMap::new();
-        collect_skill_files(&entry.path(), "", &mut files)?;
+        let files = crate::skills::read_skill_files(&entry.path())?;
+        let valid = is_valid_skill(&name, &files, ctx, &entry.path());
+        let hash = crate::skills::content_hash(&files);
+        let reason = match lock.get(&name) {
+            None => Some(("skill_unreviewed", "has no pin in skills.lock")),
+            Some(pin) if pin.content_hash != hash => Some((
+                "skill_verification_failed",
+                "does not match its pin in skills.lock",
+            )),
+            Some(_) => None,
+        };
+        if let Some((code, reason)) = reason {
+            ctx.diag(
+                Diagnostic::new(
+                    Severity::Warning,
+                    code,
+                    format!(
+                        "skill `{name}` {reason}; skipped, keeping the previously installed copy"
+                    ),
+                )
+                .with_path(entry.path().display().to_string()),
+            );
+            skipped.push(name);
+            continue;
+        }
         if files.is_empty() {
             continue;
         }
-        if !is_valid_skill(&name, &files, ctx, &entry.path()) {
+        if !valid {
             continue;
         }
         skills.insert(name, files);
     }
-    Ok(skills)
-}
-
-fn collect_skill_files(
-    dir: &Path,
-    prefix: &str,
-    files: &mut BTreeMap<String, String>,
-) -> Result<(), MusterError> {
-    for entry in std::fs::read_dir(dir).map_err(|e| io_error(dir, e))? {
-        let entry = entry.map_err(|e| io_error(dir, e))?;
-        let path = entry.path();
-        let file_type = entry.file_type().map_err(|e| io_error(&path, e))?;
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        let rel = format!("{prefix}{name}");
-        if file_type.is_dir() {
-            collect_skill_files(&path, &format!("{rel}/"), files)?;
-        } else if file_type.is_file() {
-            let text = std::fs::read_to_string(&path).map_err(|e| io_error(&path, e))?;
-            files.insert(rel, text);
-        }
-    }
-    Ok(())
+    skipped.sort();
+    Ok((skills, skipped))
 }
 
 fn read_optional(path: &Path) -> Result<Option<String>, MusterError> {

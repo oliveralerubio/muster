@@ -307,6 +307,7 @@ source = "skills"
         ),
     )
     .expect("write manifest");
+    env.run(&["skill", "pin", "review"]).assert().success();
 }
 
 #[test]

@@ -65,6 +65,19 @@ source = "skills"
         ),
     )
     .expect("write manifest");
+    let mut lock = muster::skills::lock::SkillsLock::default();
+    for name in ["review", "extra"] {
+        let files = muster::skills::read_skill_files(&dir.join("skills").join(name)).unwrap();
+        lock.upsert(muster::skills::lock::LockEntry {
+            name: name.into(),
+            origin: "local".into(),
+            commit: None,
+            content_hash: muster::skills::content_hash(&files),
+            version: None,
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        });
+    }
+    lock.save(dir).unwrap();
 }
 
 fn read(path: &Path) -> String {
@@ -145,6 +158,12 @@ fn project_with_manifest(env: &MusterEnv, agents: &[&str]) -> PathBuf {
     env.run(&["--yes", "init"]).assert().code(0);
     let project = env.path().join("my-project");
     seed_manifest(&project.join(".muster"), agents);
+    // Project skills must be approved by the trusted configuration repository.
+    std::fs::copy(
+        project.join(".muster/skills.lock"),
+        env.config_dir().join("skills.lock"),
+    )
+    .unwrap();
     project
 }
 

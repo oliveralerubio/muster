@@ -72,7 +72,11 @@ fn install(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
 
     let mut installed = Vec::new();
     for (agent, pin) in &pins {
-        ctx.progress(&format!("{agent} {}: verifying {}", pin.version, pin.url));
+        ctx.progress(&format!(
+            "{agent} {}: verifying artifact for {}",
+            pin.version,
+            machine::platform()
+        ));
         installed.push(installer::install(agent, pin, &bin_dir, ctx.dry_run)?);
     }
     Ok(json!({

@@ -415,7 +415,32 @@ fn check_agents(ctx: &Context, manifest: &Manifest) -> Check {
                 .collect()
         });
     let mut diags = Vec::new();
+    let pins = if ctx.config_dir.join(crate::installer::LOCK_FILE).exists() {
+        match crate::installer::Lock::load(&ctx.config_dir) {
+            Ok(lock) => Some(lock),
+            Err(error) => {
+                diags.push(Diagnostic::error("invalid_agent_lock", error.to_string()));
+                None
+            }
+        }
+    } else {
+        Some(crate::installer::Lock::default())
+    };
     for id in &declared {
+        if pins
+            .as_ref()
+            .is_some_and(|lock| !lock.agents.contains_key(id))
+        {
+            diags.push(
+                Diagnostic::new(
+                    Severity::Warning,
+                    "agent_unpinned",
+                    format!("agent `{id}` is configured but has no pin in muster.lock"),
+                )
+                .with_path(id.clone())
+                .with_suggestion("pin the agent version in muster.lock"),
+            );
+        }
         // Unknown ids are reported by the `adapters` check (invalid config).
         let Some(adapter) = adapters::find(id) else {
             continue;

@@ -108,6 +108,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     crate::commands::skill::LIST,
     crate::commands::skill::ADD,
     crate::commands::skill::CHECK,
+    crate::commands::skill::PIN,
     crate::commands::skill::UPDATE,
     crate::commands::skill::RM,
     crate::commands::member::ADD,
