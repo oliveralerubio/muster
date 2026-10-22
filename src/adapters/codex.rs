@@ -56,6 +56,7 @@ pub static ADAPTER: Adapter = Adapter {
         Capability::McpStdio,
         Capability::McpRemote,
         Capability::Models,
+        Capability::AiProviders,
         Capability::Skills,
         Capability::Subagents,
     ],
@@ -119,6 +120,43 @@ fn render_config(
         }
         _ => DocumentMut::new(),
     };
+
+    if let Some(provider) = super::selected_ai_provider(desired, &ADAPTER, plan) {
+        let id = provider.id;
+        doc["model_provider"] = toml_edit::value(id);
+        if let Some(model) = provider.default_model {
+            doc["model"] = toml_edit::value(model);
+        }
+        if doc.get("model_providers").is_none() {
+            doc["model_providers"] = Item::Table(Table::new());
+        }
+        let ai_providers = doc["model_providers"].as_table_like_mut().ok_or_else(|| {
+            MusterError::InvalidConfig {
+                message: "model_providers must be a table".into(),
+                path: Some(CONFIG.path.into()),
+            }
+        })?;
+        if ai_providers.get(id).is_none() {
+            ai_providers.insert(id, Item::Table(Table::new()));
+        }
+        let entry = ai_providers
+            .get_mut(id)
+            .and_then(Item::as_table_like_mut)
+            .ok_or_else(|| MusterError::InvalidConfig {
+                message: "provider must be a table".into(),
+                path: Some(CONFIG.path.into()),
+            })?;
+        entry.insert("name", toml_edit::value(id));
+        if let Some(url) = provider.base_url {
+            entry.insert("base_url", toml_edit::value(url));
+        }
+        entry.insert("wire_api", toml_edit::value("chat"));
+        if let Some(var) = provider.env_key {
+            entry.insert("env_key", toml_edit::value(var));
+        } else if let Some(key) = provider.key {
+            entry.insert("experimental_bearer_token", toml_edit::value(key.expose()));
+        }
+    }
 
     if let Some(model) = desired.agents.models.get("codex") {
         doc["model"] = toml_edit::value(model.clone());

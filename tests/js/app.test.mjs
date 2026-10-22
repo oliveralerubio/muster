@@ -123,7 +123,7 @@ seed("code", "cli");
 seed("h1", "title");
 const nav = seed("nav", "nav");
 const tabs = [];
-for (const name of ["dashboard", "machines", "team", "secrets", "skills", "profiles", "history", "doctor"]) {
+for (const name of ["dashboard", "machines", "team", "secrets", "providers", "skills", "profiles", "history", "doctor"]) {
   const tab = seed("button", null, nav);
   tab.setAttribute("role", "tab");
   tab.dataset.view = name;
@@ -423,7 +423,47 @@ async function testMcpEditClearsPreviewAndGuardsSave() {
   setResponder();
 }
 
+async function testProvidersViewListsReferencesAndAddsAndRemoves() {
+  setResponder((call) => ({ ok: true, result: call.path === "providers" ? { providers: [{
+    id: "gateway", kind: "anthropic", base_url: "https://example.invalid",
+    default_model: "example-model", key: "env://EXAMPLE_KEY", agents: ["claude"]
+  }] } : {}, diagnostics: [] }));
+  const mark = baseline();
+  tabs.find((t) => t.dataset.view === "providers").fire("click");
+  await flush();
+  assert.ok(callSince(mark, "providers"));
+  const text = (node) => node instanceof FakeElement
+    ? [node.textContent, ...node.children.map(text)].join(" ") : String(node);
+  for (const expected of ["gateway", "anthropic", "https://example.invalid", "example-model", "env://EXAMPLE_KEY", "claude"]) {
+    assert.ok(text(view).includes(expected), `provider table includes ${expected}`);
+  }
+  need("provider-id").value = "local";
+  need("provider-kind").value = "ollama";
+  need("provider-url").value = "http://localhost:11434/v1";
+  need("provider-model").value = "local-model";
+  need("provider-key").value = "env://LOCAL_KEY";
+  need("provider-form").fire("submit", { preventDefault() {} });
+  await flush();
+  const added = callSince(mark, "provider/add");
+  assert.ok(added);
+  assert.equal(added.body.confirm, true);
+  assert.equal(added.body.id, "local");
+  assert.equal(added.body.kind, "ollama");
+  assert.equal(added.body["base-url"], "http://localhost:11434/v1");
+  assert.equal(added.body["default-model"], "local-model");
+  assert.equal(added.body.key, "env://LOCAL_KEY");
+  const rmMark = baseline();
+  liveButton("Remove").fire("click");
+  await flush();
+  const removed = callSince(rmMark, "provider/rm");
+  assert.ok(removed);
+  assert.equal(removed.body.id, "gateway");
+  assert.equal(removed.body.confirm, true);
+  setResponder();
+}
+
 const tests = {
+  testProvidersViewListsReferencesAndAddsAndRemoves,
   testProfileSaveIsGatedOnPreview,
   testMcpFormUsesJsonArrayValues,
   testMcpPreviewIgnoresStaleResponse,

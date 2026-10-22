@@ -10,7 +10,9 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::adapters::config::{AgentsConfig, McpServer, DEFAULT_INSTRUCTIONS_SOURCE};
+use crate::adapters::config::{
+    AgentsConfig, AiProvider, AiProviderOverride, McpServer, DEFAULT_INSTRUCTIONS_SOURCE,
+};
 use crate::errors::MusterError;
 use crate::manifest::{self, Manifest, Profile};
 use crate::team;
@@ -34,6 +36,7 @@ pub struct Layer {
     pub dir: PathBuf,
     pub agents: AgentsConfig,
     pub mcp: BTreeMap<String, McpServer>,
+    pub ai_providers: BTreeMap<String, AiProviderOverride>,
 }
 
 impl Layer {
@@ -50,6 +53,11 @@ impl Layer {
             dir: dir.to_path_buf(),
             agents: manifest.agents.clone().unwrap_or_default(),
             mcp: manifest.mcp.clone(),
+            ai_providers: manifest
+                .ai_providers
+                .iter()
+                .map(|(id, p)| (id.clone(), p.clone().into()))
+                .collect(),
         }
     }
 
@@ -67,6 +75,7 @@ impl Layer {
             dir: dir.to_path_buf(),
             agents: p.agents.clone().unwrap_or_default(),
             mcp: p.mcp.clone(),
+            ai_providers: p.ai_providers.clone(),
         }
     }
 }
@@ -76,6 +85,7 @@ impl Layer {
 pub struct Merged {
     pub agents: AgentsConfig,
     pub mcp: BTreeMap<String, McpServer>,
+    pub ai_providers: BTreeMap<String, AiProvider>,
     /// Directory the instructions source resolves against (the layer that
     /// declared `[agents.instructions]`, else the first layer).
     pub instructions_dir: PathBuf,
@@ -119,6 +129,15 @@ pub fn global_layers(config_dir: &Path, manifest: &Manifest, machine: Option<&st
     layers
 }
 
+/// Effective user-scope configuration for this machine.
+pub fn global_merge(config_dir: &Path, state_dir: &Path, manifest: &Manifest) -> Merged {
+    merge(&global_layers(
+        config_dir,
+        manifest,
+        crate::machine::load_name(state_dir).as_deref(),
+    ))
+}
+
 /// Fingerprint of everything the team approved for `machine` (its merged
 /// layers and the shared instructions). Stable across versions and platforms
 /// (FNV-1a over canonical JSON), so machines compare digests through the repo.
@@ -131,6 +150,7 @@ pub fn digest(config_dir: &Path, manifest: &Manifest, machine: &str) -> String {
     let canonical = serde_json::json!({
         "agents": merged.agents,
         "mcp": merged.mcp,
+        "providers": merged.ai_providers,
         "instructions": instructions,
     })
     .to_string();
@@ -142,11 +162,28 @@ pub fn digest(config_dir: &Path, manifest: &Manifest, machine: &str) -> String {
 
 /// `plan --explain`: the fixed precedence and the layers that apply.
 pub fn explain(layers: &[Layer]) -> serde_json::Value {
+    let mut ai_providers = BTreeMap::new();
+    for layer in layers {
+        let source = serde_json::json!({ "layer": layer.kind, "name": layer.name, "profile": layer.profile });
+        for (id, provider) in &layer.ai_providers {
+            let fields = ai_providers.entry(id).or_insert_with(BTreeMap::new);
+            for (field, present) in [
+                ("kind", provider.kind.is_some()),
+                ("base_url", provider.base_url.is_some()),
+                ("default_model", provider.default_model.is_some()),
+                ("key", provider.key.is_some()),
+            ] {
+                if present {
+                    fields.insert(field, source.clone());
+                }
+            }
+        }
+    }
     let layers: Vec<_> = layers
         .iter()
         .map(|l| serde_json::json!({ "layer": l.kind, "name": l.name, "profile": l.profile }))
         .collect();
-    serde_json::json!({ "precedence": PRECEDENCE, "layers": layers })
+    serde_json::json!({ "precedence": PRECEDENCE, "layers": layers, "providers": ai_providers })
 }
 
 /// The project layer. Agents read user-scope and project-scope files
@@ -178,6 +215,7 @@ pub fn project_layers(project: &Path) -> Result<Vec<Layer>, MusterError> {
 pub fn merge(layers: &[Layer]) -> Merged {
     let mut agents = AgentsConfig::default();
     let mut mcp = BTreeMap::new();
+    let mut ai_providers = BTreeMap::new();
     let mut instructions_dir = layers.first().map(|l| l.dir.clone()).unwrap_or_default();
     let mut skills_dir = instructions_dir.clone();
     let mut subagents_dir = instructions_dir.clone();
@@ -202,12 +240,21 @@ pub fn merge(layers: &[Layer]) -> Merged {
             agents.permissions = over.permissions.clone();
         }
         agents.models.extend(over.models.clone());
+        agents.ai_providers.extend(over.ai_providers.clone());
         agents.hooks.extend(over.hooks.clone());
         mcp.extend(layer.mcp.clone());
+        for (id, provider) in &layer.ai_providers {
+            if let Some(current) = ai_providers.get_mut(id) {
+                provider.merge_into(current);
+            } else if let Some(declared) = provider.declared() {
+                ai_providers.insert(id.clone(), declared);
+            }
+        }
     }
     Merged {
         agents,
         mcp,
+        ai_providers,
         instructions_dir,
         skills_dir,
         subagents_dir,

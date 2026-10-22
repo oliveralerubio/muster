@@ -10,7 +10,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub use crate::adapters::config::{AgentsConfig, McpServer, SkillRemote, SkillsConfig};
+pub use crate::adapters::config::{AgentsConfig, AiProvider, McpServer, SkillRemote, SkillsConfig};
 use crate::errors::MusterError;
 
 pub const FILE_NAME: &str = "muster.toml";
@@ -48,6 +48,9 @@ pub struct Manifest {
     /// Declared MCP servers (stdio and remote), keyed by server name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mcp: BTreeMap<String, McpServer>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(rename = "providers")]
+    pub ai_providers: BTreeMap<String, AiProvider>,
     /// Managed dotfiles, keyed by target path relative to `$HOME`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub files: BTreeMap<String, ManagedDotfile>,
@@ -235,6 +238,9 @@ pub struct Profile {
     pub agents: Option<AgentsConfig>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mcp: BTreeMap<String, McpServer>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[serde(rename = "providers")]
+    pub ai_providers: BTreeMap<String, crate::adapters::config::AiProviderOverride>,
 }
 
 impl Default for Manifest {
@@ -306,6 +312,7 @@ impl Manifest {
             profiles: BTreeMap::new(),
             agents: None,
             mcp: BTreeMap::new(),
+            ai_providers: BTreeMap::new(),
             files: BTreeMap::new(),
             secrets: BTreeMap::new(),
             mcp_server: None,
@@ -355,6 +362,81 @@ impl Manifest {
             return Err(invalid(format!(
                 "unknown key `{key}` (extension keys must start with `{EXTENSION_PREFIX}`)"
             )));
+        }
+        for (id, key) in manifest
+            .ai_providers
+            .iter()
+            .map(|(id, p)| (id, &p.key))
+            .chain(
+                manifest
+                    .profiles
+                    .values()
+                    .flat_map(|p| p.ai_providers.iter().map(|(id, p)| (id, &p.key))),
+            )
+        {
+            crate::machine::validate_name(id)
+                .map_err(|_| invalid(format!("invalid provider id `{id}`")))?;
+            if let Some(key) = key {
+                crate::secrets::SecretRef::parse(key).map_err(|_| {
+                    invalid(format!(
+                        "providers.{id}.key must be a valid secret reference"
+                    ))
+                })?;
+            }
+        }
+        let declared_ai_providers: std::collections::BTreeSet<_> = manifest
+            .ai_providers
+            .keys()
+            .chain(manifest.profiles.values().flat_map(|profile| {
+                profile
+                    .ai_providers
+                    .iter()
+                    .filter_map(|(id, provider)| provider.kind.is_some().then_some(id))
+            }))
+            .collect();
+        for profile in manifest.profiles.values() {
+            for (id, provider) in &profile.ai_providers {
+                if provider.kind.is_none() && !declared_ai_providers.contains(id) {
+                    return Err(invalid(format!(
+                        "providers.{id}: kind required on first declaration"
+                    )));
+                }
+            }
+        }
+        // Validate actual layer order, not just the union of profile names.
+        for machine in
+            std::iter::once(None).chain(manifest.machines.keys().map(|m| Some(m.as_str())))
+        {
+            let layers = crate::engine::layer::global_layers(Path::new("."), &manifest, machine);
+            let mut declared = std::collections::BTreeSet::new();
+            for layer in layers {
+                for (id, provider) in layer.ai_providers {
+                    if provider.kind.is_none() && !declared.contains(&id) {
+                        return Err(invalid(format!(
+                            "providers.{id}: kind required on first declaration"
+                        )));
+                    }
+                    declared.insert(id);
+                }
+            }
+        }
+        for agents in manifest
+            .agents
+            .iter()
+            .chain(manifest.profiles.values().filter_map(|p| p.agents.as_ref()))
+        {
+            for (agent, id) in &agents.ai_providers {
+                let known = manifest.ai_providers.contains_key(id)
+                    || manifest
+                        .profiles
+                        .values()
+                        .any(|p| p.ai_providers.contains_key(id));
+                if crate::adapters::find(agent).is_none() || !known {
+                    return Err(invalid(format!(
+                        "agents.providers.{agent}: unknown agent or provider id `{id}`"
+                    )));
+                }
+            }
         }
         for (reference, policy) in &manifest.secrets {
             crate::secrets::SecretRef::parse(reference)

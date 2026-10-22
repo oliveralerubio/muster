@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 
 use crate::adapters;
 use crate::context::Context;
-use crate::engine::{self, layer, Options, Plan, Target};
+use crate::engine::{self, Options, Plan, Target};
 use crate::errors::MusterError;
 use crate::git;
 use crate::identity::Identity;
@@ -84,6 +84,9 @@ pub fn run(
 
     // Run the optional network check once, even when repairs re-examine local state.
     checkup.checks.push(api_keys::check(check_keys, offline));
+    checkup
+        .checks
+        .push(api_keys::check_declared(ctx, check_keys, offline));
     let diagnostics = checkup.diagnostics();
     let count = |s: Severity| diagnostics.iter().filter(|d| d.severity == s).count();
     let errors = count(Severity::Error);
@@ -248,6 +251,10 @@ fn examine(ctx: &mut Context) -> Checkup {
         Some(m) => check_keys(ctx, m),
         None => Check::skipped("keys"),
     });
+    checks.push(match &manifest {
+        Some(m) => check_ai_providers(ctx, m),
+        None => Check::skipped("providers"),
+    });
     Checkup {
         checks,
         repairs,
@@ -399,11 +406,7 @@ fn expect_mode(_: &Path, _: u32, _: &mut Vec<Diagnostic>, _: &mut Vec<Repair>) {
 // ---------------------------------------------------------------------------
 
 fn check_agents(ctx: &Context, manifest: &Manifest) -> Check {
-    let merged = layer::merge(&layer::global_layers(
-        &ctx.config_dir,
-        manifest,
-        crate::machine::load_name(&ctx.state_dir).as_deref(),
-    ));
+    let merged = crate::engine::layer::global_merge(&ctx.config_dir, &ctx.state_dir, manifest);
     let declared: Vec<String> = merged
         .agents
         .enabled
@@ -717,11 +720,7 @@ fn engine_suggestion(code: &str) -> &'static str {
 /// Every secret reference in MCP `env`/`headers`: one provider check per
 /// scheme, then one resolution per reference (values dropped at once).
 fn check_keys(ctx: &Context, manifest: &Manifest) -> Check {
-    let merged = layer::merge(&layer::global_layers(
-        &ctx.config_dir,
-        manifest,
-        crate::machine::load_name(&ctx.state_dir).as_deref(),
-    ));
+    let merged = crate::engine::layer::global_merge(&ctx.config_dir, &ctx.state_dir, manifest);
     let mut diags = Vec::new();
     let mut by_scheme: BTreeMap<Scheme, Vec<(String, SecretRef)>> = BTreeMap::new();
     for (server, config) in &merged.mcp {
@@ -744,9 +743,9 @@ fn check_keys(ctx: &Context, manifest: &Manifest) -> Check {
         }
     }
 
-    let mut providers = Providers::new(&ctx.config_dir, &ctx.state_dir);
+    let mut secret_providers = Providers::new(&ctx.config_dir, &ctx.state_dir);
     for (scheme, references) in by_scheme {
-        let provider = providers.provider(scheme);
+        let provider = secret_providers.provider(scheme);
         let description = provider.describe();
         let hint = |code: &str| key_suggestion(code, description.name, description.binary);
         if let Err(e) = provider.check() {
@@ -802,6 +801,72 @@ fn key_suggestion(code: &str, provider: &str, binary: Option<&str>) -> String {
         }
         _ => "fix the secret reference in muster.toml".into(),
     }
+}
+
+/// Resolve each configured endpoint on this machine, without retaining values
+/// or reporting external secret CLI output. Network validation is separate.
+fn check_ai_providers(ctx: &Context, manifest: &Manifest) -> Check {
+    let merged = crate::engine::layer::global_merge(&ctx.config_dir, &ctx.state_dir, manifest);
+    let mut secret_providers = Providers::new(&ctx.config_dir, &ctx.state_dir);
+    let mut diagnostics = Vec::new();
+    for (id, ai_provider) in &merged.ai_providers {
+        if let Some(reference) = &ai_provider.key {
+            if secret_providers.resolve(reference).is_err() {
+                diagnostics.push(
+                    Diagnostic::new(
+                        Severity::Warning,
+                        "secret_reference_unresolved",
+                        format!("provider `{id}` key cannot be resolved on this machine"),
+                    )
+                    .with_path(format!("providers.{id}"))
+                    .with_suggestion("make the referenced secret available on this machine"),
+                );
+            }
+        }
+    }
+    for (agent, id) in &merged.agents.ai_providers {
+        if merged
+            .agents
+            .enabled
+            .as_ref()
+            .is_some_and(|enabled| !enabled.contains(agent))
+        {
+            continue;
+        }
+        let Some(ai_provider) = merged.ai_providers.get(id) else {
+            continue;
+        };
+        if ai_provider.key.is_some()
+            || !matches!(
+                (agent.as_str(), ai_provider.kind),
+                ("claude", adapters::config::AiProviderKind::Anthropic)
+                    | ("codex", adapters::config::AiProviderKind::Openai)
+            )
+        {
+            continue;
+        }
+        let Some((status, _)) = crate::commands::provider::login_commands(agent) else {
+            continue;
+        };
+        let Some(adapter) = adapters::find(agent) else {
+            continue;
+        };
+        if machine::find_executable(adapter.binary)
+            .is_some_and(|binary| crate::commands::provider::logged_in(&binary, status))
+        {
+            continue;
+        }
+        diagnostics.push(
+            Diagnostic::new(
+                Severity::Warning,
+                "provider_login_required",
+                format!("agent `{agent}` needs a subscription login on this machine"),
+            )
+            .with_path(format!("providers.{id}"))
+            .with_suggestion(format!("run `muster provider login {agent}`")),
+        );
+    }
+    Check::new("providers", diagnostics)
 }
 
 #[cfg(test)]

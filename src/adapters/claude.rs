@@ -71,6 +71,7 @@ pub static ADAPTER: Adapter = Adapter {
         Capability::McpStdio,
         Capability::McpRemote,
         Capability::Models,
+        Capability::AiProviders,
         Capability::Permissions,
         Capability::Hooks,
         Capability::Skills,
@@ -95,6 +96,19 @@ fn render_settings(
     plan: &mut RenderPlan,
 ) -> Result<(), MusterError> {
     let mut object = json_object(current, SETTINGS.path)?;
+
+    if let Some(provider) = super::selected_ai_provider(desired, &ADAPTER, plan) {
+        let env = child_object(&mut object, "env");
+        if let Some(url) = provider.base_url {
+            env.insert("ANTHROPIC_BASE_URL".into(), url.into());
+        }
+        if let Some(key) = provider.key {
+            env.insert("ANTHROPIC_AUTH_TOKEN".into(), key.expose().into());
+        }
+        if let Some(model) = provider.default_model {
+            object.insert("model".into(), model.into());
+        }
+    }
 
     if let Some(model) = desired.agents.models.get("claude") {
         object.insert("model".into(), Value::String(model.clone()));

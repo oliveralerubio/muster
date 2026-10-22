@@ -60,9 +60,25 @@ pub(super) fn check(enabled: bool, offline: bool) -> Check {
             .with_suggestion("unset MUSTER_OPENROUTER_KEY_CHECK_URL")],
         );
     }
-    let Some(curl) = crate::machine::find_executable("curl") else {
-        return Check::skipped("api_keys");
-    };
+    let header = SecretValue::new(format!(
+        "header = \"Authorization: Bearer {}\"\n",
+        key.expose()
+    ));
+    match request(&header, &endpoint, local, false) {
+        Some(response) => inspect(&response),
+        None => Check::skipped("api_keys"),
+    }
+}
+
+/// Credential headers travel through stdin, never argv. No redirects, curl
+/// config files or caller-selected remote destinations are allowed.
+fn request(
+    header: &SecretValue,
+    endpoint: &str,
+    local: bool,
+    discard_body: bool,
+) -> Option<Zeroizing<Vec<u8>>> {
+    let curl = crate::machine::find_executable("curl")?;
     let mut command = Command::new(curl);
     command.args([
         "--disable",
@@ -73,7 +89,7 @@ pub(super) fn check(enabled: bool, offline: bool) -> Check {
         "--max-time",
         "5",
         "--max-filesize",
-        "16384",
+        if discard_body { "1048576" } else { "16384" },
         "--proto",
         if local { "=http" } else { "=https" },
         "--write-out",
@@ -81,10 +97,15 @@ pub(super) fn check(enabled: bool, offline: bool) -> Check {
         "--config",
         "-",
         "--url",
-        &endpoint,
+        endpoint,
     ]);
     if local {
         command.args(["--noproxy", "*"]);
+    }
+    if discard_body {
+        // Model catalogues can exceed the metadata response bound. Only
+        // the HTTP status is relevant, so curl discards the bounded body.
+        command.args(["--output", if cfg!(windows) { "NUL" } else { "/dev/null" }]);
     }
     let Ok(mut child) = command
         .env_remove("OPENROUTER_API_KEY")
@@ -93,13 +114,9 @@ pub(super) fn check(enabled: bool, offline: bool) -> Check {
         .stderr(Stdio::null())
         .spawn()
     else {
-        return Check::skipped("api_keys");
+        return None;
     };
     // Send the authorization header through stdin, never argv or a file.
-    let header = SecretValue::new(format!(
-        "header = \"Authorization: Bearer {}\"\n",
-        key.expose()
-    ));
     let written = child
         .stdin
         .take()
@@ -117,15 +134,15 @@ pub(super) fn check(enabled: bool, offline: bool) -> Check {
     if written.is_err() || read.is_err() || response.len() as u64 > MAX_RESPONSE_BYTES {
         let _ = child.kill();
         let _ = child.wait();
-        return Check::skipped("api_keys");
+        return None;
     }
     let Ok(status) = child.wait() else {
-        return Check::skipped("api_keys");
+        return None;
     };
     if !status.success() {
-        return Check::skipped("api_keys");
+        return None;
     }
-    inspect(&response)
+    Some(response)
 }
 
 #[derive(Deserialize)]
@@ -217,4 +234,101 @@ fn unavailable() -> Check {
         )
         .with_suggestion("retry later or use --offline to skip the optional check")],
     )
+}
+
+/// Cheap documented metadata requests to official endpoints only. Custom
+/// gateways are not probed: sending their credentials elsewhere is unsafe.
+pub(super) fn check_declared(ctx: &crate::context::Context, enabled: bool, offline: bool) -> Check {
+    if !enabled || offline {
+        return Check::skipped("provider_api_keys");
+    }
+    let Ok(manifest) = crate::manifest::Manifest::load(&ctx.config_dir) else {
+        return Check::skipped("provider_api_keys");
+    };
+    let merged = crate::engine::layer::global_merge(&ctx.config_dir, &ctx.state_dir, &manifest);
+    let mut secrets = crate::providers::Providers::new(&ctx.config_dir, &ctx.state_dir);
+    let mut diagnostics = Vec::new();
+    for (id, ai_provider) in &merged.ai_providers {
+        let Some(reference) = &ai_provider.key else {
+            continue;
+        };
+        use crate::adapters::config::AiProviderKind;
+        let (base, endpoint, header_name, bearer) = match ai_provider.kind {
+            AiProviderKind::Openai => (
+                "https://api.openai.com/v1",
+                "https://api.openai.com/v1/models",
+                "Authorization",
+                "Bearer ",
+            ),
+            AiProviderKind::Anthropic => (
+                "https://api.anthropic.com",
+                "https://api.anthropic.com/v1/models",
+                "x-api-key",
+                "",
+            ),
+            AiProviderKind::Google => (
+                "https://generativelanguage.googleapis.com/v1beta",
+                "https://generativelanguage.googleapis.com/v1beta/models",
+                "x-goog-api-key",
+                "",
+            ),
+            _ => continue,
+        };
+        if ai_provider
+            .base_url
+            .as_ref()
+            .is_some_and(|url| url.trim_end_matches('/') != base)
+        {
+            continue;
+        }
+        let Ok(key) = secrets.resolve(reference) else {
+            continue;
+        };
+        if key.expose().is_empty()
+            || key.expose().len() > 4096
+            || !key
+                .expose()
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+        {
+            diagnostics.push(
+                Diagnostic::error(
+                    "api_key_invalid",
+                    format!("provider `{id}` key has an invalid token format"),
+                )
+                .with_path(format!("providers.{id}")),
+            );
+            continue;
+        }
+        let mut header = format!("header = \"{header_name}: {bearer}{}\"\n", key.expose());
+        if ai_provider.kind == AiProviderKind::Anthropic {
+            header.push_str("header = \"anthropic-version: 2023-06-01\"\n");
+        }
+        let response = request(&SecretValue::new(header), endpoint, false, true);
+        let status = response.as_deref().and_then(|bytes| {
+            bytes
+                .iter()
+                .rposition(|b| *b == b'\n')
+                .map(|index| &bytes[index + 1..])
+        });
+        let (severity, code, message) = match status {
+            Some(b"200") => continue,
+            Some(b"401" | b"403") => (Severity::Error, "api_key_invalid", "rejected its key"),
+            Some(b"429") => (
+                Severity::Warning,
+                "api_key_rate_limited",
+                "key check was rate limited",
+            ),
+            _ => (
+                Severity::Warning,
+                "api_key_check_unavailable",
+                "did not return usable key metadata",
+            ),
+        };
+        diagnostics.push(
+            Diagnostic::new(severity, code, format!("provider `{id}` {message}"))
+                .with_path(format!("providers.{id}")),
+        );
+    }
+    Check::new("provider_api_keys", diagnostics)
 }

@@ -374,3 +374,65 @@ Opciones globales: `--config`, `--format text|json`, `--yes`, `--dry-run` (en to
 - **Lanzamiento:**
   - Show HN exige que el autor escriba el post y las respuestas sin IA.
   - La métrica de éxito es completar el alta en una segunda máquina y seguir usándolo, no las estrellas.
+
+
+## AI providers (issue #36)
+
+AI providers are named model endpoints, distinct from secret providers. The
+canonical `[providers.<id>]` table requires `kind` (`anthropic`, `openai`,
+`openai-compatible`, `ollama`, or `google`) on first declaration and accepts
+optional `base_url`, `default_model` and `key` (a secret reference, never a key
+value). `[agents.providers]` maps agent ids to endpoint ids. Existing
+`[agents.models]` choices win over provider defaults. Unknown kinds, missing
+first-declaration kinds and dangling selections fail validation before apply.
+
+Providers follow team → group → member → machine → project precedence.
+Profiles override individual fields without repeating `kind`; omitted fields
+remain inherited. `plan --explain` identifies the layer for each final field.
+Project configuration remains project-scoped. Resolved keys reuse the existing
+secret providers and deny-by-default `allow` rules, including `agent@project`.
+Unavailable or denied keys skip the endpoint with a warning, not the entire
+sync, and key values never appear in output, diffs, plans or the panel.
+
+Rendering:
+- Claude Code: managed settings environment (`ANTHROPIC_BASE_URL`,
+  `ANTHROPIC_AUTH_TOKEN`) and model.
+- Codex: `model_providers.<id>`, top-level `model_provider` and model;
+  `openai`, `openai-compatible` and `ollama` use the assumed `wire_api = "chat"`
+  mapping (not documented by the installed CLI help). Anthropic/Google kinds
+  emit `provider_kind_unsupported` and are not rendered. Environment references
+  use `env_key`; other resolved keys use `experimental_bearer_token`.
+- OpenCode: `provider.<id>` with SDK kind, URL, key and provider/model selection.
+- Antigravity, Pi and Hermes: no AI provider capability; `unsupported_feature`
+  only if the adapter is actually selected for a provider.
+
+Only Muster-owned provider keys are updated or pruned. Rollback restores the
+previous generation's native provider files. Unattended scheduled sync applies
+provider-only changes without executable-code approval, unlike hooks and new
+MCP servers.
+
+`provider list/add/rm/use/login` are registry commands. `provider use <id>
+--agent <agent>` selects an endpoint; `--clear` unsets the base selection.
+`provider add --value-stdin` stores a piped value in the native vault when
+`--key native://...` is supplied; `--value` remains available with a warning.
+MCP reads through `provider_list`; changes go through `propose_change`, not
+direct mutating tools. The web panel lists endpoints and exposes non-interactive
+add/remove/use routes; native login stays CLI-only because it can require a
+terminal or browser (ADR 0001).
+
+Doctor resolves declared keys on this machine. `provider_login_required`
+applies only to selected keyless Anthropic→Claude and OpenAI→Codex pairs with
+no native login. Online checks remain opt-in with `--check-keys`, and `--offline`
+wins. Subscription login is **one native login command per agent per machine**.
+Muster delegates to native status/login commands and never opens credential
+stores. Importers detect endpoints in existing Claude settings, Codex
+`model_providers` and OpenCode `provider` tables, replacing key values with
+placeholder references the user must fill. ChezMoi native provider settings
+are imported canonically, not copied as raw secret-bearing files.
+
+Out of scope: copying/syncing OAuth logins, refresh tokens, `auth.json`,
+`.credentials.json` or Keychain entries; zero-disk secret injection (`muster run`);
+provider hot swapping, usage/cost/quota tracking, and provider support for
+Antigravity or experimental adapters. Vault encryption protects keys in the
+repository; resolved keys still reside in the agent's native config on each
+machine, as MCP keys do today.

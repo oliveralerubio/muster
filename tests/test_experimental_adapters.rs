@@ -518,6 +518,7 @@ fn pure_render_is_deterministic_for_both_experimental_adapters() {
     let subagents = std::collections::BTreeMap::new();
     let access = muster::secrets::SecretAccess::default();
     let desired = Desired {
+        ai_providers: &Default::default(),
         agents: &agents,
         mcp: &mcp,
         instructions: Some("Follow the rules.\n"),

@@ -2,3 +2,5 @@
 
 pub mod chezmoi;
 pub mod cuartel;
+
+pub mod ai_providers;

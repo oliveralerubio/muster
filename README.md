@@ -164,6 +164,51 @@ muster ui            # web admin on 127.0.0.1 with a one-time login token
 
 Everything the UI does has a CLI equivalent, and every ordinary command answers `--format json` with a stable envelope for scripts and AI agents. Two commands are their own protocol: `muster mcp` speaks JSON-RPC over stdio, and `muster ui` prints one startup JSON object (`url`, `port`, `token`) before serving.
 
+## AI providers
+
+Declare endpoints once and sync their settings to your machines:
+
+```toml
+[providers.work]
+kind = "openai-compatible"
+base_url = "https://gateway.example/v1"
+default_model = "team-model"
+key = "native://app/gateway"
+
+[agents.providers]
+codex = "work"
+opencode = "work"
+
+[secrets."native://app/gateway"]
+allow = ["codex", "opencode"]
+```
+
+Use `muster provider add`, `provider list`, `provider rm`, and
+`provider use work --agent codex` (or add `--clear` to unset the selection).
+`provider add --key native://app/gateway --value-stdin --allow codex ...`
+stores a piped key in the vault; avoid `--value`, which exposes it in shell
+history and process arguments. The panel's **AI providers** view lists key
+references, receiving agents and endpoint settings, with add/remove actions.
+Profile overrides merge individual provider fields; `muster plan --explain`
+shows their sources. Explicit `[agents.models]` choices win over provider defaults.
+
+Claude Code, Codex and OpenCode receive native settings; unsupported adapters
+warn only when selected for a provider. Codex accepts OpenAI-compatible kinds;
+Anthropic and Google endpoints are skipped with a warning. The assumed Codex
+wire format is `chat` for `openai`, `openai-compatible` and `ollama`; verify
+compatibility with your installed Codex release. The installed CLI help does
+not document this mapping. Keys are protected in the repository, but resolved
+keys can live in the agent's configuration on each machine, like MCP secrets.
+For Codex `env://` keys, the named variable must also be in Codex's environment.
+
+**Subscription logins are one command per agent per machine**, not synced
+credentials: run `muster provider login claude` or `muster provider login codex`
+on each machine. Muster delegates to the native login; it never copies OAuth
+refresh tokens, `auth.json`, `.credentials.json` or Keychain entries. See the
+[agent guide](docs/agents/muster-for-agents.md#ai-providers) for commands and
+surface restrictions. `muster doctor --offline` checks local keys and required
+logins; network key checks require explicit `--check-keys`.
+
 ## Team mode
 
 Team mode starts when `[members]` in `muster.toml` is nonempty. Until then you

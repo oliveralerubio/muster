@@ -184,7 +184,20 @@ fn import_chezmoi(ctx: &mut Context, params: &Params) -> Result<Value, MusterErr
         .map(|s| json!({ "source": s.source, "reason": s.reason }))
         .collect();
 
+    let mut detected = BTreeMap::new();
     for file in &scan.files {
+        if crate::importers::ai_providers::is_credential_store(&file.target) {
+            skipped.push(json!({"source": file.source, "reason": "device-bound login credentials are never imported"}));
+            continue;
+        }
+        if crate::importers::ai_providers::NATIVE_FILES.contains(&file.target.as_str()) {
+            detected.extend(crate::importers::ai_providers::detect(
+                &file.target,
+                &file.contents,
+            )?);
+            skipped.push(json!({"source": file.source, "reason": "native AI provider settings imported canonically; raw file not copied"}));
+            continue;
+        }
         if let Err(reason) = dotfiles::locate(ctx, &file.target) {
             skipped.push(json!({ "source": file.source, "reason": reason }));
             continue;
@@ -238,6 +251,12 @@ fn import_chezmoi(ctx: &mut Context, params: &Params) -> Result<Value, MusterErr
 
     let mut templates = Vec::new();
     for template in &scan.templates {
+        if crate::importers::ai_providers::is_credential_store(&template.target)
+            || crate::importers::ai_providers::NATIVE_FILES.contains(&template.target.as_str())
+        {
+            skipped.push(json!({"source": template.source, "reason": "native credentials or templated AI providers require manual conversion; raw file not copied"}));
+            continue;
+        }
         let kept = format!("{TEMPLATES_DIR}/{}", template.source);
         ctx.diag(
             Diagnostic::new(
@@ -273,23 +292,26 @@ fn import_chezmoi(ctx: &mut Context, params: &Params) -> Result<Value, MusterErr
         );
     }
 
+    let ai_providers = merge_ai_providers(ctx, &mut manifest, detected);
+    let providers_added = ai_providers.values().any(|p| p["action"] == "add");
     let added = files.iter().filter(|f| f["action"] == "add").count();
     let result = |dry_run: bool| {
         json!({
             "source": "chezmoi",
+            "providers": ai_providers,
             "dry_run": dry_run,
             "files": files,
             "templates": templates,
             "skipped": skipped,
         })
     };
-    if ctx.dry_run || writes.is_empty() {
+    if ctx.dry_run || (writes.is_empty() && !providers_added) {
         return Ok(result(ctx.dry_run));
     }
     for (path, contents) in &writes {
         write(path, contents)?;
     }
-    if added > 0 {
+    if added > 0 || providers_added {
         manifest.save(&ctx.config_dir)?;
     }
     git::commit_if_configured(
@@ -313,6 +335,9 @@ fn import_cuartel(ctx: &mut Context, params: &Params) -> Result<Value, MusterErr
     }
     let mut manifest = Manifest::load(&ctx.config_dir)?;
     let mut changed = false;
+
+    let ai_providers = merge_ai_providers(ctx, &mut manifest, proposal.ai_providers);
+    changed |= ai_providers.values().any(|p| p["action"] == "add");
 
     let mut agents_added = Vec::new();
     if let Some(imported) = proposal.agents {
@@ -392,6 +417,7 @@ fn import_cuartel(ctx: &mut Context, params: &Params) -> Result<Value, MusterErr
 
     let result = json!({
         "source": "cuartel",
+        "providers": ai_providers,
         "dry_run": ctx.dry_run,
         "agents": agents_added,
         "mcp": mcp,
@@ -485,6 +511,13 @@ fn merge_agents(
         conflicts,
     );
     fill_map(
+        &mut current.ai_providers,
+        imported.ai_providers,
+        "providers",
+        &mut added,
+        conflicts,
+    );
+    fill_map(
         &mut current.hooks,
         imported.hooks,
         "hooks",
@@ -509,4 +542,34 @@ fn write(path: &Path, contents: &str) -> Result<(), MusterError> {
         std::fs::create_dir_all(parent).map_err(|e| io(parent, e))?;
     }
     std::fs::write(path, contents).map_err(|e| io(path, e))
+}
+
+/// Merge proposals without overwriting existing endpoints. Only references survive detection.
+fn merge_ai_providers(
+    ctx: &mut Context,
+    manifest: &mut Manifest,
+    detected: BTreeMap<String, crate::adapters::config::AiProvider>,
+) -> BTreeMap<String, Value> {
+    let mut proposals = BTreeMap::new();
+    for (id, provider) in detected {
+        let action = match manifest.ai_providers.get(&id) {
+            Some(current) if current == &provider => "unchanged",
+            Some(_) => {
+                conflict(
+                    ctx,
+                    "AI provider differs from the current manifest; kept as is".into(),
+                    format!("providers.{id}"),
+                );
+                "conflict"
+            }
+            None => {
+                manifest.ai_providers.insert(id.clone(), provider.clone());
+                "add"
+            }
+        };
+        let mut value = serde_json::to_value(provider).expect("AI provider JSON");
+        value["action"] = json!(action);
+        proposals.insert(id, value);
+    }
+    proposals
 }

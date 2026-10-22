@@ -24,6 +24,7 @@ use crate::secrets;
 
 #[derive(Default)]
 pub struct Proposal {
+    pub ai_providers: BTreeMap<String, crate::adapters::config::AiProvider>,
     pub agents: Option<AgentsConfig>,
     pub mcp: BTreeMap<String, McpServer>,
     pub instructions: Option<String>,
@@ -62,6 +63,8 @@ pub fn scan(dir: &Path) -> Result<Proposal, MusterError> {
             read_mcp_json(&path, &text, &mut proposal)?;
         }
     }
+    proposal.ai_providers = super::ai_providers::scan(dir)?;
+    found |= !proposal.ai_providers.is_empty();
     if !found {
         return Err(MusterError::Usage(format!(
             "{} has no Cuartel configuration (muster.toml, AGENTS.md or mcp.json)",
