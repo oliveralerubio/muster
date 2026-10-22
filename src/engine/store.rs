@@ -40,13 +40,15 @@ pub struct Record {
     pub contents: String,
 }
 
-/// Hooks and MCP server definitions the user approved, per target.
+/// Hooks, MCP server definitions and agent versions the user approved, per target.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Approved {
     #[serde(default)]
     pub hooks: BTreeMap<String, Value>,
     #[serde(default)]
     pub mcp: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub agents: BTreeMap<String, String>,
 }
 
 /// Applied state of a machine as of one generation.

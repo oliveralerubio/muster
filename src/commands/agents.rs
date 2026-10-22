@@ -65,14 +65,15 @@ fn install(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         }
         None => lock.agents.into_iter().collect(),
     };
-    let home = std::env::var_os("HOME")
-        .filter(|h| !h.is_empty())
-        .ok_or_else(|| MusterError::Operational("HOME is not set".into()))?;
-    let bin_dir = std::path::Path::new(&home).join(".local/bin");
+    let bin_dir = installer::bin_dir()?;
 
     let mut installed = Vec::new();
     for (agent, pin) in &pins {
-        ctx.progress(&format!("{agent} {}: verifying {}", pin.version, pin.url));
+        ctx.progress(&format!(
+            "{agent} {}: verifying artifact for {}",
+            pin.version,
+            machine::platform()
+        ));
         installed.push(installer::install(agent, pin, &bin_dir, ctx.dry_run)?);
     }
     Ok(json!({

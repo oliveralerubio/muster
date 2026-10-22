@@ -115,6 +115,20 @@ pub const ADD: CommandSpec = CommandSpec {
     handler: add,
 };
 
+pub const PIN: CommandSpec = CommandSpec {
+    name: "skill.pin",
+    about: "Approve the current contents of an own skill in skills.lock",
+    params: &[param(
+        "name",
+        "Own skill to pin",
+        ParamKind::String,
+        true,
+        true,
+    )],
+    mutating: true,
+    handler: pin,
+};
+
 pub const CHECK: CommandSpec = CommandSpec {
     name: "skill.check",
     about: "Fetch upstream sources and report updates, deprecations and removals",
@@ -562,6 +576,54 @@ fn add(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         }
         None => add_local(ctx, params, &manifest, actor.as_ref()),
     }
+}
+
+fn pin(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
+    let manifest = Manifest::load(&ctx.config_dir)?;
+    let actor = admin(ctx, &manifest)?;
+    let name = required_name(params)?;
+    let (dir, _) = skills_dir(ctx, &manifest)?;
+    let mut lock = SkillsLock::load(&ctx.config_dir)?;
+    let previous = lock.get(&name);
+    if previous.is_some_and(|entry| !entry.is_local()) {
+        return Err(MusterError::Usage(format!(
+            "skill '{name}' is subscribed; use `skill update` instead"
+        )));
+    }
+    let files = read_skill_files(&dir.join(&name))?;
+    let skill_md = files
+        .get("SKILL.md")
+        .ok_or_else(|| MusterError::Usage(format!("skill '{name}' has no SKILL.md")))?;
+    let metadata = parse_frontmatter(skill_md).ok_or_else(|| {
+        MusterError::Usage(format!(
+            "invalid skill '{name}': missing name or description"
+        ))
+    })?;
+    if metadata.name.as_deref() != Some(&name) || metadata.description.is_none() {
+        return Err(MusterError::Usage(format!(
+            "invalid skill '{name}': SKILL.md needs a matching name and description"
+        )));
+    }
+    let entry = LockEntry {
+        name: name.clone(),
+        origin: lock::LOCAL.into(),
+        commit: None,
+        content_hash: content_hash(&files),
+        version: metadata.version,
+        updated_at: now(),
+    };
+    let result = json!({"name": name, "origin": lock::LOCAL, "content_hash": entry.content_hash});
+    if !ctx.dry_run {
+        lock.upsert(entry);
+        lock.save(&ctx.config_dir)?;
+        edit_manifest(ctx, |_| Ok(()))?;
+        commit(
+            ctx,
+            actor.as_ref(),
+            &format!("feat(skills): pin skill {name}"),
+        )?;
+    }
+    Ok(result)
 }
 
 fn add_local(

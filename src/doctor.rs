@@ -415,7 +415,28 @@ fn check_agents(ctx: &Context, manifest: &Manifest) -> Check {
                 .collect()
         });
     let mut diags = Vec::new();
+    let pins = match crate::installer::Lock::load_or_default(&ctx.config_dir) {
+        Ok(lock) => Some(lock),
+        Err(error) => {
+            diags.push(Diagnostic::error("invalid_agent_lock", error.to_string()));
+            None
+        }
+    };
     for id in &declared {
+        if pins
+            .as_ref()
+            .is_some_and(|lock| !lock.agents.contains_key(id))
+        {
+            diags.push(
+                Diagnostic::new(
+                    Severity::Warning,
+                    "agent_unpinned",
+                    format!("agent `{id}` is configured but has no pin in muster.lock"),
+                )
+                .with_path(id.clone())
+                .with_suggestion("pin the agent version in muster.lock"),
+            );
+        }
         // Unknown ids are reported by the `adapters` check (invalid config).
         let Some(adapter) = adapters::find(id) else {
             continue;
@@ -437,8 +458,16 @@ fn check_agents(ctx: &Context, manifest: &Manifest) -> Check {
             );
             continue;
         }
-        let binary = adapter.binary;
-        let Some(exe) = machine::find_executable(binary) else {
+        let binary = pins
+            .as_ref()
+            .and_then(|lock| lock.agents.get(id))
+            .map(|pin| crate::installer::default_bin(id, pin))
+            .unwrap_or(adapter.binary);
+        let local = crate::installer::bin_dir().ok().map(|dir| dir.join(binary));
+        let executable = local
+            .filter(|path| path.is_file())
+            .or_else(|| machine::find_executable(binary));
+        let Some(exe) = executable else {
             diags.push(
                 Diagnostic::new(
                     Severity::Warning,

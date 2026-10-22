@@ -64,11 +64,53 @@ fn run(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
             )))
         }
     };
+    let convergence = convergence(ctx)?;
     Ok(json!({
+        "convergence": convergence,
         "sync": sync,
         "config_path": ctx.config_dir,
         "machines": machines,
         "pending": team["pending"],
         "drift": team["drift"],
+    }))
+}
+
+/// One convergence report shared by the CLI, web status and MCP status.
+fn convergence(ctx: &mut Context) -> Result<Value, MusterError> {
+    let plan = crate::engine::plan(
+        ctx,
+        &crate::engine::Options {
+            target: crate::engine::Target::Global,
+            agent: None,
+        },
+    )?;
+    let planned = plan.to_json(true, false, plan.base_generation());
+    let lock = crate::installer::Lock::load_or_default(&ctx.config_dir)?;
+    let bin_dir = crate::installer::bin_dir()?;
+    let platform = machine::platform();
+    let mut agents = Vec::new();
+    for (id, pin) in lock.agents {
+        let artifact = pin.resolve_artifact(&platform);
+        let installed_version = crate::installer::installed_version(&id, &pin, &bin_dir)?;
+        let note = artifact
+            .is_none()
+            .then(|| format!("no artifact for platform {platform}"));
+        agents.push(json!({
+            "id": id, "installed_version": installed_version,
+            "pinned_version": pin.version, "artifact": artifact, "note": note,
+        }));
+    }
+    let converged = planned["approvals"].as_array().is_some_and(Vec::is_empty)
+        && planned["skipped_skills"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+        && agents.iter().all(|agent| {
+            !agent["artifact"].is_null() && agent["installed_version"] == agent["pinned_version"]
+        });
+    Ok(json!({
+        "converged": converged,
+        "agents": agents,
+        "skipped_skills": planned["skipped_skills"],
+        "pending_approvals": planned["approvals"],
     }))
 }

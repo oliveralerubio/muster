@@ -52,6 +52,7 @@ allow = ["pi", "hermes"]
 "#,
     )
     .unwrap();
+    env.run(&["skill", "pin", "review"]).assert().success();
 }
 
 fn apply(env: &MusterEnv) -> support::Envelope {

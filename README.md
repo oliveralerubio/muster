@@ -29,7 +29,7 @@ warning, never silently lost.
 
 ## Agent Skills
 
-Declare a skills folder in `muster.toml` (`[agents.skills] source = "skills"`), one subfolder per skill with a `SKILL.md` (YAML frontmatter with `name` and `description`) plus any extra files. Muster installs every file, byte for byte, into the skill folders listed in the table above. A skill without `SKILL.md` or without `name`/`description` is skipped with a `skill_invalid` warning.
+Declare a skills folder in `muster.toml` (`[agents.skills] source = "skills"`), one subfolder per skill with a `SKILL.md` (YAML frontmatter with `name` and `description`) plus any extra files. Muster verifies each skill against `skills.lock`, then installs its reviewed files byte for byte into the skill folders listed in the table above. Missing or mismatching pins produce a warning and keep the previously installed copy; other configuration and verified skills still sync. Empty directories are ignored. A skill without `SKILL.md` or without `name`/`description` is skipped with a `skill_invalid` warning.
 
 ### Skill lifecycle (own and subscribed skills)
 
@@ -54,9 +54,12 @@ include = ["pdf"]                          # optional: only these skills
 | `muster skill list` | List every skill with origin, version, last update and status. Offline. |
 | `muster skill add <name> [--description <text>]` | Scaffold an own skill at `skills/<name>/SKILL.md`. |
 | `muster skill add --url <git-url> [--ref <ref>] [--path <dir>] [--include <skill>]` | Subscribe to a Git repository of skills and vendor them. |
+| `muster skill pin <name>` | Record the reviewed files of an own skill in `skills.lock` after editing. |
 | `muster skill check [name]` | Query upstream repositories for updates, deprecations and removals. |
 | `muster skill update [name] [--all] [--force]` | Apply upstream changes, showing files added, changed or removed (`--force` overwrites local edits). |
 | `muster skill rm <name> [--detach]` | Delete a skill, or with `--detach` keep a subscribed skill as your own. |
+
+After editing an own skill, review it, run `muster skill pin <name>`, and commit both its files and `skills.lock`. `skill add` records the initial pin; subscribed skills continue to use `skill update`. Without the pin step, edits do not spread on sync.
 
 Every command accepts `--format json`, `--dry-run` and `--yes`.
 
@@ -115,6 +118,38 @@ Requires a Rust toolchain and Git. You get a single executable — no interprete
 or runtime to install — dynamically linked against your system libraries (glibc
 on GNU/Linux), like any standard Rust build.
 
+### Pinned agent CLIs
+
+After enrollment is approved, `muster sync --yes` installs agent CLIs pinned in
+`muster.lock` into `~/.local/bin`, alongside configuration, secrets and verified
+skills. Make sure that directory is on `PATH`. Preview with `muster plan` or
+`muster sync --dry-run`; neither downloads artifacts. Pins are written by a
+person, not resolved automatically from release feeds:
+
+```toml
+[agents.claude]
+version = "1.2.3"
+
+[agents.claude.artifacts.linux-x86_64]
+url = "https://example.com/claude-1.2.3-linux-x86_64"
+sha256 = "<64 hexadecimal characters from the trusted release>"
+```
+
+Artifact keys follow the machine platform reported by Muster (for example,
+`linux-x86_64` or `macos-aarch64`). Legacy pins with `url` and `sha256` directly
+under `[agents.claude]` still work. No artifact for this platform means a warning,
+not an attempted install. You can also use `muster agents install [--agent claude]`
+without applying configuration.
+
+Interactive sync asks before installing a new pinned version and shows the old
+and new versions, URL and checksum. Without a terminal and without `--yes`, sync
+never changes agent binaries, even previously approved ones: it applies the rest and
+records approval needed. New hooks or MCP servers still refuse unattended sync
+as before. A failed download or checksum keeps the previous binary, lets the
+rest of sync continue and returns a partial-failure exit code (1). Check
+`muster status` for versions, skipped skills and pending approvals. Rollback
+restores managed files only; it never downgrades agent binaries.
+
 ## Quick start
 
 ```sh
@@ -151,7 +186,7 @@ Only admins add, update or remove skills.
 - **Recovery key.** Generated once at `muster init`, a recipient of every group, never stored on any machine.
 - **Deny-by-default agent access.** A secret reaches an agent only if its `allow` list grants that agent; otherwise the reference is omitted from generated configs with a warning. The MCP server never reveals values unless a secret is explicitly allowed for the calling client.
 - **Localhost-only UI.** `muster ui` listens on `127.0.0.1` on a random free port and requires a one-time login token from your terminal.
-- **No telemetry.** Muster collects no usage data and sends no telemetry. Its only network traffic is what you trigger: syncing with your Git remote, asking a subscribed skill upstream for updates, and `muster agents install` downloading the pinned agent CLIs.
+- **No telemetry.** Muster collects no usage data and sends no telemetry. Its only network traffic is what you trigger: syncing with your Git remote, asking a subscribed skill upstream for updates, and approved `muster sync` or manual `muster agents install` downloading pinned agent CLIs.
 
 ## Documentation
 
