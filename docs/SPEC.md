@@ -176,6 +176,29 @@ El mismo producto sirve a dos públicos:
   - Proveedores incluidos: nativo (por defecto) y `env`. Bitwarden, 1Password, Doppler e Infisical como adaptadores opcionales.
   - En el manifiesto se guardan **referencias** a secretos (`native://grupo/nombre`, `env://VAR`, `op://…`, `bws://…`), nunca valores.
   - **Aislamiento por agente (denegado por defecto):** cada secreto declara qué agentes pueden recibirlo en `[secrets."<referencia>"] allow = ["claude", "codex@mi-repo"]` del `muster.toml` del repo de configuración (o con `muster secret add <ruta> --allow <agente>`). `agente` concede en todas partes; `agente@proyecto` solo al aplicar ese proyecto (`--project DIR`, cuyo nombre de carpeta es `proyecto`). Un secreto sin `allow` no llega a ningún agente. Al generar la configuración de un agente, una referencia no permitida no se escribe (ni el valor ni la referencia): se omite esa clave de `env`/`headers` y se emite el aviso `secret_not_allowed_for_agent` con el agente y la referencia, nunca el valor; el resto de la configuración se aplica. El `muster.toml` de un proyecto no puede concederse secretos. La persona, desde la CLI (`muster secret get --reveal`), siempre puede leerlos. `muster secret list` muestra la lista `allow` de cada secreto.
+- **Aprobación de secretos en ejecución:** `[secrets."<referencia>"]` acepta
+  `approval = "none"` (predeterminado) o `"each"` y `approval_ttl = "15m"`.
+  Las duraciones admiten segundos, minutos y horas, positivas y hasta 24h.
+  Con `each`, `secret get --agent <id> --reveal` y MCP `secret_reveal`
+  comprueban el `allow` actual y exigen una aprobación vigente para esa
+  referencia y agente antes de resolver el valor. Sin aprobación, crean una
+  solicitud pendiente sin duplicados y devuelven exit 5 con
+  `secret_approval_required` y la sugerencia `muster secret approve <id>`.
+  `secret requests` lista solicitudes. `secret approve <id> [--ttl 5m]`
+  exige terminal real, incluso con `--yes`; el TTL opcional sustituye
+  `approval_ttl` y también tiene un máximo de 24h. El panel permite aprobar con sesión y confirmación.
+  `secret deny <id>`, `secret leases` y `secret revoke <id>|--all`
+  permiten denegar, consultar y revocar. MCP no ofrece estas mutaciones.
+  Una aprobación permite varios usos hasta caducar o revocarse. Las solicitudes
+  y aprobaciones viven solo en `<state>/secret-leases.json`, con permisos 0600,
+  sustitución atómica y bloqueo entre procesos. Guarda referencias, agentes y
+  fechas Unix en segundos, nunca valores; elimina aprobaciones caducadas al leer.
+  Solicitar, aprobar, revelar, denegar y revocar dejan auditoría local con actor.
+  Sin `--agent`, la CLI humana conserva su confirmación habitual.
+  El agente declarado por CLI o MCP es autodeclarado: evita entregas por error
+  y permite trazabilidad, pero no protege frente a procesos maliciosos del
+  mismo usuario, que pueden leer la bóveda, modificar estado o disponer de TTY.
+  Revocar no retira valores ya entregados ni invalida la clave en el proveedor.
 - **Adaptadores de agente**
   - Uno por herramienta. Cada uno declara qué archivos y alcances gestiona, qué capacidades soporta (instrucciones, MCP, subagentes, skills, hooks, permisos, modelos), plataformas y versión mínima.
   - Traducen la configuración canónica al formato nativo.
@@ -400,7 +423,13 @@ Rendering:
   `ANTHROPIC_AUTH_TOKEN`) and model. With `api_key_helper = true`, authorized
   key references render as `apiKeyHelper` commands instead. The command resolves
   the key through `muster secret get` at runtime, including environment references,
-  using the original config repository. Apply removes previous plaintext keys;
+  using the original config repository and `--agent claude`. With approval
+  `each`, settings set `CLAUDE_CODE_API_KEY_HELPER_TTL_MS` to the smaller of
+  60 seconds and `approval_ttl`. Claude's documented default is five minutes
+  ([settings reference](https://code.claude.com/docs/en/settings-reference#apikeyhelper),
+  [environment variables](https://code.claude.com/docs/en/env-vars)). Cached
+  credentials may remain usable after expiry or revocation until Claude refreshes
+  them; this is not per-API-request authorization. Apply removes previous plaintext keys;
   revoking access removes the managed helper. Omitted or false retains the
   existing plaintext behavior. Doctor suggests the helper with an info diagnostic.
 - Codex: `model_providers.<id>`, top-level `model_provider` and model;
@@ -409,6 +438,12 @@ Rendering:
   emit `provider_kind_unsupported` and are not rendered. Environment references
   use `env_key`; other resolved keys use `experimental_bearer_token`.
 - OpenCode: `provider.<id>` with SDK kind, URL, key and provider/model selection.
+  `env://VAR` renders `options.apiKey = "{env:VAR}"`, as documented in
+  [config variables](https://opencode.ai/docs/config/#env-vars) and
+  [providers](https://opencode.ai/docs/providers/). Export the variable in
+  OpenCode's environment. Other key schemes still write resolved values;
+  doctor suggests `env://` for those providers. Environment substitution does
+  not call Muster or enforce approval leases.
 - Antigravity, Pi and Hermes: no AI provider capability; `unsupported_feature`
   only if the adapter is actually selected for a provider.
 

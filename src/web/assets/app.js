@@ -197,7 +197,9 @@ const views = {
   },
 
   async secrets(token) {
-    const data = await api("secrets");
+    const [data, requests, leases] = await Promise.all([
+      api("secrets"), api("secret/requests"), api("secret/leases"),
+    ]);
     if (token !== undefined && token !== navToken) return;
     const secrets = Array.isArray(data.result) ? data.result : [];
     render("Secrets", [button("New secret", () => openSecretEdit(), "primary")],
@@ -207,7 +209,17 @@ const views = {
           (s.readers || []).map((r) => r.machine || r.recipient).join(", "),
           el("div", { class: "actions" }, button("Reveal…", () => openReveal(s.reference)),
             button("Change value", () => openSecretEdit(s.reference)))])),
-      diagnostics(data));
+      el("h2", {}, "Secret approvals"),
+      el("p", {}, "Approve access for the configured duration. Revoking prevents new reveals; agents may retain keys already received."),
+      table(["Pending reference", "Agent", "Requested", ""],
+        (requests.result || []).map((r) => [r.reference, r.agent, new Date(r.requested_at * 1000).toISOString(),
+          el("div", { class: "actions" },
+            button("Approve", () => secretApproval("approve", r.id)),
+            button("Deny", () => secretApproval("deny", r.id)))])),
+      table(["Approved reference", "Agent", "Expires", ""],
+        (leases.result || []).map((l) => [l.reference, l.agent, new Date(l.expires_at * 1000).toISOString(),
+          button("Revoke", () => secretApproval("revoke", l.id))])),
+      diagnostics(data), diagnostics(requests), diagnostics(leases));
   },
 
   async skills(token) {
@@ -782,3 +794,11 @@ function openMcpEdit(server) {
 }
 
 show("dashboard");
+
+
+async function secretApproval(action, id) {
+  if (!confirm(`${action === "approve" ? "Approve secret use" : action === "deny" ? "Deny secret request" : "Revoke secret approval"}?`)) return;
+  const data = await api("secret/" + action, { id, confirm: true });
+  if (!data.ok) { alert((data.diagnostics || []).map((d) => d.message).join("\n") || data.error || "Action failed"); return; }
+  await show("secrets");
+}

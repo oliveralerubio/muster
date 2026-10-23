@@ -84,6 +84,11 @@ const ROUTES: &[Route] = &[
     post("provider/use", "provider.use"),
     get("profile", "profile.show"),
     get("secrets", "secret.list"),
+    get("secret/requests", "secret.requests"),
+    get("secret/leases", "secret.leases"),
+    post("secret/approve", "secret.approve"),
+    post("secret/deny", "secret.deny"),
+    post("secret/revoke", "secret.revoke"),
     get("plan", "plan"),
     get("proposals", "proposal.list"),
     get("mcp-servers", "mcp-server.list"),
@@ -356,6 +361,7 @@ impl Ui {
             quiet: true,
             verbose: false,
             audit_actor: None,
+            web_approval: flags.confirm,
         };
         let (envelope, code) = crate::cli::execute(spec, globals, &typed, false);
         // A command that ran but reported problems (e.g. doctor) keeps its result.
@@ -425,6 +431,7 @@ impl Ui {
             quiet: true,
             verbose: false,
             audit_actor: None,
+            web_approval: false,
         };
         let (envelope, code) = crate::cli::execute_with(spec, globals, false, |ctx| {
             if route == "secret/add" {

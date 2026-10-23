@@ -358,6 +358,25 @@ fn check_permissions(ctx: &Context, repairs: &mut Vec<Repair>) -> Check {
                 ),
         );
     }
+    let leases = ctx.state_dir.join(crate::secret_leases::FILE);
+    if leases.is_file() {
+        expect_mode(&leases, 0o600, &mut diags, repairs);
+    }
+    match crate::secret_leases::Store::open(&ctx.state_dir) {
+        Ok(store) if !store.data.requests.is_empty() => diags.push(
+            Diagnostic::new(
+                Severity::Info,
+                "secret_requests_pending",
+                format!(
+                    "{} secret requests await approval",
+                    store.data.requests.len()
+                ),
+            )
+            .with_suggestion("muster secret requests"),
+        ),
+        Err(err) => diags.push(err.to_diagnostic()),
+        _ => {}
+    }
     // Agent files holding resolved secrets (from the last generation).
     for path in engine::private_files(&ctx.state_dir).unwrap_or_default() {
         if path.is_file() {
@@ -852,6 +871,22 @@ fn check_ai_providers(ctx: &Context, manifest: &Manifest) -> Check {
                 .with_suggestion(format!(
                     "set providers.{id}.api_key_helper = true to resolve the key at runtime"
                 )),
+            );
+        }
+        if agent == "opencode"
+            && ai_provider
+                .key
+                .as_deref()
+                .is_some_and(|key| !key.starts_with("env://"))
+        {
+            diagnostics.push(
+                Diagnostic::new(
+                    Severity::Info,
+                    "provider_plaintext_key",
+                    format!("OpenCode stores provider `{id}` credentials in plaintext settings"),
+                )
+                .with_path(format!("providers.{id}"))
+                .with_suggestion("use an env:// reference and export it in OpenCode's environment"),
             );
         }
         if ai_provider.key.is_some()

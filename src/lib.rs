@@ -21,6 +21,7 @@ pub mod mcp;
 pub mod output;
 pub mod providers;
 pub mod registry;
+pub mod secret_leases;
 pub mod secrets;
 pub mod skills;
 pub mod team;

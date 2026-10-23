@@ -462,7 +462,36 @@ async function testProvidersViewListsReferencesAndAddsAndRemoves() {
   setResponder();
 }
 
+async function testSecretApprovalsRequireConfirmationAndRefresh() {
+  setResponder((call) => ({ ok: true, diagnostics: [], result:
+    call.path === "secret/requests" ? [{ id: "request-1", reference: "native://app/key", agent: "claude", requested_at: 100 }] :
+    call.path === "secret/leases" ? [{ id: "lease-1", reference: "native://app/key", agent: "claude", expires_at: 200 }] : [] }));
+  await sandbox.show("secrets");
+  assert.ok(liveButton("Approve"));
+  assert.ok(liveButton("Deny"));
+  assert.ok(liveButton("Revoke"));
+  const previousConfirm = sandbox.confirm;
+  sandbox.confirm = () => false;
+  const canceled = baseline();
+  liveButton("Approve").fire("click");
+  await flush();
+  assert.equal(callSince(canceled, "secret/approve"), undefined);
+  sandbox.confirm = previousConfirm;
+  for (const [label, action, id] of [["Approve", "approve", "request-1"], ["Deny", "deny", "request-1"], ["Revoke", "revoke", "lease-1"]]) {
+    const mark = baseline();
+    liveButton(label).fire("click");
+    await flush();
+    const posted = callSince(mark, "secret/" + action);
+    assert.ok(posted);
+    assert.deepEqual(posted.body, { id, confirm: true });
+    assert.ok(callSince(mark, "secret/requests"));
+    assert.ok(callSince(mark, "secret/leases"));
+  }
+  setResponder();
+}
+
 const tests = {
+  testSecretApprovalsRequireConfirmationAndRefresh,
   testProvidersViewListsReferencesAndAddsAndRemoves,
   testProfileSaveIsGatedOnPreview,
   testMcpFormUsesJsonArrayValues,

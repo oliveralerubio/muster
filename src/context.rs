@@ -18,6 +18,7 @@ pub struct Globals {
     pub quiet: bool,
     pub verbose: bool,
     pub audit_actor: Option<String>,
+    pub web_approval: bool,
 }
 
 pub struct Context {
@@ -31,6 +32,7 @@ pub struct Context {
     pub quiet: bool,
     pub verbose: bool,
     pub audit_actor: Option<String>,
+    pub web_approval: bool,
     pub is_tty: bool,
     diagnostics: Vec<Diagnostic>,
     failed: bool,
@@ -52,6 +54,7 @@ impl Context {
             quiet: globals.quiet,
             verbose: globals.verbose,
             audit_actor: globals.audit_actor,
+            web_approval: globals.web_approval,
             is_tty: std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
             diagnostics: Vec::new(),
             failed: false,
@@ -189,6 +192,7 @@ mod tests {
             quiet: false,
             verbose: false,
             audit_actor: None,
+            web_approval: false,
             is_tty: false,
             diagnostics: Vec::new(),
             failed: false,

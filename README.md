@@ -199,7 +199,16 @@ wire format is `chat` for `openai`, `openai-compatible` and `ollama`; verify
 compatibility with your installed Codex release. The installed CLI help does
 not document this mapping. Keys are protected in the repository, but resolved
 keys can live in the agent's configuration on each machine, like MCP secrets.
-For Codex `env://` keys, the named variable must also be in Codex's environment.
+Codex and OpenCode `env://` keys keep environment references in settings;
+export the variable in the agent's environment.
+
+Claude providers can use `api_key_helper = true` to resolve keys at runtime.
+Set `approval = "each"` and `approval_ttl = "15m"` on the secret to require a
+human lease for the helper or MCP. Review `muster secret requests`, approve
+from a terminal or the panel, and revoke with `muster secret revoke <id>`.
+`--yes` alone cannot approve without a terminal. Delivered keys may remain
+cached after revocation. See [runtime secret approvals](docs/agents/muster-for-agents.md#runtime-secret-approvals)
+for the commands and trust limits.
 
 **Subscription logins are one command per agent per machine**, not synced
 credentials: run `muster provider login claude` or `muster provider login codex`

@@ -94,7 +94,9 @@ fn render(desired: &Desired, current: &Current, plan: &mut RenderPlan) -> Result
         if let Some(url) = provider.base_url {
             options.insert("baseURL".into(), url.into());
         }
-        if let Some(key) = provider.key {
+        if let Some(var) = provider.env_key {
+            options.insert("apiKey".into(), format!("{{env:{var}}}").into());
+        } else if let Some(key) = provider.key {
             options.insert("apiKey".into(), key.expose().into());
         }
         if let Some(model) = provider.default_model {

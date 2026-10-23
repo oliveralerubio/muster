@@ -1058,3 +1058,33 @@ fn doctor_suggests_runtime_helper_only_for_plaintext_claude_provider() {
         assert!(!String::from_utf8_lossy(&output.stdout).contains("doctor-test-value"));
     }
 }
+
+#[test]
+fn opencode_env_key_is_a_runtime_reference_and_doctor_suggests_it_for_native_keys() {
+    let env = MusterEnv::new();
+    let config = "version = 1\n[agents]\nenabled = ['opencode']\n[agents.providers]\nopencode = 'gateway'\n[providers.gateway]\nkind = 'openai-compatible'\nkey = 'env://MUSTER_OPENCODE_KEY'\n[secrets.'env://MUSTER_OPENCODE_KEY']\nallow = ['opencode']\n";
+    seed(&env, config);
+    env.run(&["agents", "apply", "--yes"])
+        .env("MUSTER_OPENCODE_KEY", "opencode-private-key-value")
+        .assert()
+        .success();
+    let text = std::fs::read_to_string(env.path().join(".config/opencode/opencode.json")).unwrap();
+    assert!(!text.contains("opencode-private-key-value"));
+    let settings: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        settings["provider"]["gateway"]["options"]["apiKey"],
+        "{env:MUSTER_OPENCODE_KEY}"
+    );
+    seed(
+        &env,
+        &config.replace("env://MUSTER_OPENCODE_KEY", "native://app/key"),
+    );
+    let (_, doctor) = env.run_json(&["doctor", "--offline", "--format", "json"]);
+    assert!(doctor
+        .diagnostics()
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|d| d["code"] == "provider_plaintext_key"
+            && d["suggestion"].as_str().unwrap().contains("env://")));
+}

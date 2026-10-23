@@ -106,12 +106,23 @@ fn render_settings(
         })
     {
         object.remove("apiKeyHelper");
+        if let Some(env) = object.get_mut("env").and_then(Value::as_object_mut) {
+            env.remove("CLAUDE_CODE_API_KEY_HELPER_TTL_MS");
+        }
     }
 
     if let Some(provider) = super::selected_ai_provider(desired, &ADAPTER, plan) {
         let env = child_object(&mut object, "env");
         if let Some(url) = provider.base_url {
             env.insert("ANTHROPIC_BASE_URL".into(), url.into());
+        }
+        if let Some(reference) = provider.helper_reference {
+            if let Some(ttl) = desired.access.approval_ttl(reference) {
+                env.insert(
+                    "CLAUDE_CODE_API_KEY_HELPER_TTL_MS".into(),
+                    (ttl.min(60) * 1000).to_string().into(),
+                );
+            }
         }
         if provider.helper_reference.is_some() {
             env.remove("ANTHROPIC_AUTH_TOKEN");
@@ -242,7 +253,9 @@ fn api_key_helper(reference: &str, config_dir: &std::path::Path) -> String {
     // External references may contain spaces, quotes or shell metacharacters.
     let quoted = format!("'{}'", reference.replace('\'', "'\\''"));
     let config = format!("'{}'", config_dir.to_string_lossy().replace('\'', "'\\''"));
-    format!("muster secret get {quoted} --reveal --yes --format text --config {config}")
+    format!(
+        "muster secret get {quoted} --reveal --yes --format text --config {config} --agent claude"
+    )
 }
 
 #[cfg(test)]

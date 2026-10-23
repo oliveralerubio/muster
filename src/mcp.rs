@@ -96,7 +96,7 @@ const TOOLS: &[Tool] = &[
     Tool {
         name: "secret_reveal",
         command: "secret.get",
-        hidden: &["reveal"],
+        hidden: &["reveal", "agent"],
         forced: &["reveal"],
     },
 ];
