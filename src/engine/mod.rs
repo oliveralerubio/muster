@@ -170,7 +170,13 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
     let subagents = read_subagents(ctx, &merged)?;
     let mut secrets = resolve_secrets(ctx, &merged.mcp);
     let mut secret_providers = Providers::new(&ctx.config_dir, &ctx.state_dir);
-    for ai_provider in merged.ai_providers.values() {
+    for (id, ai_provider) in &merged.ai_providers {
+        let needs_key = merged.agents.ai_providers.iter().any(|(agent, selected)| {
+            selected == id && (agent != "claude" || ai_provider.api_key_helper != Some(true))
+        });
+        if !needs_key {
+            continue;
+        }
         if let Some(reference) = &ai_provider.key {
             if !secrets.contains_key(reference) {
                 // The adapter reports an unresolved reference without exposing
@@ -188,7 +194,10 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
         Target::Project(dir) => dir.file_name().map(|n| n.to_string_lossy().into_owned()),
     };
     let access = crate::secrets::SecretAccess::new(manifest.secrets.clone(), project);
+    let config_dir = std::path::absolute(&ctx.config_dir)
+        .map_err(|e| MusterError::Operational(format!("resolve config path: {e}")))?;
     let desired = Desired {
+        config_dir: &config_dir,
         agents: &merged.agents,
         ai_providers: &merged.ai_providers,
         mcp: &merged.mcp,
@@ -347,8 +356,32 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
         }
     }
 
+    // Native credentials can predate Muster ownership. Keep them out of diffs
+    // even when runtime helpers deliberately skip provider resolution.
+    for entry in entries.values() {
+        if entry.agents.contains(&"claude") && entry.path.ends_with(".claude/settings.json") {
+            if let Some(before) = entry
+                .before
+                .as_deref()
+                .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            {
+                for key in ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"] {
+                    if let Some(value) = before["env"][key]
+                        .as_str()
+                        .filter(|value| !value.is_empty())
+                    {
+                        secrets.insert(
+                            format!("claude-settings://{key}"),
+                            SecretValue::new(value.to_owned()),
+                        );
+                    }
+                }
+            }
+        }
+    }
     for entry in entries.values_mut() {
-        entry.private |= holds_secret(entry.after.as_deref(), &secrets);
+        entry.private |= holds_secret(entry.before.as_deref(), &secrets)
+            || holds_secret(entry.after.as_deref(), &secrets);
         if entry.drift {
             ctx.diag(
                 Diagnostic::new(

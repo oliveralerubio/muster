@@ -1030,3 +1030,31 @@ fn profile_provider_first_declaration_requires_kind_even_before_assignment() {
         .assert()
         .code(3);
 }
+
+#[test]
+fn doctor_suggests_runtime_helper_only_for_plaintext_claude_provider() {
+    for helper in [false, true] {
+        let env = MusterEnv::new();
+        seed(&env, &format!("version = 1\n[agents]\nenabled = ['claude']\n[agents.providers]\nclaude = 'gateway'\n[providers.gateway]\nkind = 'anthropic'\nkey = 'env://MUSTER_DOCTOR_RUNTIME_KEY'\napi_key_helper = {helper}\n[secrets.'env://MUSTER_DOCTOR_RUNTIME_KEY']\nallow = ['claude']\n"));
+        let output = env
+            .run(&["doctor", "--offline", "--format", "json"])
+            .env("MUSTER_DOCTOR_RUNTIME_KEY", "doctor-test-value")
+            .output()
+            .unwrap();
+        let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let suggestion = envelope["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["code"] == "provider_plaintext_key");
+        assert_eq!(suggestion.is_some(), !helper);
+        if let Some(diagnostic) = suggestion {
+            assert_eq!(diagnostic["severity"], "info");
+            assert!(diagnostic["suggestion"]
+                .as_str()
+                .unwrap()
+                .contains("api_key_helper = true"));
+        }
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("doctor-test-value"));
+    }
+}

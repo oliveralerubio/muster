@@ -821,3 +821,186 @@ fn unparsable_native_file_fails_only_that_adapter_and_is_left_untouched() {
     );
     assert!(env.path().join(".codex/config.toml").is_file());
 }
+
+#[test]
+fn claude_runtime_helper_removes_plaintext_and_defers_env_resolution() {
+    let env = MusterEnv::new();
+    std::fs::create_dir_all(env.config_dir()).unwrap();
+    std::fs::write(
+        env.config_dir().join("muster.toml"),
+        r#"
+version = 1
+[agents]
+enabled = ["claude"]
+[agents.providers]
+claude = "gateway"
+[providers.gateway]
+kind = "anthropic"
+key = "env://MUSTER_RUNTIME_KEY"
+api_key_helper = true
+[secrets."env://MUSTER_RUNTIME_KEY"]
+allow = ["claude"]
+"#,
+    )
+    .unwrap();
+    let path = env.path().join(".claude/settings.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, r#"{"env":{"ANTHROPIC_AUTH_TOKEN":"old-test-token","ANTHROPIC_API_KEY":"old-test-key","KEEP":"value"}}"#).unwrap();
+    for args in [
+        vec!["plan", "--format", "json"],
+        vec!["agents", "apply", "--yes", "--format", "json"],
+    ] {
+        let output = env
+            .run(&args)
+            .env_remove("MUSTER_RUNTIME_KEY")
+            .assert()
+            .success()
+            .get_output()
+            .clone();
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("old-test-"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("old-test-"));
+    }
+    let text = std::fs::read_to_string(&path).unwrap();
+    let settings: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        settings["apiKeyHelper"],
+        format!("muster secret get 'env://MUSTER_RUNTIME_KEY' --reveal --yes --format text --config '{}'", env.config_dir().display())
+    );
+    assert!(settings["env"].get("ANTHROPIC_AUTH_TOKEN").is_none());
+    assert!(settings["env"].get("ANTHROPIC_API_KEY").is_none());
+    assert_eq!(settings["env"]["KEEP"], "value");
+    assert!(!text.contains("old-test-"));
+
+    env.run(&[
+        "secret",
+        "get",
+        "env://MUSTER_RUNTIME_KEY",
+        "--reveal",
+        "--yes",
+        "--format",
+        "text",
+    ])
+    .env("MUSTER_RUNTIME_KEY", "runtime-test-value")
+    .assert()
+    .success()
+    .stdout("runtime-test-value\n");
+    let manifest_path = env.config_dir().join("muster.toml");
+    let manifest = std::fs::read_to_string(&manifest_path).unwrap();
+    std::fs::write(
+        &manifest_path,
+        manifest.replace("allow = [\"claude\"]", "allow = []"),
+    )
+    .unwrap();
+    env.run(&["agents", "apply", "--yes"]).assert().success();
+    let settings: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert!(settings.get("apiKeyHelper").is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_helper_command_uses_the_original_config_repository() {
+    let env = MusterEnv::new();
+    let config = env.path().join("custom config's vault");
+    let config_arg = config.to_str().unwrap();
+    env.run(&[
+        "init",
+        "--config",
+        config_arg,
+        "--machine",
+        "helper-test",
+        "--yes",
+    ])
+    .assert()
+    .success();
+    env.run(&[
+        "secret",
+        "add",
+        "app/key",
+        "--config",
+        config_arg,
+        "--value-stdin",
+        "--yes",
+    ])
+    .write_stdin("runtime-native-value")
+    .assert()
+    .success();
+    let manifest_path = config.join("muster.toml");
+    let mut manifest = std::fs::read_to_string(&manifest_path).unwrap();
+    manifest.push_str(
+        r#"
+[agents]
+enabled = ["claude"]
+[agents.providers]
+claude = "gateway"
+[providers.gateway]
+kind = "anthropic"
+key = "native://app/key"
+api_key_helper = true
+[secrets."native://app/key"]
+allow = ["claude"]
+"#,
+    );
+    std::fs::write(&manifest_path, manifest).unwrap();
+    env.run(&["agents", "apply", "--config", config_arg, "--yes"])
+        .assert()
+        .success();
+    let settings: Value = serde_json::from_str(
+        &std::fs::read_to_string(env.path().join(".claude/settings.json")).unwrap(),
+    )
+    .unwrap();
+    let helper = settings["apiKeyHelper"].as_str().unwrap();
+    std::os::unix::fs::symlink(
+        assert_cmd::cargo::cargo_bin("muster"),
+        env.bin.join("muster"),
+    )
+    .unwrap();
+    let output = std::process::Command::new("sh")
+        .args(["-c", helper])
+        .env(
+            "PATH",
+            format!("{}:{}", env.bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .env("HOME", env.path())
+        .env("XDG_STATE_HOME", env.path().join(".local/state"))
+        .env("MUSTER_CONFIG", env.config_dir())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"runtime-native-value\n");
+}
+
+#[test]
+fn claude_default_provider_preserves_a_custom_helper() {
+    let env = MusterEnv::new();
+    std::fs::create_dir_all(env.config_dir()).unwrap();
+    std::fs::write(
+        env.config_dir().join("muster.toml"),
+        r#"
+version = 1
+[agents]
+enabled = ["claude"]
+[agents.providers]
+claude = "gateway"
+[providers.gateway]
+kind = "anthropic"
+key = "env://MUSTER_RUNTIME_KEY"
+[secrets."env://MUSTER_RUNTIME_KEY"]
+allow = ["claude"]
+"#,
+    )
+    .unwrap();
+    let path = env.path().join(".claude/settings.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, r#"{"apiKeyHelper":"custom-credential-helper"}"#).unwrap();
+    env.run(&["agents", "apply", "--yes"])
+        .env("MUSTER_RUNTIME_KEY", "static-test-value")
+        .assert()
+        .success();
+    let settings: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    assert_eq!(settings["apiKeyHelper"], "custom-credential-helper");
+    assert_eq!(settings["env"]["ANTHROPIC_AUTH_TOKEN"], "static-test-value");
+}

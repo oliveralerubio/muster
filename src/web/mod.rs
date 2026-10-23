@@ -355,6 +355,7 @@ impl Ui {
             dry_run: flags.dry_run,
             quiet: true,
             verbose: false,
+            audit_actor: None,
         };
         let (envelope, code) = crate::cli::execute(spec, globals, &typed, false);
         // A command that ran but reported problems (e.g. doctor) keeps its result.
@@ -423,6 +424,7 @@ impl Ui {
             dry_run: flags.dry_run,
             quiet: true,
             verbose: false,
+            audit_actor: None,
         };
         let (envelope, code) = crate::cli::execute_with(spec, globals, false, |ctx| {
             if route == "secret/add" {

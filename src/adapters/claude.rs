@@ -96,14 +96,34 @@ fn render_settings(
     plan: &mut RenderPlan,
 ) -> Result<(), MusterError> {
     let mut object = json_object(current, SETTINGS.path)?;
+    // Rebuild our helper only after access checks, including after revocation.
+    if object
+        .get("apiKeyHelper")
+        .and_then(Value::as_str)
+        .is_some_and(|command| {
+            command.starts_with("muster secret get ")
+                && command.contains(" --reveal --yes --format text --config ")
+        })
+    {
+        object.remove("apiKeyHelper");
+    }
 
     if let Some(provider) = super::selected_ai_provider(desired, &ADAPTER, plan) {
         let env = child_object(&mut object, "env");
         if let Some(url) = provider.base_url {
             env.insert("ANTHROPIC_BASE_URL".into(), url.into());
         }
-        if let Some(key) = provider.key {
+        if provider.helper_reference.is_some() {
+            env.remove("ANTHROPIC_AUTH_TOKEN");
+            env.remove("ANTHROPIC_API_KEY");
+        } else if let Some(key) = provider.key {
             env.insert("ANTHROPIC_AUTH_TOKEN".into(), key.expose().into());
+        }
+        if let Some(reference) = provider.helper_reference {
+            object.insert(
+                "apiKeyHelper".into(),
+                api_key_helper(reference, desired.config_dir).into(),
+            );
         }
         if let Some(model) = provider.default_model {
             object.insert("model".into(), model.into());
@@ -216,4 +236,32 @@ fn render_instructions(desired: &Desired, current: &Current, plan: &mut RenderPl
         file: &INSTRUCTIONS,
         contents: markdown_block(current.get(INSTRUCTIONS.path), "@AGENTS.md"),
     });
+}
+
+fn api_key_helper(reference: &str, config_dir: &std::path::Path) -> String {
+    // External references may contain spaces, quotes or shell metacharacters.
+    let quoted = format!("'{}'", reference.replace('\'', "'\\''"));
+    let config = format!("'{}'", config_dir.to_string_lossy().replace('\'', "'\\''"));
+    format!("muster secret get {quoted} --reveal --yes --format text --config {config}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::api_key_helper;
+
+    #[cfg(unix)]
+    #[test]
+    fn helper_quotes_external_references_as_one_literal_argument() {
+        let reference = "op://vault/it's $(exit 7); a key/token";
+        let command = format!(
+            "muster() {{ printf '%s' \"$3\"; }}; {}",
+            api_key_helper(reference, std::path::Path::new("/config with spaces"))
+        );
+        let output = std::process::Command::new("sh")
+            .args(["-c", &command])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), reference);
+    }
 }

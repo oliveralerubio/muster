@@ -710,6 +710,17 @@ fn secret_reveal_succeeds_for_a_client_in_the_secret_allow_list() {
     let envelope = envelope_of(&result);
     assert_eq!(result["isError"], json!(false), "{envelope}");
     assert_eq!(envelope["result"], json!(REVEAL_VALUE));
+    let history =
+        std::fs::read_to_string(env.path().join(".local/state/muster/history.jsonl")).unwrap();
+    let reveals: Vec<Value> = history
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|event| event["action"] == "secret.reveal")
+        .collect();
+    assert_eq!(reveals.len(), 1);
+    assert_eq!(reveals[0]["actor"], "claude");
+    assert_eq!(reveals[0]["subject"], "native://ci/deploy_token");
+    assert!(!history.contains(REVEAL_VALUE));
 }
 
 #[test]

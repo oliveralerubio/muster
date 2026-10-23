@@ -836,6 +836,24 @@ fn check_ai_providers(ctx: &Context, manifest: &Manifest) -> Check {
         let Some(ai_provider) = merged.ai_providers.get(id) else {
             continue;
         };
+        if agent == "claude"
+            && ai_provider.key.is_some()
+            && ai_provider.api_key_helper != Some(true)
+            && adapters::find(agent)
+                .is_some_and(|adapter| adapter.supports_ai_provider(ai_provider.kind))
+        {
+            diagnostics.push(
+                Diagnostic::new(
+                    Severity::Info,
+                    "provider_plaintext_key",
+                    format!("Claude Code stores provider `{id}` credentials in plaintext settings"),
+                )
+                .with_path(format!("providers.{id}"))
+                .with_suggestion(format!(
+                    "set providers.{id}.api_key_helper = true to resolve the key at runtime"
+                )),
+            );
+        }
         if ai_provider.key.is_some()
             || !matches!(
                 (agent.as_str(), ai_provider.kind),

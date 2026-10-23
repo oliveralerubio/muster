@@ -15,10 +15,34 @@ const FILE: &str = "history.jsonl";
 /// Append an event `{at, action, subject}`. Failing to record is an
 /// error: callers must not perform the audited action without its record.
 pub fn record(state_dir: &Path, action: &str, subject: &str) -> Result<(), MusterError> {
+    record_event(
+        state_dir,
+        action,
+        subject,
+        crate::machine::load_name(state_dir).as_deref(),
+    )
+}
+
+/// Append an event attributed to the calling agent, without secret values.
+pub fn record_with_actor(
+    state_dir: &Path,
+    action: &str,
+    subject: &str,
+    actor: &str,
+) -> Result<(), MusterError> {
+    record_event(state_dir, action, subject, Some(actor))
+}
+
+fn record_event(
+    state_dir: &Path,
+    action: &str,
+    subject: &str,
+    actor: Option<&str>,
+) -> Result<(), MusterError> {
     let at = time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_default();
-    let line = json!({ "at": at, "action": action, "subject": subject, "actor": crate::machine::load_name(state_dir) });
+    let line = json!({ "at": at, "action": action, "subject": subject, "actor": actor });
     let path = state_dir.join(FILE);
     let io = |e: std::io::Error| MusterError::Operational(format!("{}: {e}", path.display()));
     std::fs::create_dir_all(state_dir).map_err(io)?;

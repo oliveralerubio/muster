@@ -172,6 +172,7 @@ pub fn explain(layers: &[Layer]) -> serde_json::Value {
                 ("base_url", provider.base_url.is_some()),
                 ("default_model", provider.default_model.is_some()),
                 ("key", provider.key.is_some()),
+                ("api_key_helper", provider.api_key_helper.is_some()),
             ] {
                 if present {
                     fields.insert(field, source.clone());

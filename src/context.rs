@@ -17,6 +17,7 @@ pub struct Globals {
     pub dry_run: bool,
     pub quiet: bool,
     pub verbose: bool,
+    pub audit_actor: Option<String>,
 }
 
 pub struct Context {
@@ -29,6 +30,7 @@ pub struct Context {
     pub dry_run: bool,
     pub quiet: bool,
     pub verbose: bool,
+    pub audit_actor: Option<String>,
     pub is_tty: bool,
     diagnostics: Vec<Diagnostic>,
     failed: bool,
@@ -49,6 +51,7 @@ impl Context {
             dry_run: globals.dry_run,
             quiet: globals.quiet,
             verbose: globals.verbose,
+            audit_actor: globals.audit_actor,
             is_tty: std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
             diagnostics: Vec::new(),
             failed: false,
@@ -185,6 +188,7 @@ mod tests {
             dry_run: false,
             quiet: false,
             verbose: false,
+            audit_actor: None,
             is_tty: false,
             diagnostics: Vec::new(),
             failed: false,

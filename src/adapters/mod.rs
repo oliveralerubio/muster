@@ -107,6 +107,8 @@ impl Capability {
 /// calls a provider).
 #[derive(Debug, Clone, Copy)]
 pub struct Desired<'a> {
+    /// Absolute config repository path used by runtime secret helpers.
+    pub config_dir: &'a std::path::Path,
     pub agents: &'a AgentsConfig,
     pub ai_providers: &'a BTreeMap<String, config::AiProvider>,
     pub mcp: &'a BTreeMap<String, McpServer>,
@@ -559,6 +561,7 @@ struct ResolvedAiProvider<'a> {
     base_url: Option<&'a str>,
     key: Option<&'a SecretValue>,
     env_key: Option<&'a str>,
+    helper_reference: Option<&'a str>,
     default_model: Option<&'a str>,
 }
 
@@ -585,10 +588,11 @@ fn selected_ai_provider<'a>(
         );
         return None;
     }
+    let runtime_helper = adapter.id == "claude" && provider.api_key_helper == Some(true);
     if let Some(reference) = &provider.key {
         let code = if !desired.access.allows(adapter.id, reference) {
             Some("secret_not_allowed_for_agent")
-        } else if !desired.secrets.contains_key(reference) {
+        } else if !runtime_helper && !desired.secrets.contains_key(reference) {
             Some("secret_reference_unresolved")
         } else {
             None
@@ -620,6 +624,7 @@ fn selected_ai_provider<'a>(
             .key
             .as_deref()
             .and_then(|key| key.strip_prefix("env://")),
+        helper_reference: runtime_helper.then_some(provider.key.as_deref()).flatten(),
         default_model: provider.default_model.as_deref(),
     })
 }
