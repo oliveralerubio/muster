@@ -50,6 +50,14 @@ _Avoid_: threshold
 The deny-by-default rule that decides which agents may receive a secret: `[secrets."<reference>"] allow` in `muster.toml`, with `agent` for everywhere or `agent@project` for one project. Without an entry, no agent receives it.
 _Avoid_: whitelist
 
+**Secret request**:
+A pending request for a named agent to use a secret whose policy requires human
+approval. Stored locally with the reference and agent, never the value.
+
+**Lease**:
+A local human approval for one secret reference and agent, reusable until its
+expiry or revocation. It does not invalidate credentials already delivered.
+
 ### Agents and skills
 
 **Adapter**:

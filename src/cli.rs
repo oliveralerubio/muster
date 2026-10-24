@@ -199,6 +199,7 @@ fn globals(m: &ArgMatches) -> Globals {
         quiet: m.get_flag("quiet"),
         verbose: m.get_flag("verbose"),
         audit_actor: None,
+        web_approval: false,
     }
 }
 

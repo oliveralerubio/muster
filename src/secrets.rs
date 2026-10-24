@@ -199,6 +199,16 @@ impl SecretAccess {
         Self { policies, project }
     }
 
+    pub fn approval_ttl(&self, reference: &str) -> Option<i64> {
+        let policy = self.policies.get(reference)?;
+        (policy.approval == crate::manifest::SecretApproval::Each)
+            .then(|| {
+                crate::secret_leases::parse_ttl(policy.approval_ttl.as_deref().unwrap_or("15m"))
+                    .ok()
+            })
+            .flatten()
+    }
+
     /// Whether `agent` may receive the secret behind `reference`.
     pub fn allows(&self, agent: &str, reference: &str) -> bool {
         self.policies

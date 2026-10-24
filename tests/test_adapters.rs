@@ -864,7 +864,7 @@ allow = ["claude"]
     let settings: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(
         settings["apiKeyHelper"],
-        format!("muster secret get 'env://MUSTER_RUNTIME_KEY' --reveal --yes --format text --config '{}'", env.config_dir().display())
+        format!("muster secret get 'env://MUSTER_RUNTIME_KEY' --reveal --yes --format text --config '{}' --agent claude", env.config_dir().display())
     );
     assert!(settings["env"].get("ANTHROPIC_AUTH_TOKEN").is_none());
     assert!(settings["env"].get("ANTHROPIC_API_KEY").is_none());
@@ -1003,4 +1003,55 @@ allow = ["claude"]
     let settings: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     assert_eq!(settings["apiKeyHelper"], "custom-credential-helper");
     assert_eq!(settings["env"]["ANTHROPIC_AUTH_TOKEN"], "static-test-value");
+}
+
+#[test]
+fn claude_approval_helper_has_a_short_cache_and_keeps_legacy_cleanup() {
+    let env = MusterEnv::new();
+    std::fs::create_dir_all(env.config_dir()).unwrap();
+    let manifest = env.config_dir().join("muster.toml");
+    let text = "version = 1\n[agents]\nenabled = ['claude']\n[agents.providers]\nclaude = 'gateway'\n[providers.gateway]\nkind = 'anthropic'\nkey = 'env://MUSTER_LEASE_HELPER_KEY'\napi_key_helper = true\n[secrets.'env://MUSTER_LEASE_HELPER_KEY']\nallow = ['claude']\napproval = 'each'\napproval_ttl = '30s'\n";
+    std::fs::write(&manifest, text).unwrap();
+    let settings_path = env.path().join(".claude/settings.json");
+    std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+    // A phase-one command must still be recognized as managed.
+    std::fs::write(&settings_path, r#"{"apiKeyHelper":"muster secret get 'env://OLD' --reveal --yes --format text --config '/old'"}"#).unwrap();
+    env.run(&["agents", "apply", "--yes"]).assert().success();
+    let settings: Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+    assert!(settings["apiKeyHelper"]
+        .as_str()
+        .unwrap()
+        .ends_with("--agent claude"));
+    assert_eq!(
+        settings["env"]["CLAUDE_CODE_API_KEY_HELPER_TTL_MS"],
+        "30000"
+    );
+    let denied = env
+        .run(&[
+            "secret",
+            "get",
+            "env://MUSTER_LEASE_HELPER_KEY",
+            "--agent",
+            "claude",
+            "--reveal",
+            "--yes",
+            "--format",
+            "json",
+        ])
+        .env("MUSTER_LEASE_HELPER_KEY", "helper-lease-private-value")
+        .output()
+        .unwrap();
+    assert_eq!(denied.status.code(), Some(5));
+    assert!(String::from_utf8_lossy(&denied.stdout).contains("secret_approval_required"));
+    assert!(!String::from_utf8_lossy(&denied.stdout).contains("helper-lease-private-value"));
+    assert!(!String::from_utf8_lossy(&denied.stderr).contains("helper-lease-private-value"));
+    std::fs::write(&manifest, text.replace("allow = ['claude']", "allow = []")).unwrap();
+    env.run(&["agents", "apply", "--yes"]).assert().success();
+    let settings: Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+    assert!(settings.get("apiKeyHelper").is_none());
+    assert!(settings["env"]
+        .get("CLAUDE_CODE_API_KEY_HELPER_TTL_MS")
+        .is_none());
 }

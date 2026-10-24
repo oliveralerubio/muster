@@ -99,6 +99,13 @@ pub const GET: CommandSpec = CommandSpec {
     about: "Resolve a secret reference; values require --reveal",
     params: &[
         ParamSpec {
+            name: "agent",
+            about: "Declared calling agent (checked at reveal time; not an identity boundary)",
+            kind: ParamKind::String,
+            required: false,
+            positional: false,
+        },
+        ParamSpec {
             name: "reference",
             about: "Secret reference (e.g. native://app/api, env://VAR, op://...)",
             kind: ParamKind::String,
@@ -175,6 +182,7 @@ pub(crate) fn add_with_value(
             format!("native://{group}/{name}"),
             SecretPolicy {
                 allow: allow.clone(),
+                ..Default::default()
             },
         );
         manifest.save(&ctx.config_dir)?;
@@ -310,6 +318,16 @@ fn rm(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
 fn get(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let reference = SecretRef::parse(required(params, "reference")?)?;
     let reveal = params.get_bool("reveal");
+    let actor = params
+        .get_string("agent")
+        .map(str::to_owned)
+        .or_else(|| ctx.audit_actor.clone());
+    // Check current policy before resolving any value, including MCP calls.
+    let _lease_guard = if let Some(agent) = actor.as_deref().filter(|_| reveal) {
+        crate::secret_leases::authorize(ctx, reference.as_str(), agent)?
+    } else {
+        None
+    };
     if reveal {
         ctx.confirm(&format!("Print the plaintext of {reference} on stdout?"))?;
     }
@@ -318,7 +336,7 @@ fn get(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     if reveal {
         // The one explicit reveal path: the value becomes the envelope result,
         // and only once the reveal is on record.
-        if let Some(actor) = &ctx.audit_actor {
+        if let Some(actor) = &actor {
             crate::audit::record_with_actor(
                 &ctx.state_dir,
                 "secret.reveal",
@@ -463,4 +481,158 @@ fn resolve_recipients(
         ));
     }
     Ok(recipients)
+}
+
+const REQUEST_ID: ParamSpec = ParamSpec {
+    name: "id",
+    about: "Secret request id",
+    kind: ParamKind::String,
+    required: true,
+    positional: true,
+};
+pub const REQUESTS: CommandSpec = CommandSpec {
+    name: "secret.requests",
+    about: "List pending secret approvals",
+    params: &[],
+    mutating: false,
+    handler: requests,
+};
+pub const LEASES: CommandSpec = CommandSpec {
+    name: "secret.leases",
+    about: "List active secret leases",
+    params: &[],
+    mutating: false,
+    handler: leases,
+};
+pub const APPROVE: CommandSpec = CommandSpec {
+    name: "secret.approve",
+    about: "Approve a secret request from a human terminal",
+    params: &[
+        REQUEST_ID,
+        ParamSpec {
+            name: "ttl",
+            about: "Approval duration, at most 24h (default approval_ttl or 15m)",
+            kind: ParamKind::String,
+            required: false,
+            positional: false,
+        },
+    ],
+    mutating: true,
+    handler: approve_request,
+};
+pub const DENY: CommandSpec = CommandSpec {
+    name: "secret.deny",
+    about: "Deny a pending secret request",
+    params: &[REQUEST_ID],
+    mutating: true,
+    handler: deny_request,
+};
+pub const REVOKE: CommandSpec = CommandSpec {
+    name: "secret.revoke",
+    about: "Revoke a secret lease or all leases",
+    params: &[
+        ParamSpec {
+            name: "id",
+            about: "Lease id",
+            kind: ParamKind::String,
+            required: false,
+            positional: true,
+        },
+        ParamSpec {
+            name: "all",
+            about: "Revoke all active leases",
+            kind: ParamKind::Bool,
+            required: false,
+            positional: false,
+        },
+    ],
+    mutating: true,
+    handler: revoke_lease,
+};
+
+fn requests(ctx: &mut Context, _: &Params) -> Result<Value, MusterError> {
+    Ok(json!(
+        crate::secret_leases::Store::open(&ctx.state_dir)?
+            .data
+            .requests
+    ))
+}
+fn leases(ctx: &mut Context, _: &Params) -> Result<Value, MusterError> {
+    Ok(json!(
+        crate::secret_leases::Store::open(&ctx.state_dir)?
+            .data
+            .leases
+    ))
+}
+fn approve_request(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
+    if !ctx.is_tty && !ctx.web_approval {
+        return Err(MusterError::Security("secret approval requires a human terminal or a confirmed web session; --yes alone is insufficient".into()));
+    }
+    ctx.confirm("Approve this agent's secret use?")?;
+    if ctx.dry_run {
+        return Ok(json!({"dry_run": true}));
+    }
+    let actor = machine::load_name(&ctx.state_dir).unwrap_or_else(|| "human".into());
+    let mut store = crate::secret_leases::Store::open(&ctx.state_dir)?;
+    Ok(json!(store.approve(
+        &ctx.state_dir,
+        required(params, "id")?,
+        params.get_string("ttl"),
+        &actor,
+        &ctx.config_dir
+    )?))
+}
+fn deny_request(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
+    let id = required(params, "id")?;
+    ctx.confirm("Deny this secret request?")?;
+    let mut store = crate::secret_leases::Store::open(&ctx.state_dir)?;
+    let request = store
+        .data
+        .requests
+        .iter()
+        .find(|r| r.id == id)
+        .ok_or_else(|| MusterError::Usage("unknown secret request".into()))?;
+    if !ctx.dry_run {
+        let actor = machine::load_name(&ctx.state_dir).unwrap_or_else(|| "human".into());
+        crate::audit::record_with_actor(&ctx.state_dir, "secret.deny", &request.reference, &actor)?;
+        store.data.requests.retain(|r| r.id != id);
+        store.save()?;
+    }
+    Ok(json!({"denied": id}))
+}
+fn revoke_lease(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
+    let id = params.get_string("id");
+    let all = params.get_bool("all");
+    if all == id.is_some() {
+        return Err(MusterError::Usage("provide a lease id or --all".into()));
+    }
+    ctx.confirm("Revoke secret approval?")?;
+    let mut store = crate::secret_leases::Store::open(&ctx.state_dir)?;
+    let selected: Vec<_> = store
+        .data
+        .leases
+        .iter()
+        .filter(|l| all || Some(l.id.as_str()) == id)
+        .cloned()
+        .collect();
+    if selected.is_empty() && !all {
+        return Err(MusterError::Usage("unknown secret lease".into()));
+    }
+    if !ctx.dry_run {
+        for lease in &selected {
+            let actor = machine::load_name(&ctx.state_dir).unwrap_or_else(|| "human".into());
+            crate::audit::record_with_actor(
+                &ctx.state_dir,
+                "secret.revoke",
+                &lease.reference,
+                &actor,
+            )?;
+        }
+        store
+            .data
+            .leases
+            .retain(|l| !all && Some(l.id.as_str()) != id);
+        store.save()?;
+    }
+    Ok(json!({"revoked": selected.len()}))
 }

@@ -168,3 +168,47 @@ agents. Native login stores are not imported. `doctor --offline` checks local
 availability and subscription login; `doctor --check-keys` opts into online key
 checks. Codex `wire_api = "chat"` for OpenAI-compatible kinds is an assumption
 not documented by installed CLI help; Anthropic and Google kinds are skipped.
+
+
+## Runtime secret approvals
+
+For a secret that needs human approval, configure:
+
+```toml
+[secrets."native://app/key"]
+allow = ["claude"]
+approval = "each"
+approval_ttl = "15m"
+```
+
+The default is `approval = "none"`. Durations accept `s`, `m`, or `h`, up to
+24h. Use `muster secret get native://app/key --agent claude --reveal --yes`
+for agent calls. The current `allow` is checked on every reveal, even with a
+lease. Denial returns exit 5 and `secret_not_allowed_for_agent`. Without a
+lease, exit 5 and `secret_approval_required` include a suggested approval
+command. Repeated requests reuse the pending request. MCP `secret_reveal`
+uses its initialized agent and follows the same approval check.
+
+A person reviews `muster secret requests` and runs `muster secret approve <id>`
+in a real terminal, or approves in the panel with a confirmed session.
+`--yes` without a terminal cannot approve. `--ttl 5m` overrides the configured
+duration, up to 24h. `secret deny <id>` removes a request. `secret leases` lists active
+approvals, and `secret revoke <id>` or `secret revoke --all` removes them.
+Approve, deny, and revoke are never MCP tools. Human CLI reveals without an
+agent retain ordinary confirmation. Local state and audit contain no values.
+
+CLI agent names and MCP client names are self-declared, not authenticated.
+These controls provide traceability and prevent accidental delivery, not
+isolation from malicious processes running as the same OS user. Leases allow
+repeated reveals until expiry. Revocation cannot erase delivered credentials.
+
+Claude providers with `api_key_helper = true` include `--agent claude` in the
+helper. With approval `each`, the generated cache interval is at most 60s and
+never exceeds `approval_ttl`. Claude's
+[documented default](https://code.claude.com/docs/en/settings-reference#apikeyhelper)
+is five minutes. Cached keys can outlive revocation or lease expiry until the
+next refresh. OpenCode `env://VAR` providers use
+[documented environment substitution](https://opencode.ai/docs/config/#env-vars)
+and require that variable in OpenCode's environment. This avoids writing the
+value into settings but does not enforce leases. Use the runtime Claude helper
+or MCP for lease checks; static configuration injection does not check them.

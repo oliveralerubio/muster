@@ -1039,3 +1039,186 @@ fn web_provider_routes_add_select_list_remove_but_do_not_launch_login() {
     let listed: Value = serde_json::from_str(&listed).unwrap();
     assert_eq!(listed["result"]["providers"], serde_json::json!([]));
 }
+
+#[test]
+fn secret_approval_requires_a_human_and_leases_expire_and_revoke() {
+    use serde_json::json;
+    let env = support::MusterEnv::new();
+    env.run(&["init", "--yes"]).assert().success();
+    let value = "lease-test-private-value";
+    env.run(&["secret", "add", "app/key", "--value-stdin"])
+        .write_stdin(value)
+        .assert()
+        .success();
+    let manifest = env.config_dir().join("muster.toml");
+    let mut text = std::fs::read_to_string(&manifest).unwrap();
+    text.push_str("\n[secrets.'native://app/key']\nallow = ['claude']\napproval = 'each'\napproval_ttl = '15m'\n");
+    std::fs::write(&manifest, &text).unwrap();
+    let state = env.path().join(".local/state/muster");
+    let store_path = state.join("secret-leases.json");
+    let reveal = [
+        "secret",
+        "get",
+        "native://app/key",
+        "--agent",
+        "claude",
+        "--reveal",
+        "--yes",
+        "--format",
+        "json",
+    ];
+    for _ in 0..2 {
+        let (out, envelope) = env.run_json(&reveal);
+        assert_eq!(out.status.code(), Some(5));
+        assert!(!String::from_utf8_lossy(&out.stdout).contains(value));
+        assert!(!String::from_utf8_lossy(&out.stderr).contains(value));
+        assert!(envelope
+            .diagnostics()
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["code"] == "secret_approval_required"
+                && d["suggestion"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("muster secret approve ")));
+    }
+    let (_, requests) = env.run_json(&["secret", "requests", "--format", "json"]);
+    assert_eq!(requests.result().as_array().unwrap().len(), 1);
+    let first = requests.result()[0]["id"].as_str().unwrap();
+    env.run(&["secret", "approve", first, "--yes"])
+        .assert()
+        .code(5);
+    let denied = env
+        .run(&[
+            "secret",
+            "get",
+            "native://app/key",
+            "--agent",
+            "codex",
+            "--reveal",
+            "--yes",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(denied.status.code(), Some(5));
+    assert!(String::from_utf8_lossy(&denied.stdout).contains("secret_not_allowed_for_agent"));
+    assert!(!String::from_utf8_lossy(&denied.stdout).contains(value));
+
+    let mut ui = Ui::start(&env);
+    let payload = json!({"id": first, "confirm": true}).to_string();
+    assert_eq!(
+        ui.request("POST", "/api/secret/approve", None, Some(&payload))
+            .0,
+        401
+    );
+    let cookie = ui.session();
+    let unconfirmed = json!({"id": first}).to_string();
+    assert_ne!(
+        ui.request(
+            "POST",
+            "/api/secret/approve",
+            Some(&cookie),
+            Some(&unconfirmed)
+        )
+        .0,
+        200
+    );
+    let too_long = json!({"id": first, "ttl":"25h", "confirm":true}).to_string();
+    assert_ne!(
+        ui.request(
+            "POST",
+            "/api/secret/approve",
+            Some(&cookie),
+            Some(&too_long)
+        )
+        .0,
+        200
+    );
+    for cycle in 0..3 {
+        let (_, _, body) = ui.request("GET", "/api/secret/requests", Some(&cookie), None);
+        let pending: Value = serde_json::from_str(&body).unwrap();
+        let id = pending["result"][0]["id"].as_str().unwrap();
+        let payload = json!({"id":id, "confirm":true}).to_string();
+        let (status, _, body) =
+            ui.request("POST", "/api/secret/approve", Some(&cookie), Some(&payload));
+        assert_eq!(status, 200, "{body}");
+        assert!(!body.contains(value));
+        let approved: Value = serde_json::from_str(&body).unwrap();
+        let lease_id = approved["result"]["id"].as_str().unwrap();
+        let (out, envelope) = env.run_json(&reveal);
+        assert!(out.status.success(), "{}", envelope.raw);
+        assert_eq!(envelope.result(), value);
+        let stored = std::fs::read_to_string(&store_path).unwrap();
+        assert!(!stored.contains(value));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&store_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        if cycle == 0 {
+            std::fs::write(&manifest, text.replace("allow = ['claude']", "allow = []")).unwrap();
+            let (out, envelope) = env.run_json(&reveal);
+            assert_eq!(out.status.code(), Some(5));
+            assert!(envelope
+                .diagnostics()
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|d| d["code"] == "secret_not_allowed_for_agent"));
+            std::fs::write(&manifest, &text).unwrap();
+            let mut data: Value = serde_json::from_str(&stored).unwrap();
+            data["leases"][0]["expires_at"] = json!(1);
+            std::fs::write(&store_path, data.to_string()).unwrap();
+        } else if cycle == 1 {
+            env.run(&["secret", "revoke", lease_id, "--yes"])
+                .assert()
+                .success();
+        } else {
+            let payload = json!({"all":true, "confirm":true}).to_string();
+            let (status, _, body) =
+                ui.request("POST", "/api/secret/revoke", Some(&cookie), Some(&payload));
+            assert_eq!(status, 200, "{body}");
+        }
+        let (out, envelope) = env.run_json(&reveal);
+        assert_eq!(out.status.code(), Some(5), "{}", envelope.raw);
+    }
+    let (_, pending) = env.run_json(&["secret", "requests", "--format", "json"]);
+    let id = pending.result()[0]["id"].as_str().unwrap();
+    let payload = json!({"id": id, "confirm": true}).to_string();
+    assert_eq!(
+        ui.request("POST", "/api/secret/deny", Some(&cookie), Some(&payload))
+            .0,
+        200
+    );
+    let (_, requests) = env.run_json(&["secret", "requests", "--format", "json"]);
+    assert_eq!(requests.result(), &json!([]));
+    // A person can still reveal with ordinary confirmation and no agent.
+    env.run(&["secret", "get", "native://app/key", "--reveal", "--yes"])
+        .assert()
+        .success();
+    let events = muster::audit::events(&state).unwrap();
+    for action in [
+        "secret.request",
+        "secret.approve",
+        "secret.reveal",
+        "secret.revoke",
+        "secret.deny",
+    ] {
+        let matching: Vec<_> = events.iter().filter(|e| e["action"] == action).collect();
+        assert!(!matching.is_empty(), "missing {action}");
+        assert!(matching.iter().all(|e| e["actor"].is_string()));
+    }
+    assert!(events
+        .iter()
+        .any(|e| e["action"] == "secret.request" && e["actor"] == "claude"));
+    assert!(events
+        .iter()
+        .any(|e| e["action"] == "secret.reveal" && e["actor"] == "claude"));
+    assert!(!serde_json::to_string(&events).unwrap().contains(value));
+}

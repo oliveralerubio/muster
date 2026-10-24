@@ -788,3 +788,51 @@ fn server_exits_with_130_on_sigint() {
         "SIGINT must map to exit code 130 per the muster exit-code contract"
     );
 }
+
+#[test]
+fn secret_reveal_requires_a_lease_and_does_not_expose_approval_tools_or_agent_override() {
+    let env = MusterEnv::new();
+    init_machine(&env);
+    seed_secret(&env, "ci/deploy_token", REVEAL_VALUE);
+    reveal_granted_to_claude(&env);
+    let path = env.config_dir().join("muster.toml");
+    let mut text = std::fs::read_to_string(&path).unwrap();
+    text.push_str("approval = 'each'\n");
+    std::fs::write(&path, text).unwrap();
+    let mut server = McpServer::spawn(&env);
+    server.initialize_as("claude-code");
+    for id in [2, 3] {
+        let result = server.call_tool(
+            id,
+            "secret_reveal",
+            json!({"reference":"native://ci/deploy_token"}),
+        );
+        assert_eq!(result["isError"], true);
+        let text = tool_text(&result);
+        assert!(text.contains("secret_approval_required"));
+        assert!(!text.contains(REVEAL_VALUE));
+    }
+    server.send(&json!({"jsonrpc":"2.0", "id":4, "method":"tools/list", "params":{}}));
+    let tools = server.read_response();
+    let tools = tools["result"]["tools"].as_array().unwrap();
+    for forbidden in [
+        "secret.approve",
+        "secret.revoke",
+        "secret.deny",
+        "secret_approve",
+        "secret_revoke",
+        "secret_deny",
+    ] {
+        assert!(tools.iter().all(|t| t["name"] != forbidden));
+    }
+    let reveal = tools.iter().find(|t| t["name"] == "secret_reveal").unwrap();
+    assert!(reveal["inputSchema"]["properties"].get("agent").is_none());
+    server.shutdown();
+    let data: Value = serde_json::from_str(
+        &std::fs::read_to_string(env.path().join(".local/state/muster/secret-leases.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(data["requests"].as_array().unwrap().len(), 1);
+    assert_eq!(data["requests"][0]["source"], "mcp");
+}

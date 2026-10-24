@@ -719,3 +719,71 @@ fn secret_add_allow_records_the_grant_and_list_reports_it() {
         .expect("secret add --allow nobody");
     assert_eq!(bad.status.code(), Some(2));
 }
+
+#[test]
+fn secret_approval_policy_validates_durations_at_load_time() {
+    use muster::manifest::Manifest;
+    for ttl in ["0s", "25h", "-1m", "forever", "999999999999999999999999h"] {
+        let text = format!("version = 1\n[secrets.'env://KEY']\nallow = ['claude']\napproval = 'each'\napproval_ttl = '{ttl}'\n");
+        assert!(Manifest::parse(&text, "muster.toml").is_err(), "{ttl}");
+    }
+    for policy in [
+        "approval = 'each'\napproval_ttl = '24h'",
+        "approval = 'none'",
+        "",
+    ] {
+        let text = format!("version = 1\n[secrets.'env://KEY']\nallow = ['claude']\n{policy}\n");
+        assert!(Manifest::parse(&text, "muster.toml").is_ok(), "{policy}");
+    }
+}
+
+#[test]
+fn concurrent_secret_requests_are_deduplicated_without_losing_state() {
+    let env = initialized();
+    let path = env.config_dir().join("muster.toml");
+    let mut text = std::fs::read_to_string(&path).unwrap();
+    text.push_str(
+        "\n[secrets.'env://MUSTER_CONCURRENT_KEY']\nallow = ['claude']\napproval = 'each'\n",
+    );
+    std::fs::write(path, text).unwrap();
+    std::thread::scope(|scope| {
+        let jobs: Vec<_> =
+            (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let out = env
+                            .run(&[
+                                "secret",
+                                "get",
+                                "env://MUSTER_CONCURRENT_KEY",
+                                "--agent",
+                                "claude",
+                                "--reveal",
+                                "--yes",
+                            ])
+                            .env("MUSTER_CONCURRENT_KEY", "concurrent-private-value")
+                            .output()
+                            .unwrap();
+                        assert_eq!(out.status.code(), Some(5));
+                        assert!(!String::from_utf8_lossy(&out.stdout)
+                            .contains("concurrent-private-value"));
+                        assert!(!String::from_utf8_lossy(&out.stderr)
+                            .contains("concurrent-private-value"));
+                    })
+                })
+                .collect();
+        for job in jobs {
+            job.join().unwrap();
+        }
+    });
+    let requests = success(&env, &["secret", "requests", "--format", "json"]);
+    assert_eq!(requests.as_array().unwrap().len(), 1);
+    let events = muster::audit::events(&env.path().join(".local/state/muster")).unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e["action"] == "secret.request")
+            .count(),
+        1
+    );
+}

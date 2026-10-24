@@ -127,6 +127,7 @@ pub fn plan_with_overrides(
         quiet: true,
         verbose: false,
         audit_actor: None,
+        web_approval: false,
     })?;
     temp_ctx.state_dir = ctx.state_dir.clone();
 

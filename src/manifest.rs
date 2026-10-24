@@ -258,6 +258,17 @@ pub struct SecretPolicy {
     /// directory's name). Empty = no agent (the human CLI always can).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow: Vec<String>,
+    #[serde(default)]
+    pub approval: SecretApproval,
+    pub approval_ttl: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum SecretApproval {
+    #[default]
+    None,
+    Each,
 }
 
 impl SecretPolicy {
@@ -439,6 +450,10 @@ impl Manifest {
             }
         }
         for (reference, policy) in &manifest.secrets {
+            if let Some(ttl) = &policy.approval_ttl {
+                crate::secret_leases::parse_ttl(ttl)
+                    .map_err(|e| invalid(format!("secrets.\"{reference}\".approval_ttl: {e}")))?;
+            }
             crate::secrets::SecretRef::parse(reference)
                 .map_err(|e| invalid(format!("secrets: {e}")))?;
             for entry in &policy.allow {

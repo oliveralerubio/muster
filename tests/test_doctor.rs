@@ -555,3 +555,23 @@ fn checks_secret_references_through_their_providers() {
     assert_eq!(unauthorized.len(), 1, "{}", envelope.diagnostics());
     assert!(suggestion(unauthorized[0]).contains("sign in"));
 }
+
+#[test]
+fn doctor_checks_secret_lease_permissions_and_reports_pending_requests() {
+    let env = healthy_machine();
+    let path = state_dir(&env).join("secret-leases.json");
+    std::fs::write(&path, r#"{"requests":[{"id":"pending-1","reference":"env://KEY","agent":"claude","requested_at":1,"source":"cli"}],"leases":[]}"#).unwrap();
+    chmod(&path, 0o644);
+    let (_, envelope) = doctor(&env, &[]);
+    assert!(with_code(&envelope, "insecure_permissions")
+        .iter()
+        .any(|d| d["path"].as_str().unwrap().ends_with("secret-leases.json")));
+    assert!(with_code(&envelope, "secret_requests_pending")
+        .iter()
+        .any(|d| d["severity"] == "info"));
+    let (_, envelope) = doctor_fix(&env, &["--yes"]);
+    assert_eq!(mode(&path), 0o600);
+    assert!(with_code(&envelope, "insecure_permissions")
+        .iter()
+        .all(|d| !d["path"].as_str().unwrap().ends_with("secret-leases.json")));
+}
