@@ -24,29 +24,80 @@ function showCli(cli) {
   if (cli) $("#cli").textContent = cli;
 }
 
+// The view load in progress. When the panel cannot talk to muster at all
+// (server gone, session expired), the failure is recorded on the load that
+// sent the request, so a stale request never marks a newer view as failed.
+// A failed view shows the problem instead of empty tables, which would
+// wrongly read as "nothing configured".
+let loadAttempt = { failure: null };
+
 async function api(path, body) {
   const options = body === undefined
     ? {}
     : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
-  const response = await fetch("/api/" + path, options);
+  const attempt = loadAttempt;
+  let response;
+  try {
+    response = await fetch("/api/" + path, options);
+  } catch (err) {
+    attempt.failure = "Muster is not reachable. Is `muster ui` still running? (" + err.message + ")";
+    return { ok: false, error: attempt.failure, diagnostics: [] };
+  }
   const data = await response.json().catch(() => ({ ok: false, diagnostics: [] }));
+  if (response.status === 401 || response.status === 403) {
+    attempt.failure = "Session expired. Reopen the panel with `muster ui`.";
+    return { ok: false, error: attempt.failure, diagnostics: [] };
+  }
   showCli(data.cli);
   return data;
 }
 
+// Non-blocking status message; replaces alert() for failures.
+let toastTimer = null;
+function hideToast() {
+  const toast = $("#toast");
+  if (toast) toast.hidden = true;
+}
+function toast(message, kind) {
+  const box = $("#toast");
+  if (!box) return;
+  box.setAttribute("class", "toast " + (kind || "error"));
+  box.replaceChildren(el("span", {}, message), button("Dismiss", hideToast));
+  box.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(hideToast, 6000);
+}
+
+// Disable a control while its request is in flight; `gate` says whether it
+// must stay disabled afterwards (preview-gated Save buttons).
+async function busy(node, run, gate) {
+  node.disabled = true;
+  try {
+    return await run();
+  } finally {
+    node.disabled = gate ? gate() : false;
+  }
+}
+
 function diagnostics(data) {
-  const list = data.diagnostics || [];
+  const list = (data.diagnostics || []).slice();
   if (data.error) list.push({ severity: "error", code: "http", message: data.error });
   if (!list.length) return null;
   return table(["Severity", "Code", "Message", "Suggestion"],
     list.map((d) => [d.severity, d.code, d.message, d.suggestion || ""]));
 }
 
-function table(headers, rows) {
-  if (!rows.length) return el("p", {}, "Nothing to show.");
-  return el("table", {},
-    el("thead", {}, el("tr", {}, headers.map((h) => el("th", { scope: "col" }, h)))),
-    el("tbody", {}, rows.map((row) => el("tr", {}, row.map((cell) => el("td", {}, cell))))));
+function table(headers, rows, empty) {
+  if (!rows.length) return el("p", { class: "empty" }, empty || "Nothing to show.");
+  const isActions = (cell) => cell instanceof Node
+    && (cell.tagName === "BUTTON" || (cell.getAttribute("class") || "").includes("actions"));
+  const label = headers.filter(Boolean).join(", ");
+  return el("div", { class: "table-wrap", role: "region", tabindex: "0", "aria-label": label },
+    el("table", {},
+      el("thead", {}, el("tr", {}, headers.map((h) =>
+        el("th", { scope: "col" }, h || el("span", { class: "sr-only" }, "Actions"))))),
+      el("tbody", {}, rows.map((row) => el("tr", {}, row.map((cell) =>
+        el("td", isActions(cell) ? { class: "cell-actions" } : {}, cell)))))));
 }
 
 // Diff rendering shared by the plan preview and every edit preview.
@@ -58,15 +109,22 @@ function failMessage(data) {
   return (data.diagnostics || []).map((d) => d.message).join("\n") || data.error || "failed";
 }
 
-function button(label, onclick, cls) {
-  return el("button", { type: "button", class: cls || "", onclick }, label);
+// Every panel button is disabled while its handler is in flight, so a double
+// click cannot submit twice. `gate` keeps preview-gated Save buttons locked.
+function button(label, onclick, cls, gate) {
+  const node = el("button", { type: "button", class: "btn " + (cls || "") }, label);
+  node.addEventListener("click", () => {
+    if (node.disabled) return undefined;
+    return busy(node, () => onclick(), gate);
+  });
+  return node;
 }
 
 // Run a state-changing command after an explicit confirmation, then reload.
 async function act(question, path, body) {
   if (!confirm(question)) return;
   const data = await api(path, Object.assign({ confirm: true }, body || {}));
-  if (!data.ok) alert((data.diagnostics || []).map((d) => d.message).join("\n") || data.error || "failed");
+  if (!data.ok) toast(failMessage(data));
   await show(current);
 }
 
@@ -78,8 +136,7 @@ function render(title, actions, ...blocks) {
 
 const views = {
   async dashboard(token) {
-    const data = await api("status");
-    const schedule = await api("schedule");
+    const [data, schedule] = await Promise.all([api("status"), api("schedule")]);
     if (token !== undefined && token !== navToken) return;
     const r = data.result || {};
     const machines = r.machines || [];
@@ -101,14 +158,15 @@ const views = {
       diagnostics(schedule),
       el("h2", {}, "Fleet"),
       table(["Name", "Platform", "Version", "Status", "Last sync"],
-        machines.map((m) => [m.name, m.platform || "", m.version || "", m.status, m.last_sync || "never"])),
+        machines.map((m) => [m.name, m.platform || "", m.version || "", m.status, m.last_sync || "never"]),
+        "No machines in fleet."),
       el("h2", {}, "Pending members"),
-      table(["Name"], pending.map((p) => [typeof p === "string" ? p : p.name])),
+      table(["Name"], pending.map((p) => [typeof p === "string" ? p : p.name]), "No pending members."),
       el("h2", {}, "Drift"),
       table(["Kind", "Name", "Reason"], [
         ...(drift.members || []).map((d) => ["member", d.name, d.reason]),
         ...(drift.machines || []).map((d) => ["machine", d.name, d.reason]),
-      ]),
+      ], "No drift detected."),
       diagnostics(data));
   },
 
@@ -116,19 +174,18 @@ const views = {
     const data = await api("providers");
     if (token !== undefined && token !== navToken) return;
     const providers = (data.result || {}).providers || [];
-    const field = (id, label, attrs) => {
-      const input = el("input", Object.assign({ id, type: "text", autocomplete: "off" }, attrs || {}));
-      return [el("label", { for: id }, label), input];
-    };
+    const field = (id, label, attrs) => el("label", { class: "field", for: id }, label + " ",
+      el("input", Object.assign({ id, type: "text", autocomplete: "off" }, attrs || {})));
     const kind = el("select", { id: "provider-kind" },
       ["anthropic", "openai", "openai-compatible", "ollama", "google"].map((value) => el("option", { value }, value)));
+    const kindField = el("label", { class: "field", for: "provider-kind" }, "Kind ", kind);
     const form = el("form", { id: "provider-form", class: "skill-form" },
       field("provider-id", "ID", { required: "", pattern: "[a-z0-9-]+" }),
-      el("label", { for: "provider-kind" }, "Kind"), kind,
+      kindField,
       field("provider-url", "Base URL", { type: "url" }),
       field("provider-model", "Default model"),
       field("provider-key", "Key reference (not a key value)", { placeholder: "native://app/key or env://VARIABLE" }),
-      el("button", { type: "submit", class: "primary" }, "Add provider"));
+      el("button", { type: "submit", class: "btn primary" }, "Add provider"));
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
       const body = { id: $("#provider-id").value.trim(), kind: kind.value };
@@ -136,12 +193,14 @@ const views = {
         const value = $("#" + id).value.trim();
         if (value) body[name] = value;
       }
-      await act("Add or replace this AI provider?", "provider/add", body);
+      const submit = form.querySelector("button");
+      await busy(submit, () => act("Add or replace this AI provider?", "provider/add", body));
     });
     render("AI providers", [],
       table(["ID", "Kind", "Base URL", "Default model", "Key reference", "Receiving agents", ""],
         providers.map((p) => [p.id, p.kind, p.base_url || "", p.default_model || "", p.key || "", (p.agents || []).join(", "),
-          button("Remove", () => act(`Remove provider ${p.id}?`, "provider/rm", { id: p.id }), "danger")])),
+          button("Remove", () => act(`Remove provider ${p.id}?`, "provider/rm", { id: p.id }), "danger")]),
+        "No providers configured."),
       el("h2", {}, "Add provider"), form,
       el("p", {}, "Subscription logins stay on this machine. Run muster provider login claude or muster provider login codex in your terminal."),
       diagnostics(data));
@@ -164,20 +223,21 @@ const views = {
       table(["Name", "Platform", "Role", "Profile", "Agents", "Last sync", ""],
         machines.map((m) => [m.name, m.platform || "", m.role || "", m.profile || "",
           (m.agents || []).join(", "), m.last_sync || "never",
-          m.is_current ? "this machine" : button("Remove", () => act(`Remove machine ${m.name}?`, "machine/rm", { name: m.name }))])),
+          m.is_current ? "this machine" : button("Remove", () => act(`Remove machine ${m.name}?`, "machine/rm", { name: m.name }))]),
+        "No machines enrolled yet."),
       el("h2", {}, "Pending enrollment requests"),
       table(["Name", "Platform", "Version", "Agents", "Approvals", ""],
         pending.map((p) => [p.name, p.platform || "", p.version || "",
           (p.agents || []).join(", "), quorum(p),
           el("span", { class: "actions" },
             button("Approve", () => act(`Approve enrollment of machine ${p.name}?`, "approve", { name: p.name })),
-            button("Reject", () => act(`Reject the enrollment request of machine ${p.name}? Its recorded approvals are discarded.`, "reject", { name: p.name }), "danger"))])),
+            button("Reject", () => act(`Reject the enrollment request of machine ${p.name}? Its recorded approvals are discarded.`, "reject", { name: p.name }), "danger"))]),
+        "No pending enrollment requests."),
       diagnostics(data));
   },
 
   async team(token) {
-    const members = await api("members");
-    const groups = await api("groups");
+    const [members, groups] = await Promise.all([api("members"), api("groups")]);
     if (token !== undefined && token !== navToken) return;
     const memberRows = ((members.result && members.result.members) || []).map((m) => [
       m.name, m.role, m.status, (m.groups || []).join(", "), m.profile || "",
@@ -187,12 +247,28 @@ const views = {
             button("Reject", () => act(`Reject member ${m.name}? Their invitation and recorded approvals are discarded.`, "member/reject", { name: m.name }), "danger"))
         : "",
     ]);
+    const formatReaders = (readers) => {
+      if (!readers || typeof readers !== "object") return "";
+      const parts = [];
+      const known = new Set(["machines", "members", "groups", "recipients"]);
+      for (const key of ["machines", "members", "groups", "recipients"]) {
+        const val = readers[key];
+        if (Array.isArray(val) && val.length) parts.push(`${key}: ${val.join(", ")}`);
+      }
+      for (const [k, v] of Object.entries(readers)) {
+        if (known.has(k)) continue;
+        if (v && (!Array.isArray(v) || v.length)) {
+          parts.push(`${k}: ${Array.isArray(v) ? v.join(", ") : v}`);
+        }
+      }
+      return parts.join("; ") || "none";
+    };
     const groupRows = ((groups.result && groups.result.groups) || []).map((g) => [
-      g.name || g.group || "", JSON.stringify(g.readers || {}), g.profile || "",
+      g.name || g.group || "", formatReaders(g.readers), g.profile || "",
     ]);
     render("Members & groups", [],
-      el("h2", {}, "Members"), table(["Name", "Role", "Status", "Groups", "Profile", ""], memberRows),
-      el("h2", {}, "Groups"), table(["Group", "Readers", "Profile"], groupRows),
+      el("h2", {}, "Members"), table(["Name", "Role", "Status", "Groups", "Profile", ""], memberRows, "No members configured."),
+      el("h2", {}, "Groups"), table(["Group", "Readers", "Profile"], groupRows, "No groups configured."),
       diagnostics(members), diagnostics(groups));
   },
 
@@ -208,17 +284,21 @@ const views = {
         secrets.map((s) => [s.reference, s.updated_at || "", s.updated_by || "",
           (s.readers || []).map((r) => r.machine || r.recipient).join(", "),
           el("div", { class: "actions" }, button("Reveal…", () => openReveal(s.reference)),
-            button("Change value", () => openSecretEdit(s.reference)))])),
+            button("Change value", () => openSecretEdit(s.reference)))]),
+        "No secrets yet. Use New secret to add one."),
       el("h2", {}, "Secret approvals"),
       el("p", {}, "Approve access for the configured duration. Revoking prevents new reveals; agents may retain keys already received."),
       table(["Pending reference", "Agent", "Requested", ""],
         (requests.result || []).map((r) => [r.reference, r.agent, new Date(r.requested_at * 1000).toISOString(),
           el("div", { class: "actions" },
             button("Approve", () => secretApproval("approve", r.id)),
-            button("Deny", () => secretApproval("deny", r.id)))])),
+            button("Deny", () => secretApproval("deny", r.id), "danger"))]),
+        "No pending requests."),
+      el("h3", {}, "Active approvals"),
       table(["Approved reference", "Agent", "Expires", ""],
         (leases.result || []).map((l) => [l.reference, l.agent, new Date(l.expires_at * 1000).toISOString(),
-          button("Revoke", () => secretApproval("revoke", l.id))])),
+          button("Revoke", () => secretApproval("revoke", l.id))]),
+        "No active approvals."),
       diagnostics(data), diagnostics(requests), diagnostics(leases));
   },
 
@@ -263,11 +343,15 @@ const views = {
     const path = el("input", { type: "text", placeholder: "path (optional)", "aria-label": "Skills directory in the repository" });
     const include = el("input", { type: "text", placeholder: "only: a,b (optional)", "aria-label": "Skills to include" });
     render("Skills", [
-      button("Check repositories", async () => { await api("skills/check", {}); await show("skills"); }, "primary"),
+      button("Check repositories", async () => {
+        const checked = await api("skills/check", {});
+        if (!checked.ok) toast(failMessage(checked));
+        await show("skills");
+      }, "primary"),
       button("Update all", () => updateAll()),
     ],
       el("p", {}, r.checked_at ? `Last upstream check: ${r.checked_at}.` : "Upstream sources not checked yet on this machine."),
-      table(["Name", "Origin", "Version", "Updated", "Status", "", ""], rows),
+      table(["Name", "Origin", "Version", "Updated", "Status", "", ""], rows, "No skills yet. Add one below."),
       el("h2", {}, "Add an own skill"),
       el("div", { class: "skill-form" }, name, description,
         button("Create", () => act(`Create skill ${name.value}?`, "skills/add", { name: name.value, description: description.value || undefined }))),
@@ -300,7 +384,7 @@ const views = {
       table(["File", "Action", "Drift", "Diff"], (agent.files || []).map((f) => [
         f.path, f.action, f.drift ? "yes" : "no",
         f.diff ? diffPre(f.diff) : (f.private ? "private (redacted)" : ""),
-      ])),
+      ]), "No files in this plan."),
     ]);
     render("Profiles & diff preview", [
       button("New profile", () => openProfileEdit(null), "primary"),
@@ -314,7 +398,7 @@ const views = {
         el("span", { class: "actions" },
           button("Edit", () => openProfileEdit(p.name)),
           button("Remove", () => act(`Remove profile ${p.name}?`, "profile/rm", { name: p.name }), "danger")),
-      ])),
+      ]), "No profiles yet."),
       diagnostics(listData),
       el("h2", {}, "MCP servers"),
       table(["Name", "Transport", "Target", "Env / headers", ""], servers.map((s) => {
@@ -325,7 +409,7 @@ const views = {
           el("span", { class: "actions" },
             button("Edit", () => openMcpEdit(s)),
             button("Remove", () => act(`Remove MCP server ${s.name}?`, "mcp-server/rm", { name: s.name }), "danger"))];
-      })),
+      }), "No MCP servers declared."),
       mcpForm(),
       el("pre", { id: "mcp-diff", hidden: true }, ""),
       el("p", { id: "mcp-error", class: "form-error", role: "alert" }),
@@ -346,9 +430,9 @@ const views = {
       table(["#", "Created", "Kind", "Files", ""], generations.map((g) => [
         g.number, g.created_at, g.rollback_of ? `${g.kind} of ${g.rollback_of}` : g.kind, (g.files || []).length,
         button("Roll back", () => act(`Restore generation ${g.number}?`, "rollback", { generation: g.number })),
-      ])),
+      ]), "No generations yet."),
       el("h2", {}, "Events"),
-      table(["When", "Action", "Subject"], (r.events || []).slice().reverse().map((e) => [e.at, e.action, e.subject])),
+      table(["When", "Action", "Subject"], (r.events || []).slice().reverse().map((e) => [e.at, e.action, e.subject]), "No events recorded."),
       diagnostics(data));
   },
 
@@ -358,7 +442,7 @@ const views = {
     const r = data.result || {};
     render("Doctor", [button("Apply safe fixes", () => act("Run doctor --fix?", "doctor", { fix: true }), "primary")],
       el("p", {}, r.healthy ? "Healthy." : "Problems found."),
-      table(["Check", "Status"], (r.checks || []).map((c) => [c.name, c.status])),
+      table(["Check", "Status"], (r.checks || []).map((c) => [c.name, c.status]), "No checks reported."),
       diagnostics(data));
   },
 };
@@ -378,12 +462,12 @@ function fileSummary(files) {
 async function confirmUpdate(body) {
   const preview = await api("skills/update", Object.assign({ dry_run: true }, body));
   if (!preview.ok) {
-    alert((preview.diagnostics || []).map((d) => d.message).join("\n") || "update failed");
+    toast(failMessage(preview));
     return;
   }
   const updates = (preview.result && preview.result.updated) || [];
   if (!updates.length) {
-    alert("Nothing to update.");
+    toast("Nothing to update.", "info");
     return;
   }
   const lines = updates.map((u) => `${u.name}${u.version ? " " + u.version : ""}: ${fileSummary(u.files || {})}`);
@@ -414,17 +498,29 @@ async function show(name) {
     const selected = tab.dataset.view === name;
     tab.setAttribute("aria-selected", String(selected));
     tab.tabIndex = selected ? 0 : -1;
+    // On narrow screens the tab row scrolls: keep the active tab fully visible.
+    if (selected && tab.scrollIntoView) tab.scrollIntoView({ block: "nearest", inline: "nearest" });
   }
+  viewEl.setAttribute("aria-labelledby", "tab-" + name);
+  // The previous content stays in place while loading, so the layout holds still.
+  viewEl.setAttribute("aria-busy", "true");
+  const attempt = loadAttempt = { failure: null };
+  const title = tabs.find((tab) => tab.dataset.view === name);
+  const failed = (message) => render(title ? title.textContent.trim() : name, [],
+    el("div", { class: "load-error", role: "alert" },
+      el("p", {}, message),
+      button("Retry", () => show(name), "primary")));
   try {
     await views[name](token);
-    if (token !== navToken) return;
+    if (token === navToken && attempt.failure) failed(attempt.failure);
   } catch (err) {
     if (token !== navToken) return;
-    render(name, [], el("p", {}, "Failed to load: " + err.message));
+    failed("Failed to load: " + err.message);
   }
+  if (token === navToken) viewEl.setAttribute("aria-busy", "false");
 }
 
-// Keyboard: arrows/Home/End move between tabs; digits 1-7 jump to a view.
+// Keyboard: arrows/Home/End move between tabs; digits 1-9 jump to a view.
 $("#nav").addEventListener("keydown", (e) => {
   const i = tabs.indexOf(document.activeElement);
   if (i < 0) return;
@@ -437,7 +533,9 @@ $("#nav").addEventListener("keydown", (e) => {
 });
 for (const tab of tabs) tab.addEventListener("click", () => show(tab.dataset.view));
 document.addEventListener("keydown", (e) => {
-  if (e.target.closest("input, textarea, dialog") || e.altKey || e.ctrlKey || e.metaKey) return;
+  const typing = e.target && typeof e.target.closest === "function"
+    && e.target.closest("input, textarea, select, dialog, [contenteditable]");
+  if (typing || e.altKey || e.ctrlKey || e.metaKey) return;
   const n = Number(e.key);
   if (n >= 1 && n <= tabs.length) {
     tabs[n - 1].focus();
@@ -471,10 +569,16 @@ function openReveal(reference) {
   dialog.showModal();
 }
 $("#reveal-confirm").addEventListener("click", async () => {
-  const data = await api("secret/reveal", { name: revealName, confirm: true });
-  $("#reveal-value").textContent = data.ok
-    ? data.result
-    : (data.diagnostics || []).map((d) => d.message).join("\n");
+  const confirmBtn = $("#reveal-confirm");
+  if (confirmBtn.disabled) return;
+  await busy(confirmBtn, async () => {
+    try {
+      const data = await api("secret/reveal", { name: revealName, confirm: true });
+      $("#reveal-value").textContent = data.ok ? data.result : failMessage(data);
+    } catch (err) {
+      $("#reveal-value").textContent = "Failed to reveal: " + err.message;
+    }
+  });
 });
 dialog.addEventListener("close", () => { $("#reveal-value").textContent = ""; });
 
@@ -575,7 +679,13 @@ function showDiff(pre, data) {
   return null;
 }
 
-$("#profile-preview").addEventListener("click", async () => {
+$("#profile-preview").addEventListener("click", () => {
+  const previewBtn = $("#profile-preview");
+  if (previewBtn.disabled) return undefined;
+  return busy(previewBtn, previewProfile);
+});
+
+async function previewProfile() {
   const token = profileToken();
   const data = await api("profile/set", profileBody(true));
   // The form changed while the request was inflight: the response describes a
@@ -589,7 +699,7 @@ $("#profile-preview").addEventListener("click", async () => {
   // Save unlocks only after a successful preview of the exact current payload.
   profilePreviewToken = problem ? null : token;
   $("#profile-save").disabled = Boolean(problem);
-});
+}
 
 // Any edit after a preview invalidates it: Save is disabled until re-previewed.
 for (const id of ["profile-name", "profile-toml"]) {
@@ -600,7 +710,8 @@ $("#profile-cancel").addEventListener("click", () => profileDialog.close());
 profileDialog.addEventListener("close", () => $("#profile-form").reset());
 $("#profile-form").addEventListener("submit", async (event) => {
   event.preventDefault();
-  if ($("#profile-save").disabled) return;
+  const saveBtn = $("#profile-save");
+  if (saveBtn.disabled) return;
   // Belt and braces: only the exact previewed payload may be acted on.
   if (profileToken() !== profilePreviewToken) {
     $("#profile-save").disabled = true;
@@ -609,14 +720,17 @@ $("#profile-form").addEventListener("submit", async (event) => {
   }
   const body = profileBody(false);
   if (!confirm(`Save profile ${body.name}?`)) return;
-  const data = await api("profile/set", body);
-  if (data.ok) {
-    profilePreviewToken = null;
-    profileDialog.close();
-    await show("profiles");
-  } else {
-    $("#profile-error").textContent = failMessage(data);
-  }
+  // Locked while saving; afterwards only a still-previewed payload may unlock it.
+  await busy(saveBtn, async () => {
+    const data = await api("profile/set", body);
+    if (data.ok) {
+      profilePreviewToken = null;
+      profileDialog.close();
+      await show("profiles");
+    } else {
+      $("#profile-error").textContent = failMessage(data);
+    }
+  }, () => profilePreviewToken === null || profileToken() !== profilePreviewToken);
 });
 
 // MCP server form: list fields hold JSON arrays, what the API itself accepts
@@ -665,7 +779,9 @@ function mcpForm() {
     fieldArea("mcp-env", "Env KEY=reference (JSON array)", '["API_KEY=native://app/api-key"]'),
     fieldArea("mcp-header", "Headers KEY=reference (JSON array)", '["Authorization=native://app/token"]'),
   ];
-  const save = button("Save", saveMcp, "primary");
+  // After a request the lock holds unless the exact previewed values are still in the form.
+  const save = button("Save", saveMcp, "primary",
+    () => mcpPreviewToken === null || mcpToken() !== mcpPreviewToken);
   save.id = "mcp-save";
   // Like the profile dialog: Save stays disabled until the exact current
   // values have been previewed, and any edit disables it again.
@@ -740,7 +856,6 @@ async function previewMcp() {
 }
 
 async function saveMcp() {
-  if ($("#mcp-save").disabled) return;
   let body;
   try {
     body = mcpPayload();
@@ -799,6 +914,6 @@ show("dashboard");
 async function secretApproval(action, id) {
   if (!confirm(`${action === "approve" ? "Approve secret use" : action === "deny" ? "Deny secret request" : "Revoke secret approval"}?`)) return;
   const data = await api("secret/" + action, { id, confirm: true });
-  if (!data.ok) { alert((data.diagnostics || []).map((d) => d.message).join("\n") || data.error || "Action failed"); return; }
+  if (!data.ok) { toast(failMessage(data)); return; }
   await show("secrets");
 }

@@ -13,69 +13,71 @@
     <span class="brand">Muster</span>
     <nav aria-label="Views">
       <ul id="nav" role="tablist" aria-orientation="horizontal">
-        <li><button type="button" role="tab" data-view="dashboard" aria-selected="true">Dashboard</button></li>
-        <li><button type="button" role="tab" data-view="machines">Machines</button></li>
-        <li><button type="button" role="tab" data-view="team">Members &amp; groups</button></li>
-        <li><button type="button" role="tab" data-view="providers">AI providers</button></li>
-        <li><button type="button" role="tab" data-view="secrets">Secrets &amp; approvals</button></li>
-        <li><button type="button" role="tab" data-view="skills">Skills <span id="skills-dot" class="dot" hidden title="Needs attention"></span></button></li>
-        <li><button type="button" role="tab" data-view="profiles">Profiles &amp; diff</button></li>
-        <li><button type="button" role="tab" data-view="history">History</button></li>
-        <li><button type="button" role="tab" data-view="doctor">Doctor</button></li>
+        <li role="presentation"><button type="button" role="tab" id="tab-dashboard" aria-controls="view" data-view="dashboard" aria-selected="true">Dashboard</button></li>
+        <li role="presentation"><button type="button" role="tab" id="tab-machines" aria-controls="view" data-view="machines" aria-selected="false" tabindex="-1">Machines</button></li>
+        <li role="presentation"><button type="button" role="tab" id="tab-team" aria-controls="view" data-view="team" aria-selected="false" tabindex="-1">Members &amp; groups</button></li>
+        <li role="presentation"><button type="button" role="tab" id="tab-providers" aria-controls="view" data-view="providers" aria-selected="false" tabindex="-1">AI providers</button></li>
+        <li role="presentation"><button type="button" role="tab" id="tab-secrets" aria-controls="view" data-view="secrets" aria-selected="false" tabindex="-1">Secrets &amp; approvals</button></li>
+        <li role="presentation"><button type="button" role="tab" id="tab-skills" aria-controls="view" data-view="skills" aria-selected="false" tabindex="-1">Skills <span id="skills-dot" class="dot" role="img" aria-label="Needs attention" hidden title="Needs attention"></span></button></li>
+        <li role="presentation"><button type="button" role="tab" id="tab-profiles" aria-controls="view" data-view="profiles" aria-selected="false" tabindex="-1">Profiles &amp; diff</button></li>
+        <li role="presentation"><button type="button" role="tab" id="tab-history" aria-controls="view" data-view="history" aria-selected="false" tabindex="-1">History</button></li>
+        <li role="presentation"><button type="button" role="tab" id="tab-doctor" aria-controls="view" data-view="doctor" aria-selected="false" tabindex="-1">Doctor</button></li>
       </ul>
     </nav>
-    <button type="button" id="theme" aria-label="Toggle light or dark theme">Theme</button>
+    <button type="button" id="theme" class="btn" aria-label="Toggle light or dark theme">Theme</button>
   </header>
 
   <main id="main" tabindex="-1">
     <h1 id="title">Dashboard</h1>
     <div id="actions" class="actions"></div>
-    <div id="view" aria-live="polite"></div>
+    <div id="view" role="tabpanel" aria-labelledby="tab-dashboard" aria-live="polite"></div>
   </main>
 
   <footer class="cli" aria-live="polite">
     <span>CLI equivalent:</span> <code id="cli">muster status</code>
   </footer>
 
-  <dialog id="reveal">
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+  <dialog id="reveal" aria-labelledby="reveal-title">
     <form method="dialog">
-      <h2>Reveal secret</h2>
+      <h2 id="reveal-title">Reveal secret</h2>
       <p>Reveal the plaintext of <code id="reveal-name"></code>? The reveal is recorded in the history.</p>
       <output id="reveal-value" class="secret"></output>
       <div class="actions">
-        <button type="button" id="reveal-confirm" class="danger">Reveal</button>
-        <button value="cancel">Close</button>
+        <button type="button" id="reveal-confirm" class="btn danger">Reveal</button>
+        <button value="cancel" class="btn">Close</button>
       </div>
     </form>
   </dialog>
 
-  <dialog id="secret-edit">
+  <dialog id="secret-edit" aria-labelledby="secret-edit-title">
     <form id="secret-form">
       <h2 id="secret-edit-title">New secret</h2>
       <p><label>Name (group/name) <input id="secret-path" required autocomplete="off"></label></p>
       <p><label>Value <input id="secret-input" type="password" autocomplete="new-password" required></label></p>
-      <p><label><input id="secret-confirm" type="checkbox" required> I confirm saving this value</label></p>
+      <p><label class="check"><input id="secret-confirm" type="checkbox" required> I confirm saving this value</label></p>
       <div class="actions">
-        <button id="secret-save" type="submit" class="primary">Save</button>
-        <button id="secret-cancel" type="button">Cancel</button>
+        <button id="secret-save" type="submit" class="btn primary">Save</button>
+        <button id="secret-cancel" type="button" class="btn">Cancel</button>
       </div>
-      <p id="secret-error" role="alert"></p>
+      <p id="secret-error" class="form-error" role="alert"></p>
     </form>
   </dialog>
 
-  <dialog id="profile-edit">
+  <dialog id="profile-edit" aria-labelledby="profile-edit-title">
     <form id="profile-form">
       <h2 id="profile-edit-title">New profile</h2>
       <p><label>Name <input id="profile-name" required autocomplete="off" pattern="[a-z0-9-]+" title="Lowercase letters, digits and '-'"></label></p>
       <p><label for="profile-toml">Profile (TOML: [agents] and/or [mcp] tables)</label>
         <textarea id="profile-toml" rows="10" spellcheck="false" required></textarea></p>
       <div class="actions">
-        <button type="button" id="profile-preview">Preview diff</button>
-        <button id="profile-save" type="submit" class="primary" disabled>Save</button>
-        <button id="profile-cancel" type="button">Cancel</button>
+        <button type="button" id="profile-preview" class="btn">Preview diff</button>
+        <button id="profile-save" type="submit" class="btn primary" disabled>Save</button>
+        <button id="profile-cancel" type="button" class="btn">Cancel</button>
       </div>
       <pre id="profile-diff" hidden></pre>
-      <p id="profile-error" role="alert"></p>
+      <p id="profile-error" class="form-error" role="alert"></p>
     </form>
   </dialog>
   <script src="/app.js"></script>
