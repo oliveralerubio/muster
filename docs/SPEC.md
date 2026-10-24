@@ -381,9 +381,10 @@ Opciones globales: `--config`, `--format text|json`, `--yes`, `--dry-run` (en to
 AI providers are named model endpoints, distinct from secret providers. The
 canonical `[providers.<id>]` table requires `kind` (`anthropic`, `openai`,
 `openai-compatible`, `ollama`, or `google`) on first declaration and accepts
-optional `base_url`, `default_model` and `key` (a secret reference, never a key
-value). `[agents.providers]` maps agent ids to endpoint ids. Existing
-`[agents.models]` choices win over provider defaults. Unknown kinds, missing
+optional `base_url`, `default_model`, `key` (a secret reference, never a key
+value) and `api_key_helper` (an optional boolean). `[agents.providers]` maps
+agent ids to endpoint ids. Existing `[agents.models]` choices win over provider
+defaults. Unknown kinds, missing
 first-declaration kinds and dangling selections fail validation before apply.
 
 Providers follow team → group → member → machine → project precedence.
@@ -396,7 +397,12 @@ sync, and key values never appear in output, diffs, plans or the panel.
 
 Rendering:
 - Claude Code: managed settings environment (`ANTHROPIC_BASE_URL`,
-  `ANTHROPIC_AUTH_TOKEN`) and model.
+  `ANTHROPIC_AUTH_TOKEN`) and model. With `api_key_helper = true`, authorized
+  key references render as `apiKeyHelper` commands instead. The command resolves
+  the key through `muster secret get` at runtime, including environment references,
+  using the original config repository. Apply removes previous plaintext keys;
+  revoking access removes the managed helper. Omitted or false retains the
+  existing plaintext behavior. Doctor suggests the helper with an info diagnostic.
 - Codex: `model_providers.<id>`, top-level `model_provider` and model;
   `openai`, `openai-compatible` and `ollama` use the assumed `wire_api = "chat"`
   mapping (not documented by the installed CLI help). Anthropic/Google kinds

@@ -470,6 +470,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn provider_runtime_helper_round_trips_and_profiles_can_disable_it() {
+        let text = "version = 1\n[providers.gateway]\nkind = 'anthropic'\napi_key_helper = true\n[profiles.work.providers.gateway]\napi_key_helper = false\n";
+        let manifest = Manifest::parse(text, "muster.toml").unwrap();
+        let serialized = toml::to_string(&manifest).unwrap();
+        let restored = Manifest::parse(&serialized, "muster.toml").unwrap();
+        let mut provider = restored.ai_providers["gateway"].clone();
+        assert_eq!(provider.api_key_helper, Some(true));
+        restored.profiles["work"].ai_providers["gateway"].merge_into(&mut provider);
+        assert_eq!(provider.api_key_helper, Some(false));
+        provider.api_key_helper = None;
+        assert!(!toml::to_string(&provider)
+            .unwrap()
+            .contains("api_key_helper"));
+    }
+
+    #[test]
     fn accepts_version_and_extension_keys() {
         let m = Manifest::parse("version = 1\nx-team = \"core\"\n", "muster.toml").unwrap();
         assert_eq!(m.version, 1);

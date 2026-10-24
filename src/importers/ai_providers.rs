@@ -66,6 +66,7 @@ pub fn detect(file: &str, text: &str) -> Result<BTreeMap<String, AiProvider>, Mu
                 base_url,
                 default_model: model.map(str::to_owned),
                 key,
+                api_key_helper: None,
             },
         );
     };

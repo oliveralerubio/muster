@@ -335,6 +335,7 @@ impl Server {
             }
             // The manifest allow list is the human's prior, explicit approval.
             globals.yes = true;
+            globals.audit_actor = self.agent.borrow().map(str::to_owned);
         }
         cli::execute(spec, globals, arguments, false).0
     }

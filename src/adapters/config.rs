@@ -193,6 +193,9 @@ pub struct AiProvider {
     pub default_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
+    /// Resolve Claude Code credentials at runtime instead of storing plaintext.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_helper: Option<bool>,
 }
 
 /// Field-wise profile override. Only a first declaration needs `kind`.
@@ -207,6 +210,9 @@ pub struct AiProviderOverride {
     pub default_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
+    /// Resolve Claude Code credentials at runtime instead of storing plaintext.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_helper: Option<bool>,
 }
 
 impl From<AiProvider> for AiProviderOverride {
@@ -216,6 +222,7 @@ impl From<AiProvider> for AiProviderOverride {
             base_url: provider.base_url,
             default_model: provider.default_model,
             key: provider.key,
+            api_key_helper: provider.api_key_helper,
         }
     }
 }
@@ -231,6 +238,9 @@ impl AiProviderOverride {
         if self.default_model.is_some() {
             current.default_model = self.default_model.clone();
         }
+        if self.api_key_helper.is_some() {
+            current.api_key_helper = self.api_key_helper;
+        }
         if self.key.is_some() {
             current.key = self.key.clone();
         }
@@ -241,6 +251,7 @@ impl AiProviderOverride {
             base_url: self.base_url.clone(),
             default_model: self.default_model.clone(),
             key: self.key.clone(),
+            api_key_helper: self.api_key_helper,
         })
     }
 }
