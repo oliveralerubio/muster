@@ -23,8 +23,8 @@ jobs:
       vars.CI_RUNNER != '' && vars.CI_RUNNER != 'none' &&
       (github.event_name != 'pull_request' ||
       github.event.pull_request.head.repo.full_name == github.repository)
-    # CI_RUNNER is maintained by scripts/ci-runner-select.sh (omarchy if online,
-    # else ubuntu-latest if hosted minutes work, else "none" = skip).
+    # CI_RUNNER is maintained by scripts/ci-runner-select.sh (ordered self-hosted
+    # runners if online, else ubuntu-latest if hosted minutes work, else "none" = skip).
     # Unset or empty also skips: jobs only run when the selector has decided.
     runs-on: ${{ fromJSON(vars.CI_RUNNER || '["ubuntu-latest"]') }}
     steps:
