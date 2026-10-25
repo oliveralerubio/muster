@@ -1,11 +1,19 @@
 #!/usr/bin/env bash
 # Decides where CI runs and publishes the decision in the repo variable CI_RUNNER,
-# which .github/workflows/ci.yml reads at queue time:
-#   - self-hosted runner online          -> ["self-hosted","fast-runner"]
-#   - else hosted minutes proven working -> ["ubuntu-latest"]
-#   - else                               -> none (CI jobs are skipped)
+# which .github/workflows/ci.yml reads at queue time. Ordered chain, first match wins:
+#   - first online self-hosted runner in RUNNERS -> ["self-hosted","<its label>"]
+#   - else hosted minutes proven working         -> ["ubuntu-latest"]
+#   - else                                       -> none (CI jobs are skipped)
 #
-# While the self-hosted runner is offline, hosted runners are used ONLY if both
+# RUNNERS is an ordered list of name:label pairs (default: omarchy-muster, then
+# personal-muster, onesafe-muster, roadsclaw-muster). Each machine carries its own
+# unique custom label, and GitHub only gives a job to a runner holding ALL of the
+# job's labels, so ["self-hosted","<label>"] pins CI to exactly the chosen machine.
+# A runner counts when the API reports status "online"; "busy" is ignored on purpose:
+# a busy runner is still healthy and jobs queue on it, whereas skipping it would
+# flap CI_RUNNER to a lower-priority machine on every running job.
+#
+# While no self-hosted runner is online, hosted runners are used ONLY if both
 # signals agree (fail closed; anything unknown means none):
 #   1. Probe: the latest completed run of the hosted-probe workflow succeeded and
 #      finished at most PROBE_MAX_AGE seconds ago. A new probe is dispatched whenever the
@@ -28,16 +36,19 @@
 # Install: run it every 60s from an always-on Linux server with an authenticated
 # `gh` (repo admin; scopes repo + workflow), e.g. a systemd timer
 # (OnUnitActiveSec=60s) whose service runs `scripts/ci-runner-select.sh`.
-# Cost: each probe bills about 1 hosted minute, only while omarchy is offline.
+# Cost: each probe bills about 1 hosted minute, only while every self-hosted runner is offline.
 #
 # Usage: ci-runner-select.sh [owner/repo]
-# Env:   RUNNER_NAME (omarchy-muster), PROBE_WORKFLOW (hosted-probe.yml),
-#        CI_WORKFLOW (ci.yml), PROBE_INTERVAL (900), PROBE_MAX_AGE (1800)
+# Env:   RUNNERS (space-separated name:label pairs, priority order; default
+#        "omarchy-muster:muster-omarchy personal-muster:muster-personal
+#        onesafe-muster:muster-onesafe roadsclaw-muster:muster-roadsclaw"),
+#        PROBE_WORKFLOW (hosted-probe.yml), CI_WORKFLOW (ci.yml),
+#        PROBE_INTERVAL (900), PROBE_MAX_AGE (1800)
 # Needs: gh, jq, GNU date.
 set -euo pipefail
 
 REPO="${1:-oliveralerubio/muster}"
-RUNNER_NAME="${RUNNER_NAME:-omarchy-muster}"
+RUNNERS="${RUNNERS:-omarchy-muster:muster-omarchy personal-muster:muster-personal onesafe-muster:muster-onesafe roadsclaw-muster:muster-roadsclaw}"
 PROBE_WORKFLOW="${PROBE_WORKFLOW:-hosted-probe.yml}"
 CI_WORKFLOW="${CI_WORKFLOW:-ci.yml}"
 PROBE_INTERVAL="${PROBE_INTERVAL:-900}"
@@ -45,34 +56,44 @@ PROBE_MAX_AGE="${PROBE_MAX_AGE:-1800}"
 CI_LIST_LIMIT=100  # failures fetched per kind; a full page that may not reach the probe means "truncated"
 CI_RUN_MAX_SPAN=21600  # gh lists by creation time; a run can finish up to 6h (job max) after it was created
 
-SELF_HOSTED='["self-hosted","fast-runner"]'
 HOSTED='["ubuntu-latest"]'
 
 ts() { date -u -d "$1" +%s 2>/dev/null || echo 0; }
 
-# If runners cannot be queried, omarchy may have disconnected: fail safe to none
-# (still published below), then exit non-zero so the timer shows the failure.
+# If runners cannot be queried, the self-hosted machines may have disconnected: fail
+# safe to none (still published below), then exit non-zero so the timer shows the failure.
 exit_code=0
+desired="none"
+runner="offline"
 if runners_json="$(gh api "repos/$REPO/actions/runners?per_page=100")"; then
-    online="$(jq -r --arg name "$RUNNER_NAME" \
-        'any(.runners[]?; .name == $name and .status == "online")' <<<"$runners_json")"
+    online_names="$(jq -r '.runners[]? | select(.status == "online") | .name' <<<"$runners_json")"
+    # RUNNERS order is the priority; unquoted on purpose to split on whitespace.
+    # shellcheck disable=SC2086
+    for pair in $RUNNERS; do
+        name="${pair%%:*}"
+        label="${pair#*:}"
+        if [ "$name" = "$pair" ] || [ -z "$name" ] || [ -z "$label" ]; then
+            echo "ci-runner-select: ignoring malformed RUNNERS entry '$pair' (want name:label)" >&2
+            continue
+        fi
+        if grep -Fxq -- "$name" <<<"$online_names"; then
+            runner="$name"
+            desired="[\"self-hosted\",\"$label\"]"
+            break
+        fi
+    done
 else
     echo "ci-runner-select: cannot query runners for $REPO; failing safe to none" >&2
-    online="error"
+    runner="error"
     exit_code=1
 fi
 
-desired="none"
-runner="offline"
 probe="none"
 ci="none"
 probed="no"
 
-if [ "$online" = "error" ]; then
-    runner="error"
-elif [ "$online" = "true" ]; then
-    runner="online"
-    desired="$SELF_HOSTED"
+if [ "$runner" = "error" ] || [ "$desired" != "none" ]; then
+    : # runners unknown, or a self-hosted runner was chosen: no hosted evidence needed
 else
     now="$(date -u +%s)"
     list_failed="no"
@@ -80,7 +101,7 @@ else
     # --- Signal 1: hosted-probe runs (age is measured from when the probe finished)
     if ! probe_runs="$(gh run list --repo "$REPO" --workflow "$PROBE_WORKFLOW" --limit 5 \
         --json status,conclusion,createdAt,updatedAt)"; then
-        # Self-hosted is known to be offline: never leave CI pointing at it.
+        # Every self-hosted runner is known to be offline: never leave CI pointing at one.
         echo "ci-runner-select: cannot list probe runs for $REPO; failing safe to none" >&2
         probe_runs="[]"
         list_failed="yes"

@@ -122,11 +122,19 @@ chmod +x "$FAKE_BIN/gh"
 
 # ------------------------------------------------------------------ helpers --
 
-SELF_HOSTED='["self-hosted","fast-runner"]'
+SELF_HOSTED='["self-hosted","muster-omarchy"]'
 HOSTED='["ubuntu-latest"]'
 
 RUNNER_ONLINE='{"total_count":1,"runners":[{"id":1,"name":"omarchy-muster","status":"online"}]}'
 RUNNER_OFFLINE='{"total_count":1,"runners":[{"id":1,"name":"omarchy-muster","status":"offline"}]}'
+
+runners_json() { # name:status ... -> gh runners API JSON
+    local out="" pair
+    for pair in "$@"; do
+        out+="{\"name\":\"${pair%%:*}\",\"status\":\"${pair#*:}\"},"
+    done
+    printf '{"total_count":%d,"runners":[%s]}' "$#" "${out%,}"
+}
 
 iso_ago() { # seconds-ago -> ISO-8601 UTC timestamp
     date -u -d "$1 seconds ago" +"%Y-%m-%dT%H:%M:%SZ"
@@ -149,7 +157,7 @@ ci_json() { # status conclusion age-seconds -> ci.yml run list JSON (id 42, upda
 # Jobs payloads for run 42
 JOBS_BILLING='{"jobs":[{"labels":["ubuntu-latest"],"conclusion":"failure","runner_id":0,"steps":[]}]}'
 JOBS_REAL_FAIL='{"jobs":[{"labels":["ubuntu-latest"],"conclusion":"failure","runner_id":7,"steps":[{"name":"Tests","conclusion":"failure"}]}]}'
-JOBS_SELF_HOSTED='{"jobs":[{"labels":["self-hosted","fast-runner"],"conclusion":"failure","runner_id":0,"steps":[]}]}'
+JOBS_SELF_HOSTED='{"jobs":[{"labels":["self-hosted","muster-omarchy"],"conclusion":"failure","runner_id":0,"steps":[]}]}'
 
 # run_select [VAR=value ...] ; sets $status, $output, $calls.
 # Starts every case from a clean slate (no inherited FAKE_*).
@@ -157,7 +165,7 @@ run_select() {
     : >"$LOG"
     set +e
     output="$(
-        env -u FAKE_RUNNERS_JSON -u FAKE_RUNNERS_FAIL -u FAKE_RUNS_JSON -u FAKE_RUNS_FAIL -u FAKE_CI_RUNS_JSON -u FAKE_CI_RUNS_FAIL -u FAKE_JOBS_JSON -u FAKE_JOBS_JSON_41 -u FAKE_JOBS_JSON_42 -u FAKE_JOBS_FAIL -u FAKE_VAR_CURRENT \
+        env -u FAKE_RUNNERS_JSON -u FAKE_RUNNERS_FAIL -u FAKE_RUNS_JSON -u FAKE_RUNS_FAIL -u FAKE_CI_RUNS_JSON -u FAKE_CI_RUNS_FAIL -u FAKE_JOBS_JSON -u FAKE_JOBS_JSON_41 -u FAKE_JOBS_JSON_42 -u FAKE_JOBS_FAIL -u FAKE_VAR_CURRENT -u RUNNERS \
             PATH="$FAKE_BIN:$PATH" FAKE_GH_LOG="$LOG" "$@" \
             bash "$SCRIPT" 2>/dev/null
     )"
@@ -174,7 +182,64 @@ assert_eq "online: exits 0" "$status" "0"
 assert_contains "online: sets self-hosted labels" "$calls" "variable set CI_RUNNER --repo oliveralerubio/muster --body $SELF_HOSTED"
 assert_not_contains "online: does not trigger a probe" "$calls" "workflow run"
 assert_eq "online: summary line" "$output" \
-    "CI_RUNNER=$SELF_HOSTED runner=online probe=none ci=none changed=yes probed=no"
+    "CI_RUNNER=$SELF_HOSTED runner=omarchy-muster probe=none ci=none changed=yes probed=no"
+
+echo "# ordered self-hosted fallbacks (omarchy > personal > onesafe > roadsclaw)"
+run_select FAKE_RUNNERS_JSON="$(runners_json personal-muster:online)"
+assert_eq "only personal online: muster-personal" "$output" \
+    'CI_RUNNER=["self-hosted","muster-personal"] runner=personal-muster probe=none ci=none changed=yes probed=no'
+
+run_select FAKE_RUNNERS_JSON="$(runners_json omarchy-muster:offline personal-muster:online)"
+assert_eq "omarchy offline + personal online: muster-personal" "$output" \
+    'CI_RUNNER=["self-hosted","muster-personal"] runner=personal-muster probe=none ci=none changed=yes probed=no'
+assert_not_contains "fallback runner online: does not trigger a probe" "$calls" "workflow run"
+assert_not_contains "fallback runner online: hosted runs not queried" "$calls" "run list"
+
+run_select FAKE_RUNNERS_JSON="$(runners_json onesafe-muster:online)"
+assert_contains "only onesafe online: muster-onesafe" "$output" 'CI_RUNNER=["self-hosted","muster-onesafe"] runner=onesafe-muster'
+
+run_select FAKE_RUNNERS_JSON="$(runners_json roadsclaw-muster:online)"
+assert_eq "only roadsclaw online: muster-roadsclaw" "$output" \
+    'CI_RUNNER=["self-hosted","muster-roadsclaw"] runner=roadsclaw-muster probe=none ci=none changed=yes probed=no'
+
+run_select FAKE_RUNNERS_JSON="$(runners_json roadsclaw-muster:online onesafe-muster:online omarchy-muster:online)"
+assert_contains "all online (listed in reverse): omarchy wins by priority" "$output" \
+    'CI_RUNNER=["self-hosted","muster-omarchy"] runner=omarchy-muster'
+
+run_select FAKE_RUNNERS_JSON="$(runners_json onesafe-muster:online omarchy-muster:online)"
+assert_contains "omarchy and onesafe online: omarchy wins" "$output" \
+    'CI_RUNNER=["self-hosted","muster-omarchy"] runner=omarchy-muster'
+
+run_select FAKE_RUNNERS_JSON="$(runners_json omarchy-muster:offline personal-muster:offline onesafe-muster:online)"
+assert_contains "offline runners are skipped, next online one wins" "$output" \
+    'CI_RUNNER=["self-hosted","muster-onesafe"] runner=onesafe-muster'
+
+run_select FAKE_RUNNERS_JSON="$(runners_json omarchy-muster:offline personal-muster:offline)" \
+    FAKE_RUNS_JSON="$(run_json completed success 600)"
+assert_eq "all registered runners offline: hosted logic unchanged" "$output" \
+    "CI_RUNNER=$HOSTED runner=offline probe=success ci=ok changed=yes probed=no"
+
+run_select FAKE_RUNNERS_JSON="$(runners_json unknown-runner:online)" FAKE_RUNS_JSON="$(run_json completed failure 600)"
+assert_eq "online runner outside RUNNERS is ignored: none" "$output" \
+    "CI_RUNNER=none runner=offline probe=failure ci=ok changed=yes probed=no"
+
+run_select FAKE_RUNNERS_JSON='{"total_count":0,"runners":[]}' FAKE_RUNS_JSON="$(run_json completed failure 600)"
+assert_contains "no runners registered: none" "$output" "CI_RUNNER=none runner=offline"
+
+echo "# busy runner still counts (jobs queue on it)"
+run_select FAKE_RUNNERS_JSON='{"total_count":1,"runners":[{"name":"omarchy-muster","status":"online","busy":true}]}'
+assert_contains "online+busy: still chosen" "$output" "CI_RUNNER=$SELF_HOSTED runner=omarchy-muster"
+
+echo "# custom RUNNERS env"
+run_select FAKE_RUNNERS_JSON="$(runners_json box-a:online box-b:online)" RUNNERS="box-b:lbl-b box-a:lbl-a"
+assert_eq "custom RUNNERS: first listed online wins" "$output" \
+    'CI_RUNNER=["self-hosted","lbl-b"] runner=box-b probe=none ci=none changed=yes probed=no'
+
+run_select FAKE_RUNNERS_JSON="$(runners_json omarchy-muster:online)" RUNNERS="box-a:lbl-a"
+assert_contains "custom RUNNERS replaces the default list" "$output" "CI_RUNNER=none runner=offline"
+
+run_select FAKE_RUNNERS_JSON="$(runners_json box-a:online)" RUNNERS="broken box-a:lbl-a :nolabel box-c:"
+assert_contains "malformed RUNNERS entries are skipped" "$output" 'CI_RUNNER=["self-hosted","lbl-a"] runner=box-a'
 
 echo "# runner offline, recent successful probe"
 run_select FAKE_RUNNERS_JSON="$RUNNER_OFFLINE" FAKE_RUNS_JSON="$(run_json completed success 600)"
@@ -387,7 +452,7 @@ run_select FAKE_RUNNERS_JSON="$RUNNER_ONLINE" FAKE_VAR_CURRENT="$SELF_HOSTED"
 assert_eq "unchanged: exits 0" "$status" "0"
 assert_not_contains "unchanged: no variable set" "$calls" "variable set"
 assert_eq "unchanged: summary line" "$output" \
-    "CI_RUNNER=$SELF_HOSTED runner=online probe=none ci=none changed=no probed=no"
+    "CI_RUNNER=$SELF_HOSTED runner=omarchy-muster probe=none ci=none changed=no probed=no"
 
 run_select FAKE_RUNNERS_JSON="$RUNNER_OFFLINE" FAKE_RUNS_JSON="$(run_json completed failure 600)" \
     FAKE_VAR_CURRENT="none"
