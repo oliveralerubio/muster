@@ -139,7 +139,10 @@ impl Checkout {
                 continue;
             };
             let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
-            if is_dir && !name.starts_with('.') && entry.path().join("SKILL.md").is_file() {
+            if is_dir
+                && !super::is_ignored_skill_name(&name, true)
+                && entry.path().join("SKILL.md").is_file()
+            {
                 names.push(name);
             }
         }

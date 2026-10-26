@@ -47,3 +47,11 @@ contacts skill upstreams. Editing an own skill now requires an explicit
 `muster skill pin <name>` before it can spread; commit the reviewed files and
 `skills.lock` together. `skill add` records the initial pin and `skill update`
 continues to record subscribed skill changes. Deletion remains explicit.
+
+## Amendment — source hygiene
+
+Vendoring, pinning and apply use the same UTF-8 file set: dot-names, names
+ending in `~`, `.bak`, `.orig`, `.rej`, `.swp`, `.swo`, or `.tmp`, names
+containing `.bak-`, and directories `node_modules` and `__pycache__` are
+ignored at every depth. Binary files are unsupported. An unreadable skill is
+skipped with a warning and its previously installed copy is preserved.

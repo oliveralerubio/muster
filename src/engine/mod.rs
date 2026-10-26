@@ -1290,10 +1290,24 @@ fn read_skills(
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        if !file_type.is_dir() || name.starts_with('.') {
+        if !file_type.is_dir() || crate::skills::is_ignored_skill_name(&name, true) {
             continue;
         }
-        let files = crate::skills::read_skill_files(&entry.path())?;
+        let files = match crate::skills::read_skill_files(&entry.path()) {
+            Ok(files) => files,
+            Err(error) => {
+                ctx.diag(
+                    Diagnostic::new(
+                        Severity::Warning,
+                        "skill_unreadable",
+                        format!("skill `{name}` could not be read: {error}; skipped, keeping the previously installed copy"),
+                    )
+                    .with_path(entry.path().display().to_string()),
+                );
+                skipped.push(name);
+                continue;
+            }
+        };
         if files.is_empty() {
             continue;
         }
@@ -1378,7 +1392,20 @@ fn read_subagents(
         if path.extension().and_then(|e| e.to_str()) != Some("md") || name.starts_with('.') {
             continue;
         }
-        let source = std::fs::read_to_string(&path).map_err(|e| io_error(&path, e))?;
+        let source = match std::fs::read_to_string(&path) {
+            Ok(source) => source,
+            Err(error) => {
+                ctx.diag(
+                    Diagnostic::new(
+                        Severity::Warning,
+                        "subagent_unreadable",
+                        format!("subagent `{name}` could not be read: {error}; skipped"),
+                    )
+                    .with_path(path.display().to_string()),
+                );
+                continue;
+            }
+        };
         if let Some(subagent) = read_subagent(ctx, &name, &path, &source) {
             subagents.insert(name, subagent);
         }

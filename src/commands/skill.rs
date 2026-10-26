@@ -516,7 +516,9 @@ fn disk_skills(dir: &Path) -> Result<BTreeMap<String, BTreeMap<String, String>>,
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        if name.starts_with('.') || !entry.file_type().is_ok_and(|t| t.is_dir()) {
+        if crate::skills::is_ignored_skill_name(&name, true)
+            || !entry.file_type().is_ok_and(|t| t.is_dir())
+        {
             continue;
         }
         out.insert(name, read_skill_files(&entry.path())?);

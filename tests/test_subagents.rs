@@ -20,6 +20,23 @@ mod support;
 use std::path::{Path, PathBuf};
 use support::MusterEnv;
 
+#[test]
+fn unreadable_subagent_does_not_abort_other_subagents() {
+    let env = MusterEnv::new();
+    seed_manifest(&env.config_dir(), &["claude"]);
+    std::fs::write(env.config_dir().join("subagents/review.md"), [0xff]).unwrap();
+    let result = env.run(&["agents", "apply", "--yes"]).output().unwrap();
+    assert!(result.status.success());
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(output.contains("subagent_unreadable"), "{output}");
+    assert!(user_agents_dir(&env, "claude").join("explorer.md").exists());
+    assert!(!user_agents_dir(&env, "claude").join("review.md").exists());
+}
+
 const REVIEW_MD: &str = "---\nname: review\ndescription: Reviews code for quality\ntools: Read, Grep\nmodel: gpt-6-luna\n---\n\nReview carefully.\n";
 const EXPLORER_MD: &str =
     "---\nname: explorer\ndescription: Explores the repository\n---\nMap the code.\n";

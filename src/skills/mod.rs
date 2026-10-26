@@ -18,7 +18,18 @@ use crate::hash::sha256_hex;
 pub use lock::{LockEntry, SkillsLock};
 pub use upstream::{SkillStatus, UpstreamFetcher};
 
-/// Read every file of `skill_dir` recursively, relative to `skill_dir`.
+/// Ignore common editor backups and generated directories at every depth.
+pub fn is_ignored_skill_name(name: &str, is_dir: bool) -> bool {
+    name.starts_with('.')
+        || name.ends_with('~')
+        || [".bak", ".orig", ".rej", ".swp", ".swo", ".tmp"]
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
+        || name.contains(".bak-")
+        || (is_dir && matches!(name, "node_modules" | "__pycache__"))
+}
+
+/// Read supported UTF-8 files recursively, relative to `skill_dir`.
 pub fn read_skill_files(skill_dir: &Path) -> Result<BTreeMap<String, String>, MusterError> {
     let mut files = BTreeMap::new();
     collect_files(skill_dir, "", &mut files)?;
@@ -30,11 +41,8 @@ fn collect_files(
     prefix: &str,
     files: &mut BTreeMap<String, String>,
 ) -> Result<(), MusterError> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(MusterError::Operational(format!("{}: {e}", dir.display()))),
-    };
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| MusterError::Operational(format!("{}: {e}", dir.display())))?;
     for entry in entries {
         let entry =
             entry.map_err(|e| MusterError::Operational(format!("{}: {e}", dir.display())))?;
@@ -45,7 +53,7 @@ fn collect_files(
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        if name.starts_with('.') {
+        if is_ignored_skill_name(&name, file_type.is_dir()) {
             continue;
         }
         let rel = format!("{prefix}{name}");
