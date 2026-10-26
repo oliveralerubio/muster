@@ -92,12 +92,19 @@ fn convergence(ctx: &mut Context) -> Result<Value, MusterError> {
     for (id, pin) in lock.agents {
         let artifact = pin.resolve_artifact(&platform);
         let installed_version = crate::installer::installed_version(&id, &pin, &bin_dir)?;
-        let note = artifact
-            .is_none()
-            .then(|| format!("no artifact for platform {platform}"));
+        let newer = installed_version
+            .as_deref()
+            .is_some_and(|v| crate::installer::is_newer(v, &pin.version));
+        let note = if artifact.is_none() {
+            Some(format!("no artifact for platform {platform}"))
+        } else if newer {
+            Some("newer installed version kept; bump the pin in muster.lock".to_string())
+        } else {
+            None
+        };
         agents.push(json!({
             "id": id, "installed_version": installed_version,
-            "pinned_version": pin.version, "artifact": artifact, "note": note,
+            "pinned_version": pin.version, "artifact": artifact, "note": note, "kept_newer": newer,
         }));
     }
     let converged = planned["approvals"].as_array().is_some_and(Vec::is_empty)
@@ -105,7 +112,9 @@ fn convergence(ctx: &mut Context) -> Result<Value, MusterError> {
             .as_array()
             .is_some_and(Vec::is_empty)
         && agents.iter().all(|agent| {
-            !agent["artifact"].is_null() && agent["installed_version"] == agent["pinned_version"]
+            !agent["artifact"].is_null()
+                && (agent["installed_version"] == agent["pinned_version"]
+                    || agent["kept_newer"] == true)
         });
     Ok(json!({
         "converged": converged,

@@ -255,7 +255,7 @@ El mismo producto sirve a dos públicos:
   - `muster.lock` fija la versión y los artefactos por plataforma (`url`, `sha256`); el formato anterior con `url`/`sha256` al nivel del agente sigue siendo válido. Una plataforma sin artefacto emite un aviso y sigue visible en convergencia con artefacto nulo.
   - Detecta primero la versión con `<bin> --version`; solo compara el hash instalado cuando no puede determinar la versión. Una versión ya fijada no se reinstala aunque el hash sea distinto.
   - La aprobación muestra agente, versión anterior (o no instalado), nueva versión, URL y sha256; se recuerda por agente/versión. Sin TTY ni `--yes` nunca instala binarios (ni versiones antes aprobadas): aplica el resto, conserva los binarios y registra las aprobaciones pendientes. Los gates de hooks y MCP no cambian.
-  - `status` expone una convergencia compartida con web/MCP: versiones instaladas/fijadas, skills omitidas y aprobaciones pendientes.
+  - `status` expone una convergencia compartida con web/MCP: versiones instaladas/fijadas, skills omitidas y aprobaciones pendientes. Si la versión instalada es más nueva que la fijada, se conserva y se emite `agent_newer_than_pin`; `status` muestra `kept_newer` y una nota (convergente si existe artefacto para la plataforma).
 - **Transporte de flota**
   - Git es el transporte principal: el usuario elige el remoto.
   - SSH se conserva para el alta asistida y para la sincronización entre máquinas existente, como transporte opcional.

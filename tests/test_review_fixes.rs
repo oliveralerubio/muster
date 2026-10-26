@@ -382,6 +382,7 @@ fn agents_install_downloads_and_verifies_sha256_refusing_mismatch() {
 fn agents_install_antigravity_installs_the_agy_binary() {
     let env = MusterEnv::new();
     init(&env);
+    env.fake_exe("agy", "exit 1");
     let artifact = env.path().join("artifacts").join("agy");
     write(&artifact, "#!/bin/sh\necho \"agy 1.3.0\"\n");
     let sha = "f4b6c1e9b86760e8688506eb7301f385986370c143a0d9ed8123ce646b81a516";

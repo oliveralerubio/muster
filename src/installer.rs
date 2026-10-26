@@ -127,8 +127,11 @@ pub struct Outcome {
     pub agent: String,
     pub version: String,
     pub path: PathBuf,
-    pub sha256: String,
-    /// `install` or `unchanged`.
+    pub sha256: Option<String>,
+    /// The detected version when a newer installation was kept.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installed_version: Option<String>,
+    /// `install`, `unchanged`, or `kept_newer`.
     pub action: &'static str,
 }
 
@@ -139,24 +142,30 @@ pub fn install(
     bin_dir: &Path,
     dry_run: bool,
 ) -> Result<Outcome, MusterError> {
+    let installed = installed_version(agent, pin, bin_dir)?;
     let platform = crate::machine::platform();
-    let artifact = pin.resolve_artifact(&platform).ok_or_else(|| {
+    let artifact = pin.resolve_artifact(&platform);
+    let path = bin_dir.join(default_bin(agent, pin));
+    let outcome = |action, installed_version| Outcome {
+        agent: agent.to_string(),
+        version: pin.version.clone(),
+        path: path.clone(),
+        sha256: artifact.as_ref().map(|a| a.sha256.to_ascii_lowercase()),
+        installed_version,
+        action,
+    };
+    if let Some(version) = installed.as_deref().filter(|v| is_newer(v, &pin.version)) {
+        return Ok(outcome("kept_newer", Some(version.to_string())));
+    }
+    let artifact = artifact.as_ref().ok_or_else(|| {
         MusterError::Operational(format!(
             "no artifact for platform {platform} for agent {agent} {} in {LOCK_FILE}",
             pin.version
         ))
     })?;
-    let path = bin_dir.join(default_bin(agent, pin));
     let expected = artifact.sha256.to_ascii_lowercase();
-    let outcome = |action| Outcome {
-        agent: agent.to_string(),
-        version: pin.version.clone(),
-        path: path.clone(),
-        sha256: expected.clone(),
-        action,
-    };
-    if installed_version(agent, pin, bin_dir)?.as_deref() == Some(pin.version.as_str()) {
-        return Ok(outcome("unchanged"));
+    if installed.as_deref() == Some(pin.version.as_str()) {
+        return Ok(outcome("unchanged", None));
     }
 
     let bytes = fetch(&artifact.url)?;
@@ -170,7 +179,93 @@ pub fn install(
     if !dry_run {
         write_executable(&path, &bytes)?;
     }
-    Ok(outcome("install"))
+    Ok(outcome("install", None))
+}
+
+/// Compare recognizable versions conservatively; unknown versions are not newer.
+pub fn is_newer(installed: &str, pinned: &str) -> bool {
+    fn parse(value: &str) -> Option<([u64; 3], Option<&str>)> {
+        let value = value.strip_prefix('v').unwrap_or(value);
+        let (value, build) = value
+            .split_once('+')
+            .map_or((value, None), |(a, b)| (a, Some(b)));
+        let (core, pre) = value
+            .split_once('-')
+            .map_or((value, None), |(a, b)| (a, Some(b)));
+        let valid_identifiers = |s: &str| {
+            !s.is_empty()
+                && s.split('.').all(|part| {
+                    !part.is_empty() && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                })
+        };
+        if build.is_some_and(|s| !valid_identifiers(s))
+            || pre.is_some_and(|s| !valid_identifiers(s))
+        {
+            return None;
+        }
+        let parts: Vec<_> = core.split('.').collect();
+        if !(2..=3).contains(&parts.len()) {
+            return None;
+        }
+        let mut numbers = [0; 3];
+        for (i, part) in parts.iter().enumerate() {
+            if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            numbers[i] = part.parse().ok()?;
+        }
+        Some((numbers, pre))
+    }
+    match (parse(installed), parse(pinned)) {
+        (Some((a, pre_a)), Some((b, pre_b))) => {
+            use std::cmp::Ordering;
+            match a.cmp(&b) {
+                Ordering::Greater => true,
+                Ordering::Less => false,
+                Ordering::Equal => match (pre_a, pre_b) {
+                    (None, Some(_)) => true,
+                    (Some(a), Some(b)) => {
+                        let mut left = a.split('.');
+                        let mut right = b.split('.');
+                        loop {
+                            let order = match (left.next(), right.next()) {
+                                (None, None) => break false,
+                                (None, Some(_)) => break false,
+                                (Some(_), None) => break true,
+                                (Some(a), Some(b)) => {
+                                    let numeric_a = a.bytes().all(|c| c.is_ascii_digit());
+                                    let numeric_b = b.bytes().all(|c| c.is_ascii_digit());
+                                    match (numeric_a, numeric_b) {
+                                        (true, true) => {
+                                            let a = a.trim_start_matches('0');
+                                            let b = b.trim_start_matches('0');
+                                            a.len().cmp(&b.len()).then_with(|| a.cmp(b))
+                                        }
+                                        (true, false) => Ordering::Less,
+                                        (false, true) => Ordering::Greater,
+                                        (false, false) => a.cmp(b),
+                                    }
+                                }
+                            };
+                            if order != Ordering::Equal {
+                                break order == Ordering::Greater;
+                            }
+                        }
+                    }
+                    _ => false,
+                },
+            }
+        }
+        _ => false,
+    }
+}
+
+pub fn newer_diagnostic(agent: &str, installed: &str, pinned: &str) -> crate::output::Diagnostic {
+    crate::output::Diagnostic::new(
+        crate::output::Severity::Warning,
+        "agent_newer_than_pin",
+        format!("agent {agent} {installed} is newer than pin {pinned}; keeping installed version; bump the pin in muster.lock"),
+    )
 }
 
 /// `pin.bin`, else the adapter's executable name (`antigravity` -> `agy`),
@@ -282,4 +377,29 @@ fn write_executable(path: &Path, bytes: &[u8]) -> Result<(), MusterError> {
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).map_err(io)?;
     }
     std::fs::rename(&tmp, path).map_err(io)
+}
+
+#[cfg(test)]
+mod version_order_tests {
+    use super::is_newer;
+
+    #[test]
+    fn compares_versions_conservatively() {
+        for (a, b, expected) in [
+            ("v2.0", "1.9.9", true),
+            ("1.2.1", "1.2", true),
+            ("1.2", "1.2.0", false),
+            ("1.2.0", "1.2.0-rc.1", true),
+            ("1.2.0-rc.1", "1.2.0", false),
+            ("1.2.0-rc.10", "1.2.0-rc.2", true),
+            ("1.2.0+build", "1.2.0", false),
+            ("1.0", "2.0", false),
+            ("unknown", "1.0", false),
+            ("2.0", "broken", false),
+            ("2.0-", "1.0", false),
+            ("999999999999999999999999.0", "1.0", false),
+        ] {
+            assert_eq!(is_newer(a, b), expected, "{a} vs {b}");
+        }
+    }
 }
