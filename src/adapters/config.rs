@@ -13,6 +13,9 @@ pub struct AgentsConfig {
     /// Adapter ids to apply (`claude`, `codex`, `opencode`, `antigravity`). Default: every stable adapter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<Vec<String>>,
+    /// Adapter ids that skip shared instructions at user scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_instructions: Option<Vec<String>>,
     /// Shared instructions (AGENTS.md).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<Instructions>,

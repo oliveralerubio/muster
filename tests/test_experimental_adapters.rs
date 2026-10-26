@@ -5,6 +5,70 @@ use serde_json::Value;
 use support::MusterEnv;
 use yaml_rust2::{Yaml, YamlLoader};
 
+#[test]
+fn machine_profile_skips_only_user_instructions() {
+    let env = MusterEnv::new();
+    seed(&env);
+    let path = env.config_dir().join("muster.toml");
+    let mut manifest = std::fs::read_to_string(&path).unwrap();
+    manifest.push_str("\n[machines.laptop]\nrecipient = 'age1laptop'\nplatform = 'linux-x86_64'\nmuster_version = '0.1.0'\nprofile = 'personal'\n[profiles.personal.agents]\nskip_instructions = ['hermes']\n");
+    std::fs::write(&path, manifest).unwrap();
+    write(&env, ".local/state/muster/machine", "laptop\n");
+    write(&env, ".hermes/SOUL.md", "My own notes.\n");
+    let (output, plan) = env.run_json(&["plan", "--format", "json"]);
+    assert!(output.status.success(), "{:?}", plan.raw);
+    assert!(!plan.result().to_string().contains("SOUL.md"));
+    apply(&env);
+    assert_eq!(read(&env, ".hermes/SOUL.md"), "My own notes.\n");
+    assert!(read(&env, ".pi/agent/AGENTS.md").contains("Shared rules."));
+    let config = yaml(&env);
+    assert_eq!(
+        config["model"]["default"].as_str(),
+        Some("anthropic/claude-sonnet-4")
+    );
+    assert_eq!(
+        config["mcp_servers"]["local"]["command"].as_str(),
+        Some("npx")
+    );
+    assert!(env.path().join(".hermes/skills/review/SKILL.md").is_file());
+    write(&env, ".local/state/muster/machine", "other\n");
+    apply(&env);
+    assert!(read(&env, ".hermes/SOUL.md").contains("Shared rules."));
+    write(&env, ".local/state/muster/machine", "laptop\n");
+    apply(&env);
+    assert_eq!(read(&env, ".hermes/SOUL.md"), "My own notes.\n");
+}
+
+#[test]
+fn skipping_instructions_removes_created_file_and_leaves_project_scope() {
+    let env = MusterEnv::new();
+    seed(&env);
+    apply(&env);
+    assert!(env.path().join(".hermes/SOUL.md").is_file());
+    let path = env.config_dir().join("muster.toml");
+    let manifest = std::fs::read_to_string(&path).unwrap().replace(
+        "enabled = [\"pi\", \"hermes\", \"codex\"]",
+        "enabled = [\"pi\", \"hermes\", \"codex\"]\nskip_instructions = [\"hermes\"]",
+    );
+    std::fs::write(&path, manifest).unwrap();
+    apply(&env);
+    assert!(!env.path().join(".hermes/SOUL.md").exists());
+    let project = env.path().join("project");
+    std::fs::create_dir_all(project.join(".muster")).unwrap();
+    std::fs::write(
+        project.join(".muster/muster.toml"),
+        "version = 1\n[agents]\nenabled = ['hermes']\nskip_instructions = ['hermes']\n",
+    )
+    .unwrap();
+    std::fs::write(project.join(".muster/AGENTS.md"), "Project rules.\n").unwrap();
+    env.run(&["sync", "--project", project.to_str().unwrap(), "--yes"])
+        .assert()
+        .success();
+    assert!(std::fs::read_to_string(project.join("AGENTS.md"))
+        .unwrap()
+        .contains("Project rules."));
+}
+
 fn seed(env: &MusterEnv) {
     let cfg = env.config_dir();
     std::fs::create_dir_all(cfg.join("skills/review/refs")).unwrap();

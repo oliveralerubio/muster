@@ -283,7 +283,21 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
     let mut agents = BTreeMap::new();
     for adapter in &selected {
         let ctx_target = &options.target;
-        match plan_adapter(adapter, &desired, &roots, ctx_target, &ours, &entries) {
+        let skip_instructions = matches!(ctx_target, Target::Global)
+            && merged
+                .agents
+                .skip_instructions
+                .as_ref()
+                .is_some_and(|ids| ids.iter().any(|id| id == adapter.id));
+        let agent_desired = Desired {
+            instructions: if skip_instructions {
+                None
+            } else {
+                desired.instructions
+            },
+            ..desired
+        };
+        match plan_adapter(adapter, &agent_desired, &roots, ctx_target, &ours, &entries) {
             Ok((planned, diagnostics)) => {
                 for d in diagnostics {
                     ctx.diag(d);
