@@ -536,3 +536,22 @@ fn instructions_second_apply_reports_no_changes() {
         );
     }
 }
+
+#[test]
+fn edited_local_skill_warning_suggests_pin_command() {
+    let env = MusterEnv::new();
+    seed_manifest(&env.config_dir(), &["claude"]);
+    std::fs::write(
+        env.config_dir().join("skills/review/checklist.md"),
+        "changed\n",
+    )
+    .unwrap();
+    let result = env.run(&["agents", "apply", "--yes"]).output().unwrap();
+    assert!(result.status.success());
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(output.contains("muster skill pin review"), "{output}");
+}

@@ -41,8 +41,16 @@ fn collect_files(
     prefix: &str,
     files: &mut BTreeMap<String, String>,
 ) -> Result<(), MusterError> {
-    let entries = std::fs::read_dir(dir)
-        .map_err(|e| MusterError::Operational(format!("{}: {e}", dir.display())))?;
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(MusterError::Operational(format!(
+                "{}: {error}",
+                dir.display()
+            )))
+        }
+    };
     for entry in entries {
         let entry =
             entry.map_err(|e| MusterError::Operational(format!("{}: {e}", dir.display())))?;

@@ -908,3 +908,46 @@ fn opencode_description_with_tab_and_newline_parses_back_as_yaml() {
     );
     assert_eq!(frontmatter["mode"].as_str(), Some("subagent"));
 }
+
+#[test]
+fn unreadable_subagent_preserves_managed_files_without_blocking_pruning() {
+    let env = MusterEnv::new();
+    seed_manifest(
+        &env.config_dir(),
+        &["claude", "codex", "opencode", "antigravity"],
+    );
+    env.run(&["agents", "apply", "--yes"]).assert().code(0);
+    let old: Vec<_> = ["claude", "codex", "opencode", "antigravity"]
+        .iter()
+        .map(|adapter| {
+            let ext = if *adapter == "codex" { "toml" } else { "md" };
+            let path = user_agents_dir(&env, adapter).join(format!("review.{ext}"));
+            (path.clone(), read(&path))
+        })
+        .collect();
+    std::fs::write(env.config_dir().join("subagents/review.md"), [0xff]).unwrap();
+    std::fs::remove_file(env.config_dir().join("subagents/explorer.md")).unwrap();
+    let result = env.run(&["agents", "apply", "--yes"]).output().unwrap();
+    assert!(result.status.success());
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(output.contains("subagent_unreadable"), "{output}");
+    for (path, contents) in old {
+        assert_eq!(read(&path), contents);
+    }
+    for adapter in ["claude", "codex", "opencode", "antigravity"] {
+        let ext = if adapter == "codex" { "toml" } else { "md" };
+        assert!(!user_agents_dir(&env, adapter)
+            .join(format!("explorer.{ext}"))
+            .exists());
+    }
+    // The next apply must still retain ownership of the protected files.
+    env.run(&["agents", "apply", "--yes"]).assert().code(0);
+    assert_eq!(
+        read(&user_agents_dir(&env, "claude").join("review.md")),
+        REVIEW_MD
+    );
+}

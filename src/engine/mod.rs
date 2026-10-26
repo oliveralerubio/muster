@@ -167,7 +167,7 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
     };
     let instructions = read_instructions(ctx, &merged)?;
     let (skills, skipped_skills) = read_skills(ctx, &merged)?;
-    let subagents = read_subagents(ctx, &merged)?;
+    let (subagents, skipped_subagents) = read_subagents(ctx, &merged)?;
     let mut secrets = resolve_secrets(ctx, &merged.mcp);
     let mut secret_providers = Providers::new(&ctx.config_dir, &ctx.state_dir);
     for (id, ai_provider) in &merged.ai_providers {
@@ -275,6 +275,67 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
                 if let Some(parent) = path.parent() {
                     protected.insert(parent.to_path_buf());
                 }
+            }
+        }
+    }
+    // Render unreadable subagents separately: protect their exact output files,
+    // not the entire agents directory, so unrelated stale files still prune.
+    let skipped_agents: adapters::Subagents = skipped_subagents
+        .iter()
+        .map(|name| {
+            (
+                name.clone(),
+                adapters::Subagent {
+                    name: name.clone(),
+                    description: String::new(),
+                    tools: Vec::new(),
+                    model: None,
+                    extra_fields: Vec::new(),
+                    body: String::new(),
+                    source: String::new(),
+                },
+            )
+        })
+        .collect();
+    if !skipped_agents.is_empty() {
+        let empty_skills = adapters::Skills::new();
+        let skipped_desired = Desired {
+            skills: &empty_skills,
+            subagents: &skipped_agents,
+            ..desired
+        };
+        let mut visited = BTreeSet::new();
+        for adapter in selected
+            .iter()
+            .copied()
+            .chain(records.values().filter_map(|r| adapters::find(&r.agent)))
+        {
+            if !visited.insert(adapter.id) {
+                continue;
+            }
+            let rendered = match adapter.render(&skipped_desired, &Current::new()) {
+                Ok(rendered) => rendered,
+                Err(_) => {
+                    protected.extend(
+                        records
+                            .iter()
+                            .filter(|(_, record)| {
+                                record.agent == adapter.id && record.target == key
+                            })
+                            .map(|(path, _)| PathBuf::from(path)),
+                    );
+                    continue;
+                }
+            };
+            for file in rendered.tree {
+                let path = match &options.target {
+                    Target::Global => roots.base(file.base).join(file.path),
+                    Target::Project(dir) => match file.project {
+                        Some(path) => dir.join(path),
+                        None => continue,
+                    },
+                };
+                protected.insert(path);
             }
         }
     }
@@ -1322,12 +1383,19 @@ fn read_skills(
             Some(_) => None,
         };
         if let Some((code, reason)) = reason {
+            let hint = if code == "skill_verification_failed"
+                && lock.get(&name).is_some_and(|pin| pin.is_local())
+            {
+                format!("; review it and run `muster skill pin {name}`")
+            } else {
+                String::new()
+            };
             ctx.diag(
                 Diagnostic::new(
                     Severity::Warning,
                     code,
                     format!(
-                        "skill `{name}` {reason}; skipped, keeping the previously installed copy"
+                        "skill `{name}` {reason}; skipped, keeping the previously installed copy{hint}"
                     ),
                 )
                 .with_path(entry.path().display().to_string()),
@@ -1357,10 +1425,11 @@ fn read_optional(path: &Path) -> Result<Option<String>, MusterError> {
 fn read_subagents(
     ctx: &mut Context,
     merged: &layer::Merged,
-) -> Result<adapters::Subagents, MusterError> {
+) -> Result<(adapters::Subagents, Vec<String>), MusterError> {
     let mut subagents = adapters::Subagents::new();
+    let mut skipped = Vec::new();
     let Some(dir) = merged.subagents_path()? else {
-        return Ok(subagents);
+        return Ok((subagents, skipped));
     };
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
@@ -1376,7 +1445,7 @@ fn read_subagents(
                 )
                 .with_path(dir.display().to_string()),
             );
-            return Ok(subagents);
+            return Ok((subagents, skipped));
         }
         Err(e) => return Err(io_error(&dir, e)),
     };
@@ -1403,6 +1472,7 @@ fn read_subagents(
                     )
                     .with_path(path.display().to_string()),
                 );
+                skipped.push(name);
                 continue;
             }
         };
@@ -1410,7 +1480,7 @@ fn read_subagents(
             subagents.insert(name, subagent);
         }
     }
-    Ok(subagents)
+    Ok((subagents, skipped))
 }
 
 /// Parse and validate one canonical subagent file; `None` (with a
