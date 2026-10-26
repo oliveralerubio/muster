@@ -256,3 +256,7 @@ Pre-release (0.1.x): the intended v1 behavior is specified in [`docs/SPEC.md`](d
 ## License
 
 [Apache-2.0](LICENSE)
+
+Agent installs keep an installed CLI newer than its `muster.lock` pin and warn
+`agent_newer_than_pin`; bump the pin to match. Status reports `kept_newer` and a
+note, and treats that agent as converged when its platform artifact is available.

@@ -74,7 +74,13 @@ fn install(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
             pin.version,
             machine::platform()
         ));
-        installed.push(installer::install(agent, pin, &bin_dir, ctx.dry_run)?);
+        let outcome = installer::install(agent, pin, &bin_dir, ctx.dry_run)?;
+        if outcome.action == "kept_newer" {
+            if let Some(version) = installer::installed_version(agent, pin, &bin_dir)? {
+                ctx.diag(installer::newer_diagnostic(agent, &version, &pin.version));
+            }
+        }
+        installed.push(outcome);
     }
     Ok(json!({
         "dry_run": ctx.dry_run,

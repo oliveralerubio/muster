@@ -272,7 +272,12 @@ fn convergence_checks_reported_version_and_uses_checksum_when_version_is_unknown
         status["convergence"]["agents"][0]["installed_version"],
         "2.0.0"
     );
-    assert_eq!(status["convergence"]["converged"], false);
+    assert_eq!(status["convergence"]["converged"], true);
+    assert_eq!(status["convergence"]["agents"][0]["kept_newer"], true);
+    let (output, envelope) = env.run_json(&["--format", "json", "sync", "--yes"]);
+    assert!(output.status.success(), "{}", envelope.raw);
+    assert!(envelope.raw.to_string().contains("agent_newer_than_pin"));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), script);
 
     let script = "#!/bin/sh\nexit 1\n";
     write(&path, script);

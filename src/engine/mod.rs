@@ -456,6 +456,14 @@ fn agent_installs(
         if selected.is_some_and(|id| id != agent) {
             continue;
         }
+        let installed = installer::installed_version(&agent, &pin, bin_dir)?;
+        if let Some(version) = installed
+            .as_deref()
+            .filter(|v| installer::is_newer(v, &pin.version))
+        {
+            ctx.diag(installer::newer_diagnostic(&agent, version, &pin.version));
+            continue;
+        }
         if pin.resolve_artifact(&platform).is_none() {
             ctx.diag(Diagnostic::new(
                 Severity::Warning,
@@ -467,9 +475,7 @@ fn agent_installs(
             ));
             continue;
         }
-        if installer::installed_version(&agent, &pin, bin_dir)?.as_deref()
-            != Some(pin.version.as_str())
-        {
+        if installed.as_deref() != Some(pin.version.as_str()) {
             installs.push((agent, pin));
         }
     }
