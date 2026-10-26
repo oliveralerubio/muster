@@ -76,8 +76,8 @@ fn install(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         ));
         let outcome = installer::install(agent, pin, &bin_dir, ctx.dry_run)?;
         if outcome.action == "kept_newer" {
-            if let Some(version) = installer::installed_version(agent, pin, &bin_dir)? {
-                ctx.diag(installer::newer_diagnostic(agent, &version, &pin.version));
+            if let Some(version) = &outcome.installed_version {
+                ctx.diag(installer::newer_diagnostic(agent, version, &pin.version));
             }
         }
         installed.push(outcome);

@@ -293,3 +293,24 @@ fn newer_agent_is_kept_with_warning_and_older_agent_upgrades() {
     ok(&env, &["sync", "--yes"]);
     assert!(std::fs::read_to_string(binary).unwrap().contains("4.0.0"));
 }
+
+#[test]
+fn manual_install_keeps_newer_agent_without_platform_artifact() {
+    let env = MusterEnv::new();
+    init(&env);
+    env.fake_exe("claude", "echo claude 3.0.0");
+    write(
+        &env.config_dir().join("muster.lock"),
+        &format!("[agents.claude]\nversion = \"1.0.0\"\n[agents.claude.artifacts.other-platform]\nurl = \"file:///missing\"\nsha256 = \"{}\"\n", "0".repeat(64)),
+    );
+    let (out, envelope) = env.run_json(&["--format", "json", "agents", "install"]);
+    assert!(out.status.success(), "{}", envelope.raw);
+    assert_eq!(envelope.result()["installed"][0]["action"], "kept_newer");
+    assert_eq!(
+        envelope.result()["installed"][0]["installed_version"],
+        "3.0.0"
+    );
+    assert!(envelope.result()["installed"][0]["sha256"].is_null());
+    assert!(envelope.raw.to_string().contains("agent_newer_than_pin"));
+    assert!(!env.path().join(".local/bin/claude").exists());
+}

@@ -127,7 +127,10 @@ pub struct Outcome {
     pub agent: String,
     pub version: String,
     pub path: PathBuf,
-    pub sha256: String,
+    pub sha256: Option<String>,
+    /// The detected version when a newer installation was kept.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installed_version: Option<String>,
     /// `install`, `unchanged`, or `kept_newer`.
     pub action: &'static str,
 }
@@ -141,29 +144,28 @@ pub fn install(
 ) -> Result<Outcome, MusterError> {
     let installed = installed_version(agent, pin, bin_dir)?;
     let platform = crate::machine::platform();
-    let artifact = pin.resolve_artifact(&platform).ok_or_else(|| {
+    let artifact = pin.resolve_artifact(&platform);
+    let path = bin_dir.join(default_bin(agent, pin));
+    let outcome = |action, installed_version| Outcome {
+        agent: agent.to_string(),
+        version: pin.version.clone(),
+        path: path.clone(),
+        sha256: artifact.as_ref().map(|a| a.sha256.to_ascii_lowercase()),
+        installed_version,
+        action,
+    };
+    if let Some(version) = installed.as_deref().filter(|v| is_newer(v, &pin.version)) {
+        return Ok(outcome("kept_newer", Some(version.to_string())));
+    }
+    let artifact = artifact.as_ref().ok_or_else(|| {
         MusterError::Operational(format!(
             "no artifact for platform {platform} for agent {agent} {} in {LOCK_FILE}",
             pin.version
         ))
     })?;
-    let path = bin_dir.join(default_bin(agent, pin));
     let expected = artifact.sha256.to_ascii_lowercase();
-    let outcome = |action| Outcome {
-        agent: agent.to_string(),
-        version: pin.version.clone(),
-        path: path.clone(),
-        sha256: expected.clone(),
-        action,
-    };
     if installed.as_deref() == Some(pin.version.as_str()) {
-        return Ok(outcome("unchanged"));
-    }
-    if installed
-        .as_deref()
-        .is_some_and(|v| is_newer(v, &pin.version))
-    {
-        return Ok(outcome("kept_newer"));
+        return Ok(outcome("unchanged", None));
     }
 
     let bytes = fetch(&artifact.url)?;
@@ -177,7 +179,7 @@ pub fn install(
     if !dry_run {
         write_executable(&path, &bytes)?;
     }
-    Ok(outcome("install"))
+    Ok(outcome("install", None))
 }
 
 /// Compare recognizable versions conservatively; unknown versions are not newer.

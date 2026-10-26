@@ -212,3 +212,7 @@ next refresh. OpenCode `env://VAR` providers use
 and require that variable in OpenCode's environment. This avoids writing the
 value into settings but does not enforce leases. Use the runtime Claude helper
 or MCP for lease checks; static configuration injection does not check them.
+
+Agent installs preserve versions newer than `muster.lock` and emit the warning
+`agent_newer_than_pin`, suggesting a pin bump. Status includes `kept_newer` and a
+note for these agents; they count as converged when a platform artifact exists.
