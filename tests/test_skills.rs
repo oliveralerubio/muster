@@ -23,6 +23,76 @@ const CHECKLIST: &str = "- tests\n";
 const RUN_SH: &str = "#!/bin/sh\necho hi\n";
 const INSTRUCTIONS: &str = "# Shared rules\n\nBe concise.\n";
 
+#[test]
+fn editor_junk_does_not_change_pin_or_install() {
+    let env = MusterEnv::new();
+    seed_manifest(&env.config_dir(), &["claude"]);
+    let skill = env.config_dir().join("skills/review");
+    let clean = muster::skills::read_skill_files(&skill).unwrap();
+    assert_eq!(
+        muster::skills::content_hash(&clean),
+        "sha256:332bb14c4e474f4b0c2515aee233a3ddc6bfb9d8d874c5c2e05210d53e8edee7"
+    );
+    for name in [
+        "x~",
+        "x.bak",
+        "x.bak-yolo",
+        "x.orig",
+        "x.rej",
+        "x.swp",
+        "x.swo",
+        "x.tmp",
+        ".hidden",
+    ] {
+        std::fs::write(skill.join("scripts").join(name), b"junk").unwrap();
+    }
+    for name in ["node_modules", "__pycache__", ".git"] {
+        let dir = skill.join(name);
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("junk"), b"junk").unwrap();
+    }
+    assert_eq!(muster::skills::read_skill_files(&skill).unwrap(), clean);
+    let result = env
+        .run(&["agents", "apply", "--agent", "claude", "--yes"])
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(!output.contains("skill_verification_failed"), "{output}");
+    let installed = user_skills_dir(&env, "claude").join("review");
+    assert_eq!(muster::skills::read_skill_files(&installed).unwrap(), clean);
+    assert!(!installed.join("scripts/x.bak-yolo").exists());
+    assert!(!installed.join("node_modules").exists());
+}
+
+#[test]
+fn unreadable_skill_preserves_installed_copy_and_other_skills_sync() {
+    let env = MusterEnv::new();
+    seed_manifest(&env.config_dir(), &["claude", "codex"]);
+    env.run(&["agents", "apply", "--yes"]).assert().code(0);
+    let source = env.config_dir().join("skills/review");
+    std::fs::write(source.join("binary"), [0xff]).unwrap();
+    std::fs::remove_file(user_skills_dir(&env, "claude").join("extra/SKILL.md")).unwrap();
+    let result = env.run(&["agents", "apply", "--yes"]).output().unwrap();
+    assert!(result.status.success());
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(output.contains("skill_unreadable"), "{output}");
+    for adapter in ["claude", "codex"] {
+        let base = user_skills_dir(&env, adapter);
+        assert_eq!(read(&base.join("review/SKILL.md")), SKILL_MD);
+        assert!(base.join("review/scripts/run.sh").exists());
+        assert!(base.join("extra/SKILL.md").exists());
+    }
+}
+
 /// Seed a skills source with `review` (SKILL.md + checklist.md + nested
 /// `scripts/run.sh`) and a second skill `extra`.
 fn seed_skills(dir: &Path) {
@@ -465,4 +535,23 @@ fn instructions_second_apply_reports_no_changes() {
             "every adapter must be unchanged on second apply: {agent}"
         );
     }
+}
+
+#[test]
+fn edited_local_skill_warning_suggests_pin_command() {
+    let env = MusterEnv::new();
+    seed_manifest(&env.config_dir(), &["claude"]);
+    std::fs::write(
+        env.config_dir().join("skills/review/checklist.md"),
+        "changed\n",
+    )
+    .unwrap();
+    let result = env.run(&["agents", "apply", "--yes"]).output().unwrap();
+    assert!(result.status.success());
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(output.contains("muster skill pin review"), "{output}");
 }

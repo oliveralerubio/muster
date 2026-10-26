@@ -711,3 +711,41 @@ fn web_get_api_skills_returns_the_list() {
     assert_eq!(skill(&api["result"], "mine")["origin"], "local");
     assert!(api["cli"].as_str().unwrap().contains("muster skill list"));
 }
+
+#[test]
+fn missing_vendored_skill_can_be_restored_or_detached() {
+    let env = initialized();
+    let up = Upstream::new();
+    subscribe(&env, &up);
+    std::fs::remove_dir_all(skills_dir(&env).join("pdf")).unwrap();
+    ok(&env, &["skill", "update", "pdf", "--force", "--yes"]);
+    assert_eq!(read(&skills_dir(&env).join("pdf/SKILL.md")), PDF_V1);
+    std::fs::remove_dir_all(skills_dir(&env).join("pdf")).unwrap();
+    ok(&env, &["skill", "rm", "pdf", "--detach", "--yes"]);
+    assert_eq!(
+        lock_entry(&env, "pdf").unwrap()["origin"].as_str(),
+        Some("local")
+    );
+}
+
+#[test]
+fn matching_upstream_refreshes_stale_pin_without_deleting_junk() {
+    let env = initialized();
+    let up = Upstream::new();
+    subscribe(&env, &up);
+    let dir = skills_dir(&env).join("pdf");
+    std::fs::write(dir.join("note.bak-yolo"), "backup").unwrap();
+    let mut lock = muster::skills::SkillsLock::load(&env.config_dir()).unwrap();
+    let mut entry = lock.get("pdf").unwrap().clone();
+    entry.content_hash = "sha256:old-filter-hash".into();
+    lock.upsert(entry);
+    lock.save(&env.config_dir()).unwrap();
+    let result = ok(&env, &["skill", "update", "pdf", "--yes"]);
+    assert_eq!(result["updated"].as_array().unwrap().len(), 1);
+    let hash = muster::skills::content_hash(&muster::skills::read_skill_files(&dir).unwrap());
+    assert_eq!(
+        lock_entry(&env, "pdf").unwrap()["content_hash"].as_str(),
+        Some(hash.as_str())
+    );
+    assert!(dir.join("note.bak-yolo").exists());
+}

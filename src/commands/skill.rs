@@ -516,7 +516,9 @@ fn disk_skills(dir: &Path) -> Result<BTreeMap<String, BTreeMap<String, String>>,
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        if name.starts_with('.') || !entry.file_type().is_ok_and(|t| t.is_dir()) {
+        if crate::skills::is_ignored_skill_name(&name, true)
+            || !entry.file_type().is_ok_and(|t| t.is_dir())
+        {
             continue;
         }
         out.insert(name, read_skill_files(&entry.path())?);
@@ -1084,14 +1086,17 @@ fn update_with(
         };
         let disk = read_skill_files(&dir.join(&entry.name))?;
         let modified = content_hash(&disk) != entry.content_hash;
-        if skill.hash == content_hash(&disk) && entry.commit.as_deref() == Some(&checkout.commit) {
+        if skill.hash == content_hash(&disk)
+            && skill.hash == entry.content_hash
+            && entry.commit.as_deref() == Some(&checkout.commit)
+        {
             continue;
         }
         if skill.hash == entry.content_hash && !modified {
             // Same content at a newer commit: nothing to apply, nothing to bump.
             continue;
         }
-        if modified && !force {
+        if modified && skill.hash != content_hash(&disk) && !force {
             refuse(
                 ctx,
                 "skill_modified",
@@ -1110,7 +1115,7 @@ fn update_with(
             origin: entry.origin.clone(),
             commit: checkout.commit.clone(),
             skill,
-            forced: modified,
+            forced: modified && force,
         });
     }
 
@@ -1150,7 +1155,9 @@ fn update_with(
     let updated_at = now();
     let mut cache = StatusCache::load(&ctx.state_dir);
     for p in &planned {
-        write_skill(&dir.join(&p.name), &p.skill.files)?;
+        if content_hash(&read_skill_files(&dir.join(&p.name))?) != p.skill.hash {
+            write_skill(&dir.join(&p.name), &p.skill.files)?;
+        }
         lock.upsert(LockEntry {
             name: p.name.clone(),
             origin: p.origin.clone(),

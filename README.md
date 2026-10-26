@@ -31,6 +31,8 @@ warning, never silently lost.
 
 Declare a skills folder in `muster.toml` (`[agents.skills] source = "skills"`), one subfolder per skill with a `SKILL.md` (YAML frontmatter with `name` and `description`) plus any extra files. Muster verifies each skill against `skills.lock`, then installs its reviewed files byte for byte into the skill folders listed in the table above. Missing or mismatching pins produce a warning and keep the previously installed copy; other configuration and verified skills still sync. Empty directories are ignored. A skill without `SKILL.md` or without `name`/`description` is skipped with a `skill_invalid` warning.
 
+Skill files must be UTF-8; unreadable skills are skipped with a warning and their installed copies kept. Muster ignores dot-names, names ending in `~`, `.bak`, `.orig`, `.rej`, `.swp`, `.swo`, or `.tmp`, names containing `.bak-`, and the directories `node_modules` and `__pycache__`.
+
 ### Skill lifecycle (own and subscribed skills)
 
 Write your own skills in the config repo, or subscribe to an external Git repository of skills. Subscribed skills are copied (vendored) into the skills folder under `skills/<name>/`, so every machine gets them through the normal sync, even offline.

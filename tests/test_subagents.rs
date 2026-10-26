@@ -20,6 +20,23 @@ mod support;
 use std::path::{Path, PathBuf};
 use support::MusterEnv;
 
+#[test]
+fn unreadable_subagent_does_not_abort_other_subagents() {
+    let env = MusterEnv::new();
+    seed_manifest(&env.config_dir(), &["claude"]);
+    std::fs::write(env.config_dir().join("subagents/review.md"), [0xff]).unwrap();
+    let result = env.run(&["agents", "apply", "--yes"]).output().unwrap();
+    assert!(result.status.success());
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(output.contains("subagent_unreadable"), "{output}");
+    assert!(user_agents_dir(&env, "claude").join("explorer.md").exists());
+    assert!(!user_agents_dir(&env, "claude").join("review.md").exists());
+}
+
 const REVIEW_MD: &str = "---\nname: review\ndescription: Reviews code for quality\ntools: Read, Grep\nmodel: gpt-6-luna\n---\n\nReview carefully.\n";
 const EXPLORER_MD: &str =
     "---\nname: explorer\ndescription: Explores the repository\n---\nMap the code.\n";
@@ -890,4 +907,47 @@ fn opencode_description_with_tab_and_newline_parses_back_as_yaml() {
         "description with tab and newline must round-trip"
     );
     assert_eq!(frontmatter["mode"].as_str(), Some("subagent"));
+}
+
+#[test]
+fn unreadable_subagent_preserves_managed_files_without_blocking_pruning() {
+    let env = MusterEnv::new();
+    seed_manifest(
+        &env.config_dir(),
+        &["claude", "codex", "opencode", "antigravity"],
+    );
+    env.run(&["agents", "apply", "--yes"]).assert().code(0);
+    let old: Vec<_> = ["claude", "codex", "opencode", "antigravity"]
+        .iter()
+        .map(|adapter| {
+            let ext = if *adapter == "codex" { "toml" } else { "md" };
+            let path = user_agents_dir(&env, adapter).join(format!("review.{ext}"));
+            (path.clone(), read(&path))
+        })
+        .collect();
+    std::fs::write(env.config_dir().join("subagents/review.md"), [0xff]).unwrap();
+    std::fs::remove_file(env.config_dir().join("subagents/explorer.md")).unwrap();
+    let result = env.run(&["agents", "apply", "--yes"]).output().unwrap();
+    assert!(result.status.success());
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(output.contains("subagent_unreadable"), "{output}");
+    for (path, contents) in old {
+        assert_eq!(read(&path), contents);
+    }
+    for adapter in ["claude", "codex", "opencode", "antigravity"] {
+        let ext = if adapter == "codex" { "toml" } else { "md" };
+        assert!(!user_agents_dir(&env, adapter)
+            .join(format!("explorer.{ext}"))
+            .exists());
+    }
+    // The next apply must still retain ownership of the protected files.
+    env.run(&["agents", "apply", "--yes"]).assert().code(0);
+    assert_eq!(
+        read(&user_agents_dir(&env, "claude").join("review.md")),
+        REVIEW_MD
+    );
 }
