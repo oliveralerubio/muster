@@ -225,6 +225,9 @@ pub fn merge(layers: &[Layer]) -> Merged {
         if over.enabled.is_some() {
             agents.enabled = over.enabled.clone();
         }
+        if over.skip_instructions.is_some() {
+            agents.skip_instructions = over.skip_instructions.clone();
+        }
         if over.instructions.is_some() {
             agents.instructions = over.instructions.clone();
             instructions_dir = layer.dir.clone();

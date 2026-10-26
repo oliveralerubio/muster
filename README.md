@@ -164,6 +164,8 @@ muster ui            # web admin on 127.0.0.1 with a one-time login token
 
 Everything the UI does has a CLI equivalent, and every ordinary command answers `--format json` with a stable envelope for scripts and AI agents. Two commands are their own protocol: `muster mcp` speaks JSON-RPC over stdio, and `muster ui` prints one startup JSON object (`url`, `port`, `token`) before serving.
 
+To keep an agent's user-scope instructions personal, set `skip_instructions = ["hermes"]` under `[agents]`. For only one machine, set it under `[profiles.personal.agents]` and assign that profile to the machine. This leaves Hermes `~/.hermes/SOUL.md` untouched except for removing any previously managed block; MCP, models, and skills still sync. Project-scope instructions are unaffected. Higher-precedence lists replace lower ones; use `skip_instructions = []` to clear the setting.
+
 ## AI providers
 
 Declare endpoints once and sync their settings to your machines:
