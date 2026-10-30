@@ -85,8 +85,13 @@ pub(super) fn scan_codex(
                 cwd = record["payload"]["cwd"].as_str().map(str::to_owned);
                 continue;
             }
-            if options.project.is_some_and(|p| cwd.as_deref() != Some(p)) {
-                continue;
+            if let Some(project) = options.project {
+                let Some(cwd) = cwd.as_deref() else {
+                    continue;
+                };
+                if !cwd_in_project(cwd, project) {
+                    continue;
+                }
             }
             let Some(timestamp) = record["timestamp"]
                 .as_str()

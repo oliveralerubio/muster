@@ -79,11 +79,13 @@ pub(super) fn scan(
             if record["type"] != "assistant" {
                 continue;
             }
-            if options
-                .project
-                .is_some_and(|p| record["cwd"].as_str() != Some(p))
-            {
-                continue;
+            if let Some(project) = options.project {
+                let Some(cwd) = record["cwd"].as_str() else {
+                    continue;
+                };
+                if !cwd_in_project(cwd, project) {
+                    continue;
+                }
             }
             let Some(timestamp) = record["timestamp"]
                 .as_str()

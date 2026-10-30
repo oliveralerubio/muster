@@ -72,15 +72,255 @@ fn managed_unused_skill_has_disable_suggestion() {
         "---\nname: review\ndescription: Review\n---\n",
     )
     .unwrap();
+    // One scanned session, so the report has transcript coverage and unused
+    // suggestions are emitted at all.
+    let dir = env.path().join(".claude/projects/example");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("session.jsonl"), "{\"type\":\"assistant\",\"timestamp\":\"2099-01-01T00:00:00Z\",\"sessionId\":\"session\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Skill\",\"input\":{\"skill\":\"other\"}}]}}\n").unwrap();
     let (output, result) = env.run_json(&["--format", "json", "usage"]);
     assert!(output.status.success());
-    assert_eq!(result.result()["items"][0]["name"], "review");
-    assert_eq!(result.result()["items"][0]["uses"], 0);
+    let items = result.result()["items"].as_array().unwrap();
+    assert!(items
+        .iter()
+        .any(|i| i["name"] == "review" && i["uses"] == 0));
     assert_eq!(result.result()["unused"][0]["name"], "review");
     assert_eq!(
         result.result()["unused"][0]["suggestion"],
         "muster disable skill:review"
     );
+}
+
+#[test]
+fn skills_source_escaping_the_repo_discovers_nothing() {
+    let env = MusterEnv::new();
+    let config = env.config_dir();
+    std::fs::create_dir_all(config.join("skills/review")).unwrap();
+    std::fs::write(config.join("skills/review/SKILL.md"), "x\n").unwrap();
+    // Outside the config repo: must never be discovered.
+    let outside = env.path().join(".config/outside/escaped");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("SKILL.md"), "x\n").unwrap();
+    std::fs::write(
+        config.join("muster.toml"),
+        "version = 1\n[agents.skills]\nsource = '../outside'\n",
+    )
+    .unwrap();
+    let (output, result) = env.run_json(&["--format", "json", "usage"]);
+    assert!(output.status.success());
+    let names: Vec<&str> = result.result()["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|i| i["name"].as_str())
+        .collect();
+    assert!(!names.contains(&"escaped"), "{names:?}");
+    // A broken source means no skills can be trusted as managed at all.
+    assert!(!names.contains(&"review"), "{names:?}");
+}
+
+#[test]
+fn managed_discovery_stays_inside_the_config_repo() {
+    let env = MusterEnv::new();
+    let config = env.config_dir();
+    std::fs::create_dir_all(config.join("skills/review")).unwrap();
+    std::fs::write(config.join("skills/review/SKILL.md"), "x\n").unwrap();
+    // Ignored or unsafe names inside the skills directory.
+    for ignored in [".hidden", "node_modules", "backup.bak"] {
+        std::fs::create_dir_all(config.join(format!("skills/{ignored}"))).unwrap();
+        std::fs::write(config.join(format!("skills/{ignored}/SKILL.md")), "x\n").unwrap();
+    }
+    // A symlinked skill directory must not be followed.
+    std::fs::create_dir_all(env.path().join("elsewhere/linked")).unwrap();
+    std::fs::write(env.path().join("elsewhere/linked/SKILL.md"), "x\n").unwrap();
+    std::os::unix::fs::symlink(
+        env.path().join("elsewhere/linked"),
+        config.join("skills/linked"),
+    )
+    .unwrap();
+    // A symlinked SKILL.md inside an otherwise fine directory.
+    std::fs::create_dir_all(config.join("skills/symfile")).unwrap();
+    std::fs::write(env.path().join("elsewhere/SKILL.md"), "x\n").unwrap();
+    std::os::unix::fs::symlink(
+        env.path().join("elsewhere/SKILL.md"),
+        config.join("skills/symfile/SKILL.md"),
+    )
+    .unwrap();
+    std::fs::write(
+        config.join("muster.toml"),
+        "version = 1\n[agents.skills]\nsource = 'skills'\n[agents.subagents]\nsource = 'subagents'\n[mcp.\"bad key\"]\ncommand = 'x'\n",
+    )
+    .unwrap();
+    // Subagent names are stems of regular .md files; symlinks and junk names
+    // are skipped.
+    std::fs::create_dir_all(config.join("subagents")).unwrap();
+    std::fs::write(config.join("subagents/ok.md"), "x\n").unwrap();
+    std::fs::write(config.join("subagents/.hidden.md"), "x\n").unwrap();
+    std::fs::write(config.join("subagents/draft.md~"), "x\n").unwrap();
+    std::os::unix::fs::symlink(
+        env.path().join("elsewhere/linked/SKILL.md"),
+        config.join("subagents/linked.md"),
+    )
+    .unwrap();
+
+    let (output, result) = env.run_json(&["--format", "json", "usage"]);
+    assert!(output.status.success());
+    let names: Vec<&str> = result.result()["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|i| i["name"].as_str())
+        .collect();
+    for banned in [
+        "escaped",
+        ".hidden",
+        "node_modules",
+        "backup.bak",
+        "linked",
+        "symfile",
+        "bad key",
+        ".hidden.md",
+        "draft.md~",
+        "linked.md",
+    ] {
+        assert!(
+            !names.contains(&banned),
+            "{banned} must not be reported: {names:?}"
+        );
+    }
+    assert!(names.contains(&"review"));
+    assert!(names.contains(&"ok"));
+}
+
+#[test]
+fn suggestions_require_toggle_valid_names() {
+    let env = MusterEnv::new();
+    let config = env.config_dir();
+    for name in ["review", "Review"] {
+        std::fs::create_dir_all(config.join(format!("skills/{name}"))).unwrap();
+        std::fs::write(config.join(format!("skills/{name}/SKILL.md")), "x\n").unwrap();
+    }
+    std::fs::write(config.join("muster.toml"), "version = 1\n").unwrap();
+    let dir = env.path().join(".claude/projects/example");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("session.jsonl"), "{\"type\":\"assistant\",\"timestamp\":\"2099-01-01T00:00:00Z\",\"sessionId\":\"session\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Skill\",\"input\":{\"skill\":\"used\"}}]}}\n").unwrap();
+    let (output, result) = env.run_json(&["--format", "json", "usage"]);
+    assert!(output.status.success());
+    let unused = result.result()["unused"].as_array().unwrap();
+    let lower = unused.iter().find(|i| i["name"] == "review").unwrap();
+    assert_eq!(lower["suggestion"], "muster disable skill:review");
+    let upper = unused.iter().find(|i| i["name"] == "Review").unwrap();
+    assert!(
+        upper.get("suggestion").is_none(),
+        "uppercase name cannot be a toggle: {upper}"
+    );
+}
+
+#[test]
+fn unused_uses_merged_config_and_excludes_disabled_items() {
+    let env = MusterEnv::new();
+    let config = env.config_dir();
+    std::fs::create_dir_all(config.join("skills/used")).unwrap();
+    std::fs::write(config.join("skills/used/SKILL.md"), "x\n").unwrap();
+    std::fs::create_dir_all(config.join("skills/gone")).unwrap();
+    std::fs::write(config.join("skills/gone/SKILL.md"), "x\n").unwrap();
+    std::fs::create_dir_all(config.join("agents")).unwrap();
+    std::fs::write(config.join("agents/onlycodex.md"), "x\n").unwrap();
+    // `gone` is disabled for every agent; `onlycodex` only for codex, so it
+    // is still unused advice for the other selected adapters.
+    std::fs::write(
+        config.join("muster.toml"),
+        "version = 1\n[agents.toggles]\ndisable = ['skill:gone', 'subagent:onlycodex@codex']\n[agents.skills]\nsource = 'skills'\n[agents.subagents]\nsource = 'agents'\n[mcp.docs]\ncommand = 'docs'\n",
+    )
+    .unwrap();
+    let dir = env.path().join(".claude/projects/example");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("session.jsonl"), "{\"type\":\"assistant\",\"timestamp\":\"2099-01-01T00:00:00Z\",\"sessionId\":\"session\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Skill\",\"input\":{\"skill\":\"used\"}}]}}\n").unwrap();
+    let (output, result) = env.run_json(&["--format", "json", "usage"]);
+    assert!(output.status.success());
+    let unused = result.result()["unused"].as_array().unwrap();
+    let names: Vec<&str> = unused.iter().filter_map(|i| i["name"].as_str()).collect();
+    assert!(
+        !names.contains(&"gone"),
+        "disabled-for-all items are not unused advice: {unused:?}"
+    );
+    assert!(!names.contains(&"used"), "an observed item is not unused");
+    assert!(names.contains(&"docs"));
+    assert!(names.contains(&"onlycodex"));
+}
+
+#[test]
+fn no_coverage_means_no_unused_suggestions() {
+    let env = MusterEnv::new();
+    std::fs::create_dir_all(env.config_dir().join("skills/review")).unwrap();
+    std::fs::write(env.config_dir().join("skills/review/SKILL.md"), "x\n").unwrap();
+    std::fs::write(env.config_dir().join("muster.toml"), "version = 1\n").unwrap();
+    // No transcripts at all: nothing was scanned, so suggesting removals
+    // would be advice built on zero evidence.
+    let (output, result) = env.run_json(&["--format", "json", "usage"]);
+    assert!(output.status.success());
+    assert_eq!(result.result()["coverage"], "none");
+    assert_eq!(result.result()["unused"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn agent_filter_lists_only_that_source_and_gates_on_its_coverage() {
+    let env = MusterEnv::new();
+    let dir = env.path().join(".codex/sessions/2026/01/01");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("session.jsonl"),
+        "{\"type\":\"session_meta\",\"payload\":{\"id\":\"session\",\"cwd\":\"/work\"}}\n{\"type\":\"response_item\",\"timestamp\":\"2099-01-01T00:00:00Z\",\"payload\":{\"type\":\"custom_tool_call\",\"name\":\"exec\",\"input\":\"const r = await tools.exec_command({cmd: 'cat /home/user/skills/review/SKILL.md'});\"}}\n",
+    )
+    .unwrap();
+
+    // A known adapter with unsupported transcripts: accepted, reported as
+    // unsupported, no unused advice.
+    let (output, result) = env.run_json(&["--format", "json", "usage", "--agent", "opencode"]);
+    assert!(output.status.success());
+    let sources = result.result()["sources"].as_array().unwrap();
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0]["agent"], "opencode");
+    assert_eq!(sources[0]["status"], "unsupported");
+    assert_eq!(result.result()["sessions_scanned"]["opencode"], 0);
+    assert_eq!(result.result()["coverage"], "none");
+    assert_eq!(result.result()["unused"].as_array().unwrap().len(), 0);
+
+    // Same for an experimental adapter id.
+    let (output, result) = env.run_json(&["--format", "json", "usage", "--agent", "pi"]);
+    assert!(output.status.success());
+    assert_eq!(result.result()["sources"][0]["agent"], "pi");
+    assert_eq!(result.result()["sources"][0]["status"], "unsupported");
+    assert_eq!(result.result()["coverage"], "none");
+
+    // A supported agent with zero scanned sessions also gets no advice.
+    let (output, result) = env.run_json(&["--format", "json", "usage", "--agent", "claude"]);
+    assert!(output.status.success());
+    let sources = result.result()["sources"].as_array().unwrap();
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0]["agent"], "claude");
+    assert_eq!(result.result()["sessions_scanned"]["claude"], 0);
+    assert_eq!(result.result()["coverage"], "none");
+    assert_eq!(result.result()["unused"].as_array().unwrap().len(), 0);
+
+    // With transcripts scanned, the single agent's source is listed and its
+    // coverage is the agent's own (Codex is partial).
+    let (output, result) = env.run_json(&["--format", "json", "usage", "--agent", "codex"]);
+    assert!(output.status.success());
+    let sources = result.result()["sources"].as_array().unwrap();
+    assert_eq!(sources.len(), 1);
+    assert_eq!(sources[0]["agent"], "codex");
+    assert_eq!(sources[0]["status"], "partial");
+    assert_eq!(result.result()["sessions_scanned"]["codex"], 1);
+    assert_eq!(result.result()["coverage"], "partial");
+    assert_eq!(result.result()["items"][0]["name"], "review");
+}
+
+#[test]
+fn unknown_agent_is_a_usage_error() {
+    let env = MusterEnv::new();
+    env.run(&["--format", "json", "usage", "--agent", "bad"])
+        .assert()
+        .code(2);
 }
 
 #[test]
@@ -143,15 +383,80 @@ fn skipped_files_are_counted_without_exposing_transcript_paths() {
 }
 
 #[test]
-fn project_filter_selects_matching_cwd() {
+fn project_filter_canonicalizes_relative_paths_and_matches_subdirectories() {
     let env = MusterEnv::new();
     let dir = env.path().join(".claude/projects/example");
     std::fs::create_dir_all(&dir).unwrap();
+    // The muster process inherits this test's working directory, so a
+    // relative `--project .` canonicalizes to it.
+    let cwd = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+    let event = |cwd: &str, skill: &str| {
+        format!("{{\"type\":\"assistant\",\"timestamp\":\"2099-01-01T00:00:00Z\",\"sessionId\":\"session-{skill}\",\"cwd\":\"{cwd}\",\"message\":{{\"content\":[{{\"type\":\"tool_use\",\"name\":\"Skill\",\"input\":{{\"skill\":\"{skill}\"}}}}]}}}}\n")
+    };
+    let other = env.path().join("elsewhere");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(
+        dir.join("s1.jsonl"),
+        event(&cwd.display().to_string(), "here"),
+    )
+    .unwrap();
+    // A subdirectory of the project with a trailing slash in `cwd` still
+    // belongs to the project.
+    let nested = format!("{}/", cwd.join("sub").display());
+    std::fs::write(dir.join("s2.jsonl"), event(&nested, "nested")).unwrap();
+    std::fs::write(
+        dir.join("s3.jsonl"),
+        event(&other.display().to_string(), "elsewhere"),
+    )
+    .unwrap();
+    let (output, result) = env.run_json(&["--format", "json", "usage", "--project", "."]);
+    assert!(output.status.success());
+    let names: Vec<&str> = result.result()["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|i| i["name"].as_str())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["here", "nested"],
+        "cwd must match the project dir or its subdirectories"
+    );
+}
+
+#[test]
+fn project_filter_excludes_other_cwds() {
+    let env = MusterEnv::new();
+    let dir = env.path().join(".claude/projects/example");
+    std::fs::create_dir_all(&dir).unwrap();
+    let other = env.path().join("elsewhere");
+    std::fs::create_dir_all(&other).unwrap();
     std::fs::write(dir.join("session.jsonl"), "{\"type\":\"assistant\",\"timestamp\":\"2099-01-01T00:00:00Z\",\"sessionId\":\"session\",\"cwd\":\"/project/other\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Skill\",\"input\":{\"skill\":\"review\"}}]}}\n").unwrap();
-    let (output, result) =
-        env.run_json(&["--format", "json", "usage", "--project", "/project/wanted"]);
+    let wanted = env.path().join("wanted");
+    std::fs::create_dir_all(&wanted).unwrap();
+    let (output, result) = env.run_json(&[
+        "--format",
+        "json",
+        "usage",
+        "--project",
+        &wanted.display().to_string(),
+    ]);
     assert!(output.status.success());
     assert_eq!(result.result()["items"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn project_filter_rejects_missing_directories() {
+    let env = MusterEnv::new();
+    env.run(&[
+        "--format",
+        "json",
+        "usage",
+        "--project",
+        "/definitely/not/a/dir",
+    ])
+    .assert()
+    .code(2);
 }
 
 #[test]
@@ -194,6 +499,10 @@ fn managed_subagent_and_server_are_reported_unused() {
         "---\nname: reviewer\ndescription: Review\n---\n",
     )
     .unwrap();
+    // One scanned session so unused suggestions are emitted.
+    let dir = env.path().join(".claude/projects/example");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("session.jsonl"), "{\"type\":\"assistant\",\"timestamp\":\"2099-01-01T00:00:00Z\",\"sessionId\":\"session\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Skill\",\"input\":{\"skill\":\"other\"}}]}}\n").unwrap();
     let (output, result) = env.run_json(&["--format", "json", "usage"]);
     assert!(output.status.success());
     assert_eq!(result.result()["unused"][0]["name"], "docs");

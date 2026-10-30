@@ -507,10 +507,22 @@ MCP invocations, `unsupported` for OpenCode and Antigravity, plus
 `malformed_lines` and aggregate `skipped` counts for `older_than_window`,
 `too_large`, and `unreadable`; transcript paths are never emitted), and `unused`
 managed items with `muster disable <kind>:<name>`
-suggestions. The default window is 14 days; `--since`, `--agent`, `--project`,
-and `--max-file-bytes` filters are available. Suggestions are advisory because
-transcript coverage is incomplete. Session IDs are hashed in memory, item names
-are restricted to safe identifiers, and prompt, response, and argument text is
+`unused` managed items come from the effective merged configuration (the
+machine's user-scope layers; with `--project DIR`, canonicalized like `plan`,
+the project's own layer, falling back to the global merge when the project
+has no configuration). Items disabled by `[agents.toggles]` for every
+selected adapter are not "unused" advice; `disable` suggestions are emitted
+only for toggle-safe names. `coverage` is `none` when no session was scanned
+(no unused suggestions on zero evidence), `partial` when a considered agent
+has partial or unsupported transcripts, and `full` otherwise. `--agent`
+accepts any known adapter id (`adapters::find`); unsupported ones are listed
+as their only source with `coverage: "none"`. A transcript `cwd` matches
+`--project` when equal to it or nested under it (trailing slashes ignored).
+The default window is 14 days; `--since`, `--agent`, `--project`, and
+`--max-file-bytes` filters are available. Suggestions are advisory because
+transcript coverage is incomplete. Session IDs are hashed in memory, item
+names are restricted to safe identifiers, managed discovery never follows
+symlinks and skips ignored names, and prompt, response, and argument text is
 never output or stored. See
 [docs/research/session-transcripts.md](research/session-transcripts.md) and
 [docs/security/session-usage.md](security/session-usage.md).

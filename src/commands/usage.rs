@@ -50,21 +50,24 @@ fn usage(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         .ok_or_else(|| {
             MusterError::Usage("--since must be a positive number of days (e.g. 14d)".into())
         })?;
-    let agent = params.get_string("agent");
-    if agent.is_some_and(|a| !["claude", "codex", "opencode", "antigravity"].contains(&a)) {
-        return Err(MusterError::Usage("unknown agent".into()));
-    }
     let max = params.get_int("max-file-bytes").unwrap_or(50_000_000);
     if max <= 0 {
         return Err(MusterError::Usage(
             "--max-file-bytes must be positive".into(),
         ));
     }
-    Ok(crate::usage::report(
+    // Canonicalized like `plan`/`sync` targets, so transcript `cwd` values can
+    // be compared without path-spelling differences.
+    let project = match crate::commands::plan::target(params)? {
+        crate::engine::Target::Global => None,
+        crate::engine::Target::Project(dir) => Some(dir),
+    };
+    crate::usage::report(
         days,
         &ctx.config_dir,
-        agent,
+        &ctx.state_dir,
+        params.get_string("agent"),
         max as u64,
-        params.get_string("project"),
-    ))
+        project.as_deref(),
+    )
 }
