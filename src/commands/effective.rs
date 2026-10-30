@@ -161,6 +161,53 @@ fn effective(ctx: &mut Context, _: &Params) -> Result<Value, MusterError> {
             "overridden_layers": sources.iter().take(sources.len().saturating_sub(1)).map(|l| l.kind).collect::<Vec<_>>(),
             "transport": transport, "agents": agents, "adapters": views, "secret_references": references}));
     }
+    let mut subagent_views = Vec::new();
+    if let Some(dir) = merged.subagents_path()? {
+        let mut entries: Vec<_> = std::fs::read_dir(dir).into_iter().flatten().flatten().collect();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("md") { continue; }
+            let Some(name) = path.file_stem().and_then(|s| s.to_str()) else { continue; };
+            let Ok(source) = std::fs::read_to_string(&path) else { continue; };
+            let Some(rest) = source.strip_prefix("---\n") else { continue; };
+            let Some((front, body)) = rest.split_once("\n---\n") else { continue; };
+            let Ok(docs) = yaml_rust2::YamlLoader::load_from_str(front) else { continue; };
+            let Some(yaml) = docs.first() else { continue; };
+            let Some(description) = yaml["description"].as_str() else { continue; };
+            if yaml["name"].as_str() != Some(name) { continue; }
+            let tools = match &yaml["tools"] {
+                yaml_rust2::Yaml::Array(items) => items.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect(),
+                yaml_rust2::Yaml::String(s) => s.split(',').map(|s| s.trim().to_owned()).collect(),
+                _ => Vec::new(),
+            };
+            let subagent = adapters::Subagent { name: name.to_owned(), description: description.to_owned(),
+                tools, model: yaml["model"].as_str().map(str::to_owned), extra_fields: Vec::new(),
+                body: body.to_owned(), source };
+            let subagents = BTreeMap::from([(name.to_owned(), subagent)]);
+            let empty_agents = Default::default();
+            let providers = BTreeMap::new();
+            let mcp = BTreeMap::new();
+            let secrets = BTreeMap::new();
+            let skills = BTreeMap::new();
+            let access = SecretAccess::new(BTreeMap::new(), None);
+            let desired = Desired { config_dir: &ctx.config_dir, agents: &empty_agents, ai_providers: &providers,
+                mcp: &mcp, instructions: None, secrets: &secrets, access: &access, skills: &skills, subagents: &subagents };
+            let mut views = BTreeMap::new();
+            for adapter in engine::enabled_adapters(Some(&merged.agents))? {
+                let rendered = adapter.render(&desired, &Current::new())?;
+                if let Some(file) = rendered.tree.first() {
+                    let path = roots.base(file.base).join(&file.path);
+                    let state = match std::fs::read_to_string(path) {
+                        Err(_) => "missing", Ok(current) if current == file.contents => "in_sync", Ok(_) => "drifted"
+                    };
+                    views.insert(adapter.id, json!({"state": state}));
+                }
+            }
+            let layer = layers.iter().rev().find(|l| l.agents.subagents.is_some()).map(|l| l.kind);
+            subagent_views.push(json!({"name": name, "layer": layer, "adapters": views}));
+        }
+    }
     let mut skill_views = Vec::new();
     let mut skill_dirs = BTreeMap::new();
     let listed = (crate::commands::skill::LIST.handler)(ctx, &Params::default())?;
@@ -263,6 +310,6 @@ fn effective(ctx: &mut Context, _: &Params) -> Result<Value, MusterError> {
         (id, extra)
     }).collect();
     Ok(
-        json!({"mcp": mcp_views, "extra_on_disk": extra_on_disk, "skills": skill_views, "layers": layers.iter().map(|l| json!({"kind": l.kind, "name": l.name})).collect::<Vec<_>>(), "instructions": instructions}),
+        json!({"subagents": subagent_views, "mcp": mcp_views, "extra_on_disk": extra_on_disk, "skills": skill_views, "layers": layers.iter().map(|l| json!({"kind": l.kind, "name": l.name})).collect::<Vec<_>>(), "instructions": instructions}),
     )
 }

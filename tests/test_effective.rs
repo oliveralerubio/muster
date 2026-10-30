@@ -123,3 +123,21 @@ fn effective_reports_mcp_without_secret_values() {
     assert_eq!(result.result()["mcp"][0]["agents"], serde_json::json!(["claude"]));
     assert_eq!(result.result()["mcp"][0]["adapters"]["claude"]["state"], "missing");
 }
+
+#[test]
+fn effective_reports_subagent_state() {
+    let env = MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    std::fs::write(env.config_dir().join("muster.toml"), "version = 1\n[agents]\nenabled = [\"claude\"]\n[agents.subagents]\nsource = \"agents\"\n").unwrap();
+    std::fs::create_dir_all(env.config_dir().join("agents")).unwrap();
+    let source = "---\nname: reviewer\ndescription: Review changes\n---\nReview.\n";
+    std::fs::write(env.config_dir().join("agents/reviewer.md"), source).unwrap();
+    let (_, result) = env.run_json(&["effective", "--format", "json"]);
+    assert_eq!(result.result()["subagents"][0]["name"], "reviewer");
+    assert_eq!(result.result()["subagents"][0]["layer"], "team");
+    assert_eq!(result.result()["subagents"][0]["adapters"]["claude"]["state"], "missing");
+    std::fs::create_dir_all(env.path().join(".claude/agents")).unwrap();
+    std::fs::write(env.path().join(".claude/agents/reviewer.md"), source).unwrap();
+    let (_, result) = env.run_json(&["effective", "--format", "json"]);
+    assert_eq!(result.result()["subagents"][0]["adapters"]["claude"]["state"], "in_sync");
+}
