@@ -165,3 +165,16 @@ fn effective_filters_adapters_and_rejects_unknown() {
     assert_eq!(result.result()["instructions"][0]["adapters"].as_object().unwrap().keys().collect::<Vec<_>>(), vec!["claude"]);
     env.run(&["effective", "--agent", "unknown"]).assert().code(2);
 }
+
+#[test]
+fn effective_totals_instruction_and_skill_description_tokens() {
+    let env = MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    std::fs::write(env.config_dir().join("muster.toml"), "version = 1\n[agents]\nenabled = [\"claude\", \"codex\"]\nskip_instructions = [\"codex\"]\n[agents.instructions]\nsource = \"AGENTS.md\"\n[agents.skills]\nsource = \"skills\"\n").unwrap();
+    std::fs::write(env.config_dir().join("AGENTS.md"), "Be kind.\n").unwrap();
+    std::fs::create_dir_all(env.config_dir().join("skills/demo")).unwrap();
+    std::fs::write(env.config_dir().join("skills/demo/SKILL.md"), "---\nname: demo\ndescription: Helpful skill\n---\nHello\n").unwrap();
+    let (_, result) = env.run_json(&["effective", "--format", "json"]);
+    assert_eq!(result.result()["totals"]["claude"], 5);
+    assert_eq!(result.result()["totals"]["codex"], 3);
+}

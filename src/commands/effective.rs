@@ -320,7 +320,14 @@ fn effective(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         extra.sort();
         (id, extra)
     }).collect();
+    let totals: BTreeMap<_, u64> = selected.iter().map(|adapter| {
+        let instruction_tokens: u64 = instructions.iter().filter(|v| v["adapters"][adapter.id]["state"] != "skipped")
+            .filter_map(|v| v["approx_tokens"].as_u64()).sum();
+        let skill_tokens: u64 = skill_views.iter().filter(|v| !v["adapters"][adapter.id].is_null())
+            .filter_map(|v| v["description_tokens"].as_u64()).sum();
+        (adapter.id, instruction_tokens + skill_tokens)
+    }).collect();
     Ok(
-        json!({"subagents": subagent_views, "mcp": mcp_views, "extra_on_disk": extra_on_disk, "skills": skill_views, "layers": layers.iter().map(|l| json!({"kind": l.kind, "name": l.name})).collect::<Vec<_>>(), "instructions": instructions}),
+        json!({"totals": totals, "subagents": subagent_views, "mcp": mcp_views, "extra_on_disk": extra_on_disk, "skills": skill_views, "layers": layers.iter().map(|l| json!({"kind": l.kind, "name": l.name})).collect::<Vec<_>>(), "instructions": instructions}),
     )
 }
