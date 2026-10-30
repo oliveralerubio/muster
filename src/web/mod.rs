@@ -71,6 +71,7 @@ const fn post(path: &'static str, command: &'static str) -> Route {
 
 const ROUTES: &[Route] = &[
     get("status", "status"),
+    get("effective", "effective"),
     get("machines", "machine.list"),
     get("members", "member.list"),
     get("groups", "group.list"),

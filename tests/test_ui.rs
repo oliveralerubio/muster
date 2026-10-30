@@ -212,6 +212,18 @@ fn ui_status_api_matches_cli_status() {
 }
 
 #[test]
+fn ui_effective_api_matches_cli_effective() {
+    let env = support::MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    let (_, cli) = env.run_json(&["--format", "json", "effective"]);
+    let mut ui = Ui::start(&env);
+    let (status, _, body) = ui.authorized("/api/effective");
+    assert_eq!(status, 200);
+    let api: Value = serde_json::from_str(&body).expect("effective API JSON");
+    assert_eq!(api["result"], *cli.result());
+}
+
+#[test]
 fn ui_doctor_uses_only_the_simulated_machine_path() {
     let env = support::MusterEnv::new();
     env.link_system_exe("git");
