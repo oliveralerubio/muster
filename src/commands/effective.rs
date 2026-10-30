@@ -15,18 +15,21 @@ use crate::registry::{CommandSpec, Params};
 pub const SPEC: CommandSpec = CommandSpec {
     name: "effective",
     about: "Show the effective configuration and its sources",
-    params: &[],
+    params: &[crate::commands::plan::PROJECT_PARAM],
     mutating: false,
     handler: effective,
 };
 
-fn effective(ctx: &mut Context, _: &Params) -> Result<Value, MusterError> {
+fn effective(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let manifest = Manifest::load(&ctx.config_dir)?;
-    let layers = layer::global_layers(
+    let mut layers = layer::global_layers(
         &ctx.config_dir,
         &manifest,
         crate::machine::load_name(&ctx.state_dir).as_deref(),
     );
+    if let engine::Target::Project(project) = crate::commands::plan::target(params)? {
+        layers.extend(layer::project_layers(&project)?);
+    }
     let merged = layer::merge(&layers);
     let (path, _) = merged.instructions_path()?;
     let source = layers

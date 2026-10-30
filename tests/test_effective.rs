@@ -141,3 +141,16 @@ fn effective_reports_subagent_state() {
     let (_, result) = env.run_json(&["effective", "--format", "json"]);
     assert_eq!(result.result()["subagents"][0]["adapters"]["claude"]["state"], "in_sync");
 }
+
+#[test]
+fn effective_lists_project_layer() {
+    let env = MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    let project = env.path().join("project");
+    std::fs::create_dir_all(project.join(".muster")).unwrap();
+    std::fs::write(project.join(".muster/muster.toml"), "version = 1\n[mcp.local]\ncommand = \"project-tool\"\n").unwrap();
+    let (_, result) = env.run_json(&["effective", "--project", project.to_str().unwrap(), "--format", "json"]);
+    assert_eq!(result.result()["layers"][1]["kind"], "project");
+    assert_eq!(result.result()["mcp"][0]["name"], "local");
+    assert_eq!(result.result()["mcp"][0]["layer"], "project");
+}
