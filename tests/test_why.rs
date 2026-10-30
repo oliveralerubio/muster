@@ -33,3 +33,43 @@ fn searches_sources_and_native_content_with_agent_and_regex_filters() {
     assert_eq!(result.result()["matches"].as_array().unwrap().len(), 1);
     env.run(&["why", "[", "--regex"]).assert().failure();
 }
+
+#[test]
+fn searches_installed_skills_and_subagents() {
+    let env = MusterEnv::new();
+    let cfg = env.config_dir();
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(
+        cfg.join("muster.toml"),
+        "version = 1\n[agents]\nenabled = ['claude']\n",
+    )
+    .unwrap();
+    let skill = env.path().join(".claude/skills/example");
+    let agent = env.path().join(".claude/agents");
+    std::fs::create_dir_all(&skill).unwrap();
+    std::fs::create_dir_all(&agent).unwrap();
+    std::fs::write(skill.join("SKILL.md"), "Skill searchable\n").unwrap();
+    std::fs::write(agent.join("helper.md"), "Agent searchable\n").unwrap();
+    let (output, result) = env.run_json(&["why", "searchable", "--format", "json"]);
+    assert!(output.status.success());
+    let matches = result.result()["matches"].as_array().unwrap();
+    assert!(matches.iter().any(|m| m["kind"] == "skill"));
+    assert!(matches.iter().any(|m| m["kind"] == "subagent"));
+}
+
+#[test]
+fn rejects_overlong_patterns() {
+    let env = MusterEnv::new();
+    let cfg = env.config_dir();
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(
+        cfg.join("muster.toml"),
+        "version = 1\n[agents]\nenabled = ['claude']\n",
+    )
+    .unwrap();
+    let long = "a".repeat(2000);
+    env.run(&["why", &long, "--regex"])
+        .assert()
+        .failure();
+    env.run(&["why", &long]).assert().failure();
+}

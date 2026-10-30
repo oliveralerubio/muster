@@ -44,6 +44,12 @@ pub const SPEC: CommandSpec = CommandSpec {
 
 fn why(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let query = params.get_string("text").unwrap_or_default();
+    const MAX_PATTERN_BYTES: usize = 1024;
+    if query.len() > MAX_PATTERN_BYTES {
+        return Err(MusterError::Usage(format!(
+            "search text is too long (max {MAX_PATTERN_BYTES} bytes)"
+        )));
+    }
     let pattern = if params.get_bool("regex") {
         query.to_owned()
     } else {
