@@ -220,3 +220,13 @@ fn effective_project_reports_both_user_and_project_disk_states() {
     assert_eq!(servers[1]["name"], "local");
     assert_eq!(servers[1]["adapters"]["claude"]["state"], "in_sync");
 }
+
+#[test]
+fn effective_finds_extra_skills_without_managed_skills() {
+    let env = MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    std::fs::write(env.config_dir().join("muster.toml"), "version = 1\n[agents]\nenabled = [\"claude\"]\n").unwrap();
+    std::fs::create_dir_all(env.path().join(".claude/skills/personal")).unwrap();
+    let (_, result) = env.run_json(&["effective", "--format", "json"]);
+    assert_eq!(result.result()["extra_on_disk"]["claude"], serde_json::json!(["personal"]));
+}

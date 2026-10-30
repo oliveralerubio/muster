@@ -234,6 +234,23 @@ fn scope(ctx: &mut Context, params: &Params, layers: &[layer::Layer], project: O
     }
     let mut skill_views = Vec::new();
     let mut skill_dirs = BTreeMap::new();
+    let sentinel = BTreeMap::from([("__muster_probe__".to_owned(), BTreeMap::from([("SKILL.md".to_owned(), String::new())]))]);
+    let empty_agents = Default::default();
+    let providers = BTreeMap::new();
+    let mcp = BTreeMap::new();
+    let secrets = BTreeMap::new();
+    let subagents = BTreeMap::new();
+    let access = SecretAccess::new(BTreeMap::new(), None);
+    let desired = Desired { config_dir: &ctx.config_dir, agents: &empty_agents, ai_providers: &providers,
+        mcp: &mcp, instructions: None, secrets: &secrets, access: &access, skills: &sentinel, subagents: &subagents };
+    for &adapter in &selected {
+        let rendered = adapter.render(&desired, &Current::new())?;
+        if let Some(file) = rendered.tree.first() {
+            if project.is_some() && file.project.is_none() { continue; }
+            let path = locate_tree(&roots, file, project);
+            if let Some(dir) = path.parent().and_then(|p| p.parent()) { skill_dirs.insert(adapter.id, dir.to_path_buf()); }
+        }
+    }
     let listed = if project.is_some() {
         let mut names: Vec<_> = merged.skills_path()?.into_iter().flat_map(|dir| std::fs::read_dir(dir).into_iter().flatten().flatten())
             .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
