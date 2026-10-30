@@ -84,6 +84,7 @@ impl Layer {
 #[derive(Debug, Clone)]
 pub struct Merged {
     pub agents: AgentsConfig,
+    pub toggles: Vec<(&'static str, crate::adapters::config::Toggles)>,
     pub mcp: BTreeMap<String, McpServer>,
     pub ai_providers: BTreeMap<String, AiProvider>,
     /// Directory the instructions source resolves against (the layer that
@@ -149,6 +150,7 @@ pub fn digest(config_dir: &Path, manifest: &Manifest, machine: &str) -> String {
         .and_then(|(path, _)| std::fs::read_to_string(path).ok());
     let canonical = serde_json::json!({
         "agents": merged.agents,
+        "toggles": merged.toggles,
         "mcp": merged.mcp,
         "providers": merged.ai_providers,
         "instructions": instructions,
@@ -257,6 +259,10 @@ pub fn merge(layers: &[Layer]) -> Merged {
     }
     Merged {
         agents,
+        toggles: layers
+            .iter()
+            .filter_map(|l| l.agents.toggles.clone().map(|t| (l.kind, t)))
+            .collect(),
         mcp,
         ai_providers,
         instructions_dir,
@@ -266,6 +272,29 @@ pub fn merge(layers: &[Layer]) -> Merged {
 }
 
 impl Merged {
+    pub fn disabled(&self, kind: &str, name: &str, agent: &str) -> Option<&'static str> {
+        let mut disabled = None;
+        for (layer, toggles) in &self.toggles {
+            for scoped in [false, true] {
+                for (items, value) in [(&toggles.disable, true), (&toggles.enable, false)] {
+                    for item in items {
+                        let Ok((k, n, a)) = crate::adapters::config::parse_toggle(item) else {
+                            continue;
+                        };
+                        if k == kind
+                            && n == name
+                            && a.is_some() == scoped
+                            && a.is_none_or(|a| a == agent)
+                        {
+                            disabled = value.then_some(*layer);
+                        }
+                    }
+                }
+            }
+        }
+        disabled
+    }
+
     /// Path of the canonical instructions and whether it was declared.
     pub fn instructions_path(&self) -> Result<(PathBuf, bool), MusterError> {
         let declared = self.agents.instructions.as_ref();

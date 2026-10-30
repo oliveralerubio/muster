@@ -16,6 +16,9 @@ pub struct AgentsConfig {
     /// Adapter ids that skip shared instructions at user scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skip_instructions: Option<Vec<String>>,
+    /// Per-item deployment overrides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toggles: Option<Toggles>,
     /// Shared instructions (AGENTS.md).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<Instructions>,
@@ -38,6 +41,58 @@ pub struct AgentsConfig {
     /// Custom subagents installed from the config repository.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagents: Option<SubagentsConfig>,
+}
+
+/// Toggle entries in one configuration layer.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Toggles {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disable: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enable: Vec<String>,
+}
+
+pub fn parse_toggle(item: &str) -> Result<(&str, &str, Option<&str>), String> {
+    let (kind, rest) = item
+        .split_once(':')
+        .ok_or_else(|| format!("invalid toggle `{item}`: expected kind:name[@adapter]"))?;
+    if !matches!(kind, "skill" | "mcp" | "subagent") {
+        return Err(format!("unknown toggle kind `{kind}`"));
+    }
+    let (name, agent) = match rest.split_once('@') {
+        Some((name, agent)) => (name, Some(agent)),
+        None => (rest, None),
+    };
+    if !is_valid_item_name(name) {
+        return Err(format!(
+            "invalid toggle name `{name}` in `{item}`: names are lowercase letters \
+             or digits first, then lowercase letters, digits, `.`, `_` or `-` \
+             (no `/`, `\\`, `..` or leading punctuation)"
+        ));
+    }
+    if let Some(agent) = agent {
+        if crate::adapters::find(agent).is_none() {
+            return Err(format!("unknown toggle adapter `{agent}`"));
+        }
+    }
+    Ok((kind, name, agent))
+}
+
+/// A toggle item name is matched against file and directory names (skills,
+/// subagents) and table keys (MCP servers), so it follows the identifier rule
+/// of `is_valid_agent_name`/`machine::validate_name`: a lowercase letter or
+/// digit first, then lowercase letters, digits, dots, underscores or hyphens.
+/// `/`, `\\` and `..` are rejected so a name can never traverse a path.
+fn is_valid_item_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_lowercase() || first.is_ascii_digit() => {}
+        _ => return false,
+    }
+    name.chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
+        && !name.contains("..")
 }
 
 /// `[agents.skills]`: a directory of the config repository holding one

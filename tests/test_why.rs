@@ -68,8 +68,6 @@ fn rejects_overlong_patterns() {
     )
     .unwrap();
     let long = "a".repeat(2000);
-    env.run(&["why", &long, "--regex"])
-        .assert()
-        .failure();
+    env.run(&["why", &long, "--regex"]).assert().failure();
     env.run(&["why", &long]).assert().failure();
 }

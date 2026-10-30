@@ -490,7 +490,18 @@ async function testSecretApprovalsRequireConfirmationAndRefresh() {
   setResponder();
 }
 
+async function testSkillToggleControls() {
+  setResponder((call) => ({ ok: true, diagnostics: [], result: call.path === "skills" ? { skills: [{ name: "pdf", origin: "local", status: "local" }] } : {} }));
+  await sandbox.show("skills");
+  const mark = baseline();
+  liveButton("Disable").fire("click");
+  await flush();
+  assert.deepEqual(callSince(mark, "disable").body, { item: "skill:pdf", confirm: true });
+  setResponder();
+}
+
 const tests = {
+  testSkillToggleControls,
   testSecretApprovalsRequireConfirmationAndRefresh,
   testProvidersViewListsReferencesAndAddsAndRemoves,
   testProfileSaveIsGatedOnPreview,

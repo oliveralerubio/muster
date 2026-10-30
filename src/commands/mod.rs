@@ -23,4 +23,5 @@ pub mod sync;
 pub mod ui;
 pub mod uninstall;
 
+pub mod toggle;
 pub mod why;

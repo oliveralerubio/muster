@@ -436,6 +436,11 @@ impl Manifest {
             .iter()
             .chain(manifest.profiles.values().filter_map(|p| p.agents.as_ref()))
         {
+            if let Some(toggles) = &agents.toggles {
+                for item in toggles.disable.iter().chain(&toggles.enable) {
+                    crate::adapters::config::parse_toggle(item).map_err(invalid)?;
+                }
+            }
             for (agent, id) in &agents.ai_providers {
                 let known = manifest.ai_providers.contains_key(id)
                     || manifest
