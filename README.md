@@ -27,6 +27,18 @@ warning, never silently lost.
 - Project scope comes from `<project>/.muster/muster.toml`. Codex and Antigravity share `.agents/skills` in a project; the file is written once.
 - Skills removed from the source are deleted on the next apply; skills you add by hand are left alone.
 
+## Effective configuration
+
+Run `muster effective` to see the active layers, instructions, skills, MCP servers, and subagents, their origins, and their state on disk for each adapter. Use `--project DIR` to inspect a project, `--agent ID` to select an adapter, and `--format json` for machine-readable output. The web panel also has an **Effective** tab. Unmanaged entries found on disk are listed separately. Token counts are approximate.
+
+States describe each adapter's files:
+
+- `in_sync`: the managed configuration matches the expected content.
+- `drifted`: the files differ from the expected content.
+- `missing`: the expected files or configuration are absent.
+- `skipped`: Muster does not apply that configuration for the adapter.
+- `installed`: the item is present on disk.
+
 ## Agent Skills
 
 Declare a skills folder in `muster.toml` (`[agents.skills] source = "skills"`), one subfolder per skill with a `SKILL.md` (YAML frontmatter with `name` and `description`) plus any extra files. Muster verifies each skill against `skills.lock`, then installs its reviewed files byte for byte into the skill folders listed in the table above. Missing or mismatching pins produce a warning and keep the previously installed copy; other configuration and verified skills still sync. Empty directories are ignored. A skill without `SKILL.md` or without `name`/`description` is skipped with a `skill_invalid` warning.

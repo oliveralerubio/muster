@@ -60,6 +60,9 @@ expiry or revocation. It does not invalidate credentials already delivered.
 
 ### Agents and skills
 
+**Effective configuration**:
+The configuration selected for a machine or project after layers are merged, together with its origins and per-adapter state on disk.
+
 **Adapter**:
 The per-agent translator (Claude Code, Codex, OpenCode, Antigravity CLI) that renders the canonical configuration into the agent's native files, declaring which files, capabilities, platforms and minimum version it supports. It rewrites only the keys it manages.
 _Avoid_: plugin, driver
