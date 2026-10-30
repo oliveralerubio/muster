@@ -123,3 +123,8 @@ _Avoid_: version, revision
 A layer's enable or disable rule for a named skill, MCP server, or subagent,
 optionally limited to one adapter. Toggles control deployment and do not change
 `skills.lock`.
+
+**Usage report**:
+A local summary of observed skill, MCP server, and subagent calls in agent
+session transcripts. An unused item has no observed calls in the selected
+window; incomplete transcript coverage does not prove it was never used.

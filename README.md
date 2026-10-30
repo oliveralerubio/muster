@@ -307,3 +307,16 @@ team manifest. Use `--profile NAME` for a profile or `--project DIR` for a
 project. Run `muster plan --format json` to see disabled items and their layers.
 A toggle does not change `skills.lock`. Sync removes disabled managed copies;
 re-enabling a skill still requires a valid lock entry.
+
+## Usage
+
+`muster usage [--since 14d] [--agent ID] [--project DIR] [--max-file-bytes N]`
+scans local session transcripts on this machine without network access and
+reports per-item `uses`, `sessions`, `last_used`, per-agent breakdown,
+`sessions_scanned`, `sources` (with `malformed_lines` and `skipped` files by
+reason), and `unused` managed skills, MCP servers, and subagents with a
+`muster disable <kind>:<name>` suggestion. Claude Code transcripts are supported
+for skills, MCP servers, and subagents; Codex transcripts are partially
+supported (skills and MCP servers); OpenCode and Antigravity are reported as
+`unsupported`. Prompt, response, and tool argument text is never output or
+stored. Suggestions are advisory because transcript coverage can be incomplete.

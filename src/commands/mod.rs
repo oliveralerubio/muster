@@ -21,8 +21,8 @@ pub mod secret;
 pub mod skill;
 pub mod status;
 pub mod sync;
+pub mod toggle;
 pub mod ui;
 pub mod uninstall;
-
-pub mod toggle;
+pub mod usage;
 pub mod why;

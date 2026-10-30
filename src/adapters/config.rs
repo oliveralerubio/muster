@@ -84,7 +84,7 @@ pub fn parse_toggle(item: &str) -> Result<(&str, &str, Option<&str>), String> {
 /// of `is_valid_agent_name`/`machine::validate_name`: a lowercase letter or
 /// digit first, then lowercase letters, digits, dots, underscores or hyphens.
 /// `/`, `\\` and `..` are rejected so a name can never traverse a path.
-fn is_valid_item_name(name: &str) -> bool {
+pub(crate) fn is_valid_item_name(name: &str) -> bool {
     let mut chars = name.chars();
     match chars.next() {
         Some(first) if first.is_ascii_lowercase() || first.is_ascii_digit() => {}

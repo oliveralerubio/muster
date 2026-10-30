@@ -157,6 +157,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     crate::commands::toggle::ENABLE,
     crate::commands::toggle::DISABLE,
     crate::mcp::SPEC,
+    crate::commands::usage::SPEC,
 ];
 
 pub fn find(name: &str) -> Option<&'static CommandSpec> {
