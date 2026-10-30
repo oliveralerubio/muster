@@ -252,4 +252,54 @@ fn unreadable_and_malformed_transcripts_are_counted_without_aborting() {
     );
 }
 
+#[test]
+fn privacy_rejects_unsafe_item_names_and_never_outputs_or_stores_secrets() {
+    let env = MusterEnv::new();
+    let claude_dir = env.path().join(".claude/projects/example");
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    std::fs::write(
+        claude_dir.join("session.jsonl"),
+        concat!(
+            "{\"type\":\"user\",\"timestamp\":\"2099-01-01T00:00:00Z\",\"sessionId\":\"RAW-SESSION-SECRET-1\",\"message\":{\"content\":\"sk-proj-SECRET-USER-PROMPT\"}}\n",
+            "{\"type\":\"assistant\",\"timestamp\":\"2099-01-01T00:00:00Z\",\"sessionId\":\"RAW-SESSION-SECRET-1\",\"message\":{\"content\":[",
+            "{\"type\":\"text\",\"text\":\"sk-proj-SECRET-ASSISTANT-TEXT\"},",
+            "{\"type\":\"tool_use\",\"name\":\"Skill\",\"input\":{\"skill\":\"review\",\"args\":\"sk-proj-SECRET-SKILL-ARGS\"}},",
+            "{\"type\":\"tool_use\",\"name\":\"Skill\",\"input\":{\"skill\":\"review sk-proj-SECRET-IN-SKILL-NAME\"}},",
+            "{\"type\":\"tool_use\",\"name\":\"Agent\",\"input\":{\"subagent_type\":\"reviewer/sk-proj-SECRET-IN-AGENT\",\"prompt\":\"sk-proj-SECRET-AGENT-PROMPT\"}},",
+            "{\"type\":\"tool_use\",\"name\":\"mcp__docs:sk-proj-SECRET-IN-MCP__search\",\"input\":{\"q\":\"sk-proj-SECRET-MCP-INPUT\"}}",
+            "]}}\n"
+        ),
+    )
+    .unwrap();
+
+    let codex_dir = env.path().join(".codex/sessions/2026/01/01");
+    std::fs::create_dir_all(&codex_dir).unwrap();
+    std::fs::write(
+        codex_dir.join("session.jsonl"),
+        concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"RAW-SESSION-SECRET-2\",\"cwd\":\"/work\"}}\n",
+            "{\"type\":\"event_msg\",\"timestamp\":\"2099-01-01T00:00:00Z\",\"payload\":{\"type\":\"mcp_tool_call_end\",\"call_id\":\"c1\",\"invocation\":{\"server\":\"docs\",\"tool\":\"search\",\"arguments\":{\"token\":\"sk-proj-SECRET-CODEX-ARG\"}},\"result\":\"sk-proj-SECRET-CODEX-RES\"}}\n",
+            "{\"type\":\"event_msg\",\"timestamp\":\"2099-01-01T00:00:00Z\",\"payload\":{\"type\":\"mcp_tool_call_end\",\"call_id\":\"c2\",\"invocation\":{\"server\":\"bad/sk-proj-SECRET-SERVER\",\"tool\":\"search\",\"arguments\":{}}}}\n"
+        ),
+    )
+    .unwrap();
+
+    for fmt in ["json", "text"] {
+        let output = env.run(&["--format", fmt, "usage"]).output().unwrap();
+        assert!(output.status.success());
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!combined.contains("sk-proj-SECRET"), "{fmt}: {combined}");
+        assert!(
+            !combined.contains("RAW-SESSION-SECRET"),
+            "{fmt}: {combined}"
+        );
+    }
+    assert!(!env.path().join(".local/state/muster").exists());
+}
+
+
 

@@ -90,7 +90,7 @@ pub(super) fn scan_codex(
             if record["type"] == "event_msg" && payload["type"] == "mcp_tool_call_end" {
                 if let Some(server) = payload["invocation"]["server"]
                     .as_str()
-                    .filter(|s| !s.is_empty())
+                    .filter(|s| valid_item_name(s))
                 {
                     let count = counts.entry(("mcp".into(), server.into())).or_default();
                     count.uses += 1;
@@ -118,11 +118,7 @@ pub(super) fn scan_codex(
                 let Some((name, _)) = suffix.split_once("/SKILL.md") else {
                     continue;
                 };
-                if name.is_empty()
-                    || !name
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || "-_".contains(c))
-                {
+                if !valid_item_name(name) {
                     continue;
                 }
                 let count = counts.entry(("skill".into(), name.into())).or_default();

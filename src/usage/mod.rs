@@ -19,6 +19,16 @@ struct Options<'a> {
     project: Option<&'a str>,
 }
 
+pub(super) fn valid_item_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && !name.starts_with('.')
+        && !name.contains("..")
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+}
+
 mod claude;
 mod codex;
 

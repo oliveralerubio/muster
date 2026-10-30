@@ -104,7 +104,9 @@ pub(super) fn scan(
                             .and_then(|s| s.split_once("__"))
                             .map(|(n, _)| ("mcp", n))
                     };
-                    if let Some((kind, name)) = item {
+                    if let Some((kind, name)) =
+                        item.filter(|(_, name)| valid_item_name(name))
+                    {
                         let count = counts
                             .entry((kind.to_owned(), name.to_owned()))
                             .or_default();
