@@ -120,6 +120,13 @@ fn disable_and_enable_edit_manifest_idempotently() {
     assert!(text.contains("# keep this comment"));
     assert!(text.contains("enable = [\"skill:pdf\"]"));
     assert!(!text.contains("disable = [\"skill:pdf\"]"));
+    // And the reverse: disabling removes the matching enable.
+    env.run(&["disable", "skill:pdf", "--yes"])
+        .assert()
+        .success();
+    let text = std::fs::read_to_string(dir.join("muster.toml")).unwrap();
+    assert!(text.contains("disable = [\"skill:pdf\"]"));
+    assert!(!text.contains("enable = [\"skill:pdf\"]"));
 }
 
 #[test]
@@ -300,4 +307,104 @@ fn toggle_commands_target_profile_and_project_and_honor_dry_run() {
     let result = std::fs::read_to_string(project.join(".muster/muster.toml")).unwrap();
     assert!(result.contains("# project comment"));
     assert!(result.contains("enable = [\"mcp:figma\"]"));
+}
+
+#[test]
+fn member_layer_enable_overrides_team_disable() {
+    let env = MusterEnv::new();
+    let dir = env.config_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("muster.toml"), "version = 1\n[agents]\nenabled = ['claude']\n[agents.toggles]\ndisable = ['mcp:figma']\n[mcp.figma]\ncommand = 'figma'\n[members.alice]\nstatus = 'active'\nmachines = ['laptop']\nprofile = 'personal'\n[machines.laptop]\nrecipient = 'age1laptop'\nplatform = 'linux-x86_64'\nmuster_version = '0.1.0'\n[profiles.personal.agents.toggles]\nenable = ['mcp:figma']\n").unwrap();
+    std::fs::create_dir_all(env.path().join(".local/state/muster")).unwrap();
+    std::fs::write(env.path().join(".local/state/muster/machine"), "laptop\n").unwrap();
+    let (output, plan) = env.run_json(&["plan", "--format", "json"]);
+    assert!(output.status.success());
+    assert_eq!(plan.result()["disabled"], serde_json::json!([]));
+}
+
+#[test]
+fn schema_exposes_toggles_and_toggle_commands() {
+    let env = MusterEnv::new();
+    let (output, schema) = env.run_json(&["schema", "--format", "json"]);
+    assert!(output.status.success());
+    let agents = &schema.result()["manifest_schema"]["$defs"]["AgentsConfig"]["properties"];
+    let text = serde_json::to_string(agents).unwrap();
+    assert!(text.contains("toggles"), "{text}");
+    let commands: Vec<_> = schema.result()["commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    for name in ["enable", "disable"] {
+        let spec = schema.result()["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"].as_str() == Some(name))
+            .unwrap();
+        assert_eq!(spec["mutating"], serde_json::json!(true));
+        assert!(commands.contains(&name));
+    }
+}
+
+#[test]
+fn sync_removes_disabled_skill_and_leaves_skills_lock_alone() {
+    let env = MusterEnv::new();
+    let dir = env.config_dir();
+    std::fs::create_dir_all(dir.join("skills/pdf")).unwrap();
+    std::fs::write(
+        dir.join("skills/pdf/SKILL.md"),
+        "---\nname: pdf\ndescription: PDF\n---\nPDF\n",
+    )
+    .unwrap();
+    let manifest =
+        "version = 1\n[agents]\nenabled = ['claude']\n[agents.skills]\nsource = 'skills'\n";
+    std::fs::write(dir.join("muster.toml"), manifest).unwrap();
+    env.run(&["skill", "pin", "pdf", "--yes"])
+        .assert()
+        .success();
+    env.run(&["agents", "apply", "--yes"]).assert().success();
+    let installed = env.path().join(".claude/skills/pdf/SKILL.md");
+    assert!(installed.exists());
+    let lock = std::fs::read_to_string(dir.join("skills.lock")).unwrap();
+    std::fs::write(
+        dir.join("muster.toml"),
+        format!("{manifest}\n[agents.toggles]\ndisable = ['skill:pdf']\n"),
+    )
+    .unwrap();
+    env.run(&["sync", "--yes"]).assert().success();
+    assert!(!installed.exists());
+    assert_eq!(
+        lock,
+        std::fs::read_to_string(dir.join("skills.lock")).unwrap()
+    );
+}
+
+#[test]
+fn team_manifest_toggle_requires_an_admin() {
+    let env = MusterEnv::new();
+    let dir = env.config_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    let identity = muster::identity::Identity::generate();
+    std::fs::write(
+        dir.join("muster.toml"),
+        format!(
+            "version = 1\n[members.alice]\nstatus = 'active'\nmachines = ['box']\n[machines.box]\nrecipient = '{}'\nplatform = 'linux-x86_64'\nmuster_version = '0.1.0'\n",
+            identity.recipient()
+        ),
+    )
+    .unwrap();
+    let state = env.path().join(".local/state/muster");
+    identity.save(&state).unwrap();
+    std::fs::write(state.join("machine"), "box\n").unwrap();
+    let (output, envelope) = env.run_json(&["disable", "skill:pdf", "--yes", "--format", "json"]);
+    assert_eq!(output.status.code(), Some(5));
+    assert!(envelope
+        .diagnostics()
+        .to_string()
+        .contains("only team admins"));
+    assert!(!std::fs::read_to_string(dir.join("muster.toml"))
+        .unwrap()
+        .contains("toggles"));
 }
