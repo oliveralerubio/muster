@@ -92,7 +92,11 @@ fn effective_reports_skill_disk_changes_and_extras() {
     let env = MusterEnv::new();
     env.run(&["--yes", "init"]).assert().success();
     let config = env.config_dir();
-    std::fs::write(config.join("muster.toml"), "version = 1\n[agents]\nenabled = [\"claude\"]\n[agents.skills]\nsource = \"skills\"\n").unwrap();
+    std::fs::write(
+        config.join("muster.toml"),
+        "version = 1\n[agents]\nenabled = [\"claude\"]\n[agents.skills]\nsource = \"skills\"\n",
+    )
+    .unwrap();
     std::fs::create_dir_all(config.join("skills/demo")).unwrap();
     let source = "---\nname: demo\ndescription: Helpful skill\n---\nHello\n";
     std::fs::write(config.join("skills/demo/SKILL.md"), source).unwrap();
@@ -101,11 +105,20 @@ fn effective_reports_skill_disk_changes_and_extras() {
     std::fs::create_dir_all(base.join("personal")).unwrap();
     std::fs::write(base.join("demo/SKILL.md"), source).unwrap();
     let (_, result) = env.run_json(&["effective", "--format", "json"]);
-    assert_eq!(result.result()["skills"][0]["adapters"]["claude"]["state"], "installed");
-    assert_eq!(result.result()["extra_on_disk"]["claude"], serde_json::json!(["personal"]));
+    assert_eq!(
+        result.result()["skills"][0]["adapters"]["claude"]["state"],
+        "installed"
+    );
+    assert_eq!(
+        result.result()["extra_on_disk"]["claude"],
+        serde_json::json!(["personal"])
+    );
     std::fs::write(base.join("demo/SKILL.md"), "changed").unwrap();
     let (_, result) = env.run_json(&["effective", "--format", "json"]);
-    assert_eq!(result.result()["skills"][0]["adapters"]["claude"]["state"], "drifted");
+    assert_eq!(
+        result.result()["skills"][0]["adapters"]["claude"]["state"],
+        "drifted"
+    );
 }
 
 #[test]
@@ -118,28 +131,47 @@ fn effective_reports_mcp_without_secret_values() {
     assert!(!String::from_utf8_lossy(&output.stdout).contains("super-secret-value"));
     assert_eq!(result.result()["mcp"][0]["name"], "tool");
     assert_eq!(result.result()["mcp"][0]["layer"], "team");
-    assert_eq!(result.result()["mcp"][0]["overridden_layers"], serde_json::json!([]));
+    assert_eq!(
+        result.result()["mcp"][0]["overridden_layers"],
+        serde_json::json!([])
+    );
     assert_eq!(result.result()["mcp"][0]["transport"], "stdio");
-    assert_eq!(result.result()["mcp"][0]["agents"], serde_json::json!(["claude"]));
-    assert_eq!(result.result()["mcp"][0]["adapters"]["claude"]["state"], "missing");
+    assert_eq!(
+        result.result()["mcp"][0]["agents"],
+        serde_json::json!(["claude"])
+    );
+    assert_eq!(
+        result.result()["mcp"][0]["adapters"]["claude"]["state"],
+        "missing"
+    );
 }
 
 #[test]
 fn effective_reports_subagent_state() {
     let env = MusterEnv::new();
     env.run(&["--yes", "init"]).assert().success();
-    std::fs::write(env.config_dir().join("muster.toml"), "version = 1\n[agents]\nenabled = [\"claude\"]\n[agents.subagents]\nsource = \"agents\"\n").unwrap();
+    std::fs::write(
+        env.config_dir().join("muster.toml"),
+        "version = 1\n[agents]\nenabled = [\"claude\"]\n[agents.subagents]\nsource = \"agents\"\n",
+    )
+    .unwrap();
     std::fs::create_dir_all(env.config_dir().join("agents")).unwrap();
     let source = "---\nname: reviewer\ndescription: Review changes\n---\nReview.\n";
     std::fs::write(env.config_dir().join("agents/reviewer.md"), source).unwrap();
     let (_, result) = env.run_json(&["effective", "--format", "json"]);
     assert_eq!(result.result()["subagents"][0]["name"], "reviewer");
     assert_eq!(result.result()["subagents"][0]["layer"], "team");
-    assert_eq!(result.result()["subagents"][0]["adapters"]["claude"]["state"], "missing");
+    assert_eq!(
+        result.result()["subagents"][0]["adapters"]["claude"]["state"],
+        "missing"
+    );
     std::fs::create_dir_all(env.path().join(".claude/agents")).unwrap();
     std::fs::write(env.path().join(".claude/agents/reviewer.md"), source).unwrap();
     let (_, result) = env.run_json(&["effective", "--format", "json"]);
-    assert_eq!(result.result()["subagents"][0]["adapters"]["claude"]["state"], "in_sync");
+    assert_eq!(
+        result.result()["subagents"][0]["adapters"]["claude"]["state"],
+        "in_sync"
+    );
 }
 
 #[test]
@@ -148,8 +180,18 @@ fn effective_lists_project_layer() {
     env.run(&["--yes", "init"]).assert().success();
     let project = env.path().join("project");
     std::fs::create_dir_all(project.join(".muster")).unwrap();
-    std::fs::write(project.join(".muster/muster.toml"), "version = 1\n[mcp.local]\ncommand = \"project-tool\"\n").unwrap();
-    let (_, result) = env.run_json(&["effective", "--project", project.to_str().unwrap(), "--format", "json"]);
+    std::fs::write(
+        project.join(".muster/muster.toml"),
+        "version = 1\n[mcp.local]\ncommand = \"project-tool\"\n",
+    )
+    .unwrap();
+    let (_, result) = env.run_json(&[
+        "effective",
+        "--project",
+        project.to_str().unwrap(),
+        "--format",
+        "json",
+    ]);
     assert_eq!(result.result()["layers"][1]["kind"], "project");
     assert_eq!(result.result()["mcp"][0]["name"], "local");
     assert_eq!(result.result()["mcp"][0]["layer"], "project");
@@ -162,8 +204,17 @@ fn effective_filters_adapters_and_rejects_unknown() {
     std::fs::write(env.config_dir().join("muster.toml"), "version = 1\n[agents]\nenabled = [\"claude\", \"codex\"]\n[agents.instructions]\nsource = \"AGENTS.md\"\n").unwrap();
     std::fs::write(env.config_dir().join("AGENTS.md"), "Hello\n").unwrap();
     let (_, result) = env.run_json(&["effective", "--agent", "claude", "--format", "json"]);
-    assert_eq!(result.result()["instructions"][0]["adapters"].as_object().unwrap().keys().collect::<Vec<_>>(), vec!["claude"]);
-    env.run(&["effective", "--agent", "unknown"]).assert().code(2);
+    assert_eq!(
+        result.result()["instructions"][0]["adapters"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>(),
+        vec!["claude"]
+    );
+    env.run(&["effective", "--agent", "unknown"])
+        .assert()
+        .code(2);
 }
 
 #[test]
@@ -173,7 +224,11 @@ fn effective_totals_instruction_and_skill_description_tokens() {
     std::fs::write(env.config_dir().join("muster.toml"), "version = 1\n[agents]\nenabled = [\"claude\", \"codex\"]\nskip_instructions = [\"codex\"]\n[agents.instructions]\nsource = \"AGENTS.md\"\n[agents.skills]\nsource = \"skills\"\n").unwrap();
     std::fs::write(env.config_dir().join("AGENTS.md"), "Be kind.\n").unwrap();
     std::fs::create_dir_all(env.config_dir().join("skills/demo")).unwrap();
-    std::fs::write(env.config_dir().join("skills/demo/SKILL.md"), "---\nname: demo\ndescription: Helpful skill\n---\nHello\n").unwrap();
+    std::fs::write(
+        env.config_dir().join("skills/demo/SKILL.md"),
+        "---\nname: demo\ndescription: Helpful skill\n---\nHello\n",
+    )
+    .unwrap();
     let (_, result) = env.run_json(&["effective", "--format", "json"]);
     assert_eq!(result.result()["totals"]["claude"], 5);
     assert_eq!(result.result()["totals"]["codex"], 3);
@@ -183,11 +238,20 @@ fn effective_totals_instruction_and_skill_description_tokens() {
 fn effective_text_shows_compact_sections() {
     let env = MusterEnv::new();
     env.run(&["--yes", "init"]).assert().success();
-    std::fs::write(env.config_dir().join("muster.toml"), "version = 1\n[agents]\nenabled = [\"claude\"]\n").unwrap();
-    let output = env.run(&["effective", "--format", "text"]).output().unwrap();
+    std::fs::write(
+        env.config_dir().join("muster.toml"),
+        "version = 1\n[agents]\nenabled = [\"claude\"]\n",
+    )
+    .unwrap();
+    let output = env
+        .run(&["effective", "--format", "text"])
+        .output()
+        .unwrap();
     assert!(output.status.success());
     let text = String::from_utf8(output.stdout).unwrap();
-    for expected in ["Instructions", "Skills", "MCP", "Subagents", "claude"] { assert!(text.contains(expected), "{text}"); }
+    for expected in ["Instructions", "Skills", "MCP", "Subagents", "claude"] {
+        assert!(text.contains(expected), "{text}");
+    }
 }
 
 #[test]
@@ -195,24 +259,56 @@ fn effective_compares_mcp_without_disclosing_existing_secrets() {
     let env = MusterEnv::new();
     env.run(&["--yes", "init"]).assert().success();
     std::fs::write(env.config_dir().join("muster.toml"), "version = 1\n[agents]\nenabled = [\"claude\"]\n[mcp.tool]\ncommand = \"tool\"\n[mcp.tool.env]\nTOKEN = \"native://app/token\"\n").unwrap();
-    std::fs::write(env.path().join(".claude.json"), r#"{"mcpServers":{"tool":{"command":"tool","env":{"TOKEN":"super-secret-value"}}}}"#).unwrap();
+    std::fs::write(
+        env.path().join(".claude.json"),
+        r#"{"mcpServers":{"tool":{"command":"tool","env":{"TOKEN":"super-secret-value"}}}}"#,
+    )
+    .unwrap();
     let (output, result) = env.run_json(&["effective", "--format", "json"]);
     assert!(!String::from_utf8_lossy(&output.stdout).contains("super-secret-value"));
-    assert_eq!(result.result()["mcp"][0]["adapters"]["claude"]["state"], "in_sync");
-    assert_eq!(result.result()["mcp"][0]["secret_references"], serde_json::json!(["native://app/token"]));
+    assert_eq!(
+        result.result()["mcp"][0]["adapters"]["claude"]["state"],
+        "in_sync"
+    );
+    assert_eq!(
+        result.result()["mcp"][0]["secret_references"],
+        serde_json::json!(["native://app/token"])
+    );
 }
 
 #[test]
 fn effective_project_reports_both_user_and_project_disk_states() {
     let env = MusterEnv::new();
     env.run(&["--yes", "init"]).assert().success();
-    std::fs::write(env.config_dir().join("muster.toml"), "version = 1\n[agents]\nenabled = [\"claude\"]\n[mcp.user]\ncommand = \"user-tool\"\n").unwrap();
-    std::fs::write(env.path().join(".claude.json"), r#"{"mcpServers":{"user":{"command":"user-tool"}}}"#).unwrap();
+    std::fs::write(
+        env.config_dir().join("muster.toml"),
+        "version = 1\n[agents]\nenabled = [\"claude\"]\n[mcp.user]\ncommand = \"user-tool\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        env.path().join(".claude.json"),
+        r#"{"mcpServers":{"user":{"command":"user-tool"}}}"#,
+    )
+    .unwrap();
     let project = env.path().join("project");
     std::fs::create_dir_all(project.join(".muster")).unwrap();
-    std::fs::write(project.join(".muster/muster.toml"), "version = 1\n[mcp.local]\ncommand = \"project-tool\"\n").unwrap();
-    std::fs::write(project.join(".mcp.json"), r#"{"mcpServers":{"local":{"command":"project-tool"}}}"#).unwrap();
-    let (_, result) = env.run_json(&["effective", "--project", project.to_str().unwrap(), "--format", "json"]);
+    std::fs::write(
+        project.join(".muster/muster.toml"),
+        "version = 1\n[mcp.local]\ncommand = \"project-tool\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.join(".mcp.json"),
+        r#"{"mcpServers":{"local":{"command":"project-tool"}}}"#,
+    )
+    .unwrap();
+    let (_, result) = env.run_json(&[
+        "effective",
+        "--project",
+        project.to_str().unwrap(),
+        "--format",
+        "json",
+    ]);
     let servers = result.result()["mcp"].as_array().unwrap();
     assert_eq!(servers.len(), 2);
     assert_eq!(servers[0]["name"], "user");
@@ -225,8 +321,15 @@ fn effective_project_reports_both_user_and_project_disk_states() {
 fn effective_finds_extra_skills_without_managed_skills() {
     let env = MusterEnv::new();
     env.run(&["--yes", "init"]).assert().success();
-    std::fs::write(env.config_dir().join("muster.toml"), "version = 1\n[agents]\nenabled = [\"claude\"]\n").unwrap();
+    std::fs::write(
+        env.config_dir().join("muster.toml"),
+        "version = 1\n[agents]\nenabled = [\"claude\"]\n",
+    )
+    .unwrap();
     std::fs::create_dir_all(env.path().join(".claude/skills/personal")).unwrap();
     let (_, result) = env.run_json(&["effective", "--format", "json"]);
-    assert_eq!(result.result()["extra_on_disk"]["claude"], serde_json::json!(["personal"]));
+    assert_eq!(
+        result.result()["extra_on_disk"]["claude"],
+        serde_json::json!(["personal"])
+    );
 }

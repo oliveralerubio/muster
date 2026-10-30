@@ -15,43 +15,79 @@ use crate::registry::{CommandSpec, Params};
 pub const SPEC: CommandSpec = CommandSpec {
     name: "effective",
     about: "Show the effective configuration and its sources",
-    params: &[crate::commands::plan::PROJECT_PARAM, crate::registry::ParamSpec {
-        name: "agent", about: "Restrict output to one adapter", kind: crate::registry::ParamKind::String,
-        required: false, positional: false,
-    }],
+    params: &[
+        crate::commands::plan::PROJECT_PARAM,
+        crate::registry::ParamSpec {
+            name: "agent",
+            about: "Restrict output to one adapter",
+            kind: crate::registry::ParamKind::String,
+            required: false,
+            positional: false,
+        },
+    ],
     mutating: false,
     handler: effective,
 };
 
 fn effective(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let manifest = Manifest::load(&ctx.config_dir)?;
-    let layers = layer::global_layers(&ctx.config_dir, &manifest, crate::machine::load_name(&ctx.state_dir).as_deref());
+    let layers = layer::global_layers(
+        &ctx.config_dir,
+        &manifest,
+        crate::machine::load_name(&ctx.state_dir).as_deref(),
+    );
     let mut result = scope(ctx, params, &layers, None, None)?;
     if let engine::Target::Project(project) = crate::commands::plan::target(params)? {
         let project_layers = layer::project_layers(&project)?;
         let global_enabled = layer::merge(&layers).agents.enabled;
         let project_result = scope(ctx, params, &project_layers, Some(&project), global_enabled)?;
         for key in ["layers", "instructions", "skills", "mcp", "subagents"] {
-            result[key].as_array_mut().unwrap().extend(project_result[key].as_array().unwrap().iter().cloned());
+            result[key]
+                .as_array_mut()
+                .unwrap()
+                .extend(project_result[key].as_array().unwrap().iter().cloned());
         }
-        if let (Some(totals), Some(project_totals)) = (result["totals"].as_object_mut(), project_result["totals"].as_object()) {
+        if let (Some(totals), Some(project_totals)) = (
+            result["totals"].as_object_mut(),
+            project_result["totals"].as_object(),
+        ) {
             for (id, value) in project_totals {
-                let sum = totals.get(id).and_then(Value::as_u64).unwrap_or(0) + value.as_u64().unwrap_or(0);
+                let sum = totals.get(id).and_then(Value::as_u64).unwrap_or(0)
+                    + value.as_u64().unwrap_or(0);
                 totals.insert(id.clone(), json!(sum));
             }
         }
     }
-    if ctx.format == crate::output::Format::Text { Ok(Value::String(format_text(&result))) } else { Ok(result) }
+    if ctx.format == crate::output::Format::Text {
+        Ok(Value::String(format_text(&result)))
+    } else {
+        Ok(result)
+    }
 }
 
-fn scope(ctx: &mut Context, params: &Params, layers: &[layer::Layer], project: Option<&std::path::Path>, fallback_enabled: Option<Vec<String>>) -> Result<Value, MusterError> {
+fn scope(
+    ctx: &mut Context,
+    params: &Params,
+    layers: &[layer::Layer],
+    project: Option<&std::path::Path>,
+    fallback_enabled: Option<Vec<String>>,
+) -> Result<Value, MusterError> {
     let mut merged = layer::merge(layers);
-    if merged.agents.enabled.is_none() { merged.agents.enabled = fallback_enabled; }
+    if merged.agents.enabled.is_none() {
+        merged.agents.enabled = fallback_enabled;
+    }
     let selected = if let Some(id) = params.get_string("agent") {
-        let adapter = adapters::find(id).ok_or_else(|| MusterError::Usage(format!("unknown agent `{id}`")))?;
-        if !adapter.available() { return Err(MusterError::Unavailable(format!("agent `{id}` is unavailable"))); }
+        let adapter = adapters::find(id)
+            .ok_or_else(|| MusterError::Usage(format!("unknown agent `{id}`")))?;
+        if !adapter.available() {
+            return Err(MusterError::Unavailable(format!(
+                "agent `{id}` is unavailable"
+            )));
+        }
         vec![adapter]
-    } else { engine::enabled_adapters(Some(&merged.agents))? };
+    } else {
+        engine::enabled_adapters(Some(&merged.agents))?
+    };
     let (path, _) = merged.instructions_path()?;
     let source = layers
         .iter()
@@ -94,7 +130,8 @@ fn scope(ctx: &mut Context, params: &Params, layers: &[layer::Layer], project: O
                 }
                 let mut current = Current::new();
                 for file in adapter.files {
-                    if let Ok(content) = std::fs::read_to_string(locate_file(&roots, file, project)) {
+                    if let Ok(content) = std::fs::read_to_string(locate_file(&roots, file, project))
+                    {
                         current.insert(file.path, content);
                     }
                 }
@@ -151,16 +188,37 @@ fn scope(ctx: &mut Context, params: &Params, layers: &[layer::Layer], project: O
             let skills = BTreeMap::new();
             let subagents = BTreeMap::new();
             let access = SecretAccess::new(BTreeMap::new(), None);
-            let desired = Desired { config_dir: &ctx.config_dir, agents: &empty_agents,
-                ai_providers: &providers, mcp: &mcp, instructions: None, secrets: &secrets,
-                access: &access, skills: &skills, subagents: &subagents };
+            let desired = Desired {
+                config_dir: &ctx.config_dir,
+                agents: &empty_agents,
+                ai_providers: &providers,
+                mcp: &mcp,
+                instructions: None,
+                secrets: &secrets,
+                access: &access,
+                skills: &skills,
+                subagents: &subagents,
+            };
             let rendered = adapter.render(&desired, &current)?;
             let empty = BTreeMap::new();
-            let baseline = adapter.render(&Desired { mcp: &empty, ..desired }, &current)?;
-            let changed: Vec<_> = rendered.files.iter().filter(|file| {
-                baseline.files.iter().find(|base| base.file.path == file.file.path)
-                    .is_none_or(|base| base.contents != file.contents)
-            }).collect();
+            let baseline = adapter.render(
+                &Desired {
+                    mcp: &empty,
+                    ..desired
+                },
+                &current,
+            )?;
+            let changed: Vec<_> = rendered
+                .files
+                .iter()
+                .filter(|file| {
+                    baseline
+                        .files
+                        .iter()
+                        .find(|base| base.file.path == file.file.path)
+                        .is_none_or(|base| base.contents != file.contents)
+                })
+                .collect();
             if let Some(file) = changed.first() {
                 let state = match current.get(file.file.path) {
                     None => "missing",
@@ -170,44 +228,89 @@ fn scope(ctx: &mut Context, params: &Params, layers: &[layer::Layer], project: O
             } else {
                 // Render against an empty current file to identify the MCP output.
                 let rendered = adapter.render(&desired, &Current::new())?;
-                let baseline = adapter.render(&Desired { mcp: &empty, ..desired }, &Current::new())?;
-                if rendered.files.iter().any(|file| baseline.files.iter()
-                    .find(|base| base.file.path == file.file.path)
-                    .is_none_or(|base| base.contents != file.contents)) {
+                let baseline = adapter.render(
+                    &Desired {
+                        mcp: &empty,
+                        ..desired
+                    },
+                    &Current::new(),
+                )?;
+                if rendered.files.iter().any(|file| {
+                    baseline
+                        .files
+                        .iter()
+                        .find(|base| base.file.path == file.file.path)
+                        .is_none_or(|base| base.contents != file.contents)
+                }) {
                     views.insert(adapter.id, json!({"state": "in_sync"}));
                 }
             }
         }
         let agents: Vec<_> = views.keys().copied().collect();
-        let references: Vec<_> = server.env.values().chain(server.headers.values())
-            .filter(|v| adapters::is_secret_reference(v)).collect();
+        let references: Vec<_> = server
+            .env
+            .values()
+            .chain(server.headers.values())
+            .filter(|v| adapters::is_secret_reference(v))
+            .collect();
         mcp_views.push(json!({"name": name, "layer": sources.last().map(|l| l.kind),
             "overridden_layers": sources.iter().take(sources.len().saturating_sub(1)).map(|l| l.kind).collect::<Vec<_>>(),
             "transport": transport, "agents": agents, "adapters": views, "secret_references": references}));
     }
     let mut subagent_views = Vec::new();
     if let Some(dir) = merged.subagents_path()? {
-        let mut entries: Vec<_> = std::fs::read_dir(dir).into_iter().flatten().flatten().collect();
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .collect();
         entries.sort_by_key(|entry| entry.file_name());
         for entry in entries {
             let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("md") { continue; }
-            let Some(name) = path.file_stem().and_then(|s| s.to_str()) else { continue; };
-            let Ok(source) = std::fs::read_to_string(&path) else { continue; };
-            let Some(rest) = source.strip_prefix("---\n") else { continue; };
-            let Some((front, body)) = rest.split_once("\n---\n") else { continue; };
-            let Ok(docs) = yaml_rust2::YamlLoader::load_from_str(front) else { continue; };
-            let Some(yaml) = docs.first() else { continue; };
-            let Some(description) = yaml["description"].as_str() else { continue; };
-            if yaml["name"].as_str() != Some(name) { continue; }
+            if path.extension().and_then(|s| s.to_str()) != Some("md") {
+                continue;
+            }
+            let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let Ok(source) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Some(rest) = source.strip_prefix("---\n") else {
+                continue;
+            };
+            let Some((front, body)) = rest.split_once("\n---\n") else {
+                continue;
+            };
+            let Ok(docs) = yaml_rust2::YamlLoader::load_from_str(front) else {
+                continue;
+            };
+            let Some(yaml) = docs.first() else {
+                continue;
+            };
+            let Some(description) = yaml["description"].as_str() else {
+                continue;
+            };
+            if yaml["name"].as_str() != Some(name) {
+                continue;
+            }
             let tools = match &yaml["tools"] {
-                yaml_rust2::Yaml::Array(items) => items.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect(),
+                yaml_rust2::Yaml::Array(items) => items
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect(),
                 yaml_rust2::Yaml::String(s) => s.split(',').map(|s| s.trim().to_owned()).collect(),
                 _ => Vec::new(),
             };
-            let subagent = adapters::Subagent { name: name.to_owned(), description: description.to_owned(),
-                tools, model: yaml["model"].as_str().map(str::to_owned), extra_fields: Vec::new(),
-                body: body.to_owned(), source };
+            let subagent = adapters::Subagent {
+                name: name.to_owned(),
+                description: description.to_owned(),
+                tools,
+                model: yaml["model"].as_str().map(str::to_owned),
+                extra_fields: Vec::new(),
+                body: body.to_owned(),
+                source,
+            };
             let subagents = BTreeMap::from([(name.to_owned(), subagent)]);
             let empty_agents = Default::default();
             let providers = BTreeMap::new();
@@ -215,49 +318,86 @@ fn scope(ctx: &mut Context, params: &Params, layers: &[layer::Layer], project: O
             let secrets = BTreeMap::new();
             let skills = BTreeMap::new();
             let access = SecretAccess::new(BTreeMap::new(), None);
-            let desired = Desired { config_dir: &ctx.config_dir, agents: &empty_agents, ai_providers: &providers,
-                mcp: &mcp, instructions: None, secrets: &secrets, access: &access, skills: &skills, subagents: &subagents };
+            let desired = Desired {
+                config_dir: &ctx.config_dir,
+                agents: &empty_agents,
+                ai_providers: &providers,
+                mcp: &mcp,
+                instructions: None,
+                secrets: &secrets,
+                access: &access,
+                skills: &skills,
+                subagents: &subagents,
+            };
             let mut views = BTreeMap::new();
             for &adapter in &selected {
                 let rendered = adapter.render(&desired, &Current::new())?;
                 if let Some(file) = rendered.tree.first() {
                     let path = locate_tree(&roots, file, project);
                     let state = match std::fs::read_to_string(path) {
-                        Err(_) => "missing", Ok(current) if current == file.contents => "in_sync", Ok(_) => "drifted"
+                        Err(_) => "missing",
+                        Ok(current) if current == file.contents => "in_sync",
+                        Ok(_) => "drifted",
                     };
                     views.insert(adapter.id, json!({"state": state}));
                 }
             }
-            let layer = layers.iter().rev().find(|l| l.agents.subagents.is_some()).map(|l| l.kind);
+            let layer = layers
+                .iter()
+                .rev()
+                .find(|l| l.agents.subagents.is_some())
+                .map(|l| l.kind);
             subagent_views.push(json!({"name": name, "layer": layer, "adapters": views}));
         }
     }
     let mut skill_views = Vec::new();
     let mut skill_dirs = BTreeMap::new();
-    let sentinel = BTreeMap::from([("__muster_probe__".to_owned(), BTreeMap::from([("SKILL.md".to_owned(), String::new())]))]);
+    let sentinel = BTreeMap::from([(
+        "__muster_probe__".to_owned(),
+        BTreeMap::from([("SKILL.md".to_owned(), String::new())]),
+    )]);
     let empty_agents = Default::default();
     let providers = BTreeMap::new();
     let mcp = BTreeMap::new();
     let secrets = BTreeMap::new();
     let subagents = BTreeMap::new();
     let access = SecretAccess::new(BTreeMap::new(), None);
-    let desired = Desired { config_dir: &ctx.config_dir, agents: &empty_agents, ai_providers: &providers,
-        mcp: &mcp, instructions: None, secrets: &secrets, access: &access, skills: &sentinel, subagents: &subagents };
+    let desired = Desired {
+        config_dir: &ctx.config_dir,
+        agents: &empty_agents,
+        ai_providers: &providers,
+        mcp: &mcp,
+        instructions: None,
+        secrets: &secrets,
+        access: &access,
+        skills: &sentinel,
+        subagents: &subagents,
+    };
     for &adapter in &selected {
         let rendered = adapter.render(&desired, &Current::new())?;
         if let Some(file) = rendered.tree.first() {
-            if project.is_some() && file.project.is_none() { continue; }
+            if project.is_some() && file.project.is_none() {
+                continue;
+            }
             let path = locate_tree(&roots, file, project);
-            if let Some(dir) = path.parent().and_then(|p| p.parent()) { skill_dirs.insert(adapter.id, dir.to_path_buf()); }
+            if let Some(dir) = path.parent().and_then(|p| p.parent()) {
+                skill_dirs.insert(adapter.id, dir.to_path_buf());
+            }
         }
     }
     let listed = if project.is_some() {
-        let mut names: Vec<_> = merged.skills_path()?.into_iter().flat_map(|dir| std::fs::read_dir(dir).into_iter().flatten().flatten())
+        let mut names: Vec<_> = merged
+            .skills_path()?
+            .into_iter()
+            .flat_map(|dir| std::fs::read_dir(dir).into_iter().flatten().flatten())
             .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
-            .filter_map(|entry| entry.file_name().into_string().ok()).collect();
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .collect();
         names.sort();
         json!({"skills": names.into_iter().map(|name| json!({"name": name})).collect::<Vec<_>>()})
-    } else { (crate::commands::skill::LIST.handler)(ctx, &Params::default())? };
+    } else {
+        (crate::commands::skill::LIST.handler)(ctx, &Params::default())?
+    };
     let lock = crate::skills::SkillsLock::load(&ctx.config_dir)?;
     if let Some(dir) = merged.skills_path()? {
         if let Some(items) = listed["skills"].as_array() {
@@ -346,39 +486,80 @@ fn scope(ctx: &mut Context, params: &Params, layers: &[layer::Layer], project: O
             }
         }
     }
-    let names: std::collections::BTreeSet<_> = skill_views.iter()
-        .filter_map(|v| v["name"].as_str()).collect();
-    let extra_on_disk: BTreeMap<_, Vec<_>> = skill_dirs.into_iter().map(|(id, dir)| {
-        let mut extra: Vec<_> = std::fs::read_dir(dir).into_iter().flatten().flatten()
-            .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
-            .filter_map(|entry| entry.file_name().into_string().ok())
-            .filter(|name| !names.contains(name.as_str())).collect();
-        extra.sort();
-        (id, extra)
-    }).collect();
-    let totals: BTreeMap<_, u64> = selected.iter().map(|adapter| {
-        let instruction_tokens: u64 = instructions.iter().filter(|v| v["adapters"][adapter.id]["state"] != "skipped")
-            .filter_map(|v| v["approx_tokens"].as_u64()).sum();
-        let skill_tokens: u64 = skill_views.iter().filter(|v| !v["adapters"][adapter.id].is_null())
-            .filter_map(|v| v["description_tokens"].as_u64()).sum();
-        (adapter.id, instruction_tokens + skill_tokens)
-    }).collect();
+    let names: std::collections::BTreeSet<_> = skill_views
+        .iter()
+        .filter_map(|v| v["name"].as_str())
+        .collect();
+    let extra_on_disk: BTreeMap<_, Vec<_>> = skill_dirs
+        .into_iter()
+        .map(|(id, dir)| {
+            let mut extra: Vec<_> = std::fs::read_dir(dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .filter(|name| !names.contains(name.as_str()))
+                .collect();
+            extra.sort();
+            (id, extra)
+        })
+        .collect();
+    let totals: BTreeMap<_, u64> = selected
+        .iter()
+        .map(|adapter| {
+            let instruction_tokens: u64 = instructions
+                .iter()
+                .filter(|v| v["adapters"][adapter.id]["state"] != "skipped")
+                .filter_map(|v| v["approx_tokens"].as_u64())
+                .sum();
+            let skill_tokens: u64 = skill_views
+                .iter()
+                .filter(|v| !v["adapters"][adapter.id].is_null())
+                .filter_map(|v| v["description_tokens"].as_u64())
+                .sum();
+            (adapter.id, instruction_tokens + skill_tokens)
+        })
+        .collect();
     let result = json!({"totals": totals, "subagents": subagent_views, "mcp": mcp_views, "extra_on_disk": extra_on_disk, "skills": skill_views, "layers": layers.iter().map(|l| json!({"kind": l.kind, "name": l.name})).collect::<Vec<_>>(), "instructions": instructions});
     Ok(result)
 }
 
-fn scrub_mcp_secrets(content: &str, name: &str, server: &crate::adapters::config::McpServer) -> String {
-    let secrets = |map: &BTreeMap<String, String>| map.iter().filter(|(_, value)| adapters::is_secret_reference(value)).map(|(key, _)| key.clone()).collect::<Vec<_>>();
+fn scrub_mcp_secrets(
+    content: &str,
+    name: &str,
+    server: &crate::adapters::config::McpServer,
+) -> String {
+    let secrets = |map: &BTreeMap<String, String>| {
+        map.iter()
+            .filter(|(_, value)| adapters::is_secret_reference(value))
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>()
+    };
     let env = secrets(&server.env);
     let headers = secrets(&server.headers);
-    if env.is_empty() && headers.is_empty() { return content.to_owned(); }
+    if env.is_empty() && headers.is_empty() {
+        return content.to_owned();
+    }
     if let Ok(mut value) = serde_json::from_str::<Value>(content) {
         for root in ["mcpServers", "mcp", "mcp_servers"] {
-            if let Some(entry) = value.get_mut(root).and_then(|v| v.get_mut(name)).and_then(Value::as_object_mut) {
-                for (field, keys) in [("env", &env), ("headers", &headers), ("http_headers", &headers)] {
+            if let Some(entry) = value
+                .get_mut(root)
+                .and_then(|v| v.get_mut(name))
+                .and_then(Value::as_object_mut)
+            {
+                for (field, keys) in [
+                    ("env", &env),
+                    ("headers", &headers),
+                    ("http_headers", &headers),
+                ] {
                     if let Some(map) = entry.get_mut(field).and_then(Value::as_object_mut) {
-                        for key in keys { map.remove(key); }
-                        if map.is_empty() { entry.remove(field); }
+                        for key in keys {
+                            map.remove(key);
+                        }
+                        if map.is_empty() {
+                            entry.remove(field);
+                        }
                     }
                 }
             }
@@ -390,26 +571,53 @@ fn scrub_mcp_secrets(content: &str, name: &str, server: &crate::adapters::config
 
 fn format_text(result: &Value) -> String {
     let mut text = String::new();
-        for (heading, key) in [("Instructions", "instructions"), ("Skills", "skills"), ("MCP", "mcp"), ("Subagents", "subagents")] {
-            text.push_str(&format!("{heading}\n"));
-            if let Some(items) = result[key].as_array() {
-                for item in items {
-                    let name = item["name"].as_str().or_else(|| item["source"].as_str()).unwrap_or("");
-                    text.push_str(&format!("  {name}\n"));
-                    if let Some(adapters) = item["adapters"].as_object() {
-                        for (id, view) in adapters { text.push_str(&format!("    {id}: {}\n", view["state"].as_str().unwrap_or("unknown"))); }
+    for (heading, key) in [
+        ("Instructions", "instructions"),
+        ("Skills", "skills"),
+        ("MCP", "mcp"),
+        ("Subagents", "subagents"),
+    ] {
+        text.push_str(&format!("{heading}\n"));
+        if let Some(items) = result[key].as_array() {
+            for item in items {
+                let name = item["name"]
+                    .as_str()
+                    .or_else(|| item["source"].as_str())
+                    .unwrap_or("");
+                text.push_str(&format!("  {name}\n"));
+                if let Some(adapters) = item["adapters"].as_object() {
+                    for (id, view) in adapters {
+                        text.push_str(&format!(
+                            "    {id}: {}\n",
+                            view["state"].as_str().unwrap_or("unknown")
+                        ));
                     }
                 }
             }
         }
-        text.push_str("Totals\n");
-        for (id, tokens) in result["totals"].as_object().unwrap() { text.push_str(&format!("  {id}: {tokens} tokens\n")); }
+    }
+    text.push_str("Totals\n");
+    for (id, tokens) in result["totals"].as_object().unwrap() {
+        text.push_str(&format!("  {id}: {tokens} tokens\n"));
+    }
     text
 }
 
-fn locate_file(roots: &Roots, file: &adapters::ManagedFile, project: Option<&std::path::Path>) -> std::path::PathBuf {
-    project.and_then(|p| file.project.map(|path| p.join(path))).unwrap_or_else(|| roots.resolve(file))
+fn locate_file(
+    roots: &Roots,
+    file: &adapters::ManagedFile,
+    project: Option<&std::path::Path>,
+) -> std::path::PathBuf {
+    project
+        .and_then(|p| file.project.map(|path| p.join(path)))
+        .unwrap_or_else(|| roots.resolve(file))
 }
-fn locate_tree(roots: &Roots, file: &adapters::RenderedTreeFile, project: Option<&std::path::Path>) -> std::path::PathBuf {
-    project.and_then(|p| file.project.as_ref().map(|path| p.join(path))).unwrap_or_else(|| roots.base(file.base).join(&file.path))
+fn locate_tree(
+    roots: &Roots,
+    file: &adapters::RenderedTreeFile,
+    project: Option<&std::path::Path>,
+) -> std::path::PathBuf {
+    project
+        .and_then(|p| file.project.as_ref().map(|path| p.join(path)))
+        .unwrap_or_else(|| roots.base(file.base).join(&file.path))
 }
