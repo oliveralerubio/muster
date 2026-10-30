@@ -94,6 +94,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     crate::commands::init::SPEC,
     crate::commands::schema::SPEC,
     crate::commands::status::SPEC,
+    crate::commands::why::SPEC,
     crate::commands::sync::SPEC,
     crate::commands::plan::SPEC,
     crate::commands::effective::SPEC,

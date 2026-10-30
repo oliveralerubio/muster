@@ -1055,3 +1055,24 @@ fn claude_approval_helper_has_a_short_cache_and_keeps_legacy_cleanup() {
         .get("CLAUDE_CODE_API_KEY_HELPER_TTL_MS")
         .is_none());
 }
+
+#[test]
+fn instruction_overlays_match_snapshots() {
+    let env = MusterEnv::new();
+    seed_full_config(&env);
+    std::fs::write(
+        env.config_dir().join("AGENTS.claude.md"),
+        "Claude-only instruction\n",
+    )
+    .unwrap();
+    env.run(&["agents", "apply", "--yes"]).assert().success();
+    for (name, path) in [
+        ("claude_overlay", ".claude/AGENTS.md"),
+        ("codex_without_claude_overlay", ".codex/AGENTS.md"),
+    ] {
+        insta::assert_snapshot!(
+            name,
+            std::fs::read_to_string(env.path().join(path)).unwrap()
+        );
+    }
+}

@@ -25,3 +25,4 @@ pub mod ui;
 pub mod uninstall;
 
 pub mod toggle;
+pub mod why;

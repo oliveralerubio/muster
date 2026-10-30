@@ -1083,6 +1083,7 @@ dependencies = [
  "ctrlc",
  "insta",
  "predicates",
+ "regex",
  "schemars",
  "secrecy",
  "serde",
