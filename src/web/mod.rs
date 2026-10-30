@@ -127,6 +127,7 @@ const ROUTES: &[Route] = &[
     post("proposal/create", "proposal.create"),
     post("proposal/accept", "proposal.accept"),
     get("skills", "skill.list"),
+    get("usage", "usage"),
     post("skills/check", "skill.check"),
     post("skills/add", "skill.add"),
     post("skills/update", "skill.update"),

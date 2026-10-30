@@ -22,3 +22,4 @@ pub mod status;
 pub mod sync;
 pub mod ui;
 pub mod uninstall;
+pub mod usage;

@@ -479,3 +479,11 @@ provider hot swapping, usage/cost/quota tracking, and provider support for
 Antigravity or experimental adapters. Vault encryption protects keys in the
 repository; resolved keys still reside in the agent's native config on each
 machine, as MCP keys do today.
+
+## Local usage report
+
+`usage` reads local session transcripts without network access and reports
+observed skill, MCP server and subagent use, unused managed items and source
+coverage. The default window is 14 days; agent, project and maximum file size
+filters are available. Unverified formats are identified as unsupported and
+suggestions are advisory. Prompt and response content is not returned or stored.

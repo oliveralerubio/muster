@@ -25,5 +25,6 @@ pub mod secret_leases;
 pub mod secrets;
 pub mod skills;
 pub mod team;
+pub mod usage;
 pub mod vault;
 pub mod web;

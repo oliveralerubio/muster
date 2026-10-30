@@ -490,7 +490,17 @@ async function testSecretApprovalsRequireConfirmationAndRefresh() {
   setResponder();
 }
 
+async function testUsageShowsUnusedItemsAsText() {
+  setResponder((call) => ({ ok: true, diagnostics: [], result: call.path === "usage" ? { unused: [{ kind: "skill", name: "<unsafe>", suggestion: "muster disable skill:<unsafe>" }] } : { skills: [] } }));
+  await sandbox.show("skills");
+  const text = (node) => typeof node === "string" ? node : (node.children || []).map(text).join(" ");
+  assert.match(text(view), /Usage/);
+  assert.match(text(view), /<unsafe>/);
+  assert.match(text(view), /muster disable skill:<unsafe>/);
+}
+
 const tests = {
+  testUsageShowsUnusedItemsAsText,
   testSecretApprovalsRequireConfirmationAndRefresh,
   testProvidersViewListsReferencesAndAddsAndRemoves,
   testProfileSaveIsGatedOnPreview,

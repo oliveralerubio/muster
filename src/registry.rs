@@ -153,6 +153,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     crate::commands::proposal::ACCEPT,
     crate::commands::proposal::LIST,
     crate::mcp::SPEC,
+    crate::commands::usage::SPEC,
 ];
 
 pub fn find(name: &str) -> Option<&'static CommandSpec> {

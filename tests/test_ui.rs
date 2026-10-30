@@ -1222,3 +1222,15 @@ fn secret_approval_requires_a_human_and_leases_expire_and_revoke() {
         .any(|e| e["action"] == "secret.reveal" && e["actor"] == "claude"));
     assert!(!serde_json::to_string(&events).unwrap().contains(value));
 }
+
+#[test]
+fn usage_api_matches_cli() {
+    let env = support::MusterEnv::new();
+    let (_, cli) = env.run_json(&["--format", "json", "usage"]);
+    let mut ui = Ui::start(&env);
+    let cookie = ui.session();
+    let (status, _, body) = ui.request("GET", "/api/usage", Some(&cookie), None);
+    assert_eq!(status, 200);
+    let response: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(response["result"], *cli.result());
+}

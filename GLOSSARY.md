@@ -112,3 +112,8 @@ The versioned TOML file pinning agent CLI versions. Each agent pin has optional 
 **Generation**:
 A numbered snapshot in local state of every managed file after an apply. Rollback restores the exact files of a previous generation and records the restoration as a new generation.
 _Avoid_: version, revision
+
+**Usage report**:
+A local summary of observed skill, MCP server, and subagent calls in agent
+session transcripts. An unused item has no observed calls in the selected
+window; incomplete transcript coverage does not prove it was never used.

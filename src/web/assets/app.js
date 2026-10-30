@@ -303,7 +303,7 @@ const views = {
   },
 
   async skills(token) {
-    const data = await api("skills");
+    const [data, usage] = await Promise.all([api("skills"), api("usage")]);
     if (token !== undefined && token !== navToken) return;
     const r = data.result || {};
     const skills = r.skills || [];
@@ -352,6 +352,9 @@ const views = {
     ],
       el("p", {}, r.checked_at ? `Last upstream check: ${r.checked_at}.` : "Upstream sources not checked yet on this machine."),
       table(["Name", "Origin", "Version", "Updated", "Status", "", ""], rows, "No skills yet. Add one below."),
+      el("h2", {}, "Usage"),
+      table(["Kind", "Name", "Suggestion"], ((usage.result || {}).unused || []).map((item) => [item.kind, item.name, item.suggestion]), "No unused items found in supported transcripts."),
+      diagnostics(usage),
       el("h2", {}, "Add an own skill"),
       el("div", { class: "skill-form" }, name, description,
         button("Create", () => act(`Create skill ${name.value}?`, "skills/add", { name: name.value, description: description.value || undefined }))),

@@ -264,3 +264,11 @@ Pre-release (0.1.x): the intended v1 behavior is specified in [`docs/SPEC.md`](d
 Agent installs keep an installed CLI newer than its `muster.lock` pin and warn
 `agent_newer_than_pin`; bump the pin to match. Status reports `kept_newer` and a
 note, and treats that agent as converged when its platform artifact is available.
+
+## Usage
+
+`muster usage --format json` summarizes local session transcripts for the last
+14 days. Use `--since 30d`, `--agent claude`, `--project DIR`, or
+`--max-file-bytes N` to narrow the scan. The report includes observed uses,
+unused managed items, and source coverage. Suggestions are advisory: transcript
+coverage can be incomplete, and `muster disable` is provided separately.
