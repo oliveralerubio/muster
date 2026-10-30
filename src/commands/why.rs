@@ -71,7 +71,17 @@ fn why(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     };
     let mut merged = layer::merge(&layers);
     if merged.agents.enabled.is_none() {
-        merged.agents.enabled = manifest.agents.as_ref().and_then(|a| a.enabled.clone());
+        // A project layer that does not set `enabled` inherits the machine's
+        // effective agents (team -> group -> member -> machine), not just the
+        // team profile's raw list.
+        merged.agents.enabled = match &target {
+            Target::Project(_) => {
+                layer::global_merge(&ctx.config_dir, &ctx.state_dir, &manifest)
+                    .agents
+                    .enabled
+            }
+            Target::Global => manifest.agents.as_ref().and_then(|a| a.enabled.clone()),
+        };
     }
     let selected = if let Some(id) = params.get_string("agent") {
         let adapter = adapters::find(id)
@@ -94,13 +104,19 @@ fn why(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         path.clone(),
         ("instructions", source_layer, ids.clone(), true),
     );
+    // The engine skips overlays it cannot render: globally skipped agents,
+    // and (matching `instructions_overlay_shared_project_file`) agents that
+    // share one project AGENTS.md with several enabled agents. Claude's
+    // overlay is still rendered into the project CLAUDE.md.
+    let enabled_count = engine::enabled_adapters(Some(&merged.agents))?.len();
     for id in &ids {
-        let skip = matches!(target, Target::Global)
+        let skip = (matches!(target, Target::Global)
             && merged
                 .agents
                 .skip_instructions
                 .as_ref()
-                .is_some_and(|v| v.iter().any(|x| x == id));
+                .is_some_and(|v| v.iter().any(|x| x == id)))
+            || (matches!(target, Target::Project(_)) && *id != "claude" && enabled_count > 1);
         if !skip {
             files.insert(
                 path.with_file_name(format!("AGENTS.{id}.md")),
@@ -130,29 +146,48 @@ fn why(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
                     .or_insert(("instructions", "native", vec![adapter.id], false));
             }
         }
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_default();
-        let xdg = std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".config"));
-        let (base, skills, agents) = match (adapter.id, &target) {
-            ("claude", Target::Global) => (home.clone(), ".claude/skills", ".claude/agents"),
-            ("codex", Target::Global) => (home.clone(), ".agents/skills", ".codex/agents"),
-            ("antigravity", Target::Global) => (
-                home.clone(),
-                ".gemini/antigravity-cli/skills",
-                ".gemini/antigravity-cli/agents",
+        // Native skills/subagents directories, matching what the adapters
+        // render (global and project scopes; pi and hermes have no native
+        // subagent directory).
+        let (base, skills, subagents) = match (adapter.id, &target) {
+            ("claude", Target::Global) => (
+                roots.base(adapters::Base::Home),
+                ".claude/skills",
+                Some(".claude/agents"),
             ),
-            ("opencode", Target::Global) => (xdg, "opencode/skills", "opencode/agents"),
-            ("claude", Target::Project(dir)) => (dir.clone(), ".claude/skills", ".claude/agents"),
-            ("codex", Target::Project(dir)) => (dir.clone(), ".agents/skills", ".codex/agents"),
+            ("codex", Target::Global) => (
+                roots.base(adapters::Base::Home),
+                ".agents/skills",
+                Some(".codex/agents"),
+            ),
+            ("antigravity", Target::Global) => (
+                roots.base(adapters::Base::Home),
+                ".gemini/antigravity-cli/skills",
+                Some(".gemini/antigravity-cli/agents"),
+            ),
+            ("opencode", Target::Global) => (
+                roots.base(adapters::Base::XdgConfig),
+                "opencode/skills",
+                Some("opencode/agents"),
+            ),
+            ("pi", Target::Global) => (roots.base(adapters::Base::Home), ".pi/agent/skills", None),
+            ("hermes", Target::Global) => {
+                (roots.base(adapters::Base::Home), ".hermes/skills", None)
+            }
+            ("claude", Target::Project(dir)) => {
+                (dir.as_path(), ".claude/skills", Some(".claude/agents"))
+            }
+            ("codex", Target::Project(dir)) => {
+                (dir.as_path(), ".agents/skills", Some(".codex/agents"))
+            }
             ("antigravity", Target::Project(dir)) => {
-                (dir.clone(), ".agents/skills", ".agents/agents")
+                (dir.as_path(), ".agents/skills", Some(".agents/agents"))
             }
             ("opencode", Target::Project(dir)) => {
-                (dir.clone(), ".opencode/skills", ".opencode/agents")
+                (dir.as_path(), ".opencode/skills", Some(".opencode/agents"))
             }
+            ("pi", Target::Project(dir)) => (dir.as_path(), ".pi/skills", None),
+            ("hermes", Target::Project(dir)) => (dir.as_path(), ".hermes/skills", None),
             _ => continue,
         };
         if let Ok(entries) = std::fs::read_dir(base.join(skills)) {
@@ -170,27 +205,38 @@ fn why(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
                 }
             }
         }
-        if let Ok(entries) = std::fs::read_dir(base.join(agents)) {
-            for e in entries.flatten() {
-                let p = e.path();
-                if matches!(p.extension().and_then(|s| s.to_str()), Some("md" | "toml"))
-                    && e.file_type().is_ok_and(|t| t.is_file())
-                {
-                    files
-                        .entry(p)
-                        .and_modify(|v| {
-                            if !v.2.contains(&adapter.id) {
-                                v.2.push(adapter.id);
-                            }
-                        })
-                        .or_insert(("subagent", "native", vec![adapter.id], false));
+        if let Some(subagents) = subagents {
+            if let Ok(entries) = std::fs::read_dir(base.join(subagents)) {
+                for e in entries.flatten() {
+                    let p = e.path();
+                    if matches!(p.extension().and_then(|s| s.to_str()), Some("md" | "toml"))
+                        && e.file_type().is_ok_and(|t| t.is_file())
+                    {
+                        files
+                            .entry(p)
+                            .and_modify(|v| {
+                                if !v.2.contains(&adapter.id) {
+                                    v.2.push(adapter.id);
+                                }
+                            })
+                            .or_insert(("subagent", "native", vec![adapter.id], false));
+                    }
                 }
             }
         }
     }
+    // Search roots, most specific first: a file is screened by its path
+    // inside the first root that contains it.
+    let mut search_roots: Vec<&Path> = Vec::new();
+    if let Target::Project(dir) = &target {
+        search_roots.push(dir.as_path());
+    }
+    search_roots.push(ctx.config_dir.as_path());
+    search_roots.push(roots.base(adapters::Base::XdgConfig));
+    search_roots.push(roots.base(adapters::Base::Home));
     let mut matches = Vec::new();
     for (file, (kind, layer, agents, canonical)) in files {
-        if !safe_file(&file) {
+        if !safe_file(&file, &search_roots) {
             continue;
         }
         let Ok(text) = std::fs::read_to_string(&file) else {
@@ -214,11 +260,22 @@ fn why(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     Ok(json!({"query": query, "matches": matches}))
 }
 
-fn safe_file(path: &Path) -> bool {
-    let mut current = PathBuf::new();
-    for component in path.components() {
-        let name = component.as_os_str().to_string_lossy().to_lowercase();
-        if name.contains("secret") || name.contains("vault") {
+/// Searchable file? Screens the name of secret material (the path inside a
+/// Muster root, or the file name outside every root) and rejects symlinked
+/// components below the root. Ancestors of the roots themselves are not
+/// screened, so a project checked out under e.g. `~/my-vault-repo/` is
+/// still searchable.
+fn safe_file(path: &Path, roots: &[&Path]) -> bool {
+    let Some((root, relative)) = roots
+        .iter()
+        .find_map(|root| path.strip_prefix(root).ok().map(|rel| (*root, rel)))
+    else {
+        return path.file_name().is_some_and(|name| !sensitive(name))
+            && std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file());
+    };
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        if sensitive(component.as_os_str()) {
             return false;
         }
         current.push(component);
@@ -227,4 +284,9 @@ fn safe_file(path: &Path) -> bool {
         }
     }
     std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file())
+}
+
+fn sensitive(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy().to_lowercase();
+    name.contains("secret") || name.contains("vault")
 }

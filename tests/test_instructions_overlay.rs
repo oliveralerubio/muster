@@ -129,3 +129,26 @@ fn project_overlay_can_use_an_unshared_root_file() {
         .unwrap()
         .contains("Codex only"));
 }
+
+/// No canonical AGENTS.md: the overlay alone is the agent's instructions and
+/// is rendered under its own heading instead of being dropped.
+#[test]
+fn overlay_alone_without_canonical_instructions_is_rendered() {
+    let env = MusterEnv::new();
+    let cfg = env.config_dir();
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(
+        cfg.join("muster.toml"),
+        "version = 1\n[agents]\nenabled = [\"claude\"]\n",
+    )
+    .unwrap();
+    std::fs::write(cfg.join("AGENTS.claude.md"), "Claude rule\n").unwrap();
+    env.run(&["agents", "apply"]).assert().success();
+    let agents = std::fs::read_to_string(env.path().join(".claude/AGENTS.md")).unwrap();
+    let claude = std::fs::read_to_string(env.path().join(".claude/CLAUDE.md")).unwrap();
+    assert!(
+        agents.contains("## AGENTS.claude.md\n\nClaude rule"),
+        "{agents}"
+    );
+    assert!(claude.contains("@AGENTS.md"), "{claude}");
+}

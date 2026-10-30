@@ -484,6 +484,9 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
                 adapter.id,
                 extra
             )),
+            // No canonical AGENTS.md: the overlay alone is still the agent's
+            // instructions, rendered under its own heading.
+            (None, Some(extra)) => Some(format!("## AGENTS.{}.md\n\n{}", adapter.id, extra)),
             _ => instructions.clone(),
         };
         let agent_skills = skills
@@ -1395,7 +1398,9 @@ impl Roots {
         self.base(file.base).join(file.path)
     }
 
-    fn base(&self, base: Base) -> &Path {
+    /// Path of `base` (user home or `$XDG_CONFIG_HOME`), where user-scope
+    /// managed files live.
+    pub fn base(&self, base: Base) -> &Path {
         match base {
             Base::Home => &self.home,
             Base::XdgConfig => &self.xdg_config,
