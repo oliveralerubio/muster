@@ -339,7 +339,7 @@ fn invalid_since_and_max_file_bytes_are_usage_errors() {
         full.extend(&args);
         let output = env.run(&full).assert().code(2).get_output().clone();
         assert!(
-            output.stdout.len() > 0 || output.stderr.len() > 0,
+            !output.stdout.is_empty() || !output.stderr.is_empty(),
             "{args:?}"
         );
     }

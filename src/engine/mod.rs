@@ -175,6 +175,30 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
         None => enabled_adapters(Some(&merged.agents))?,
     };
     let instructions = read_instructions(ctx, &merged)?;
+    let source = merged.instructions_path()?.0;
+    if let Some(dir) = source.parent() {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if let Some(id) = name
+                    .strip_prefix("AGENTS.")
+                    .and_then(|s| s.strip_suffix(".md"))
+                {
+                    if adapters::find(id).is_none() {
+                        ctx.diag(
+                            Diagnostic::new(
+                                Severity::Warning,
+                                "instructions_overlay_unknown_agent",
+                                format!("unknown adapter `{id}` in instruction overlay"),
+                            )
+                            .with_path(entry.path().display().to_string()),
+                        );
+                    }
+                }
+            }
+        }
+    }
     let (skills, skipped_skills) = read_skills(ctx, &merged)?;
     let (subagents, skipped_subagents) = read_subagents(ctx, &merged)?;
     let mut disabled = Vec::new();
@@ -404,6 +428,7 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
         }
     }
     let preserve = |path: &Path| protected.iter().any(|dir| path.starts_with(dir));
+    let enabled_project_agents = enabled_adapters(Some(&merged.agents))?.len();
     let mut entries: BTreeMap<PathBuf, Entry> = BTreeMap::new();
     let mut agents = BTreeMap::new();
     for adapter in &selected {
@@ -414,6 +439,56 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
                 .skip_instructions
                 .as_ref()
                 .is_some_and(|ids| ids.iter().any(|id| id == adapter.id));
+        let overlay_path = merged
+            .instructions_path()?
+            .0
+            .with_file_name(format!("AGENTS.{}.md", adapter.id));
+        let overlay = read_optional(&overlay_path)?;
+        let project_overlay = matches!(ctx_target, Target::Project(_));
+        let shared_project_overlay = project_overlay && adapter.id != "claude";
+        let project_file_shared = shared_project_overlay && enabled_project_agents > 1;
+        if project_file_shared && overlay.is_some() {
+            ctx.diag(
+                Diagnostic::new(
+                    Severity::Warning,
+                    "instructions_overlay_shared_project_file",
+                    format!(
+                        "instruction overlay for {} cannot be written to shared project AGENTS.md",
+                        adapter.id
+                    ),
+                )
+                .with_path(overlay_path.display().to_string()),
+            );
+        }
+        if skip_instructions && overlay.is_some() {
+            ctx.diag(
+                Diagnostic::new(
+                    Severity::Warning,
+                    "instructions_overlay_skipped",
+                    format!("instruction overlay for {} was skipped", adapter.id),
+                )
+                .with_path(overlay_path.display().to_string()),
+            );
+        }
+        let combined = match (
+            instructions.as_deref(),
+            if project_file_shared || (project_overlay && adapter.id == "claude") {
+                None
+            } else {
+                overlay.as_deref()
+            },
+        ) {
+            (Some(shared), Some(extra)) => Some(format!(
+                "{}\n\n## AGENTS.{}.md\n\n{}",
+                shared.trim_end(),
+                adapter.id,
+                extra
+            )),
+            // No canonical AGENTS.md: the overlay alone is still the agent's
+            // instructions, rendered under its own heading.
+            (None, Some(extra)) => Some(format!("## AGENTS.{}.md\n\n{}", adapter.id, extra)),
+            _ => instructions.clone(),
+        };
         let agent_skills = skills
             .iter()
             .filter(|(name, _)| merged.disabled("skill", name, adapter.id).is_none())
@@ -437,11 +512,23 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
             instructions: if skip_instructions {
                 None
             } else {
-                desired.instructions
+                combined.as_deref()
             },
             ..desired
         };
-        match plan_adapter(adapter, &agent_desired, &roots, ctx_target, &ours, &entries) {
+        match plan_adapter(
+            adapter,
+            &agent_desired,
+            &roots,
+            ctx_target,
+            &ours,
+            &entries,
+            if project_overlay && adapter.id == "claude" {
+                overlay.as_deref()
+            } else {
+                None
+            },
+        ) {
             Ok((planned, diagnostics)) => {
                 for d in diagnostics {
                     ctx.diag(d);
@@ -652,6 +739,7 @@ fn plan_adapter(
     target: &Target,
     ours: &Ours<'_>,
     pending: &BTreeMap<PathBuf, Entry>,
+    project_overlay: Option<&str>,
 ) -> Result<(Vec<Entry>, Vec<Diagnostic>), MusterError> {
     // What the adapter owns today = what it writes into an empty file.
     let owned_now: BTreeMap<&str, Vec<Vec<String>>> = adapter
@@ -706,6 +794,16 @@ fn plan_adapter(
     }
 
     let mut rendered = adapter.render(desired, &current)?;
+    if let Some(overlay) = project_overlay {
+        if let Some(file) = rendered
+            .files
+            .iter_mut()
+            .find(|f| f.file.project == Some("CLAUDE.md"))
+        {
+            let body = format!("@AGENTS.md\n\n## AGENTS.claude.md\n\n{overlay}");
+            file.contents = adapters::markdown_block(current.get(file.file.path), &body);
+        }
+    }
     if matches!(target, Target::Project(_))
         && adapter.id == "hermes"
         && (!desired.mcp.is_empty() || desired.agents.models.contains_key(adapter.id))
@@ -1300,7 +1398,9 @@ impl Roots {
         self.base(file.base).join(file.path)
     }
 
-    fn base(&self, base: Base) -> &Path {
+    /// Path of `base` (user home or `$XDG_CONFIG_HOME`), where user-scope
+    /// managed files live.
+    pub fn base(&self, base: Base) -> &Path {
         match base {
             Base::Home => &self.home,
             Base::XdgConfig => &self.xdg_config,

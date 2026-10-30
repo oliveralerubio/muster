@@ -205,7 +205,8 @@ El mismo producto sirve a dos públicos:
   - **Solo escriben las claves que gestionan** y preservan el resto del archivo (TOML y JSON con merge controlado).
   - Informan de lo que no pueden traducir.
   - Un fallo queda aislado a ese agente.
-  - AGENTS.md es el formato canónico de instrucciones. CLAUDE.md se genera o enlaza a partir de él.
+  - AGENTS.md es el formato canónico de instrucciones. CLAUDE.md se genera o enlaza a partir de él. Los archivos `AGENTS.<agente>.md` junto a la fuente añaden instrucciones para ese agente. En proyecto, Claude recibe su contenido en `CLAUDE.md`; si varios agentes comparten `AGENTS.md`, Muster omite sus instrucciones particulares y avisa.
+  - `muster why <texto> [--project DIR] [--agent ID] [--regex]` busca sin distinguir mayúsculas en las instrucciones, archivos nativos, skills instaladas y subagentes. Devuelve la ruta, línea, texto, tipo, capa, agentes y estado gestionado.
   - **Skills** (`[agents.skills] source = "skills"`, una carpeta por skill con `SKILL.md` y archivos extra): los cuatro agentes las soportan. Muster verifica cada skill contra `skills.lock` y copia cada archivo aprobado tal cual; las skills que se quitan de la fuente se borran en el siguiente apply y las que el usuario añade a mano no se tocan. Una skill sin `SKILL.md` o sin `name`/`description` en el frontmatter se omite con el aviso `skill_invalid`. Rutas:
 
     | Agente | Usuario | Proyecto |
@@ -318,12 +319,15 @@ Comandos de primer nivel:
 | `plan` / `sync` | Ver y aplicar cambios |
 | `rollback` | Volver a una generación anterior |
 | `status` | Estado de la flota |
+| `effective [--project DIR] [--agent ID]` | Consultar capas, origen y estado en disco por adaptador de la configuración activa |
 | `doctor` | Diagnóstico |
 | `ui` | Abrir la interfaz web |
 | `mcp` | Arrancar el servidor MCP |
 | `schema` | Exportar el JSON Schema |
 
 Opciones globales: `--config`, `--format text|json`, `--yes`, `--dry-run` (en todo lo que modifique algo), `--quiet` y `--verbose`.
+
+`effective` es de solo lectura. Incluye instrucciones, skills, MCP, subagentes, elementos no gestionados en disco y totales aproximados de tokens. Los estados por adaptador son `in_sync`, `drifted`, `missing`, `skipped`, `installed` y `disabled` (desactivado con `[agents.toggles]`, sin contar sus tokens). La pestaña Effective del panel muestra la misma información.
 
 - **Precedencia de valores:** opciones de CLI > variables `MUSTER_*` > manifiesto > valores por defecto.
 - **Salida JSON:** un único objeto en stdout con `schema_version`, `command`, `ok`, `result` y `diagnostics`. Cada diagnóstico tiene `code`, `message`, `severity` y `path` opcional. El progreso va a stderr.

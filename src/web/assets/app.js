@@ -302,6 +302,48 @@ const views = {
       diagnostics(data), diagnostics(requests), diagnostics(leases));
   },
 
+  async effective(token) {
+    const data = await api("effective");
+    if (token !== undefined && token !== navToken) return;
+    const r = data.result || {};
+    // `instructions` is a list of sources (user scope plus, with --project,
+    // the project scope); a single object is tolerated from older payloads.
+    const instructions = Array.isArray(r.instructions)
+      ? r.instructions
+      : r.instructions && r.instructions.source ? [r.instructions] : [];
+    const skills = Array.isArray(r.skills) ? r.skills : [];
+    const mcp = Array.isArray(r.mcp) ? r.mcp : [];
+    const subagents = Array.isArray(r.subagents) ? r.subagents : [];
+    const entries = [
+      ...instructions.map((i) => ["Instructions", i.source, i.layer, i]),
+      ...skills.map((s) => ["Skill", s.name, s.origin, s]),
+      ...mcp.map((s) => ["MCP", s.name, s.layer, s]),
+      ...subagents.map((s) => ["Subagent", s.name, s.layer, s]),
+    ];
+    const extras = r.extra_on_disk || {};
+    const totals = r.totals || {};
+    const ids = [...new Set([...Object.keys(totals), ...Object.keys(extras),
+      ...entries.flatMap((entry) => Object.keys(entry[3].adapters || {}))])].sort();
+    const rows = entries.map(([kind, name, origin, entry]) => [kind, name || "", origin || "",
+      ...ids.map((id) => {
+        const state = (entry.adapters || {})[id]?.state;
+        return state ? el("span", { class: "badge " + (state === "drifted" || state === "missing" ? "danger" : "") }, state) : "—";
+      })]);
+    const layers = Array.isArray(r.layers) ? r.layers : [];
+    const warnings = Array.isArray(r.warnings) ? r.warnings : [];
+    render("Effective", [],
+      el("h2", {}, "Layers"),
+      table(["Kind", "Name"], layers.map((layer) => [layer.kind || "", layer.name || ""]), "No layers."),
+      el("h2", {}, "Configuration by adapter"),
+      table(["Type", "Name", "Origin", ...ids], rows, "No configuration to show."),
+      el("h2", {}, "Approximate tokens"),
+      table(["Adapter", "Tokens"], Object.entries(totals).map(([id, count]) => [id, count]), "No token totals."),
+      el("h2", {}, "Unmanaged extras on disk"),
+      table(["Adapter", "Names"], Object.entries(extras).map(([id, names]) => [id, Array.isArray(names) ? names.join(", ") : ""]), "No unmanaged extras."),
+      warnings.length ? el("div", {}, el("h2", {}, "Warnings"), el("ul", {}, warnings.map((warning) => el("li", {}, typeof warning === "string" ? warning : JSON.stringify(warning))))) : null,
+      diagnostics(data));
+  },
+
   async skills(token) {
     const [data, usage] = await Promise.all([api("skills"), api("usage")]);
     if (token !== undefined && token !== navToken) return;

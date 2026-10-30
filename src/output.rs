@@ -105,14 +105,39 @@ pub fn render(envelope: &Envelope, format: Format, quiet: bool) {
             let _ = writeln!(stdout, "{}", json_text(envelope));
         }
         Format::Text => {
-            match &envelope.result {
-                Value::Null => {}
-                Value::String(s) => {
-                    let _ = writeln!(stdout, "{s}");
+            if envelope.command == "why" {
+                if let Some(matches) = envelope.result["matches"].as_array() {
+                    for item in matches {
+                        let agents = item["agents"]
+                            .as_array()
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(Value::as_str)
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            })
+                            .unwrap_or_default();
+                        let _ = writeln!(
+                            stdout,
+                            "{}:{}  [{}, {}]  {}",
+                            item["file"].as_str().unwrap_or_default(),
+                            item["line"],
+                            item["layer"].as_str().unwrap_or_default(),
+                            agents,
+                            item["excerpt"].as_str().unwrap_or_default()
+                        );
+                    }
                 }
-                other => {
-                    let text = serde_json::to_string_pretty(other).expect("result serializes");
-                    let _ = writeln!(stdout, "{text}");
+            } else {
+                match &envelope.result {
+                    Value::Null => {}
+                    Value::String(s) => {
+                        let _ = writeln!(stdout, "{s}");
+                    }
+                    other => {
+                        let text = serde_json::to_string_pretty(other).expect("result serializes");
+                        let _ = writeln!(stdout, "{text}");
+                    }
                 }
             }
             let mut stderr = std::io::stderr().lock();

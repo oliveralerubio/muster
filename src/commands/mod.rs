@@ -1,6 +1,7 @@
 pub mod agents;
 pub mod approve;
 pub mod doctor;
+pub mod effective;
 pub mod enroll;
 pub mod group;
 pub mod import;
@@ -24,3 +25,4 @@ pub mod toggle;
 pub mod ui;
 pub mod uninstall;
 pub mod usage;
+pub mod why;

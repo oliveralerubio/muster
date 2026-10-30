@@ -27,6 +27,18 @@ warning, never silently lost.
 - Project scope comes from `<project>/.muster/muster.toml`. Codex and Antigravity share `.agents/skills` in a project; the file is written once.
 - Skills removed from the source are deleted on the next apply; skills you add by hand are left alone.
 
+## Effective configuration
+
+Run `muster effective` to see the active layers, instructions, skills, MCP servers, and subagents, their origins, and their state on disk for each adapter. Use `--project DIR` to inspect a project, `--agent ID` to select an adapter, and `--format json` for machine-readable output. The web panel also has an **Effective** tab. Unmanaged entries found on disk are listed separately. Token counts are approximate.
+
+States describe each adapter's files:
+
+- `in_sync`: the managed configuration matches the expected content.
+- `drifted`: the files differ from the expected content.
+- `missing`: the expected files or configuration are absent.
+- `skipped`: Muster does not apply that configuration for the adapter.
+- `installed`: the item is present on disk.
+
 ## Agent Skills
 
 Declare a skills folder in `muster.toml` (`[agents.skills] source = "skills"`), one subfolder per skill with a `SKILL.md` (YAML frontmatter with `name` and `description`) plus any extra files. Muster verifies each skill against `skills.lock`, then installs its reviewed files byte for byte into the skill folders listed in the table above. Missing or mismatching pins produce a warning and keep the previously installed copy; other configuration and verified skills still sync. Empty directories are ignored. A skill without `SKILL.md` or without `name`/`description` is skipped with a `skill_invalid` warning.
@@ -167,6 +179,16 @@ muster ui            # web admin on 127.0.0.1 with a one-time login token
 Everything the UI does has a CLI equivalent, and every ordinary command answers `--format json` with a stable envelope for scripts and AI agents. Two commands are their own protocol: `muster mcp` speaks JSON-RPC over stdio, and `muster ui` prints one startup JSON object (`url`, `port`, `token`) before serving.
 
 To keep an agent's user-scope instructions personal, set `skip_instructions = ["hermes"]` under `[agents]`. For only one machine, set it under `[profiles.personal.agents]` and assign that profile to the machine. This leaves Hermes `~/.hermes/SOUL.md` untouched except for removing any previously managed block; MCP, models, and skills still sync. Project-scope instructions are unaffected. Higher-precedence lists replace lower ones; use `skip_instructions = []` to clear the setting.
+
+## Instruction overlays
+
+Place `AGENTS.<agent-id>.md` next to the canonical `AGENTS.md` to add instructions for one agent. For example, `AGENTS.claude.md` adds instructions for Claude. Muster warns about unknown agent IDs and skips user overlays for agents listed in `skip_instructions`.
+
+For a project, place the files in the project instruction source directory, normally `.muster/`. Claude's overlay goes into `CLAUDE.md`. If multiple enabled agents share root `AGENTS.md`, Muster leaves overlays that would go into that shared file out and warns.
+
+## Why
+
+Run `muster why <text>` to find matching lines in instruction sources and native files, installed skills, and subagents. The search ignores case. Add `--regex` for a regular expression, `--agent <id>` to select an agent, or `--project <dir>` to search project scope. Use `--format json` for paths, line numbers, layers, agents, and managed status.
 
 ## AI providers
 
