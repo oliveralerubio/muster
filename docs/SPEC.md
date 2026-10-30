@@ -504,8 +504,9 @@ observed skill, MCP server and subagent use (`uses`, `sessions`, `last_used`,
 and per-agent breakdown), `sessions_scanned`, `sources` (`supported` for Claude
 Code skills/MCP/subagents, `partial` for Codex skills and `mcp_tool_call_end`
 MCP invocations, `unsupported` for OpenCode and Antigravity, plus
-`malformed_lines` and `skipped` files with `older_than_window`, `too_large`, or
-`unreadable`), and `unused` managed items with `muster disable <kind>:<name>`
+`malformed_lines` and aggregate `skipped` counts for `older_than_window`,
+`too_large`, and `unreadable`; transcript paths are never emitted), and `unused`
+managed items with `muster disable <kind>:<name>`
 suggestions. The default window is 14 days; `--since`, `--agent`, `--project`,
 and `--max-file-bytes` filters are available. Suggestions are advisory because
 transcript coverage is incomplete. Session IDs are hashed in memory, item names

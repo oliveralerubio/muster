@@ -1,7 +1,7 @@
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 
@@ -17,6 +17,40 @@ struct Options<'a> {
     cutoff: OffsetDateTime,
     max: u64,
     project: Option<&'a str>,
+}
+
+/// Why a transcript file (or directory) was not read. Reported as an
+/// aggregate count only: transcript paths contain session ids and encoded
+/// project paths, so they are never emitted.
+#[derive(Default)]
+pub(super) struct Skipped {
+    older_than_window: u64,
+    too_large: u64,
+    unreadable: u64,
+}
+
+impl Skipped {
+    pub(super) fn count(&mut self, reason: SkipReason) {
+        match reason {
+            SkipReason::OlderThanWindow => self.older_than_window += 1,
+            SkipReason::TooLarge => self.too_large += 1,
+            SkipReason::Unreadable => self.unreadable += 1,
+        }
+    }
+
+    fn into_json(self) -> Value {
+        json!({
+            "older_than_window": self.older_than_window,
+            "too_large": self.too_large,
+            "unreadable": self.unreadable,
+        })
+    }
+}
+
+pub(super) enum SkipReason {
+    OlderThanWindow,
+    TooLarge,
+    Unreadable,
 }
 
 pub(super) fn valid_item_name(name: &str) -> bool {
@@ -46,7 +80,7 @@ pub fn report(
     };
     let mut counts = BTreeMap::new();
     let mut malformed = 0;
-    let mut skipped = Vec::new();
+    let mut skipped = Skipped::default();
     let mut sessions = BTreeSet::new();
     if let Some(home) =
         std::env::var_os("HOME").filter(|_| agent.is_none() || agent == Some("claude"))
@@ -61,7 +95,7 @@ pub fn report(
         );
     }
     let mut codex_malformed = 0;
-    let mut codex_skipped = Vec::new();
+    let mut codex_skipped = Skipped::default();
     let mut codex_sessions = BTreeSet::new();
     if let Some(home) =
         std::env::var_os("HOME").filter(|_| agent.is_none() || agent == Some("codex"))
@@ -113,8 +147,8 @@ pub fn report(
     }
     let items: Vec<Value> = counts.into_iter().map(|((kind, name), c)| json!({"kind": kind, "name": name, "uses": c.uses, "sessions": c.sessions.len(), "last_used": c.last.and_then(|t| t.format(&Rfc3339).ok()), "agents": c.agents.into_iter().map(|(a, (uses, sessions))| (a, json!({"uses": uses, "sessions": sessions.len()}))).collect::<BTreeMap<_,_>>()})).collect();
     json!({"items": items, "unused": unused, "sessions_scanned": {"claude": sessions.len(), "codex": codex_sessions.len()}, "sources": [
-        {"agent": "claude", "status": "supported", "directory": "~/.claude/projects", "malformed_lines": malformed, "skipped": skipped},
-        {"agent": "codex", "status": "partial", "directory": "~/.codex/sessions", "malformed_lines": codex_malformed, "skipped": codex_skipped},
+        {"agent": "claude", "status": "supported", "directory": "~/.claude/projects", "malformed_lines": malformed, "skipped": skipped.into_json()},
+        {"agent": "codex", "status": "partial", "directory": "~/.codex/sessions", "malformed_lines": codex_malformed, "skipped": codex_skipped.into_json()},
         {"agent": "opencode", "status": "unsupported", "directory": "~/.local/share/opencode"},
         {"agent": "antigravity", "status": "unsupported", "directory": "~/.gemini"}
     ]})

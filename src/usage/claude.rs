@@ -5,38 +5,51 @@ pub(super) fn scan(
     options: &Options,
     counts: &mut BTreeMap<(String, String), Count>,
     malformed: &mut u64,
-    skipped: &mut Vec<Value>,
+    skipped: &mut Skipped,
     sessions: &mut BTreeSet<String>,
 ) {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
         Err(_) => {
-            skipped.push(json!({"path": dir, "reason": "unreadable"}));
+            skipped.count(SkipReason::Unreadable);
             return;
         }
     };
     for entry in entries {
         let Ok(entry) = entry else {
-            skipped.push(json!({"path": dir, "reason": "unreadable"}));
+            skipped.count(SkipReason::Unreadable);
             continue;
         };
-        let path = entry.path();
-        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
-            skipped.push(json!({"path": path, "reason": "unreadable"}));
+        // Directory-entry metadata never follows symlinks.
+        let Ok(file_type) = entry.file_type() else {
+            skipped.count(SkipReason::Unreadable);
             continue;
         };
-        if metadata.file_type().is_symlink() {
+        if file_type.is_symlink() {
             continue;
         }
-        if metadata.is_dir() {
+        let path = entry.path();
+        if file_type.is_dir() {
             scan(&path, options, counts, malformed, skipped, sessions);
             continue;
         }
         if path.extension().and_then(|x| x.to_str()) != Some("jsonl") {
             continue;
         }
+        let Ok(file) = std::fs::File::open(&path) else {
+            skipped.count(SkipReason::Unreadable);
+            continue;
+        };
+        // The open handle's own metadata decides: skip anything that is not a
+        // regular file, and bound the read so a file that grew after the size
+        // check cannot stream unbounded bytes.
+        let Ok(metadata) = file.metadata() else {
+            skipped.count(SkipReason::Unreadable);
+            continue;
+        };
         if !metadata.is_file() {
+            skipped.count(SkipReason::Unreadable);
             continue;
         }
         if metadata
@@ -44,20 +57,19 @@ pub(super) fn scan(
             .ok()
             .is_some_and(|m| OffsetDateTime::from(m) < options.cutoff)
         {
-            skipped.push(json!({"path": path, "reason": "older_than_window"}));
+            skipped.count(SkipReason::OlderThanWindow);
             continue;
         }
         if metadata.len() > options.max {
-            skipped.push(json!({"path": path, "reason": "too_large"}));
+            skipped.count(SkipReason::TooLarge);
             continue;
         }
-        let Ok(file) = std::fs::File::open(&path) else {
-            skipped.push(json!({"path": path, "reason": "unreadable"}));
-            continue;
-        };
-        for line in BufReader::new(file).lines() {
+        for line in BufReader::new(file)
+            .take(options.max.saturating_add(1))
+            .lines()
+        {
             let Ok(line) = line else {
-                skipped.push(json!({"path": path, "reason": "unreadable"}));
+                skipped.count(SkipReason::Unreadable);
                 break;
             };
             let Ok(record) = serde_json::from_str::<Value>(&line) else {

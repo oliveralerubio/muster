@@ -102,10 +102,44 @@ fn oversized_transcripts_are_skipped_with_reason() {
     std::fs::write(dir.join("session.jsonl"), "0123456789").unwrap();
     let (output, result) = env.run_json(&["--format", "json", "usage", "--max-file-bytes", "5"]);
     assert!(output.status.success());
+    assert_eq!(result.result()["sources"][0]["skipped"]["too_large"], 1);
+}
+
+#[test]
+fn skipped_files_are_counted_without_exposing_transcript_paths() {
+    let env = MusterEnv::new();
+    let dir = env.path().join(".claude/projects/example");
+    std::fs::create_dir_all(&dir).unwrap();
+    // A real transcript filename: a session uuid, itself identifying data.
+    let uuid = "3fa85f64-5717-4562-b3fc-2c963f66afa6";
+    let old = dir.join(format!("{uuid}.jsonl"));
+    std::fs::write(&old, "{}\n").unwrap();
+    let file = std::fs::File::options().append(true).open(&old).unwrap();
+    file.set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))
+        .unwrap();
+    std::fs::write(
+        dir.join("current.jsonl"),
+        "{\"type\":\"assistant\",\"timestamp\":\"2099-01-01T00:00:00Z\",\"sessionId\":\"session\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Skill\",\"input\":{\"skill\":\"review\"}}]}}\n",
+    )
+    .unwrap();
+    for fmt in ["json", "text"] {
+        let output = env.run(&["--format", fmt, "usage"]).output().unwrap();
+        assert!(output.status.success());
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!combined.contains(uuid), "{fmt}: {combined}");
+        assert!(!combined.contains(".jsonl"), "{fmt}: {combined}");
+    }
+    let (_, result) = env.run_json(&["--format", "json", "usage"]);
     assert_eq!(
-        result.result()["sources"][0]["skipped"][0]["reason"],
-        "too_large"
+        result.result()["sources"][0]["skipped"]["older_than_window"],
+        1
     );
+    assert_eq!(result.result()["sources"][0]["skipped"]["too_large"], 0);
+    assert_eq!(result.result()["sources"][0]["skipped"]["unreadable"], 0);
 }
 
 #[test]
@@ -219,25 +253,17 @@ fn unreadable_and_malformed_transcripts_are_counted_without_aborting() {
     let claude_src = &result.result()["sources"][0];
     assert_eq!(claude_src["agent"], "claude");
     assert_eq!(claude_src["malformed_lines"], 1);
-    assert!(claude_src["skipped"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|s| s["reason"] == "unreadable"));
+    assert!(claude_src["skipped"]["unreadable"].as_u64().unwrap() >= 1);
 
     let codex_src = &result.result()["sources"][1];
     assert_eq!(codex_src["agent"], "codex");
     assert_eq!(codex_src["malformed_lines"], 1);
-    assert!(codex_src["skipped"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|s| s["reason"] == "unreadable"));
-    assert!(codex_src["skipped"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|s| s["reason"] == "too_large"));
+    assert!(codex_src["skipped"]["unreadable"].as_u64().unwrap() >= 1);
+    assert_eq!(codex_src["skipped"]["too_large"], 1);
+    // No transcript path may appear in the report.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains(".jsonl"));
+    assert!(!stdout.contains("unreadable.jsonl"));
 
     assert_eq!(result.result()["items"].as_array().unwrap().len(), 2);
 
@@ -246,10 +272,7 @@ fn unreadable_and_malformed_transcripts_are_counted_without_aborting() {
     std::fs::write(env2.path().join(".claude/projects"), "not a dir").unwrap();
     let (output2, result2) = env2.run_json(&["--format", "json", "usage"]);
     assert!(output2.status.success());
-    assert_eq!(
-        result2.result()["sources"][0]["skipped"][0]["reason"],
-        "unreadable"
-    );
+    assert_eq!(result2.result()["sources"][0]["skipped"]["unreadable"], 1);
 }
 
 #[test]
