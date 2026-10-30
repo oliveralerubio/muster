@@ -1206,7 +1206,7 @@ impl Roots {
         self.base(file.base).join(file.path)
     }
 
-    fn base(&self, base: Base) -> &Path {
+    pub(crate) fn base(&self, base: Base) -> &Path {
         match base {
             Base::Home => &self.home,
             Base::XdgConfig => &self.xdg_config,
