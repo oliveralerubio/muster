@@ -30,7 +30,7 @@ serves the JSON command list (`commands_json`).
   same handler as the CLI. The registry guarantees no drift in what an
   operation means; it does not make the interfaces automatically at parity —
   each one explicitly selects which operations it exposes. The MCP server
-  offers seven chosen tools (`status`, `doctor`, `plan`, `provider_list`,
+  offers ten chosen tools (`status`, `doctor`, `plan`, `effective`, `why`, `usage`, `provider_list`,
   `secret_list_meta`,
   `propose_change`, `secret_reveal`), and the web panel serves its own explicit
   route table over the registry; the CLI remains the complete surface.

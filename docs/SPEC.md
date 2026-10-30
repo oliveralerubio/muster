@@ -277,7 +277,8 @@ El mismo producto sirve a dos públicos:
   - La revelación de valores de secretos exige confirmación explícita y queda registrada.
   - Tema claro y oscuro, y uso completo con teclado.
 - **Servidor MCP** (`muster mcp`)
-  - Expone estado, plan, doctor, listado de metadatos y propuesta de cambios.
+  - Expone estado, plan, doctor, configuración efectiva, búsqueda en contexto, uso local, proveedores, metadatos de secretos y propuesta de cambios. `effective`, `why` y `usage` son de solo lectura y no aceptan `project`; `usage` tampoco acepta `max-file-bytes`.
+  - Para proponer activar o desactivar un elemento, se envía el `muster.toml` completo con el elemento en la lista `enable` o `disable` de `[agents.toggles]` (o del perfil); la aceptación sigue siendo humana. No expone `enable` ni `disable` directamente.
   - Las propuestas pasan por plan y aprobación.
   - No devuelve valores de secretos salvo que esté permitido de forma explícita para cada secreto.
 

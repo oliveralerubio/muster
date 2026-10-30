@@ -12,7 +12,7 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use support::MusterEnv;
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
-const EXPECTED_TOOLS: [&str; 7] = [
+const EXPECTED_TOOLS: [&str; 10] = [
     "status",
     "doctor",
     "plan",
@@ -20,6 +20,9 @@ const EXPECTED_TOOLS: [&str; 7] = [
     "secret_list_meta",
     "secret_reveal",
     "provider_list",
+    "effective",
+    "why",
+    "usage",
 ];
 
 /// A live `muster mcp` subprocess bound to an isolated machine environment.
@@ -835,4 +838,99 @@ fn secret_reveal_requires_a_lease_and_does_not_expose_approval_tools_or_agent_ov
     .unwrap();
     assert_eq!(data["requests"].as_array().unwrap().len(), 1);
     assert_eq!(data["requests"][0]["source"], "mcp");
+}
+
+#[test]
+fn harness_tools_match_cli_and_reject_hidden_arguments() {
+    let env = MusterEnv::new();
+    init_machine(&env);
+    let mut server = McpServer::spawn(&env);
+    server.initialize();
+    server.send(&json!({"jsonrpc":"2.0", "id":2, "method":"tools/list"}));
+    let response = server.read_response();
+    let tools = response["result"]["tools"].as_array().unwrap();
+    for (name, visible) in [
+        ("effective", vec!["agent"]),
+        ("why", vec!["text", "agent", "regex"]),
+        ("usage", vec!["since", "agent"]),
+    ] {
+        let tool = tools.iter().find(|t| t["name"] == name).unwrap();
+        let schema = &tool["inputSchema"];
+        let properties = schema["properties"].as_object().unwrap();
+        assert_eq!(properties.len(), visible.len(), "{tool}");
+        for key in visible {
+            let expected = if key == "regex" { "boolean" } else { "string" };
+            assert_eq!(properties[key]["type"], expected, "{tool}");
+        }
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(
+            schema["required"],
+            if name == "why" {
+                json!(["text"])
+            } else {
+                json!([])
+            }
+        );
+    }
+    for (name, args, cli_args) in [
+        (
+            "effective",
+            json!({}),
+            vec!["--format", "json", "effective"],
+        ),
+        (
+            "why",
+            json!({"text":"example"}),
+            vec!["--format", "json", "why", "example"],
+        ),
+        ("usage", json!({}), vec!["--format", "json", "usage"]),
+    ] {
+        let (_, cli) = env.run_json(&cli_args);
+        assert_eq!(
+            envelope_of(&server.call_tool(3, name, args)),
+            cli.raw,
+            "{name}"
+        );
+        for bad in [json!({"project":"/tmp"}), json!({"unexpected":true})] {
+            let mut args = bad;
+            if name == "why" {
+                args["text"] = json!("example");
+            }
+            server.send(&json!({"jsonrpc":"2.0", "id":4, "method":"tools/call", "params":{"name":name, "arguments":args}}));
+            assert_eq!(server.read_response()["error"]["code"], -32602);
+        }
+    }
+    for (name, args) in [
+        ("usage", json!({"max-file-bytes": 10})),
+        ("enable", json!({"item":"skill:x"})),
+        ("disable", json!({"item":"skill:x"})),
+    ] {
+        assert!(tools.iter().all(|t| t["name"] != name) || name == "usage");
+        server.send(&json!({"jsonrpc":"2.0", "id":5, "method":"tools/call", "params":{"name":name, "arguments":args}}));
+        assert_eq!(server.read_response()["error"]["code"], -32602);
+    }
+    server.shutdown();
+}
+
+#[test]
+fn propose_toggle_change_requires_acceptance() {
+    let env = MusterEnv::new();
+    init_machine(&env);
+    let before = manifest_text(&env);
+    let proposed = format!("{before}\n[agents.toggles]\ndisable = [\"skill:demo@claude\"]\n");
+    let mut server = McpServer::spawn(&env);
+    server.initialize();
+    let result = server.call_tool(
+        2,
+        "propose_change",
+        json!({"path":"muster.toml", "contents":proposed}),
+    );
+    let envelope = envelope_of(&result);
+    assert_eq!(result["isError"], false, "{envelope}");
+    assert_eq!(manifest_text(&env), before);
+    let id = envelope["result"]["id"].as_str().unwrap();
+    let (output, accepted) = env.run_json(&["--format", "json", "--yes", "proposal", "accept", id]);
+    assert!(output.status.success(), "{}", accepted.raw);
+    assert!(manifest_text(&env).contains("skill:demo@claude"));
+    server.shutdown();
 }
