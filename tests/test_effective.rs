@@ -154,3 +154,14 @@ fn effective_lists_project_layer() {
     assert_eq!(result.result()["mcp"][0]["name"], "local");
     assert_eq!(result.result()["mcp"][0]["layer"], "project");
 }
+
+#[test]
+fn effective_filters_adapters_and_rejects_unknown() {
+    let env = MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    std::fs::write(env.config_dir().join("muster.toml"), "version = 1\n[agents]\nenabled = [\"claude\", \"codex\"]\n[agents.instructions]\nsource = \"AGENTS.md\"\n").unwrap();
+    std::fs::write(env.config_dir().join("AGENTS.md"), "Hello\n").unwrap();
+    let (_, result) = env.run_json(&["effective", "--agent", "claude", "--format", "json"]);
+    assert_eq!(result.result()["instructions"][0]["adapters"].as_object().unwrap().keys().collect::<Vec<_>>(), vec!["claude"]);
+    env.run(&["effective", "--agent", "unknown"]).assert().code(2);
+}

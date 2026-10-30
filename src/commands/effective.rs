@@ -15,7 +15,10 @@ use crate::registry::{CommandSpec, Params};
 pub const SPEC: CommandSpec = CommandSpec {
     name: "effective",
     about: "Show the effective configuration and its sources",
-    params: &[crate::commands::plan::PROJECT_PARAM],
+    params: &[crate::commands::plan::PROJECT_PARAM, crate::registry::ParamSpec {
+        name: "agent", about: "Restrict output to one adapter", kind: crate::registry::ParamKind::String,
+        required: false, positional: false,
+    }],
     mutating: false,
     handler: effective,
 };
@@ -31,6 +34,11 @@ fn effective(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         layers.extend(layer::project_layers(&project)?);
     }
     let merged = layer::merge(&layers);
+    let selected = if let Some(id) = params.get_string("agent") {
+        let adapter = adapters::find(id).ok_or_else(|| MusterError::Usage(format!("unknown agent `{id}`")))?;
+        if !adapter.available() { return Err(MusterError::Unavailable(format!("agent `{id}` is unavailable"))); }
+        vec![adapter]
+    } else { engine::enabled_adapters(Some(&merged.agents))? };
     let (path, _) = merged.instructions_path()?;
     let source = layers
         .iter()
@@ -61,7 +69,7 @@ fn effective(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
             };
             let roots = Roots::from_env()?;
             let mut views = BTreeMap::new();
-            for adapter in engine::enabled_adapters(Some(&merged.agents))? {
+            for &adapter in &selected {
                 if merged
                     .agents
                     .skip_instructions
@@ -116,7 +124,7 @@ fn effective(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         };
         let sources: Vec<_> = layers.iter().filter(|l| l.mcp.contains_key(name)).collect();
         let mut views = BTreeMap::new();
-        for adapter in engine::enabled_adapters(Some(&merged.agents))? {
+        for &adapter in &selected {
             let mut current = Current::new();
             for file in adapter.files {
                 if let Ok(content) = std::fs::read_to_string(roots.resolve(file)) {
@@ -197,7 +205,7 @@ fn effective(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
             let desired = Desired { config_dir: &ctx.config_dir, agents: &empty_agents, ai_providers: &providers,
                 mcp: &mcp, instructions: None, secrets: &secrets, access: &access, skills: &skills, subagents: &subagents };
             let mut views = BTreeMap::new();
-            for adapter in engine::enabled_adapters(Some(&merged.agents))? {
+            for &adapter in &selected {
                 let rendered = adapter.render(&desired, &Current::new())?;
                 if let Some(file) = rendered.tree.first() {
                     let path = roots.base(file.base).join(&file.path);
@@ -249,7 +257,7 @@ fn effective(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
                     }
                 };
                 let mut adapter_views = BTreeMap::new();
-                for adapter in engine::enabled_adapters(Some(&merged.agents))? {
+                for &adapter in &selected {
                     let skill_map = BTreeMap::from([(name.to_owned(), data.clone())]);
                     let empty_agents = Default::default();
                     let providers = BTreeMap::new();
