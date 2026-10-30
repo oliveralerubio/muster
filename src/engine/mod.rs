@@ -378,11 +378,21 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
             .instructions_path()?
             .0
             .with_file_name(format!("AGENTS.{}.md", adapter.id));
-        let overlay = if matches!(ctx_target, Target::Global) {
-            read_optional(&overlay_path)?
-        } else {
-            None
-        };
+        let overlay = read_optional(&overlay_path)?;
+        let project_overlay = matches!(ctx_target, Target::Project(_));
+        if project_overlay && adapter.id != "claude" && overlay.is_some() {
+            ctx.diag(
+                Diagnostic::new(
+                    Severity::Warning,
+                    "instructions_overlay_shared_project_file",
+                    format!(
+                        "instruction overlay for {} cannot be written to shared project AGENTS.md",
+                        adapter.id
+                    ),
+                )
+                .with_path(overlay_path.display().to_string()),
+            );
+        }
         if skip_instructions && overlay.is_some() {
             ctx.diag(
                 Diagnostic::new(
@@ -393,7 +403,14 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
                 .with_path(overlay_path.display().to_string()),
             );
         }
-        let combined = match (instructions.as_deref(), overlay.as_deref()) {
+        let combined = match (
+            instructions.as_deref(),
+            if project_overlay {
+                None
+            } else {
+                overlay.as_deref()
+            },
+        ) {
             (Some(shared), Some(extra)) => Some(format!(
                 "{}\n\n## AGENTS.{}.md\n\n{}",
                 shared.trim_end(),
@@ -410,7 +427,19 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
             },
             ..desired
         };
-        match plan_adapter(adapter, &agent_desired, &roots, ctx_target, &ours, &entries) {
+        match plan_adapter(
+            adapter,
+            &agent_desired,
+            &roots,
+            ctx_target,
+            &ours,
+            &entries,
+            if project_overlay && adapter.id == "claude" {
+                overlay.as_deref()
+            } else {
+                None
+            },
+        ) {
             Ok((planned, diagnostics)) => {
                 for d in diagnostics {
                     ctx.diag(d);
@@ -620,6 +649,7 @@ fn plan_adapter(
     target: &Target,
     ours: &Ours<'_>,
     pending: &BTreeMap<PathBuf, Entry>,
+    project_overlay: Option<&str>,
 ) -> Result<(Vec<Entry>, Vec<Diagnostic>), MusterError> {
     // What the adapter owns today = what it writes into an empty file.
     let owned_now: BTreeMap<&str, Vec<Vec<String>>> = adapter
@@ -674,6 +704,16 @@ fn plan_adapter(
     }
 
     let mut rendered = adapter.render(desired, &current)?;
+    if let Some(overlay) = project_overlay {
+        if let Some(file) = rendered
+            .files
+            .iter_mut()
+            .find(|f| f.file.project == Some("CLAUDE.md"))
+        {
+            let body = format!("@AGENTS.md\n\n## AGENTS.claude.md\n\n{overlay}");
+            file.contents = adapters::markdown_block(current.get(file.file.path), &body);
+        }
+    }
     if matches!(target, Target::Project(_))
         && adapter.id == "hermes"
         && (!desired.mcp.is_empty() || desired.agents.models.contains_key(adapter.id))

@@ -67,3 +67,41 @@ fn skipped_instructions_win_over_overlay_and_warn() {
         .any(|d| d["code"] == "instructions_overlay_skipped"));
     assert!(!env.path().join(".claude/AGENTS.md").exists());
 }
+
+#[test]
+fn project_overlay_stays_out_of_shared_instructions() {
+    let env = MusterEnv::new();
+    let cfg = env.config_dir();
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(
+        cfg.join("muster.toml"),
+        "version = 1\n[agents]\nenabled = ['claude', 'codex']\n",
+    )
+    .unwrap();
+    let project = env.path().join("project");
+    let source = project.join(".muster");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("muster.toml"), "version = 1\n").unwrap();
+    std::fs::write(source.join("AGENTS.md"), "Shared rule\n").unwrap();
+    std::fs::write(source.join("AGENTS.claude.md"), "Claude rule\n").unwrap();
+    std::fs::write(source.join("AGENTS.codex.md"), "Codex rule\n").unwrap();
+    let (_, result) = env.run_json(&[
+        "sync",
+        "--project",
+        project.to_str().unwrap(),
+        "--format",
+        "json",
+    ]);
+    assert!(result.ok(), "{:?}", result.raw);
+    let shared = std::fs::read_to_string(project.join("AGENTS.md")).unwrap();
+    let claude = std::fs::read_to_string(project.join("CLAUDE.md")).unwrap();
+    assert!(shared.contains("Shared rule"));
+    assert!(!shared.contains("Claude rule") && !shared.contains("Codex rule"));
+    assert!(claude.contains("Claude rule"));
+    assert!(result
+        .diagnostics()
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|d| d["code"] == "instructions_overlay_shared_project_file"));
+}

@@ -509,7 +509,7 @@ const BLOCK_END: &str = "<!-- END MUSTER MANAGED BLOCK -->";
 
 /// Replace (or append) Muster's managed block in a Markdown file, keeping the
 /// rest of the file as the user wrote it.
-fn markdown_block(current: Option<&String>, body: &str) -> String {
+pub(crate) fn markdown_block(current: Option<&String>, body: &str) -> String {
     let block = format!("{BLOCK_BEGIN}\n{}\n{BLOCK_END}\n", body.trim_end());
     let Some(text) = current.filter(|t| !t.trim().is_empty()) else {
         return block;
