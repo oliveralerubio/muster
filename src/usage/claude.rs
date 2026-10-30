@@ -8,12 +8,22 @@ pub(super) fn scan(
     skipped: &mut Vec<Value>,
     sessions: &mut BTreeSet<String>,
 ) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+        Err(_) => {
+            skipped.push(json!({"path": dir, "reason": "unreadable"}));
+            return;
+        }
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let Ok(entry) = entry else {
+            skipped.push(json!({"path": dir, "reason": "unreadable"}));
+            continue;
+        };
         let path = entry.path();
         let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            skipped.push(json!({"path": path, "reason": "unreadable"}));
             continue;
         };
         if metadata.file_type().is_symlink() {
@@ -41,10 +51,15 @@ pub(super) fn scan(
             skipped.push(json!({"path": path, "reason": "too_large"}));
             continue;
         }
-        let Ok(file) = std::fs::File::open(path) else {
+        let Ok(file) = std::fs::File::open(&path) else {
+            skipped.push(json!({"path": path, "reason": "unreadable"}));
             continue;
         };
-        for line in BufReader::new(file).lines().map_while(Result::ok) {
+        for line in BufReader::new(file).lines() {
+            let Ok(line) = line else {
+                skipped.push(json!({"path": path, "reason": "unreadable"}));
+                break;
+            };
             let Ok(record) = serde_json::from_str::<Value>(&line) else {
                 *malformed += 1;
                 continue;

@@ -191,3 +191,65 @@ fn codex_mcp_call_is_counted_without_exposing_arguments_or_result() {
     );
 }
 
+#[test]
+fn unreadable_and_malformed_transcripts_are_counted_without_aborting() {
+    let env = MusterEnv::new();
+    let claude_dir = env.path().join(".claude/projects/example");
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    std::fs::write(claude_dir.join("unreadable.jsonl"), [0xff, 0xfe, b'\n']).unwrap();
+    std::fs::write(
+        claude_dir.join("valid.jsonl"),
+        "not json\n{\"type\":\"assistant\",\"timestamp\":\"2099-01-01T00:00:00Z\",\"sessionId\":\"s1\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Skill\",\"input\":{\"skill\":\"review\"}}]}}\n",
+    )
+    .unwrap();
+
+    let codex_dir = env.path().join(".codex/sessions/2026/01/01");
+    std::fs::create_dir_all(&codex_dir).unwrap();
+    std::fs::write(codex_dir.join("unreadable.jsonl"), [0xff, 0xfe, b'\n']).unwrap();
+    std::fs::write(codex_dir.join("oversized.jsonl"), "x".repeat(400)).unwrap();
+    std::fs::write(
+        codex_dir.join("valid.jsonl"),
+        "bad line\n{\"type\":\"session_meta\",\"payload\":{\"id\":\"s2\",\"cwd\":\"/work\"}}\n{\"type\":\"event_msg\",\"timestamp\":\"2099-01-01T00:00:00Z\",\"payload\":{\"type\":\"mcp_tool_call_end\",\"call_id\":\"c1\",\"invocation\":{\"server\":\"docs\",\"tool\":\"search\",\"arguments\":{}}}}\n",
+    )
+    .unwrap();
+
+    let (output, result) = env.run_json(&["--format", "json", "usage", "--max-file-bytes", "300"]);
+    assert!(output.status.success());
+
+    let claude_src = &result.result()["sources"][0];
+    assert_eq!(claude_src["agent"], "claude");
+    assert_eq!(claude_src["malformed_lines"], 1);
+    assert!(claude_src["skipped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s["reason"] == "unreadable"));
+
+    let codex_src = &result.result()["sources"][1];
+    assert_eq!(codex_src["agent"], "codex");
+    assert_eq!(codex_src["malformed_lines"], 1);
+    assert!(codex_src["skipped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s["reason"] == "unreadable"));
+    assert!(codex_src["skipped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s["reason"] == "too_large"));
+
+    assert_eq!(result.result()["items"].as_array().unwrap().len(), 2);
+
+    let env2 = MusterEnv::new();
+    std::fs::create_dir_all(env2.path().join(".claude")).unwrap();
+    std::fs::write(env2.path().join(".claude/projects"), "not a dir").unwrap();
+    let (output2, result2) = env2.run_json(&["--format", "json", "usage"]);
+    assert!(output2.status.success());
+    assert_eq!(
+        result2.result()["sources"][0]["skipped"][0]["reason"],
+        "unreadable"
+    );
+}
+
+
