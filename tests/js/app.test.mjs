@@ -510,9 +510,52 @@ async function testUsageShowsUnusedItemsAsText() {
   setResponder();
 }
 
+const USAGE_FIXTURE = {
+  items: [
+    { kind: "skill", name: "review", uses: 3, sessions: 2, last_used: "2099-01-02T00:00:00Z", agents: { claude: { uses: 3, sessions: 2 } } },
+    { kind: "mcp", name: "docs", uses: 0, sessions: 0, last_used: null, agents: {} },
+  ],
+  unused: [{ kind: "mcp", name: "docs", suggestion: "muster disable mcp:docs" }],
+  coverage: "partial",
+  sessions_scanned: { claude: 2, codex: 0, opencode: 0 },
+  sources: [
+    { agent: "claude", status: "supported", directory: "~/.claude/projects", malformed_lines: 0, skipped: {} },
+    { agent: "codex", status: "partial", directory: "~/.codex/sessions" },
+    { agent: "opencode", status: "unsupported", directory: "~/.local/share/opencode" },
+  ],
+};
+
+async function testUsageShowsCoverageActiveAndUnusedItems() {
+  setResponder((call) => ({ ok: true, diagnostics: [], result: call.path === "usage" ? USAGE_FIXTURE : { skills: [] } }));
+  await sandbox.show("skills");
+  const text = (node) => typeof node === "string" ? node : (node.children || []).map(text).join(" ");
+  const rendered = text(view);
+  assert.match(rendered, /claude: 2/);
+  assert.match(rendered, /unsupported: opencode/);
+  assert.doesNotMatch(rendered, /unsupported: 2/);
+  assert.match(rendered, /Active items/);
+  assert.match(rendered, /review/);
+  assert.match(rendered, /2099-01-02T00:00:00Z/);
+  assert.doesNotMatch(rendered, /mcp docs 0/);
+  assert.match(rendered, /Unused items/);
+  assert.match(rendered, /muster disable mcp:docs/);
+  setResponder();
+}
+
+async function testUsageWithoutSessionsExplainsNoCoverage() {
+  const empty = { items: [], unused: [], coverage: "none", sessions_scanned: { claude: 0 }, sources: [{ agent: "claude", status: "supported" }] };
+  setResponder((call) => ({ ok: true, diagnostics: [], result: call.path === "usage" ? empty : { skills: [] } }));
+  await sandbox.show("skills");
+  const text = (node) => typeof node === "string" ? node : (node.children || []).map(text).join(" ");
+  assert.match(text(view), /No transcript sessions scanned/);
+  setResponder();
+}
+
 const tests = {
   testSkillToggleControls,
   testUsageShowsUnusedItemsAsText,
+  testUsageShowsCoverageActiveAndUnusedItems,
+  testUsageWithoutSessionsExplainsNoCoverage,
   testSecretApprovalsRequireConfirmationAndRefresh,
   testProvidersViewListsReferencesAndAddsAndRemoves,
   testProfileSaveIsGatedOnPreview,

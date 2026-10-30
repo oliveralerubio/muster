@@ -127,7 +127,12 @@ const ROUTES: &[Route] = &[
     post("proposal/create", "proposal.create"),
     post("proposal/accept", "proposal.accept"),
     get("skills", "skill.list"),
-    get("usage", "usage"),
+    // `--project` and `--max-file-bytes` would let the panel probe arbitrary
+    // directories and force unbounded transcript reads.
+    Route {
+        hidden: &["project", "max-file-bytes"],
+        ..get("usage", "usage")
+    },
     post("skills/check", "skill.check"),
     post("skills/add", "skill.add"),
     post("skills/update", "skill.update"),

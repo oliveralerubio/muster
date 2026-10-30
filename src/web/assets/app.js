@@ -356,7 +356,27 @@ const views = {
       el("p", {}, r.checked_at ? `Last upstream check: ${r.checked_at}.` : "Upstream sources not checked yet on this machine."),
       table(["Name", "Origin", "Version", "Updated", "Status", "", ""], rows, "No skills yet. Add one below."),
       el("h2", {}, "Usage"),
-      table(["Kind", "Name", "Suggestion"], ((usage.result || {}).unused || []).map((item) => [item.kind, item.name, item.suggestion]), "No unused items found in supported transcripts."),
+      (() => {
+        const u = usage.result || {};
+        const scanned = Object.entries(u.sessions_scanned || {})
+          .map(([a, count]) => `${a}: ${count}`)
+          .join(", ");
+        const unsupp = (Array.isArray(u.sources) ? u.sources : [])
+          .filter((s) => s.status === "unsupported")
+          .map((s) => s.agent)
+          .join(", ");
+        const coverageMsg = (Object.values(u.sessions_scanned || {}).reduce((a, b) => a + b, 0) === 0)
+          ? "No transcript sessions scanned yet on this machine."
+          : `Sessions scanned: ${scanned || "none"}${unsupp ? ` (unsupported: ${unsupp})` : ""}.`;
+        const items = (u.items || []).filter((it) => it.uses > 0).map((it) => [it.kind, it.name, String(it.uses), it.last_used || "—"]);
+        const unused = (u.unused || []).map((it) => [it.kind, it.name, it.suggestion || "—"]);
+        return el("div", { class: "usage-section" },
+          el("p", { class: "coverage-note" }, coverageMsg),
+          el("h3", {}, "Active items"),
+          table(["Kind", "Name", "Uses", "Last used"], items, "No active item usage recorded."),
+          el("h3", {}, "Unused items"),
+          table(["Kind", "Name", "Suggestion"], unused, "No unused items flagged for pruning."));
+      })(),
       diagnostics(usage),
       el("h2", {}, "Add an own skill"),
       el("div", { class: "skill-form" }, name, description,

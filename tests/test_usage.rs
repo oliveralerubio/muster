@@ -324,6 +324,31 @@ fn unknown_agent_is_a_usage_error() {
 }
 
 #[test]
+fn invalid_since_and_max_file_bytes_are_usage_errors() {
+    let env = MusterEnv::new();
+    let dir = env.path().join(".claude/projects/example");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("session.jsonl"), "{}\n").unwrap();
+    let before = std::fs::read_dir(env.path()).unwrap().count();
+    for args in [
+        vec!["--since", "0d"],
+        vec!["--since", "bad"],
+        vec!["--max-file-bytes", "0"],
+    ] {
+        let mut full = vec!["--format", "json", "usage"];
+        full.extend(&args);
+        let output = env.run(&full).assert().code(2).get_output().clone();
+        assert!(
+            output.stdout.len() > 0 || output.stderr.len() > 0,
+            "{args:?}"
+        );
+    }
+    // Read-only: nothing is created in the machine's home by a rejected run.
+    assert_eq!(std::fs::read_dir(env.path()).unwrap().count(), before);
+    assert!(!env.config_dir().join("muster.toml").exists());
+}
+
+#[test]
 fn agent_filter_excludes_other_transcripts() {
     let env = MusterEnv::new();
     let dir = env.path().join(".claude/projects/example");

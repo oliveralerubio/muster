@@ -1285,11 +1285,28 @@ fn web_toggle_routes_match_cli() {
 #[test]
 fn usage_api_matches_cli() {
     let env = support::MusterEnv::new();
+    let dir = env.path().join(".claude/projects/example");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("session.jsonl"), "{\"type\":\"assistant\",\"timestamp\":\"2099-01-01T00:00:00Z\",\"sessionId\":\"session\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Skill\",\"input\":{\"skill\":\"review\"}}]}}\n").unwrap();
     let (_, cli) = env.run_json(&["--format", "json", "usage"]);
+    assert_eq!(cli.result()["items"][0]["name"], "review");
     let mut ui = Ui::start(&env);
     let cookie = ui.session();
     let (status, _, body) = ui.request("GET", "/api/usage", Some(&cookie), None);
     assert_eq!(status, 200);
     let response: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(response["result"], *cli.result());
+}
+
+#[test]
+fn usage_api_rejects_project_and_max_file_bytes() {
+    let env = support::MusterEnv::new();
+    let mut ui = Ui::start(&env);
+    let cookie = ui.session();
+    for query in ["project=/tmp", "max-file-bytes=1"] {
+        let (status, _, body) =
+            ui.request("GET", &format!("/api/usage?{query}"), Some(&cookie), None);
+        assert_eq!(status, 400, "{query}: {body}");
+        assert!(body.contains("unknown parameter"), "{query}: {body}");
+    }
 }
