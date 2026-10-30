@@ -113,6 +113,7 @@ pub struct Plan {
     installs: Vec<(String, installer::Pin)>,
     bin_dir: PathBuf,
     skipped_skills: Vec<String>,
+    disabled: Vec<Value>,
     /// Approvals for this target once the plan is applied.
     approved: Approved,
     base: Option<(u64, State)>,
@@ -142,6 +143,12 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
     };
     // The single place layers become desired state.
     let mut merged = layer::merge(&layers);
+    if matches!(options.target, Target::Project(_)) {
+        let global = layer::global_merge(&ctx.config_dir, &ctx.state_dir, &manifest);
+        let mut toggles = global.toggles;
+        toggles.extend(merged.toggles);
+        merged.toggles = toggles;
+    }
     if merged.agents.enabled.is_none() {
         merged.agents.enabled = manifest.agents.as_ref().and_then(|a| a.enabled.clone());
     }
@@ -168,6 +175,39 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
     let instructions = read_instructions(ctx, &merged)?;
     let (skills, skipped_skills) = read_skills(ctx, &merged)?;
     let (subagents, skipped_subagents) = read_subagents(ctx, &merged)?;
+    let mut disabled = Vec::new();
+    let known: BTreeSet<(&str, &str)> = skills
+        .keys()
+        .chain(skipped_skills.iter())
+        .map(|n| ("skill", n.as_str()))
+        .chain(
+            subagents
+                .keys()
+                .chain(skipped_subagents.iter())
+                .map(|n| ("subagent", n.as_str())),
+        )
+        .chain(merged.mcp.keys().map(|n| ("mcp", n.as_str())))
+        .collect();
+    for (_, toggles) in &merged.toggles {
+        for item in toggles.disable.iter().chain(&toggles.enable) {
+            let (kind, name, _) =
+                crate::adapters::config::parse_toggle(item).expect("validated toggle");
+            if !known.contains(&(kind, name)) {
+                ctx.diag(Diagnostic::new(
+                    Severity::Warning,
+                    "toggle_unknown_item",
+                    format!("unknown toggle item `{item}`"),
+                ));
+            }
+        }
+    }
+    for adapter in &selected {
+        for (kind, name) in &known {
+            if let Some(layer) = merged.disabled(kind, name, adapter.id) {
+                disabled.push(json!({"kind":kind, "name":name, "agent":adapter.id, "layer":layer}));
+            }
+        }
+    }
     let mut secrets = resolve_secrets(ctx, &merged.mcp);
     let mut secret_providers = Providers::new(&ctx.config_dir, &ctx.state_dir);
     for (id, ai_provider) in &merged.ai_providers {
@@ -248,7 +288,16 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
             if !visited.insert(adapter.id) {
                 continue;
             }
-            let rendered = match adapter.render(&skipped_desired, &Current::new()) {
+            let allowed_skills = skipped
+                .iter()
+                .filter(|(name, _)| merged.disabled("skill", name, adapter.id).is_none())
+                .map(|(name, files)| (name.clone(), files.clone()))
+                .collect();
+            let adapter_skipped = Desired {
+                skills: &allowed_skills,
+                ..skipped_desired
+            };
+            let rendered = match adapter.render(&adapter_skipped, &Current::new()) {
                 Ok(rendered) => rendered,
                 Err(_) => {
                     // Keep adapter failures isolated and never prune a skipped
@@ -313,7 +362,16 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
             if !visited.insert(adapter.id) {
                 continue;
             }
-            let rendered = match adapter.render(&skipped_desired, &Current::new()) {
+            let allowed_subagents = skipped_agents
+                .iter()
+                .filter(|(name, _)| merged.disabled("subagent", name, adapter.id).is_none())
+                .map(|(name, subagent)| (name.clone(), subagent.clone()))
+                .collect();
+            let adapter_skipped = Desired {
+                subagents: &allowed_subagents,
+                ..skipped_desired
+            };
+            let rendered = match adapter.render(&adapter_skipped, &Current::new()) {
                 Ok(rendered) => rendered,
                 Err(_) => {
                     protected.extend(
@@ -350,7 +408,26 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
                 .skip_instructions
                 .as_ref()
                 .is_some_and(|ids| ids.iter().any(|id| id == adapter.id));
+        let agent_skills = skills
+            .iter()
+            .filter(|(name, _)| merged.disabled("skill", name, adapter.id).is_none())
+            .map(|(name, skill)| (name.clone(), skill.clone()))
+            .collect();
+        let agent_mcp = merged
+            .mcp
+            .iter()
+            .filter(|(name, _)| merged.disabled("mcp", name, adapter.id).is_none())
+            .map(|(name, server)| (name.clone(), server.clone()))
+            .collect();
+        let agent_subagents = subagents
+            .iter()
+            .filter(|(name, _)| merged.disabled("subagent", name, adapter.id).is_none())
+            .map(|(name, subagent)| (name.clone(), subagent.clone()))
+            .collect();
         let agent_desired = Desired {
+            mcp: &agent_mcp,
+            subagents: &agent_subagents,
+            skills: &agent_skills,
             instructions: if skip_instructions {
                 None
             } else {
@@ -511,6 +588,7 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
         installs,
         bin_dir,
         skipped_skills,
+        disabled,
         approved,
         base,
         secrets,
@@ -774,6 +852,15 @@ fn approvals(
     if supports(&[Capability::McpStdio, Capability::McpRemote]) {
         next.mcp = BTreeMap::new();
         for (name, server) in &merged.mcp {
+            if !selected.iter().any(|adapter| {
+                merged.disabled("mcp", name, adapter.id).is_none()
+                    && adapter
+                        .capabilities
+                        .iter()
+                        .any(|c| matches!(c, Capability::McpStdio | Capability::McpRemote))
+            }) {
+                continue;
+            }
             let value = serde_json::to_value(server).expect("server serializes");
             if previous.mcp.get(name) != Some(&value) {
                 let detail = match server.transport() {
@@ -874,6 +961,7 @@ impl Plan {
             "files": files,
             "approvals": approvals,
             "skipped_skills": self.skipped_skills,
+            "disabled": self.disabled,
         })
     }
 

@@ -1222,3 +1222,28 @@ fn secret_approval_requires_a_human_and_leases_expire_and_revoke() {
         .any(|e| e["action"] == "secret.reveal" && e["actor"] == "claude"));
     assert!(!serde_json::to_string(&events).unwrap().contains(value));
 }
+
+#[test]
+fn web_toggle_routes_match_cli() {
+    let env = support::MusterEnv::new();
+    std::fs::create_dir_all(env.config_dir()).unwrap();
+    std::fs::write(env.config_dir().join("muster.toml"), "version = 1\n").unwrap();
+    let mut ui = Ui::start(&env);
+    let cookie = ui_session_cookie(&mut ui);
+    let (status, body) = ui_post(
+        &mut ui,
+        &cookie,
+        "/api/disable",
+        &serde_json::json!({"item":"skill:pdf", "confirm":true}),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["result"]["action"], "disable");
+    let (status, body) = ui_post(
+        &mut ui,
+        &cookie,
+        "/api/enable",
+        &serde_json::json!({"item":"skill:pdf", "confirm":true}),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["result"]["action"], "enable");
+}

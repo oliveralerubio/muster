@@ -133,6 +133,8 @@ const ROUTES: &[Route] = &[
     post("skills/rm", "skill.rm"),
     post("schedule/enable", "schedule.enable"),
     post("schedule/disable", "schedule.disable"),
+    post("enable", "enable"),
+    post("disable", "disable"),
 ];
 /// Reference schemes the panel may reveal. `env://` is excluded: it would read
 /// the panel process's own environment.
