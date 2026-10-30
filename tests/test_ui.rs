@@ -1222,3 +1222,17 @@ fn secret_approval_requires_a_human_and_leases_expire_and_revoke() {
         .any(|e| e["action"] == "secret.reveal" && e["actor"] == "claude"));
     assert!(!serde_json::to_string(&events).unwrap().contains(value));
 }
+
+#[test]
+fn ui_why_api_matches_cli() {
+    let env = support::MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    std::fs::write(env.config_dir().join("AGENTS.md"), "Searchable rule\n").unwrap();
+    let (_, cli) = env.run_json(&["--format", "json", "why", "Searchable"]);
+    let mut ui = Ui::start(&env);
+    let cookie = ui.session();
+    let (status, _, body) = ui.request("GET", "/api/why?text=Searchable", Some(&cookie), None);
+    assert_eq!(status, 200);
+    let api: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(api["result"], *cli.result());
+}

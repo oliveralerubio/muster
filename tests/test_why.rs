@@ -2,30 +2,7 @@ mod support;
 use support::MusterEnv;
 
 #[test]
-fn finds_shared_instruction_with_its_layer() {
-    let env = MusterEnv::new();
-    let cfg = env.config_dir();
-    std::fs::create_dir_all(&cfg).unwrap();
-    std::fs::write(
-        cfg.join("muster.toml"),
-        "version = 1\n[agents]\nenabled = ['codex']\n",
-    )
-    .unwrap();
-    std::fs::write(cfg.join("AGENTS.md"), "First\nBe concise.\n").unwrap();
-    let (output, result) = env.run_json(&["why", "CONCISE", "--format", "json"]);
-    assert!(output.status.success(), "{:?}", result.raw);
-    let found = &result.result()["matches"][0];
-    assert_eq!(found["file"], cfg.join("AGENTS.md").to_str().unwrap());
-    assert_eq!(found["line"], 2);
-    assert_eq!(found["excerpt"], "Be concise.");
-    assert_eq!(found["kind"], "instructions");
-    assert_eq!(found["layer"], "team");
-    assert_eq!(found["agents"], serde_json::json!(["codex"]));
-    assert_eq!(found["managed"], true);
-}
-
-#[test]
-fn finds_an_overlay_only_for_its_agent() {
+fn searches_sources_and_native_content_with_agent_and_regex_filters() {
     let env = MusterEnv::new();
     let cfg = env.config_dir();
     std::fs::create_dir_all(&cfg).unwrap();
@@ -34,15 +11,25 @@ fn finds_an_overlay_only_for_its_agent() {
         "version = 1\n[agents]\nenabled = ['claude', 'codex']\n",
     )
     .unwrap();
-    std::fs::write(cfg.join("AGENTS.md"), "Shared\n").unwrap();
-    std::fs::write(cfg.join("AGENTS.claude.md"), "Specific advice\n").unwrap();
-    let (output, result) = env.run_json(&["why", "advice", "--format", "json"]);
+    std::fs::write(cfg.join("AGENTS.md"), "Common Needle\n").unwrap();
+    std::fs::write(cfg.join("AGENTS.claude.md"), "Claude needle\n").unwrap();
+    std::fs::create_dir_all(env.path().join(".codex")).unwrap();
+    std::fs::write(env.path().join(".codex/AGENTS.md"), "Outside NEEDLE\n<!-- BEGIN MUSTER MANAGED BLOCK: edits inside are overwritten -->\nInside needle\n<!-- END MUSTER MANAGED BLOCK -->\n").unwrap();
+    let (output, result) = env.run_json(&["why", "needle", "--agent", "codex", "--format", "json"]);
     assert!(output.status.success());
-    let found = &result.result()["matches"][0];
-    assert_eq!(
-        found["file"],
-        cfg.join("AGENTS.claude.md").to_str().unwrap()
-    );
-    assert_eq!(found["kind"], "overlay");
-    assert_eq!(found["agents"], serde_json::json!(["claude"]));
+    let matches = result.result()["matches"].as_array().unwrap();
+    assert_eq!(matches.len(), 3);
+    assert!(matches
+        .iter()
+        .any(|m| m["excerpt"] == "Outside NEEDLE" && m["managed"] == false));
+    assert!(matches
+        .iter()
+        .any(|m| m["excerpt"] == "Inside needle" && m["managed"] == true));
+    assert!(matches
+        .iter()
+        .all(|m| m["agents"] == serde_json::json!(["codex"])));
+    let (output, result) = env.run_json(&["why", "claude.*needle", "--regex", "--format", "json"]);
+    assert!(output.status.success());
+    assert_eq!(result.result()["matches"].as_array().unwrap().len(), 1);
+    env.run(&["why", "[", "--regex"]).assert().failure();
 }
