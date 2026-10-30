@@ -333,3 +333,150 @@ fn effective_finds_extra_skills_without_managed_skills() {
         serde_json::json!(["personal"])
     );
 }
+
+#[test]
+fn effective_reflects_toggles_in_adapter_states_and_totals() {
+    let env = MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    std::fs::write(
+        env.config_dir().join("muster.toml"),
+        "version = 1\n[agents]\nenabled = [\"claude\", \"codex\"]\n[agents.skills]\nsource = \"skills\"\n[agents.subagents]\nsource = \"agents\"\n[agents.toggles]\ndisable = [\"skill:demo@claude\", \"mcp:tool@claude\", \"subagent:reviewer@claude\"]\n[mcp.tool]\ncommand = \"tool\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(env.config_dir().join("skills/demo")).unwrap();
+    std::fs::write(
+        env.config_dir().join("skills/demo/SKILL.md"),
+        "---\nname: demo\ndescription: Helpful skill\n---\nHello\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(env.config_dir().join("agents")).unwrap();
+    std::fs::write(
+        env.config_dir().join("agents/reviewer.md"),
+        "---\nname: reviewer\ndescription: Review changes\n---\nReview.\n",
+    )
+    .unwrap();
+    let (_, result) = env.run_json(&["effective", "--format", "json"]);
+    let r = result.result();
+    assert_eq!(r["skills"][0]["adapters"]["claude"]["state"], "disabled");
+    assert_eq!(r["skills"][0]["adapters"]["codex"]["state"], "missing");
+    assert_eq!(r["mcp"][0]["adapters"]["claude"]["state"], "disabled");
+    assert_eq!(r["subagents"][0]["adapters"]["claude"]["state"], "disabled");
+    // A skill disabled for claude contributes no description tokens to its
+    // totals; codex still gets its (not disabled) skill tokens.
+    assert_eq!(r["totals"]["claude"], 0);
+    assert_eq!(r["totals"]["codex"], 3);
+}
+
+#[test]
+fn effective_compares_toml_yaml_and_opencode_configs_without_secret_values() {
+    let env = MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    std::fs::write(
+        env.config_dir().join("muster.toml"),
+        "version = 1\n[agents]\nenabled = [\"codex\", \"hermes\", \"opencode\"]\n[mcp.tool]\ncommand = \"tool\"\n[mcp.tool.env]\nTOKEN = \"native://app/token\"\n",
+    )
+    .unwrap();
+    // On disk as sync leaves it: the resolved secret this read-only view
+    // cannot reproduce. TOML (Codex), YAML (Hermes) and OpenCode's
+    // `environment` field must not read as drift because of it.
+    std::fs::create_dir_all(env.path().join(".codex")).unwrap();
+    std::fs::write(
+        env.path().join(".codex/config.toml"),
+        "[mcp_servers.tool]\ncommand = \"tool\"\nenv = { TOKEN = \"super-secret-value\" }\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(env.path().join(".hermes")).unwrap();
+    std::fs::write(
+        env.path().join(".hermes/config.yaml"),
+        "mcp_servers:\n  tool:\n    command: tool\n    args: []\n    env:\n      TOKEN: super-secret-value\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(env.path().join(".config/opencode")).unwrap();
+    std::fs::write(
+        env.path().join(".config/opencode/opencode.json"),
+        "{\n  \"mcp\": {\n    \"tool\": {\n      \"type\": \"local\",\n      \"command\": [\"tool\"],\n      \"environment\": {\"TOKEN\": \"super-secret-value\"}\n    }\n  }\n}\n",
+    )
+    .unwrap();
+    let (output, result) = env.run_json(&["effective", "--format", "json"]);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("super-secret-value"));
+    let adapters = &result.result()["mcp"][0]["adapters"];
+    assert_eq!(adapters["codex"]["state"], "in_sync");
+    assert_eq!(adapters["hermes"]["state"], "in_sync");
+    assert_eq!(adapters["opencode"]["state"], "in_sync");
+}
+
+#[test]
+fn effective_project_mcp_overrides_lower_layers_and_merges_extras() {
+    let env = MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    std::fs::write(
+        env.config_dir().join("muster.toml"),
+        "version = 1\n[agents]\nenabled = [\"claude\", \"opencode\"]\n[mcp.tool]\ncommand = \"team-tool\"\n",
+    )
+    .unwrap();
+    // User-scope unmanaged extra.
+    std::fs::create_dir_all(env.path().join(".claude/skills/personal")).unwrap();
+    let project = env.path().join("project");
+    std::fs::create_dir_all(project.join(".muster")).unwrap();
+    std::fs::write(
+        project.join(".muster/muster.toml"),
+        "version = 1\n[mcp.tool]\ncommand = \"project-tool\"\n",
+    )
+    .unwrap();
+    // Project-scope unmanaged extra (OpenCode reads project skills from
+    // `.opencode/skills` under the project root).
+    std::fs::create_dir_all(project.join(".opencode/skills/stray")).unwrap();
+    let (_, result) = env.run_json(&[
+        "effective",
+        "--project",
+        project.to_str().unwrap(),
+        "--format",
+        "json",
+    ]);
+    let r = result.result();
+    // The project layer's `tool` replaces the team one instead of duplicating it.
+    let servers = r["mcp"].as_array().unwrap();
+    assert_eq!(servers.len(), 1);
+    assert_eq!(servers[0]["name"], "tool");
+    assert_eq!(servers[0]["layer"], "project");
+    assert_eq!(servers[0]["overridden_layers"], serde_json::json!(["team"]));
+    // Extras from both scopes are merged per adapter.
+    assert_eq!(
+        r["extra_on_disk"]["claude"],
+        serde_json::json!(["personal"])
+    );
+    assert_eq!(r["extra_on_disk"]["opencode"], serde_json::json!(["stray"]));
+}
+
+#[test]
+fn effective_text_prints_layers_and_provenance() {
+    let env = MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    std::fs::write(
+        env.config_dir().join("muster.toml"),
+        "version = 1\n[agents]\nenabled = [\"claude\"]\n[agents.instructions]\nsource = \"AGENTS.md\"\n[agents.skills]\nsource = \"skills\"\n[mcp.tool]\ncommand = \"tool\"\n",
+    )
+    .unwrap();
+    std::fs::write(env.config_dir().join("AGENTS.md"), "Be kind.\n").unwrap();
+    std::fs::create_dir_all(env.config_dir().join("skills/demo")).unwrap();
+    std::fs::write(
+        env.config_dir().join("skills/demo/SKILL.md"),
+        "---\nname: demo\ndescription: Helpful skill\n---\nHello\n",
+    )
+    .unwrap();
+    let output = env
+        .run(&["effective", "--format", "text"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    for expected in [
+        "Layers\n  team: team\n",
+        "AGENTS.md (team, ~2 tokens)",
+        "demo (team, unreviewed, ~3 description tokens, ~13 body tokens)",
+        "tool (team, stdio)",
+        "claude: missing",
+    ] {
+        assert!(text.contains(expected), "missing `{expected}` in:\n{text}");
+    }
+}

@@ -491,12 +491,18 @@ async function testSecretApprovalsRequireConfirmationAndRefresh() {
 }
 
 async function testEffectiveViewShowsStatesAndEscapesNames() {
+  // The real `effective` schema: `instructions` is a list of sources (user
+  // scope plus the project scope) and per-adapter states live in `adapters`.
   setResponder(() => ({ ok: true, diagnostics: [], result: {
-    layers: [{ kind: "project", name: "demo" }],
-    instructions: { source: "AGENTS.md", layer: "project", agents: { claude: { state: "in_sync" } } },
-    skills: [{ name: "<script>alert(1)</script>", origin: "local", agents: { claude: { state: "drifted" } } }],
-    mcp: [{ name: "context", layer: "team", agents: { claude: { state: "missing" } } }],
-    subagents: [{ name: "reviewer", layer: "team", agents: { claude: { state: "installed" } } }],
+    layers: [{ kind: "team", name: "team" }, { kind: "project", name: "/srv/demo" }],
+    instructions: [
+      { source: "AGENTS.md", layer: "team", approx_tokens: 2, adapters: { claude: { state: "in_sync" } } },
+      { source: "demo/AGENTS.md", layer: "project", approx_tokens: 4, adapters: { claude: { state: "missing" } } },
+    ],
+    skills: [{ name: "<script>alert(1)</script>", origin: "local", layer: "team", verification: "unreviewed",
+      description_tokens: 3, body_tokens: 13, adapters: { claude: { state: "drifted" } } }],
+    mcp: [{ name: "context", layer: "team", transport: "stdio", overridden_layers: [], adapters: { claude: { state: "missing" } } }],
+    subagents: [{ name: "reviewer", layer: "team", adapters: { claude: { state: "installed" } } }],
     totals: { claude: 42 }, extra_on_disk: { claude: ["personal"] },
   } }));
   await sandbox.show("effective");
@@ -504,11 +510,15 @@ async function testEffectiveViewShowsStatesAndEscapesNames() {
   const walk = (node) => { if (node instanceof FakeElement) { nodes.push(node); node.children.forEach(walk); } };
   walk(view);
   const text = nodes.flatMap((node) => [node.textContent, ...node.children.filter((c) => typeof c === "string")]).join(" ");
-  for (const expected of ["AGENTS.md", "<script>alert(1)</script>", "context", "reviewer", "project", "42", "personal"]) {
+  // Both instruction sources render with their supplying layer.
+  for (const expected of ["AGENTS.md", "team", "demo/AGENTS.md", "project",
+    "<script>alert(1)</script>", "context", "reviewer", "42", "personal"]) {
     assert.ok(text.includes(expected), `effective view includes ${expected}`);
   }
   assert.ok(nodes.some((node) => node.children.includes("drifted") && node.getAttribute("class").includes("danger")));
   assert.ok(nodes.some((node) => node.children.includes("missing") && node.getAttribute("class").includes("danger")));
+  assert.ok(nodes.some((node) => node.children.includes("in_sync")));
+  assert.ok(nodes.some((node) => node.children.includes("installed")));
   assert.ok(!nodes.some((node) => node.tagName === "SCRIPT"));
   setResponder();
 }

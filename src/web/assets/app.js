@@ -306,12 +306,16 @@ const views = {
     const data = await api("effective");
     if (token !== undefined && token !== navToken) return;
     const r = data.result || {};
-    const instructions = r.instructions && !Array.isArray(r.instructions) ? r.instructions : {};
+    // `instructions` is a list of sources (user scope plus, with --project,
+    // the project scope); a single object is tolerated from older payloads.
+    const instructions = Array.isArray(r.instructions)
+      ? r.instructions
+      : r.instructions && r.instructions.source ? [r.instructions] : [];
     const skills = Array.isArray(r.skills) ? r.skills : [];
     const mcp = Array.isArray(r.mcp) ? r.mcp : [];
     const subagents = Array.isArray(r.subagents) ? r.subagents : [];
     const entries = [
-      ...(instructions.source ? [["Instructions", instructions.source, instructions.layer, instructions]] : []),
+      ...instructions.map((i) => ["Instructions", i.source, i.layer, i]),
       ...skills.map((s) => ["Skill", s.name, s.origin, s]),
       ...mcp.map((s) => ["MCP", s.name, s.layer, s]),
       ...subagents.map((s) => ["Subagent", s.name, s.layer, s]),
@@ -319,10 +323,10 @@ const views = {
     const extras = r.extra_on_disk || {};
     const totals = r.totals || {};
     const ids = [...new Set([...Object.keys(totals), ...Object.keys(extras),
-      ...entries.flatMap((entry) => Object.keys(entry[3].agents || {}))])].sort();
+      ...entries.flatMap((entry) => Object.keys(entry[3].adapters || {}))])].sort();
     const rows = entries.map(([kind, name, origin, entry]) => [kind, name || "", origin || "",
       ...ids.map((id) => {
-        const state = (entry.agents || {})[id]?.state;
+        const state = (entry.adapters || {})[id]?.state;
         return state ? el("span", { class: "badge " + (state === "drifted" || state === "missing" ? "danger" : "") }, state) : "—";
       })]);
     const layers = Array.isArray(r.layers) ? r.layers : [];
