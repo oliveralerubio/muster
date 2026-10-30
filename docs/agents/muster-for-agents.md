@@ -59,10 +59,15 @@ The MCP server runs over stdio using newline-delimited JSON-RPC 2.0.
 | `status` | `status` | Fleet machines, sync state, local machine identity | No |
 | `doctor` | `doctor` | Machine health, binary versions, permissions (`fix` is hidden) | No |
 | `plan` | `plan` | Desired vs. current state diff (secrets redacted) | No |
+| `effective` | `effective` | Effective configuration and its sources | No |
+| `why` | `why` | Find text in agent context | No |
+| `usage` | `usage` | Local agent usage | No |
 | `provider_list` | `provider.list` | AI endpoint settings, key references and receiving agents | No |
 | `secret_list_meta` | `secret.list` | Secret metadata, groups, readers, allowed agents (never secret values) | No |
 | `propose_change` | `proposal.create` | Stashes a proposed config change and returns its plan | Proposal only |
 | `secret_reveal` | `secret.get --reveal` | Reveals an explicitly allowlisted secret reference | Read-only |
+
+The new read-only tools use global scope: `project` is hidden, as is `usage`'s `max-file-bytes`.
 
 ### Safety Boundaries
 
@@ -121,6 +126,12 @@ When an agent needs to adjust Muster configuration (e.g. adding an MCP server, t
      "message": "add postgres MCP server"
    }
    ```
+   To propose enabling or disabling an item, supply the complete `muster.toml`
+   with the item moved between the `enable` and `disable` arrays under
+   `[agents.toggles]` (or `[profiles.<name>.agents.toggles]` for a profile).
+   For example, `disable = ["skill:demo@claude"]` disables that skill for
+   Claude. Preserve the rest of the manifest. Project configuration outside
+   the config repository cannot be proposed through this flow.
 2. **Muster validates and stashes:**
    - Validates paths: restricted to configuration files (cannot escape, cannot touch `vault/`, `.git/`, or `proposals/`).
    - If targeting `muster.toml`, checks manifest syntax and schema.

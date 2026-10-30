@@ -33,7 +33,7 @@ const INVALID_PARAMS: i64 = -32602;
 
 pub const SPEC: CommandSpec = CommandSpec {
     name: "mcp",
-    about: "Run the MCP server over stdio (tools: status, doctor, plan, provider_list, secret_list_meta, propose_change, secret_reveal)",
+    about: "Run the MCP server over stdio (tools: status, doctor, plan, effective, why, usage, provider_list, secret_list_meta, propose_change, secret_reveal)",
     params: &[],
     mutating: false,
     handler: not_a_handler,
@@ -79,6 +79,24 @@ const TOOLS: &[Tool] = &[
         name: "plan",
         command: "plan",
         hidden: &[],
+        forced: &[],
+    },
+    Tool {
+        name: "effective",
+        command: "effective",
+        hidden: &["project"],
+        forced: &[],
+    },
+    Tool {
+        name: "why",
+        command: "why",
+        hidden: &["project"],
+        forced: &[],
+    },
+    Tool {
+        name: "usage",
+        command: "usage",
+        hidden: &["project", "max-file-bytes"],
         forced: &[],
     },
     Tool {
@@ -132,6 +150,8 @@ impl Tool {
                 "{about}. Refused unless the reference is listed in muster.toml [mcp_server] reveal \
                  and its [secrets.\"<reference>\"] allow grants the calling agent"
             )
+        } else if self.name == "propose_change" {
+            format!("{about}. To enable or disable an item, propose muster.toml with the item moved to the corresponding [agents.toggles] enable or disable list; a human accepts the proposal")
         } else {
             about.to_string()
         };
