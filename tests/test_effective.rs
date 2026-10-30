@@ -107,3 +107,19 @@ fn effective_reports_skill_disk_changes_and_extras() {
     let (_, result) = env.run_json(&["effective", "--format", "json"]);
     assert_eq!(result.result()["skills"][0]["adapters"]["claude"]["state"], "drifted");
 }
+
+#[test]
+fn effective_reports_mcp_without_secret_values() {
+    let env = MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    std::fs::write(env.config_dir().join("muster.toml"), "version = 1\n[agents]\nenabled = [\"claude\"]\n[mcp.tool]\ncommand = \"tool\"\n[mcp.tool.env]\nTOKEN = \"native://app/token\"\n").unwrap();
+    let (output, result) = env.run_json(&["effective", "--format", "json"]);
+    assert!(output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("super-secret-value"));
+    assert_eq!(result.result()["mcp"][0]["name"], "tool");
+    assert_eq!(result.result()["mcp"][0]["layer"], "team");
+    assert_eq!(result.result()["mcp"][0]["overridden_layers"], serde_json::json!([]));
+    assert_eq!(result.result()["mcp"][0]["transport"], "stdio");
+    assert_eq!(result.result()["mcp"][0]["agents"], serde_json::json!(["claude"]));
+    assert_eq!(result.result()["mcp"][0]["adapters"]["claude"]["state"], "missing");
+}

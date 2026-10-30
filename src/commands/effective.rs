@@ -104,6 +104,63 @@ fn effective(ctx: &mut Context, _: &Params) -> Result<Value, MusterError> {
         }
         Err(_) => vec![],
     };
+    let roots = Roots::from_env()?;
+    let mut mcp_views = Vec::new();
+    for (name, server) in &merged.mcp {
+        let transport = match server.transport().map_err(MusterError::Operational)? {
+            crate::adapters::config::Transport::Stdio { .. } => "stdio",
+            crate::adapters::config::Transport::Remote { .. } => "remote",
+        };
+        let sources: Vec<_> = layers.iter().filter(|l| l.mcp.contains_key(name)).collect();
+        let mut views = BTreeMap::new();
+        for adapter in engine::enabled_adapters(Some(&merged.agents))? {
+            let mut current = Current::new();
+            for file in adapter.files {
+                if let Ok(content) = std::fs::read_to_string(roots.resolve(file)) {
+                    current.insert(file.path, content);
+                }
+            }
+            let empty_agents = Default::default();
+            let providers = BTreeMap::new();
+            let mcp = BTreeMap::from([(name.clone(), server.clone())]);
+            let secrets = BTreeMap::new();
+            let skills = BTreeMap::new();
+            let subagents = BTreeMap::new();
+            let access = SecretAccess::new(BTreeMap::new(), None);
+            let desired = Desired { config_dir: &ctx.config_dir, agents: &empty_agents,
+                ai_providers: &providers, mcp: &mcp, instructions: None, secrets: &secrets,
+                access: &access, skills: &skills, subagents: &subagents };
+            let rendered = adapter.render(&desired, &current)?;
+            let empty = BTreeMap::new();
+            let baseline = adapter.render(&Desired { mcp: &empty, ..desired }, &current)?;
+            let changed: Vec<_> = rendered.files.iter().filter(|file| {
+                baseline.files.iter().find(|base| base.file.path == file.file.path)
+                    .is_none_or(|base| base.contents != file.contents)
+            }).collect();
+            if let Some(file) = changed.first() {
+                let state = match current.get(file.file.path) {
+                    None => "missing",
+                    Some(_) => "drifted",
+                };
+                views.insert(adapter.id, json!({"state": state}));
+            } else {
+                // Render against an empty current file to identify the MCP output.
+                let rendered = adapter.render(&desired, &Current::new())?;
+                let baseline = adapter.render(&Desired { mcp: &empty, ..desired }, &Current::new())?;
+                if rendered.files.iter().any(|file| baseline.files.iter()
+                    .find(|base| base.file.path == file.file.path)
+                    .is_none_or(|base| base.contents != file.contents)) {
+                    views.insert(adapter.id, json!({"state": "in_sync"}));
+                }
+            }
+        }
+        let agents: Vec<_> = views.keys().copied().collect();
+        let references: Vec<_> = server.env.values().chain(server.headers.values())
+            .filter(|v| adapters::is_secret_reference(v)).collect();
+        mcp_views.push(json!({"name": name, "layer": sources.last().map(|l| l.kind),
+            "overridden_layers": sources.iter().take(sources.len().saturating_sub(1)).map(|l| l.kind).collect::<Vec<_>>(),
+            "transport": transport, "agents": agents, "adapters": views, "secret_references": references}));
+    }
     let mut skill_views = Vec::new();
     let mut skill_dirs = BTreeMap::new();
     let listed = (crate::commands::skill::LIST.handler)(ctx, &Params::default())?;
@@ -206,6 +263,6 @@ fn effective(ctx: &mut Context, _: &Params) -> Result<Value, MusterError> {
         (id, extra)
     }).collect();
     Ok(
-        json!({"extra_on_disk": extra_on_disk, "skills": skill_views, "layers": layers.iter().map(|l| json!({"kind": l.kind, "name": l.name})).collect::<Vec<_>>(), "instructions": instructions}),
+        json!({"mcp": mcp_views, "extra_on_disk": extra_on_disk, "skills": skill_views, "layers": layers.iter().map(|l| json!({"kind": l.kind, "name": l.name})).collect::<Vec<_>>(), "instructions": instructions}),
     )
 }
