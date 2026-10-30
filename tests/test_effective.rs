@@ -178,3 +178,14 @@ fn effective_totals_instruction_and_skill_description_tokens() {
     assert_eq!(result.result()["totals"]["claude"], 5);
     assert_eq!(result.result()["totals"]["codex"], 3);
 }
+
+#[test]
+fn effective_text_shows_compact_sections() {
+    let env = MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    std::fs::write(env.config_dir().join("muster.toml"), "version = 1\n[agents]\nenabled = [\"claude\"]\n").unwrap();
+    let output = env.run(&["effective", "--format", "text"]).output().unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    for expected in ["Instructions", "Skills", "MCP", "Subagents", "claude"] { assert!(text.contains(expected), "{text}"); }
+}

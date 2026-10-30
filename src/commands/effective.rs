@@ -327,7 +327,23 @@ fn effective(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
             .filter_map(|v| v["description_tokens"].as_u64()).sum();
         (adapter.id, instruction_tokens + skill_tokens)
     }).collect();
-    Ok(
-        json!({"totals": totals, "subagents": subagent_views, "mcp": mcp_views, "extra_on_disk": extra_on_disk, "skills": skill_views, "layers": layers.iter().map(|l| json!({"kind": l.kind, "name": l.name})).collect::<Vec<_>>(), "instructions": instructions}),
-    )
+    let result = json!({"totals": totals, "subagents": subagent_views, "mcp": mcp_views, "extra_on_disk": extra_on_disk, "skills": skill_views, "layers": layers.iter().map(|l| json!({"kind": l.kind, "name": l.name})).collect::<Vec<_>>(), "instructions": instructions});
+    if ctx.format == crate::output::Format::Text {
+        let mut text = String::new();
+        for (heading, key) in [("Instructions", "instructions"), ("Skills", "skills"), ("MCP", "mcp"), ("Subagents", "subagents")] {
+            text.push_str(&format!("{heading}\n"));
+            if let Some(items) = result[key].as_array() {
+                for item in items {
+                    let name = item["name"].as_str().or_else(|| item["source"].as_str()).unwrap_or("");
+                    text.push_str(&format!("  {name}\n"));
+                    if let Some(adapters) = item["adapters"].as_object() {
+                        for (id, view) in adapters { text.push_str(&format!("    {id}: {}\n", view["state"].as_str().unwrap_or("unknown"))); }
+                    }
+                }
+            }
+        }
+        text.push_str("Totals\n");
+        for (id, tokens) in totals { text.push_str(&format!("  {id}: {tokens} tokens\n")); }
+        Ok(Value::String(text))
+    } else { Ok(result) }
 }
