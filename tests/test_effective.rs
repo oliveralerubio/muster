@@ -1,0 +1,482 @@
+mod support;
+
+use support::MusterEnv;
+
+#[test]
+fn effective_reports_layers_and_instruction_source() {
+    let env = MusterEnv::new();
+    env.run(&["--format", "json", "--yes", "init"])
+        .assert()
+        .success();
+    let config = env.config_dir();
+    std::fs::write(config.join("muster.toml"), "version = 1\n[agents]\nenabled = [\"claude\"]\n[agents.instructions]\nsource = \"AGENTS.md\"\n").unwrap();
+    std::fs::write(config.join("AGENTS.md"), "Be kind.\n").unwrap();
+    let (output, envelope) = env.run_json(&["effective", "--format", "json"]);
+    assert!(output.status.success());
+    assert_eq!(envelope.command(), "effective");
+    assert_eq!(
+        envelope.result()["layers"],
+        serde_json::json!([{ "kind": "team", "name": "team" }])
+    );
+    assert_eq!(
+        envelope.result()["instructions"][0]["source"],
+        config.join("AGENTS.md").to_str().unwrap()
+    );
+    assert_eq!(envelope.result()["instructions"][0]["layer"], "team");
+    assert_eq!(envelope.result()["instructions"][0]["approx_tokens"], 2);
+}
+
+#[test]
+fn effective_reports_instruction_disk_states() {
+    let env = MusterEnv::new();
+    env.run(&["--format", "json", "--yes", "init"])
+        .assert()
+        .success();
+    let config = env.config_dir();
+    std::fs::write(config.join("muster.toml"), "version = 1\n[agents]\nenabled = [\"claude\", \"codex\"]\nskip_instructions = [\"codex\"]\n[agents.instructions]\nsource = \"AGENTS.md\"\n").unwrap();
+    std::fs::write(config.join("AGENTS.md"), "Be kind.\n").unwrap();
+    let (_, before) = env.run_json(&["effective", "--format", "json"]);
+    assert_eq!(
+        before.result()["instructions"][0]["adapters"]["claude"]["state"],
+        "missing"
+    );
+    assert_eq!(
+        before.result()["instructions"][0]["adapters"]["codex"]["state"],
+        "skipped"
+    );
+    env.run(&["--format", "json", "--yes", "sync"])
+        .assert()
+        .success();
+    let (_, synced) = env.run_json(&["effective", "--format", "json"]);
+    assert_eq!(
+        synced.result()["instructions"][0]["adapters"]["claude"]["state"],
+        "in_sync"
+    );
+    std::fs::write(env.path().join(".claude/AGENTS.md"), "Changed\n").unwrap();
+    let (_, changed) = env.run_json(&["effective", "--format", "json"]);
+    assert_eq!(
+        changed.result()["instructions"][0]["adapters"]["claude"]["state"],
+        "drifted"
+    );
+}
+
+#[test]
+fn effective_reports_skills_and_installation() {
+    let env = MusterEnv::new();
+    env.run(&["--format", "json", "--yes", "init"])
+        .assert()
+        .success();
+    let config = env.config_dir();
+    std::fs::write(
+        config.join("muster.toml"),
+        "version = 1\n[agents]\nenabled = [\"claude\"]\n[agents.skills]\nsource = \"skills\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(config.join("skills/demo")).unwrap();
+    std::fs::write(
+        config.join("skills/demo/SKILL.md"),
+        "---\nname: demo\ndescription: Helpful skill\n---\nHello\n",
+    )
+    .unwrap();
+    let (_, result) = env.run_json(&["effective", "--format", "json"]);
+    let skill = &result.result()["skills"][0];
+    assert_eq!(skill["name"], "demo");
+    assert_eq!(skill["verification"], "unreviewed");
+    assert_eq!(skill["description_tokens"], 3);
+    assert_eq!(skill["body_tokens"], 13);
+    assert_eq!(skill["adapters"]["claude"]["state"], "missing");
+}
+
+#[test]
+fn effective_reports_skill_disk_changes_and_extras() {
+    let env = MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    let config = env.config_dir();
+    std::fs::write(
+        config.join("muster.toml"),
+        "version = 1\n[agents]\nenabled = [\"claude\"]\n[agents.skills]\nsource = \"skills\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(config.join("skills/demo")).unwrap();
+    let source = "---\nname: demo\ndescription: Helpful skill\n---\nHello\n";
+    std::fs::write(config.join("skills/demo/SKILL.md"), source).unwrap();
+    let base = env.path().join(".claude/skills");
+    std::fs::create_dir_all(base.join("demo")).unwrap();
+    std::fs::create_dir_all(base.join("personal")).unwrap();
+    std::fs::write(base.join("demo/SKILL.md"), source).unwrap();
+    let (_, result) = env.run_json(&["effective", "--format", "json"]);
+    assert_eq!(
+        result.result()["skills"][0]["adapters"]["claude"]["state"],
+        "installed"
+    );
+    assert_eq!(
+        result.result()["extra_on_disk"]["claude"],
+        serde_json::json!(["personal"])
+    );
+    std::fs::write(base.join("demo/SKILL.md"), "changed").unwrap();
+    let (_, result) = env.run_json(&["effective", "--format", "json"]);
+    assert_eq!(
+        result.result()["skills"][0]["adapters"]["claude"]["state"],
+        "drifted"
+    );
+}
+
+#[test]
+fn effective_reports_mcp_without_secret_values() {
+    let env = MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    std::fs::write(env.config_dir().join("muster.toml"), "version = 1\n[agents]\nenabled = [\"claude\"]\n[mcp.tool]\ncommand = \"tool\"\n[mcp.tool.env]\nTOKEN = \"native://app/token\"\n").unwrap();
+    let (output, result) = env.run_json(&["effective", "--format", "json"]);
+    assert!(output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("super-secret-value"));
+    assert_eq!(result.result()["mcp"][0]["name"], "tool");
+    assert_eq!(result.result()["mcp"][0]["layer"], "team");
+    assert_eq!(
+        result.result()["mcp"][0]["overridden_layers"],
+        serde_json::json!([])
+    );
+    assert_eq!(result.result()["mcp"][0]["transport"], "stdio");
+    assert_eq!(
+        result.result()["mcp"][0]["agents"],
+        serde_json::json!(["claude"])
+    );
+    assert_eq!(
+        result.result()["mcp"][0]["adapters"]["claude"]["state"],
+        "missing"
+    );
+}
+
+#[test]
+fn effective_reports_subagent_state() {
+    let env = MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    std::fs::write(
+        env.config_dir().join("muster.toml"),
+        "version = 1\n[agents]\nenabled = [\"claude\"]\n[agents.subagents]\nsource = \"agents\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(env.config_dir().join("agents")).unwrap();
+    let source = "---\nname: reviewer\ndescription: Review changes\n---\nReview.\n";
+    std::fs::write(env.config_dir().join("agents/reviewer.md"), source).unwrap();
+    let (_, result) = env.run_json(&["effective", "--format", "json"]);
+    assert_eq!(result.result()["subagents"][0]["name"], "reviewer");
+    assert_eq!(result.result()["subagents"][0]["layer"], "team");
+    assert_eq!(
+        result.result()["subagents"][0]["adapters"]["claude"]["state"],
+        "missing"
+    );
+    std::fs::create_dir_all(env.path().join(".claude/agents")).unwrap();
+    std::fs::write(env.path().join(".claude/agents/reviewer.md"), source).unwrap();
+    let (_, result) = env.run_json(&["effective", "--format", "json"]);
+    assert_eq!(
+        result.result()["subagents"][0]["adapters"]["claude"]["state"],
+        "in_sync"
+    );
+}
+
+#[test]
+fn effective_lists_project_layer() {
+    let env = MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    let project = env.path().join("project");
+    std::fs::create_dir_all(project.join(".muster")).unwrap();
+    std::fs::write(
+        project.join(".muster/muster.toml"),
+        "version = 1\n[mcp.local]\ncommand = \"project-tool\"\n",
+    )
+    .unwrap();
+    let (_, result) = env.run_json(&[
+        "effective",
+        "--project",
+        project.to_str().unwrap(),
+        "--format",
+        "json",
+    ]);
+    assert_eq!(result.result()["layers"][1]["kind"], "project");
+    assert_eq!(result.result()["mcp"][0]["name"], "local");
+    assert_eq!(result.result()["mcp"][0]["layer"], "project");
+}
+
+#[test]
+fn effective_filters_adapters_and_rejects_unknown() {
+    let env = MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    std::fs::write(env.config_dir().join("muster.toml"), "version = 1\n[agents]\nenabled = [\"claude\", \"codex\"]\n[agents.instructions]\nsource = \"AGENTS.md\"\n").unwrap();
+    std::fs::write(env.config_dir().join("AGENTS.md"), "Hello\n").unwrap();
+    let (_, result) = env.run_json(&["effective", "--agent", "claude", "--format", "json"]);
+    assert_eq!(
+        result.result()["instructions"][0]["adapters"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect::<Vec<_>>(),
+        vec!["claude"]
+    );
+    env.run(&["effective", "--agent", "unknown"])
+        .assert()
+        .code(2);
+}
+
+#[test]
+fn effective_totals_instruction_and_skill_description_tokens() {
+    let env = MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    std::fs::write(env.config_dir().join("muster.toml"), "version = 1\n[agents]\nenabled = [\"claude\", \"codex\"]\nskip_instructions = [\"codex\"]\n[agents.instructions]\nsource = \"AGENTS.md\"\n[agents.skills]\nsource = \"skills\"\n").unwrap();
+    std::fs::write(env.config_dir().join("AGENTS.md"), "Be kind.\n").unwrap();
+    std::fs::create_dir_all(env.config_dir().join("skills/demo")).unwrap();
+    std::fs::write(
+        env.config_dir().join("skills/demo/SKILL.md"),
+        "---\nname: demo\ndescription: Helpful skill\n---\nHello\n",
+    )
+    .unwrap();
+    let (_, result) = env.run_json(&["effective", "--format", "json"]);
+    assert_eq!(result.result()["totals"]["claude"], 5);
+    assert_eq!(result.result()["totals"]["codex"], 3);
+}
+
+#[test]
+fn effective_text_shows_compact_sections() {
+    let env = MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    std::fs::write(
+        env.config_dir().join("muster.toml"),
+        "version = 1\n[agents]\nenabled = [\"claude\"]\n",
+    )
+    .unwrap();
+    let output = env
+        .run(&["effective", "--format", "text"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    for expected in ["Instructions", "Skills", "MCP", "Subagents", "claude"] {
+        assert!(text.contains(expected), "{text}");
+    }
+}
+
+#[test]
+fn effective_compares_mcp_without_disclosing_existing_secrets() {
+    let env = MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    std::fs::write(env.config_dir().join("muster.toml"), "version = 1\n[agents]\nenabled = [\"claude\"]\n[mcp.tool]\ncommand = \"tool\"\n[mcp.tool.env]\nTOKEN = \"native://app/token\"\n").unwrap();
+    std::fs::write(
+        env.path().join(".claude.json"),
+        r#"{"mcpServers":{"tool":{"command":"tool","env":{"TOKEN":"super-secret-value"}}}}"#,
+    )
+    .unwrap();
+    let (output, result) = env.run_json(&["effective", "--format", "json"]);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("super-secret-value"));
+    assert_eq!(
+        result.result()["mcp"][0]["adapters"]["claude"]["state"],
+        "in_sync"
+    );
+    assert_eq!(
+        result.result()["mcp"][0]["secret_references"],
+        serde_json::json!(["native://app/token"])
+    );
+}
+
+#[test]
+fn effective_project_reports_both_user_and_project_disk_states() {
+    let env = MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    std::fs::write(
+        env.config_dir().join("muster.toml"),
+        "version = 1\n[agents]\nenabled = [\"claude\"]\n[mcp.user]\ncommand = \"user-tool\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        env.path().join(".claude.json"),
+        r#"{"mcpServers":{"user":{"command":"user-tool"}}}"#,
+    )
+    .unwrap();
+    let project = env.path().join("project");
+    std::fs::create_dir_all(project.join(".muster")).unwrap();
+    std::fs::write(
+        project.join(".muster/muster.toml"),
+        "version = 1\n[mcp.local]\ncommand = \"project-tool\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.join(".mcp.json"),
+        r#"{"mcpServers":{"local":{"command":"project-tool"}}}"#,
+    )
+    .unwrap();
+    let (_, result) = env.run_json(&[
+        "effective",
+        "--project",
+        project.to_str().unwrap(),
+        "--format",
+        "json",
+    ]);
+    let servers = result.result()["mcp"].as_array().unwrap();
+    assert_eq!(servers.len(), 2);
+    assert_eq!(servers[0]["name"], "user");
+    assert_eq!(servers[0]["adapters"]["claude"]["state"], "in_sync");
+    assert_eq!(servers[1]["name"], "local");
+    assert_eq!(servers[1]["adapters"]["claude"]["state"], "in_sync");
+}
+
+#[test]
+fn effective_finds_extra_skills_without_managed_skills() {
+    let env = MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    std::fs::write(
+        env.config_dir().join("muster.toml"),
+        "version = 1\n[agents]\nenabled = [\"claude\"]\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(env.path().join(".claude/skills/personal")).unwrap();
+    let (_, result) = env.run_json(&["effective", "--format", "json"]);
+    assert_eq!(
+        result.result()["extra_on_disk"]["claude"],
+        serde_json::json!(["personal"])
+    );
+}
+
+#[test]
+fn effective_reflects_toggles_in_adapter_states_and_totals() {
+    let env = MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    std::fs::write(
+        env.config_dir().join("muster.toml"),
+        "version = 1\n[agents]\nenabled = [\"claude\", \"codex\"]\n[agents.skills]\nsource = \"skills\"\n[agents.subagents]\nsource = \"agents\"\n[agents.toggles]\ndisable = [\"skill:demo@claude\", \"mcp:tool@claude\", \"subagent:reviewer@claude\"]\n[mcp.tool]\ncommand = \"tool\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(env.config_dir().join("skills/demo")).unwrap();
+    std::fs::write(
+        env.config_dir().join("skills/demo/SKILL.md"),
+        "---\nname: demo\ndescription: Helpful skill\n---\nHello\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(env.config_dir().join("agents")).unwrap();
+    std::fs::write(
+        env.config_dir().join("agents/reviewer.md"),
+        "---\nname: reviewer\ndescription: Review changes\n---\nReview.\n",
+    )
+    .unwrap();
+    let (_, result) = env.run_json(&["effective", "--format", "json"]);
+    let r = result.result();
+    assert_eq!(r["skills"][0]["adapters"]["claude"]["state"], "disabled");
+    assert_eq!(r["skills"][0]["adapters"]["codex"]["state"], "missing");
+    assert_eq!(r["mcp"][0]["adapters"]["claude"]["state"], "disabled");
+    assert_eq!(r["subagents"][0]["adapters"]["claude"]["state"], "disabled");
+    // A skill disabled for claude contributes no description tokens to its
+    // totals; codex still gets its (not disabled) skill tokens.
+    assert_eq!(r["totals"]["claude"], 0);
+    assert_eq!(r["totals"]["codex"], 3);
+}
+
+#[test]
+fn effective_compares_toml_yaml_and_opencode_configs_without_secret_values() {
+    let env = MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    std::fs::write(
+        env.config_dir().join("muster.toml"),
+        "version = 1\n[agents]\nenabled = [\"codex\", \"hermes\", \"opencode\"]\n[mcp.tool]\ncommand = \"tool\"\n[mcp.tool.env]\nTOKEN = \"native://app/token\"\n",
+    )
+    .unwrap();
+    // On disk as sync leaves it: the resolved secret this read-only view
+    // cannot reproduce. TOML (Codex), YAML (Hermes) and OpenCode's
+    // `environment` field must not read as drift because of it.
+    std::fs::create_dir_all(env.path().join(".codex")).unwrap();
+    std::fs::write(
+        env.path().join(".codex/config.toml"),
+        "[mcp_servers.tool]\ncommand = \"tool\"\nenv = { TOKEN = \"super-secret-value\" }\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(env.path().join(".hermes")).unwrap();
+    std::fs::write(
+        env.path().join(".hermes/config.yaml"),
+        "mcp_servers:\n  tool:\n    command: tool\n    args: []\n    env:\n      TOKEN: super-secret-value\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(env.path().join(".config/opencode")).unwrap();
+    std::fs::write(
+        env.path().join(".config/opencode/opencode.json"),
+        "{\n  \"mcp\": {\n    \"tool\": {\n      \"type\": \"local\",\n      \"command\": [\"tool\"],\n      \"environment\": {\"TOKEN\": \"super-secret-value\"}\n    }\n  }\n}\n",
+    )
+    .unwrap();
+    let (output, result) = env.run_json(&["effective", "--format", "json"]);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("super-secret-value"));
+    let adapters = &result.result()["mcp"][0]["adapters"];
+    assert_eq!(adapters["codex"]["state"], "in_sync");
+    assert_eq!(adapters["hermes"]["state"], "in_sync");
+    assert_eq!(adapters["opencode"]["state"], "in_sync");
+}
+
+#[test]
+fn effective_project_mcp_overrides_lower_layers_and_merges_extras() {
+    let env = MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    std::fs::write(
+        env.config_dir().join("muster.toml"),
+        "version = 1\n[agents]\nenabled = [\"claude\", \"opencode\"]\n[mcp.tool]\ncommand = \"team-tool\"\n",
+    )
+    .unwrap();
+    // User-scope unmanaged extra.
+    std::fs::create_dir_all(env.path().join(".claude/skills/personal")).unwrap();
+    let project = env.path().join("project");
+    std::fs::create_dir_all(project.join(".muster")).unwrap();
+    std::fs::write(
+        project.join(".muster/muster.toml"),
+        "version = 1\n[mcp.tool]\ncommand = \"project-tool\"\n",
+    )
+    .unwrap();
+    // Project-scope unmanaged extra (OpenCode reads project skills from
+    // `.opencode/skills` under the project root).
+    std::fs::create_dir_all(project.join(".opencode/skills/stray")).unwrap();
+    let (_, result) = env.run_json(&[
+        "effective",
+        "--project",
+        project.to_str().unwrap(),
+        "--format",
+        "json",
+    ]);
+    let r = result.result();
+    // The project layer's `tool` replaces the team one instead of duplicating it.
+    let servers = r["mcp"].as_array().unwrap();
+    assert_eq!(servers.len(), 1);
+    assert_eq!(servers[0]["name"], "tool");
+    assert_eq!(servers[0]["layer"], "project");
+    assert_eq!(servers[0]["overridden_layers"], serde_json::json!(["team"]));
+    // Extras from both scopes are merged per adapter.
+    assert_eq!(
+        r["extra_on_disk"]["claude"],
+        serde_json::json!(["personal"])
+    );
+    assert_eq!(r["extra_on_disk"]["opencode"], serde_json::json!(["stray"]));
+}
+
+#[test]
+fn effective_text_prints_layers_and_provenance() {
+    let env = MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    std::fs::write(
+        env.config_dir().join("muster.toml"),
+        "version = 1\n[agents]\nenabled = [\"claude\"]\n[agents.instructions]\nsource = \"AGENTS.md\"\n[agents.skills]\nsource = \"skills\"\n[mcp.tool]\ncommand = \"tool\"\n",
+    )
+    .unwrap();
+    std::fs::write(env.config_dir().join("AGENTS.md"), "Be kind.\n").unwrap();
+    std::fs::create_dir_all(env.config_dir().join("skills/demo")).unwrap();
+    std::fs::write(
+        env.config_dir().join("skills/demo/SKILL.md"),
+        "---\nname: demo\ndescription: Helpful skill\n---\nHello\n",
+    )
+    .unwrap();
+    let output = env
+        .run(&["effective", "--format", "text"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    for expected in [
+        "Layers\n  team: team\n",
+        "AGENTS.md (team, ~2 tokens)",
+        "demo (team, unreviewed, ~3 description tokens, ~13 body tokens)",
+        "tool (team, stdio)",
+        "claude: missing",
+    ] {
+        assert!(text.contains(expected), "missing `{expected}` in:\n{text}");
+    }
+}

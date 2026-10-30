@@ -37,7 +37,8 @@ fn web_panel_javascript_passes_its_node_suite() {
             && stdout.contains("ok testProfileSaveIsGatedOnPreview")
             && stdout.contains("ok testMcpFormUsesJsonArrayValues")
             && stdout.contains("ok testMcpPreviewIgnoresStaleResponse")
-            && stdout.contains("ok testMcpEditClearsPreviewAndGuardsSave"),
+            && stdout.contains("ok testMcpEditClearsPreviewAndGuardsSave")
+            && stdout.contains("ok testEffectiveViewShowsStatesAndEscapesNames"),
         "the suite must actually run its tests:\n{stdout}{stderr}"
     );
 }

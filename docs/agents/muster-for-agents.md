@@ -78,6 +78,10 @@ The MCP server runs over stdio using newline-delimited JSON-RPC 2.0.
   The calling agent is identified from the `initialize` request's `clientInfo.name` (contains `claude` -> claude, `codex` -> codex, `opencode` -> opencode, `antigravity`/`agy` -> antigravity). Unknown clients are never granted. A denied reveal returns a `security` diagnostic and `isError: true`.
 - **Secret isolation in generated configs:** deny by default. When Muster renders an agent's MCP `env`/`headers`, a secret reference resolves only if its `[secrets."<ref>"] allow` grants that agent (`agent` everywhere, `agent@project` only in that project's scope). Otherwise the key is omitted and a `secret_not_allowed_for_agent` warning is emitted.
 
+## Effective configuration
+
+`muster effective --format json` reports active layers, origins, instructions, skills, MCP servers, subagents, per-adapter disk states, unmanaged extras, approximate token totals, and warnings. Use `--project DIR` for a project and `--agent ID` to select an adapter. The read-only web route `GET /api/effective` returns the same result as the CLI.
+
 ## Agent Skills
 
 `[agents.skills] source = "skills"` in `muster.toml` points to a folder with one subfolder per skill (`SKILL.md` with `name` and `description` frontmatter, plus any files). `agents apply` / `sync` install them for every supported agent:
