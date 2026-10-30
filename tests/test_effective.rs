@@ -86,3 +86,24 @@ fn effective_reports_skills_and_installation() {
     assert_eq!(skill["body_tokens"], 13);
     assert_eq!(skill["adapters"]["claude"]["state"], "missing");
 }
+
+#[test]
+fn effective_reports_skill_disk_changes_and_extras() {
+    let env = MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    let config = env.config_dir();
+    std::fs::write(config.join("muster.toml"), "version = 1\n[agents]\nenabled = [\"claude\"]\n[agents.skills]\nsource = \"skills\"\n").unwrap();
+    std::fs::create_dir_all(config.join("skills/demo")).unwrap();
+    let source = "---\nname: demo\ndescription: Helpful skill\n---\nHello\n";
+    std::fs::write(config.join("skills/demo/SKILL.md"), source).unwrap();
+    let base = env.path().join(".claude/skills");
+    std::fs::create_dir_all(base.join("demo")).unwrap();
+    std::fs::create_dir_all(base.join("personal")).unwrap();
+    std::fs::write(base.join("demo/SKILL.md"), source).unwrap();
+    let (_, result) = env.run_json(&["effective", "--format", "json"]);
+    assert_eq!(result.result()["skills"][0]["adapters"]["claude"]["state"], "installed");
+    assert_eq!(result.result()["extra_on_disk"]["claude"], serde_json::json!(["personal"]));
+    std::fs::write(base.join("demo/SKILL.md"), "changed").unwrap();
+    let (_, result) = env.run_json(&["effective", "--format", "json"]);
+    assert_eq!(result.result()["skills"][0]["adapters"]["claude"]["state"], "drifted");
+}

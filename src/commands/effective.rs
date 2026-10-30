@@ -105,6 +105,7 @@ fn effective(ctx: &mut Context, _: &Params) -> Result<Value, MusterError> {
         Err(_) => vec![],
     };
     let mut skill_views = Vec::new();
+    let mut skill_dirs = BTreeMap::new();
     let listed = (crate::commands::skill::LIST.handler)(ctx, &Params::default())?;
     let lock = crate::skills::SkillsLock::load(&ctx.config_dir)?;
     if let Some(dir) = merged.skills_path()? {
@@ -181,6 +182,9 @@ fn effective(ctx: &mut Context, _: &Params) -> Result<Value, MusterError> {
                         .first()
                         .and_then(|(p, _)| p.parent())
                         .map(|p| p.to_path_buf());
+                    if let Some(dir) = path.as_ref().and_then(|p| p.parent()) {
+                        skill_dirs.insert(adapter.id, dir.to_path_buf());
+                    }
                     adapter_views.insert(adapter.id, json!({"path": path, "state": state}));
                 }
                 view["verification"] = json!(verification);
@@ -191,7 +195,17 @@ fn effective(ctx: &mut Context, _: &Params) -> Result<Value, MusterError> {
             }
         }
     }
+    let names: std::collections::BTreeSet<_> = skill_views.iter()
+        .filter_map(|v| v["name"].as_str()).collect();
+    let extra_on_disk: BTreeMap<_, Vec<_>> = skill_dirs.into_iter().map(|(id, dir)| {
+        let mut extra: Vec<_> = std::fs::read_dir(dir).into_iter().flatten().flatten()
+            .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| !names.contains(name.as_str())).collect();
+        extra.sort();
+        (id, extra)
+    }).collect();
     Ok(
-        json!({"skills": skill_views, "layers": layers.iter().map(|l| json!({"kind": l.kind, "name": l.name})).collect::<Vec<_>>(), "instructions": instructions}),
+        json!({"extra_on_disk": extra_on_disk, "skills": skill_views, "layers": layers.iter().map(|l| json!({"kind": l.kind, "name": l.name})).collect::<Vec<_>>(), "instructions": instructions}),
     )
 }
