@@ -357,7 +357,10 @@ const views = {
     const rows = skills.map((s) => {
       const status = el("span", { class: "badge " + (badgeClass[s.status] || "") }, statusLabel[s.status] || s.status);
       if (s.reason) status.setAttribute("title", s.reason);
-      const actions = [];
+      const actions = [
+        button("Disable", () => act(`Disable skill ${s.name}?`, "disable", { item: `skill:${s.name}` })),
+        button("Enable", () => act(`Enable skill ${s.name}?`, "enable", { item: `skill:${s.name}` })),
+      ];
       if (s.status === "upstream_removed") {
         actions.push(button("Keep as own", () => act(`Keep ${s.name} as an own skill and stop following ${s.origin}?`, "skills/rm", { name: s.name, detach: true })));
         actions.push(button("Delete", () => act(`Delete skill ${s.name} and its files?`, "skills/rm", { name: s.name }), "danger"));
@@ -445,6 +448,8 @@ const views = {
           .concat(Object.entries(server.headers || {}).map(([k, v]) => `${k}=${v}`));
         return [s.name, s.transport, server.command || server.url || "", settings.join(", "),
           el("span", { class: "actions" },
+            button("Disable", () => act(`Disable MCP server ${s.name}?`, "disable", { item: `mcp:${s.name}` })),
+            button("Enable", () => act(`Enable MCP server ${s.name}?`, "enable", { item: `mcp:${s.name}` })),
             button("Edit", () => openMcpEdit(s)),
             button("Remove", () => act(`Remove MCP server ${s.name}?`, "mcp-server/rm", { name: s.name }), "danger"))];
       }), "No MCP servers declared."),

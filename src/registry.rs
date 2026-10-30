@@ -153,6 +153,8 @@ pub static COMMANDS: &[CommandSpec] = &[
     crate::commands::proposal::CREATE,
     crate::commands::proposal::ACCEPT,
     crate::commands::proposal::LIST,
+    crate::commands::toggle::ENABLE,
+    crate::commands::toggle::DISABLE,
     crate::mcp::SPEC,
 ];
 

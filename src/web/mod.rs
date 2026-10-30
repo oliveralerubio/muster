@@ -134,6 +134,16 @@ const ROUTES: &[Route] = &[
     post("skills/rm", "skill.rm"),
     post("schedule/enable", "schedule.enable"),
     post("schedule/disable", "schedule.disable"),
+    // `--project` would let the panel edit any directory's `muster.toml`;
+    // the panel toggles only the shared configuration.
+    Route {
+        hidden: &["project"],
+        ..post("enable", "enable")
+    },
+    Route {
+        hidden: &["project"],
+        ..post("disable", "disable")
+    },
 ];
 /// Reference schemes the panel may reveal. `env://` is excluded: it would read
 /// the panel process's own environment.
