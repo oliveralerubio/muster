@@ -201,3 +201,22 @@ fn effective_compares_mcp_without_disclosing_existing_secrets() {
     assert_eq!(result.result()["mcp"][0]["adapters"]["claude"]["state"], "in_sync");
     assert_eq!(result.result()["mcp"][0]["secret_references"], serde_json::json!(["native://app/token"]));
 }
+
+#[test]
+fn effective_project_reports_both_user_and_project_disk_states() {
+    let env = MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    std::fs::write(env.config_dir().join("muster.toml"), "version = 1\n[agents]\nenabled = [\"claude\"]\n[mcp.user]\ncommand = \"user-tool\"\n").unwrap();
+    std::fs::write(env.path().join(".claude.json"), r#"{"mcpServers":{"user":{"command":"user-tool"}}}"#).unwrap();
+    let project = env.path().join("project");
+    std::fs::create_dir_all(project.join(".muster")).unwrap();
+    std::fs::write(project.join(".muster/muster.toml"), "version = 1\n[mcp.local]\ncommand = \"project-tool\"\n").unwrap();
+    std::fs::write(project.join(".mcp.json"), r#"{"mcpServers":{"local":{"command":"project-tool"}}}"#).unwrap();
+    let (_, result) = env.run_json(&["effective", "--project", project.to_str().unwrap(), "--format", "json"]);
+    let servers = result.result()["mcp"].as_array().unwrap();
+    assert_eq!(servers.len(), 2);
+    assert_eq!(servers[0]["name"], "user");
+    assert_eq!(servers[0]["adapters"]["claude"]["state"], "in_sync");
+    assert_eq!(servers[1]["name"], "local");
+    assert_eq!(servers[1]["adapters"]["claude"]["state"], "in_sync");
+}

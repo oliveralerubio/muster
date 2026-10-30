@@ -25,15 +25,28 @@ pub const SPEC: CommandSpec = CommandSpec {
 
 fn effective(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let manifest = Manifest::load(&ctx.config_dir)?;
-    let mut layers = layer::global_layers(
-        &ctx.config_dir,
-        &manifest,
-        crate::machine::load_name(&ctx.state_dir).as_deref(),
-    );
+    let layers = layer::global_layers(&ctx.config_dir, &manifest, crate::machine::load_name(&ctx.state_dir).as_deref());
+    let mut result = scope(ctx, params, &layers, None, None)?;
     if let engine::Target::Project(project) = crate::commands::plan::target(params)? {
-        layers.extend(layer::project_layers(&project)?);
+        let project_layers = layer::project_layers(&project)?;
+        let global_enabled = layer::merge(&layers).agents.enabled;
+        let project_result = scope(ctx, params, &project_layers, Some(&project), global_enabled)?;
+        for key in ["layers", "instructions", "skills", "mcp", "subagents"] {
+            result[key].as_array_mut().unwrap().extend(project_result[key].as_array().unwrap().iter().cloned());
+        }
+        if let (Some(totals), Some(project_totals)) = (result["totals"].as_object_mut(), project_result["totals"].as_object()) {
+            for (id, value) in project_totals {
+                let sum = totals.get(id).and_then(Value::as_u64).unwrap_or(0) + value.as_u64().unwrap_or(0);
+                totals.insert(id.clone(), json!(sum));
+            }
+        }
     }
-    let merged = layer::merge(&layers);
+    if ctx.format == crate::output::Format::Text { Ok(Value::String(format_text(&result))) } else { Ok(result) }
+}
+
+fn scope(ctx: &mut Context, params: &Params, layers: &[layer::Layer], project: Option<&std::path::Path>, fallback_enabled: Option<Vec<String>>) -> Result<Value, MusterError> {
+    let mut merged = layer::merge(layers);
+    if merged.agents.enabled.is_none() { merged.agents.enabled = fallback_enabled; }
     let selected = if let Some(id) = params.get_string("agent") {
         let adapter = adapters::find(id).ok_or_else(|| MusterError::Usage(format!("unknown agent `{id}`")))?;
         if !adapter.available() { return Err(MusterError::Unavailable(format!("agent `{id}` is unavailable"))); }
@@ -81,7 +94,7 @@ fn effective(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
                 }
                 let mut current = Current::new();
                 for file in adapter.files {
-                    if let Ok(content) = std::fs::read_to_string(roots.resolve(file)) {
+                    if let Ok(content) = std::fs::read_to_string(locate_file(&roots, file, project)) {
                         current.insert(file.path, content);
                     }
                 }
@@ -91,7 +104,7 @@ fn effective(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
                     .iter()
                     .filter(|f| f.file.format == adapters::FileFormat::Markdown)
                     .map(|f| {
-                        let path = roots.resolve(f.file);
+                        let path = locate_file(&roots, f.file, project);
                         let state = match current.get(f.file.path) {
                             None => "missing",
                             Some(old) if old == &f.contents => "in_sync",
@@ -127,7 +140,7 @@ fn effective(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         for &adapter in &selected {
             let mut current = Current::new();
             for file in adapter.files {
-                if let Ok(content) = std::fs::read_to_string(roots.resolve(file)) {
+                if let Ok(content) = std::fs::read_to_string(locate_file(&roots, file, project)) {
                     current.insert(file.path, scrub_mcp_secrets(&content, name, server));
                 }
             }
@@ -208,7 +221,7 @@ fn effective(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
             for &adapter in &selected {
                 let rendered = adapter.render(&desired, &Current::new())?;
                 if let Some(file) = rendered.tree.first() {
-                    let path = roots.base(file.base).join(&file.path);
+                    let path = locate_tree(&roots, file, project);
                     let state = match std::fs::read_to_string(path) {
                         Err(_) => "missing", Ok(current) if current == file.contents => "in_sync", Ok(_) => "drifted"
                     };
@@ -221,7 +234,13 @@ fn effective(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     }
     let mut skill_views = Vec::new();
     let mut skill_dirs = BTreeMap::new();
-    let listed = (crate::commands::skill::LIST.handler)(ctx, &Params::default())?;
+    let listed = if project.is_some() {
+        let mut names: Vec<_> = merged.skills_path()?.into_iter().flat_map(|dir| std::fs::read_dir(dir).into_iter().flatten().flatten())
+            .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
+            .filter_map(|entry| entry.file_name().into_string().ok()).collect();
+        names.sort();
+        json!({"skills": names.into_iter().map(|name| json!({"name": name})).collect::<Vec<_>>()})
+    } else { (crate::commands::skill::LIST.handler)(ctx, &Params::default())? };
     let lock = crate::skills::SkillsLock::load(&ctx.config_dir)?;
     if let Some(dir) = merged.skills_path()? {
         if let Some(items) = listed["skills"].as_array() {
@@ -281,7 +300,7 @@ fn effective(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
                     let paths: Vec<_> = rendered
                         .tree
                         .iter()
-                        .map(|f| (roots.base(f.base).join(&f.path), &f.contents))
+                        .map(|f| (locate_tree(&roots, f, project), &f.contents))
                         .collect();
                     let state = if paths.is_empty() || paths.iter().any(|(p, _)| !p.exists()) {
                         "missing"
@@ -328,24 +347,7 @@ fn effective(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         (adapter.id, instruction_tokens + skill_tokens)
     }).collect();
     let result = json!({"totals": totals, "subagents": subagent_views, "mcp": mcp_views, "extra_on_disk": extra_on_disk, "skills": skill_views, "layers": layers.iter().map(|l| json!({"kind": l.kind, "name": l.name})).collect::<Vec<_>>(), "instructions": instructions});
-    if ctx.format == crate::output::Format::Text {
-        let mut text = String::new();
-        for (heading, key) in [("Instructions", "instructions"), ("Skills", "skills"), ("MCP", "mcp"), ("Subagents", "subagents")] {
-            text.push_str(&format!("{heading}\n"));
-            if let Some(items) = result[key].as_array() {
-                for item in items {
-                    let name = item["name"].as_str().or_else(|| item["source"].as_str()).unwrap_or("");
-                    text.push_str(&format!("  {name}\n"));
-                    if let Some(adapters) = item["adapters"].as_object() {
-                        for (id, view) in adapters { text.push_str(&format!("    {id}: {}\n", view["state"].as_str().unwrap_or("unknown"))); }
-                    }
-                }
-            }
-        }
-        text.push_str("Totals\n");
-        for (id, tokens) in totals { text.push_str(&format!("  {id}: {tokens} tokens\n")); }
-        Ok(Value::String(text))
-    } else { Ok(result) }
+    Ok(result)
 }
 
 fn scrub_mcp_secrets(content: &str, name: &str, server: &crate::adapters::config::McpServer) -> String {
@@ -367,4 +369,30 @@ fn scrub_mcp_secrets(content: &str, name: &str, server: &crate::adapters::config
         return value.to_string();
     }
     content.to_owned()
+}
+
+fn format_text(result: &Value) -> String {
+    let mut text = String::new();
+        for (heading, key) in [("Instructions", "instructions"), ("Skills", "skills"), ("MCP", "mcp"), ("Subagents", "subagents")] {
+            text.push_str(&format!("{heading}\n"));
+            if let Some(items) = result[key].as_array() {
+                for item in items {
+                    let name = item["name"].as_str().or_else(|| item["source"].as_str()).unwrap_or("");
+                    text.push_str(&format!("  {name}\n"));
+                    if let Some(adapters) = item["adapters"].as_object() {
+                        for (id, view) in adapters { text.push_str(&format!("    {id}: {}\n", view["state"].as_str().unwrap_or("unknown"))); }
+                    }
+                }
+            }
+        }
+        text.push_str("Totals\n");
+        for (id, tokens) in result["totals"].as_object().unwrap() { text.push_str(&format!("  {id}: {tokens} tokens\n")); }
+    text
+}
+
+fn locate_file(roots: &Roots, file: &adapters::ManagedFile, project: Option<&std::path::Path>) -> std::path::PathBuf {
+    project.and_then(|p| file.project.map(|path| p.join(path))).unwrap_or_else(|| roots.resolve(file))
+}
+fn locate_tree(roots: &Roots, file: &adapters::RenderedTreeFile, project: Option<&std::path::Path>) -> std::path::PathBuf {
+    project.and_then(|p| file.project.as_ref().map(|path| p.join(path))).unwrap_or_else(|| roots.base(file.base).join(&file.path))
 }
