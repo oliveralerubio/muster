@@ -502,8 +502,11 @@ agent's separately loaded user-scope configuration.
 `usage` reads local session transcripts without network access and reports
 observed skill, MCP server and subagent use (`uses`, `sessions`, `last_used`,
 and per-agent breakdown), `sessions_scanned`, `sources` (`supported` for Claude
-Code skills/MCP/subagents, `partial` for Codex skills and `mcp_tool_call_end`
-MCP invocations, `unsupported` for OpenCode and Antigravity, plus
+Code skills/MCP/subagents, `partial` for Codex skills (both `exec`
+custom tool calls and `exec_command`/`shell_command`/`shell` function calls
+that read a `SKILL.md` with `cat`/`sed`/`head`/`less`/`bat`/`rg`) and
+`mcp_tool_call_end` MCP invocations, `unsupported` for OpenCode and
+Antigravity, plus
 `malformed_lines` and aggregate `skipped` counts for `older_than_window`,
 `too_large`, and `unreadable`; transcript paths are never emitted), and `unused`
 managed items with `muster disable <kind>:<name>`

@@ -122,6 +122,19 @@ pub(super) fn scan_codex(
                 }
                 continue;
             }
+            if record["type"] == "response_item" && payload["type"] == "function_call" {
+                // Shell-style function calls that read a skill's SKILL.md with
+                // a reader command. Only the skill name is extracted; the
+                // arguments are never copied anywhere.
+                if matches!(
+                    payload["name"].as_str(),
+                    Some("exec_command" | "shell_command" | "shell")
+                ) {
+                    let arguments = payload["arguments"].to_string();
+                    count_skill_reads(&arguments, timestamp, session, counts);
+                }
+                continue;
+            }
             if record["type"] != "response_item"
                 || payload["type"] != "custom_tool_call"
                 || payload["name"] != "exec"
@@ -131,24 +144,42 @@ pub(super) fn scan_codex(
             let Some(input) = payload["input"].as_str() else {
                 continue;
             };
-            if !input.contains("tools.exec_command") || !input.contains("cat ") {
+            if !input.contains("tools.exec_command") {
                 continue;
             }
-            for suffix in input.split("/skills/").skip(1) {
-                let Some((name, _)) = suffix.split_once("/SKILL.md") else {
-                    continue;
-                };
-                if !valid_item_name(name) {
-                    continue;
-                }
-                let count = counts.entry(("skill".into(), name.into())).or_default();
-                count.uses += 1;
-                let breakdown = count.agents.entry("codex".into()).or_default();
-                breakdown.0 += 1;
-                breakdown.1.insert(session.clone());
-                count.sessions.insert(session.clone());
-                count.last = Some(count.last.map_or(timestamp, |t| t.max(timestamp)));
-            }
+            count_skill_reads(input, timestamp, session, counts);
         }
+    }
+}
+
+/// Count skill reads in a command string: a reader command
+/// (`cat`/`sed`/`head`/`less`/`bat`/`rg`) mentioning `.../skills/<name>/SKILL.md`.
+/// Only the extracted name is ever stored.
+fn count_skill_reads(
+    text: &str,
+    timestamp: OffsetDateTime,
+    session: &str,
+    counts: &mut BTreeMap<(String, String), Count>,
+) {
+    let reads_with_reader = text
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|token| matches!(token, "cat" | "sed" | "head" | "less" | "bat" | "rg"));
+    if !reads_with_reader {
+        return;
+    }
+    for suffix in text.split("/skills/").skip(1) {
+        let Some((name, _)) = suffix.split_once("/SKILL.md") else {
+            continue;
+        };
+        if !valid_item_name(name) {
+            continue;
+        }
+        let count = counts.entry(("skill".into(), name.into())).or_default();
+        count.uses += 1;
+        let breakdown = count.agents.entry("codex".into()).or_default();
+        breakdown.0 += 1;
+        breakdown.1.insert(session.to_owned());
+        count.sessions.insert(session.to_owned());
+        count.last = Some(count.last.map_or(timestamp, |t| t.max(timestamp)));
     }
 }

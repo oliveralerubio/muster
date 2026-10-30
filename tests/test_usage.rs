@@ -632,3 +632,36 @@ fn privacy_rejects_unsafe_item_names_and_never_outputs_or_stores_secrets() {
     }
     assert!(!env.path().join(".local/state/muster").exists());
 }
+
+#[test]
+fn codex_function_call_skill_reads_are_counted_without_arguments() {
+    let env = MusterEnv::new();
+    let dir = env.path().join(".codex/sessions/2026/01/01");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("session.jsonl"),
+        concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"session\",\"cwd\":\"/work\"}}\n",
+            "{\"type\":\"response_item\",\"timestamp\":\"2099-01-01T00:00:00Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":[\\\"sed\\\",\\\"-n\\\",\\\"1,50p\\\",\\\"/root/.claude/skills/review/SKILL.md\\\"],\\\"token\\\":\\\"sk-proj-SECRET-SHELL-ARGS\\\"}\"}}\n",
+            "{\"type\":\"response_item\",\"timestamp\":\"2099-01-01T00:00:01Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"arguments\":\"rg -l PATTERN /root/.claude/skills/lint/SKILL.md\"}}\n",
+            "{\"type\":\"response_item\",\"timestamp\":\"2099-01-01T00:00:02Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"shell\",\"arguments\":\"python /root/.claude/skills/notcounted/SKILL.md\"}}\n",
+            "{\"type\":\"response_item\",\"timestamp\":\"2099-01-01T00:00:03Z\",\"payload\":{\"type\":\"function_call\",\"name\":\"other_tool\",\"arguments\":\"cat /root/.claude/skills/alsonotcounted/SKILL.md\"}}\n",
+        ),
+    )
+    .unwrap();
+    let (output, result) = env.run_json(&["--format", "json", "usage", "--agent", "codex"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("sk-proj-SECRET-SHELL-ARGS"), "{stdout}");
+    let names: Vec<&str> = result.result()["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|i| i["name"].as_str())
+        .collect();
+    // Only reader commands (cat/sed/head/less/bat/rg) reading a skill's
+    // SKILL.md count, whatever the function is called.
+    assert_eq!(names, vec!["lint", "review"]);
+    assert_eq!(result.result()["items"][1]["uses"], 1);
+    assert_eq!(result.result()["items"][1]["agents"]["codex"]["uses"], 1);
+}
