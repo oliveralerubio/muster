@@ -165,3 +165,29 @@ fn managed_subagent_and_server_are_reported_unused() {
     assert_eq!(result.result()["unused"][0]["name"], "docs");
     assert_eq!(result.result()["unused"][1]["name"], "reviewer");
 }
+
+#[test]
+fn codex_mcp_call_is_counted_without_exposing_arguments_or_result() {
+    let env = MusterEnv::new();
+    let dir = env.path().join(".codex/sessions/2026/01/01");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("session.jsonl"),
+        "{\"type\":\"session_meta\",\"payload\":{\"id\":\"session\",\"cwd\":\"/work\"}}\n{\"type\":\"event_msg\",\"timestamp\":\"2099-01-01T00:00:00Z\",\"payload\":{\"type\":\"mcp_tool_call_end\",\"call_id\":\"call_1\",\"invocation\":{\"server\":\"docs\",\"tool\":\"search\",\"arguments\":{\"query\":\"SECRET-MCP-ARG\"}},\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"SECRET-MCP-RESULT\"}]}}}\n",
+    )
+    .unwrap();
+    let (output, result) = env.run_json(&["--format", "json", "usage", "--agent", "codex"]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("SECRET-MCP-ARG"));
+    assert!(!stdout.contains("SECRET-MCP-RESULT"));
+    assert_eq!(result.result()["items"][0]["kind"], "mcp");
+    assert_eq!(result.result()["items"][0]["name"], "docs");
+    assert_eq!(result.result()["items"][0]["uses"], 1);
+    assert_eq!(result.result()["items"][0]["agents"]["codex"]["uses"], 1);
+    assert_eq!(
+        result.result()["items"][0]["agents"]["codex"]["sessions"],
+        1
+    );
+}
+

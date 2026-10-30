@@ -72,6 +72,21 @@ pub(super) fn scan_codex(
             };
             sessions.insert(session.clone());
             let payload = &record["payload"];
+            if record["type"] == "event_msg" && payload["type"] == "mcp_tool_call_end" {
+                if let Some(server) = payload["invocation"]["server"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                {
+                    let count = counts.entry(("mcp".into(), server.into())).or_default();
+                    count.uses += 1;
+                    let breakdown = count.agents.entry("codex".into()).or_default();
+                    breakdown.0 += 1;
+                    breakdown.1.insert(session.clone());
+                    count.sessions.insert(session.clone());
+                    count.last = Some(count.last.map_or(timestamp, |t| t.max(timestamp)));
+                }
+                continue;
+            }
             if record["type"] != "response_item"
                 || payload["type"] != "custom_tool_call"
                 || payload["name"] != "exec"
