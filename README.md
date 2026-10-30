@@ -267,8 +267,13 @@ note, and treats that agent as converged when its platform artifact is available
 
 ## Usage
 
-`muster usage --format json` summarizes local session transcripts for the last
-14 days. Use `--since 30d`, `--agent claude`, `--project DIR`, or
-`--max-file-bytes N` to narrow the scan. The report includes observed uses,
-unused managed items, and source coverage. Suggestions are advisory: transcript
-coverage can be incomplete, and `muster disable` is provided separately.
+`muster usage [--since 14d] [--agent ID] [--project DIR] [--max-file-bytes N]`
+scans local session transcripts on this machine without network access and
+reports per-item `uses`, `sessions`, `last_used`, per-agent breakdown,
+`sessions_scanned`, `sources` (with `malformed_lines` and `skipped` files by
+reason), and `unused` managed skills, MCP servers, and subagents with a
+`muster disable <kind>:<name>` suggestion. Claude Code transcripts are supported
+for skills, MCP servers, and subagents; Codex transcripts are partially
+supported (skills and MCP servers); OpenCode and Antigravity are reported as
+`unsupported`. Prompt, response, and tool argument text is never output or
+stored. Suggestions are advisory because transcript coverage can be incomplete.

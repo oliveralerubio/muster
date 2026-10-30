@@ -483,7 +483,16 @@ machine, as MCP keys do today.
 ## Local usage report
 
 `usage` reads local session transcripts without network access and reports
-observed skill, MCP server and subagent use, unused managed items and source
-coverage. The default window is 14 days; agent, project and maximum file size
-filters are available. Unverified formats are identified as unsupported and
-suggestions are advisory. Prompt and response content is not returned or stored.
+observed skill, MCP server and subagent use (`uses`, `sessions`, `last_used`,
+and per-agent breakdown), `sessions_scanned`, `sources` (`supported` for Claude
+Code skills/MCP/subagents, `partial` for Codex skills and `mcp_tool_call_end`
+MCP invocations, `unsupported` for OpenCode and Antigravity, plus
+`malformed_lines` and `skipped` files with `older_than_window`, `too_large`, or
+`unreadable`), and `unused` managed items with `muster disable <kind>:<name>`
+suggestions. The default window is 14 days; `--since`, `--agent`, `--project`,
+and `--max-file-bytes` filters are available. Suggestions are advisory because
+transcript coverage is incomplete. Session IDs are hashed in memory, item names
+are restricted to safe identifiers, and prompt, response, and argument text is
+never output or stored. See
+[docs/research/session-transcripts.md](research/session-transcripts.md) and
+[docs/security/session-usage.md](security/session-usage.md).
