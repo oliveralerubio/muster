@@ -1,0 +1,9 @@
+---
+source: tests/test_adapters.rs
+expression: "std::fs::read_to_string(env.path().join(path)).unwrap()"
+---
+<!-- BEGIN MUSTER MANAGED BLOCK: edits inside are overwritten -->
+# Shared rules
+
+Be concise.
+<!-- END MUSTER MANAGED BLOCK -->

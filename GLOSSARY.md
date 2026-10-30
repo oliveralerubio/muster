@@ -76,6 +76,9 @@ _Avoid_: "provider" unqualified when it could mean a secret provider
 A named configuration profile assigned to members, groups or machines; the fixed precedence is team → group → member → machine → project.
 _Avoid_: preset, config layer
 
+**Instruction overlay**:
+An `AGENTS.<agent-id>.md` file beside the canonical instructions that adds instructions for one agent.
+
 **Managed block**:
 The region of a Markdown file delimited by `BEGIN`/`END MUSTER MANAGED BLOCK` markers that Muster replaces on every apply; the rest of the file is preserved as the user wrote it. In JSON and TOML files the managed unit is the keys and sections Muster declares.
 _Avoid_: heredoc, section

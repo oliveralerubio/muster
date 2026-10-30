@@ -168,6 +168,16 @@ Everything the UI does has a CLI equivalent, and every ordinary command answers 
 
 To keep an agent's user-scope instructions personal, set `skip_instructions = ["hermes"]` under `[agents]`. For only one machine, set it under `[profiles.personal.agents]` and assign that profile to the machine. This leaves Hermes `~/.hermes/SOUL.md` untouched except for removing any previously managed block; MCP, models, and skills still sync. Project-scope instructions are unaffected. Higher-precedence lists replace lower ones; use `skip_instructions = []` to clear the setting.
 
+## Instruction overlays
+
+Place `AGENTS.<agent-id>.md` next to the canonical `AGENTS.md` to add instructions for one agent. For example, `AGENTS.claude.md` adds instructions for Claude. Muster warns about unknown agent IDs and skips user overlays for agents listed in `skip_instructions`.
+
+For a project, place the files in the project instruction source directory, normally `.muster/`. Claude's overlay goes into `CLAUDE.md`. If multiple enabled agents share root `AGENTS.md`, Muster leaves overlays that would go into that shared file out and warns.
+
+## Why
+
+Run `muster why <text>` to find matching lines in instruction sources and native files, installed skills, and subagents. The search ignores case. Add `--regex` for a regular expression, `--agent <id>` to select an agent, or `--project <dir>` to search project scope. Use `--format json` for paths, line numbers, layers, agents, and managed status.
+
 ## AI providers
 
 Declare endpoints once and sync their settings to your machines:
