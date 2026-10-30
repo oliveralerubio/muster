@@ -128,7 +128,7 @@ fn effective(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
             let mut current = Current::new();
             for file in adapter.files {
                 if let Ok(content) = std::fs::read_to_string(roots.resolve(file)) {
-                    current.insert(file.path, content);
+                    current.insert(file.path, scrub_mcp_secrets(&content, name, server));
                 }
             }
             let empty_agents = Default::default();
@@ -346,4 +346,25 @@ fn effective(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         for (id, tokens) in totals { text.push_str(&format!("  {id}: {tokens} tokens\n")); }
         Ok(Value::String(text))
     } else { Ok(result) }
+}
+
+fn scrub_mcp_secrets(content: &str, name: &str, server: &crate::adapters::config::McpServer) -> String {
+    let secrets = |map: &BTreeMap<String, String>| map.iter().filter(|(_, value)| adapters::is_secret_reference(value)).map(|(key, _)| key.clone()).collect::<Vec<_>>();
+    let env = secrets(&server.env);
+    let headers = secrets(&server.headers);
+    if env.is_empty() && headers.is_empty() { return content.to_owned(); }
+    if let Ok(mut value) = serde_json::from_str::<Value>(content) {
+        for root in ["mcpServers", "mcp", "mcp_servers"] {
+            if let Some(entry) = value.get_mut(root).and_then(|v| v.get_mut(name)).and_then(Value::as_object_mut) {
+                for (field, keys) in [("env", &env), ("headers", &headers), ("http_headers", &headers)] {
+                    if let Some(map) = entry.get_mut(field).and_then(Value::as_object_mut) {
+                        for key in keys { map.remove(key); }
+                        if map.is_empty() { entry.remove(field); }
+                    }
+                }
+            }
+        }
+        return value.to_string();
+    }
+    content.to_owned()
 }

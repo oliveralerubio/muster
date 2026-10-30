@@ -189,3 +189,15 @@ fn effective_text_shows_compact_sections() {
     let text = String::from_utf8(output.stdout).unwrap();
     for expected in ["Instructions", "Skills", "MCP", "Subagents", "claude"] { assert!(text.contains(expected), "{text}"); }
 }
+
+#[test]
+fn effective_compares_mcp_without_disclosing_existing_secrets() {
+    let env = MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    std::fs::write(env.config_dir().join("muster.toml"), "version = 1\n[agents]\nenabled = [\"claude\"]\n[mcp.tool]\ncommand = \"tool\"\n[mcp.tool.env]\nTOKEN = \"native://app/token\"\n").unwrap();
+    std::fs::write(env.path().join(".claude.json"), r#"{"mcpServers":{"tool":{"command":"tool","env":{"TOKEN":"super-secret-value"}}}}"#).unwrap();
+    let (output, result) = env.run_json(&["effective", "--format", "json"]);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("super-secret-value"));
+    assert_eq!(result.result()["mcp"][0]["adapters"]["claude"]["state"], "in_sync");
+    assert_eq!(result.result()["mcp"][0]["secret_references"], serde_json::json!(["native://app/token"]));
+}
