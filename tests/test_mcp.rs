@@ -605,8 +605,16 @@ fn secret_values_never_appear_in_mcp_responses() {
     );
 
     // ...and neither may any other tool response.
-    for (id, tool) in (3..).zip(["status", "doctor", "plan"]) {
-        let result = server.call_tool(id, tool, json!({}));
+    let calls = [
+        ("status", json!({})),
+        ("doctor", json!({})),
+        ("plan", json!({})),
+        ("effective", json!({})),
+        ("why", json!({ "text": "muster" })),
+        ("usage", json!({})),
+    ];
+    for (id, (tool, args)) in (3..).zip(calls) {
+        let result = server.call_tool(id, tool, args);
         let text = tool_text(&result);
         assert!(
             !text.contains(SECRET_VALUE),
