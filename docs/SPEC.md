@@ -318,12 +318,15 @@ Comandos de primer nivel:
 | `plan` / `sync` | Ver y aplicar cambios |
 | `rollback` | Volver a una generación anterior |
 | `status` | Estado de la flota |
+| `effective [--project DIR] [--agent ID]` | Consultar capas, origen y estado en disco por adaptador de la configuración activa |
 | `doctor` | Diagnóstico |
 | `ui` | Abrir la interfaz web |
 | `mcp` | Arrancar el servidor MCP |
 | `schema` | Exportar el JSON Schema |
 
 Opciones globales: `--config`, `--format text|json`, `--yes`, `--dry-run` (en todo lo que modifique algo), `--quiet` y `--verbose`.
+
+`effective` es de solo lectura. Incluye instrucciones, skills, MCP, subagentes, elementos no gestionados en disco y totales aproximados de tokens. Los estados por adaptador son `in_sync`, `drifted`, `missing`, `skipped` e `installed`. La pestaña Effective del panel muestra la misma información.
 
 - **Precedencia de valores:** opciones de CLI > variables `MUSTER_*` > manifiesto > valores por defecto.
 - **Salida JSON:** un único objeto en stdout con `schema_version`, `command`, `ok`, `result` y `diagnostics`. Cada diagnóstico tiene `code`, `message`, `severity` y `path` opcional. El progreso va a stderr.
