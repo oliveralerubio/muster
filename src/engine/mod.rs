@@ -166,6 +166,30 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
         None => enabled_adapters(Some(&merged.agents))?,
     };
     let instructions = read_instructions(ctx, &merged)?;
+    let source = merged.instructions_path()?.0;
+    if let Some(dir) = source.parent() {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if let Some(id) = name
+                    .strip_prefix("AGENTS.")
+                    .and_then(|s| s.strip_suffix(".md"))
+                {
+                    if adapters::find(id).is_none() {
+                        ctx.diag(
+                            Diagnostic::new(
+                                Severity::Warning,
+                                "instructions_overlay_unknown_agent",
+                                format!("unknown adapter `{id}` in instruction overlay"),
+                            )
+                            .with_path(entry.path().display().to_string()),
+                        );
+                    }
+                }
+            }
+        }
+    }
     let (skills, skipped_skills) = read_skills(ctx, &merged)?;
     let (subagents, skipped_subagents) = read_subagents(ctx, &merged)?;
     let mut secrets = resolve_secrets(ctx, &merged.mcp);
@@ -350,11 +374,39 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
                 .skip_instructions
                 .as_ref()
                 .is_some_and(|ids| ids.iter().any(|id| id == adapter.id));
+        let overlay_path = merged
+            .instructions_path()?
+            .0
+            .with_file_name(format!("AGENTS.{}.md", adapter.id));
+        let overlay = if matches!(ctx_target, Target::Global) {
+            read_optional(&overlay_path)?
+        } else {
+            None
+        };
+        if skip_instructions && overlay.is_some() {
+            ctx.diag(
+                Diagnostic::new(
+                    Severity::Warning,
+                    "instructions_overlay_skipped",
+                    format!("instruction overlay for {} was skipped", adapter.id),
+                )
+                .with_path(overlay_path.display().to_string()),
+            );
+        }
+        let combined = match (instructions.as_deref(), overlay.as_deref()) {
+            (Some(shared), Some(extra)) => Some(format!(
+                "{}\n\n## AGENTS.{}.md\n\n{}",
+                shared.trim_end(),
+                adapter.id,
+                extra
+            )),
+            _ => instructions.clone(),
+        };
         let agent_desired = Desired {
             instructions: if skip_instructions {
                 None
             } else {
-                desired.instructions
+                combined.as_deref()
             },
             ..desired
         };
