@@ -105,3 +105,27 @@ fn project_overlay_stays_out_of_shared_instructions() {
         .iter()
         .any(|d| d["code"] == "instructions_overlay_shared_project_file"));
 }
+
+#[test]
+fn project_overlay_can_use_an_unshared_root_file() {
+    let env = MusterEnv::new();
+    let cfg = env.config_dir();
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(
+        cfg.join("muster.toml"),
+        "version = 1\n[agents]\nenabled = ['codex']\n",
+    )
+    .unwrap();
+    let project = env.path().join("project");
+    let source = project.join(".muster");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("muster.toml"), "version = 1\n").unwrap();
+    std::fs::write(source.join("AGENTS.md"), "Shared\n").unwrap();
+    std::fs::write(source.join("AGENTS.codex.md"), "Codex only\n").unwrap();
+    env.run(&["sync", "--project", project.to_str().unwrap()])
+        .assert()
+        .success();
+    assert!(std::fs::read_to_string(project.join("AGENTS.md"))
+        .unwrap()
+        .contains("Codex only"));
+}

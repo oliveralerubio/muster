@@ -209,8 +209,16 @@ fn why(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
 }
 
 fn safe_file(path: &Path) -> bool {
-    path.components().all(|c| {
-        let s = c.as_os_str().to_string_lossy().to_lowercase();
-        !s.contains("secret") && !s.contains("vault")
-    }) && std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file())
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        let name = component.as_os_str().to_string_lossy().to_lowercase();
+        if name.contains("secret") || name.contains("vault") {
+            return false;
+        }
+        current.push(component);
+        if std::fs::symlink_metadata(&current).is_ok_and(|m| m.file_type().is_symlink()) {
+            return false;
+        }
+    }
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file())
 }

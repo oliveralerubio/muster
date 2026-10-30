@@ -364,6 +364,7 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
         }
     }
     let preserve = |path: &Path| protected.iter().any(|dir| path.starts_with(dir));
+    let enabled_project_agents = enabled_adapters(Some(&merged.agents))?.len();
     let mut entries: BTreeMap<PathBuf, Entry> = BTreeMap::new();
     let mut agents = BTreeMap::new();
     for adapter in &selected {
@@ -380,7 +381,9 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
             .with_file_name(format!("AGENTS.{}.md", adapter.id));
         let overlay = read_optional(&overlay_path)?;
         let project_overlay = matches!(ctx_target, Target::Project(_));
-        if project_overlay && adapter.id != "claude" && overlay.is_some() {
+        let shared_project_overlay = project_overlay && adapter.id != "claude";
+        let project_file_shared = shared_project_overlay && enabled_project_agents > 1;
+        if project_file_shared && overlay.is_some() {
             ctx.diag(
                 Diagnostic::new(
                     Severity::Warning,
@@ -405,7 +408,7 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
         }
         let combined = match (
             instructions.as_deref(),
-            if project_overlay {
+            if project_file_shared || (project_overlay && adapter.id == "claude") {
                 None
             } else {
                 overlay.as_deref()
