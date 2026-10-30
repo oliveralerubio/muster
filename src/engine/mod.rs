@@ -143,8 +143,10 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
     };
     // The single place layers become desired state.
     let mut merged = layer::merge(&layers);
+    let mut inherited_known: BTreeSet<(&'static str, String)> = BTreeSet::new();
     if matches!(options.target, Target::Project(_)) {
         let global = layer::global_merge(&ctx.config_dir, &ctx.state_dir, &manifest);
+        inherited_known = user_scope_names(&global);
         let mut toggles = global.toggles;
         toggles.extend(merged.toggles);
         merged.toggles = toggles;
@@ -192,7 +194,11 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
         for item in toggles.disable.iter().chain(&toggles.enable) {
             let (kind, name, _) =
                 crate::adapters::config::parse_toggle(item).expect("validated toggle");
-            if !known.contains(&(kind, name)) {
+            // A project run also inherits global and machine toggles, whose
+            // items live in user scope: known either here or there is no typo.
+            if !known.contains(&(kind, name))
+                && !inherited_known.contains(&(kind, name.to_string()))
+            {
                 ctx.diag(Diagnostic::new(
                     Severity::Warning,
                     "toggle_unknown_item",
@@ -1421,6 +1427,41 @@ fn read_instructions(
             Ok(None)
         }
     }
+}
+
+/// Names of the skills, subagents and MCP servers declared in user scope (the
+/// global merge). Names are listed without validation or diagnostics: the
+/// `toggle_unknown_item` warning for a project run only asks whether an
+/// inherited toggle names something that exists in either scope.
+fn user_scope_names(merged: &layer::Merged) -> BTreeSet<(&'static str, String)> {
+    let mut names = BTreeSet::new();
+    if let Ok(Some(dir)) = merged.skills_path() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                if let Some(name) = entry.file_name().to_str() {
+                    if !crate::skills::is_ignored_skill_name(name, true) {
+                        names.insert(("skill", name.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    if let Ok(Some(dir)) = merged.subagents_path() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("md") {
+                if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
+                    if !name.starts_with('.') {
+                        names.insert(("subagent", name.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    for name in merged.mcp.keys() {
+        names.insert(("mcp", name.clone()));
+    }
+    names
 }
 
 /// Files of every skill under `[agents.skills] source`: one subdirectory per

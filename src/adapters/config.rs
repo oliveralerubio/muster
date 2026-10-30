@@ -64,12 +64,12 @@ pub fn parse_toggle(item: &str) -> Result<(&str, &str, Option<&str>), String> {
         Some((name, agent)) => (name, Some(agent)),
         None => (rest, None),
     };
-    if name.is_empty()
-        || name
-            .chars()
-            .any(|c| c.is_whitespace() || c.is_control() || c == ':' || c == '@')
-    {
-        return Err(format!("invalid toggle name in `{item}`"));
+    if !is_valid_item_name(name) {
+        return Err(format!(
+            "invalid toggle name `{name}` in `{item}`: names are lowercase letters \
+             or digits first, then lowercase letters, digits, `.`, `_` or `-` \
+             (no `/`, `\\`, `..` or leading punctuation)"
+        ));
     }
     if let Some(agent) = agent {
         if crate::adapters::find(agent).is_none() {
@@ -77,6 +77,22 @@ pub fn parse_toggle(item: &str) -> Result<(&str, &str, Option<&str>), String> {
         }
     }
     Ok((kind, name, agent))
+}
+
+/// A toggle item name is matched against file and directory names (skills,
+/// subagents) and table keys (MCP servers), so it follows the identifier rule
+/// of `is_valid_agent_name`/`machine::validate_name`: a lowercase letter or
+/// digit first, then lowercase letters, digits, dots, underscores or hyphens.
+/// `/`, `\\` and `..` are rejected so a name can never traverse a path.
+fn is_valid_item_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_lowercase() || first.is_ascii_digit() => {}
+        _ => return false,
+    }
+    name.chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
+        && !name.contains("..")
 }
 
 /// `[agents.skills]`: a directory of the config repository holding one

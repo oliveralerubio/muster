@@ -408,3 +408,91 @@ fn team_manifest_toggle_requires_an_admin() {
         .unwrap()
         .contains("toggles"));
 }
+
+#[test]
+fn unsafe_toggle_names_are_rejected() {
+    let env = MusterEnv::new();
+    let dir = env.config_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("muster.toml"), "version = 1\n").unwrap();
+    let before = std::fs::read_to_string(dir.join("muster.toml")).unwrap();
+    for item in [
+        "skill:../x",
+        "skill:x/y",
+        "skill:x\\y",
+        "skill:..",
+        "skill:UPPER",
+        "skill:-lead",
+        "skill:.hidden",
+        "subagent:two..dots",
+    ] {
+        let (output, envelope) = env.run_json(&["disable", item, "--yes", "--format", "json"]);
+        assert_eq!(output.status.code(), Some(2), "{item}");
+        let diagnostics = envelope.diagnostics().to_string();
+        assert!(
+            diagnostics.contains("invalid toggle name"),
+            "{item}: {diagnostics}"
+        );
+    }
+    assert_eq!(
+        before,
+        std::fs::read_to_string(dir.join("muster.toml")).unwrap()
+    );
+}
+
+#[test]
+fn manifest_rejects_unsafe_toggle_names() {
+    let env = MusterEnv::new();
+    let dir = env.config_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("muster.toml"),
+        "version = 1\n[agents.toggles]\ndisable = ['skill:../x']\n",
+    )
+    .unwrap();
+    let (output, envelope) = env.run_json(&["plan", "--format", "json"]);
+    assert_eq!(output.status.code(), Some(3));
+    assert!(envelope
+        .diagnostics()
+        .to_string()
+        .contains("invalid toggle name"));
+}
+
+#[test]
+fn project_plan_does_not_warn_for_inherited_global_items() {
+    let env = MusterEnv::new();
+    let dir = env.config_dir();
+    std::fs::create_dir_all(dir.join("skills/pdf")).unwrap();
+    std::fs::write(
+        dir.join("skills/pdf/SKILL.md"),
+        "---\nname: pdf\ndescription: PDF\n---\nPDF\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("muster.toml"),
+        "version = 1\n[agents]\nenabled = ['claude']\n[agents.skills]\nsource = 'skills'\n[agents.toggles]\ndisable = ['skill:pdf', 'mcp:figma']\n[mcp.figma]\ncommand = 'figma'\n",
+    )
+    .unwrap();
+    let project = env.path().join("project");
+    std::fs::create_dir_all(project.join(".muster")).unwrap();
+    std::fs::write(project.join(".muster/muster.toml"), "version = 1\n").unwrap();
+    let project_arg = project.to_str().unwrap();
+    let (output, plan) = env.run_json(&["plan", "--project", project_arg, "--format", "json"]);
+    assert!(output.status.success());
+    let diagnostics = plan.diagnostics().to_string();
+    assert!(
+        !diagnostics.contains("toggle_unknown_item"),
+        "inherited global items must not warn: {diagnostics}"
+    );
+    // A name unknown in both scopes still warns.
+    std::fs::write(
+        project.join(".muster/muster.toml"),
+        "version = 1\n[agents.toggles]\ndisable = ['skill:nope']\n",
+    )
+    .unwrap();
+    let (_, plan) = env.run_json(&["plan", "--project", project_arg, "--format", "json"]);
+    assert!(plan
+        .diagnostics()
+        .to_string()
+        .contains("toggle_unknown_item"));
+}
