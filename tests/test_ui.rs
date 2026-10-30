@@ -1224,6 +1224,65 @@ fn secret_approval_requires_a_human_and_leases_expire_and_revoke() {
 }
 
 #[test]
+fn web_toggle_routes_match_cli() {
+    let env = support::MusterEnv::new();
+    std::fs::create_dir_all(env.config_dir()).unwrap();
+    std::fs::write(env.config_dir().join("muster.toml"), "version = 1\n").unwrap();
+    let mut ui = Ui::start(&env);
+    let cookie = ui_session_cookie(&mut ui);
+    let manifest = || std::fs::read_to_string(env.config_dir().join("muster.toml")).unwrap();
+
+    // Unconfirmed calls are refused like the CLI without --yes, and write nothing.
+    let before = manifest();
+    for path in ["/api/disable", "/api/enable"] {
+        let (status, body) = ui_post(
+            &mut ui,
+            &cookie,
+            path,
+            &serde_json::json!({"item":"skill:pdf"}),
+        );
+        assert_eq!(status, 400, "{path}: {body}");
+        assert_eq!(
+            manifest(),
+            before,
+            "{path}: unconfirmed toggle must not write"
+        );
+    }
+    // `project` is not accepted: the panel may not toggle arbitrary paths.
+    let (status, body) = ui_post(
+        &mut ui,
+        &cookie,
+        "/api/disable",
+        &serde_json::json!({"item":"skill:pdf", "project":"/tmp", "confirm":true}),
+    );
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body["diagnostics"]
+            .to_string()
+            .contains("unknown parameter"),
+        "{body}"
+    );
+    assert_eq!(manifest(), before, "project must stay hidden");
+
+    let (status, body) = ui_post(
+        &mut ui,
+        &cookie,
+        "/api/disable",
+        &serde_json::json!({"item":"skill:pdf", "confirm":true}),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["result"]["action"], "disable");
+    let (status, body) = ui_post(
+        &mut ui,
+        &cookie,
+        "/api/enable",
+        &serde_json::json!({"item":"skill:pdf", "confirm":true}),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["result"]["action"], "enable");
+}
+
+#[test]
 fn usage_api_matches_cli() {
     let env = support::MusterEnv::new();
     let (_, cli) = env.run_json(&["--format", "json", "usage"]);

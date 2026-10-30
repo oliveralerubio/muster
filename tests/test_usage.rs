@@ -300,6 +300,3 @@ fn privacy_rejects_unsafe_item_names_and_never_outputs_or_stores_secrets() {
     }
     assert!(!env.path().join(".local/state/muster").exists());
 }
-
-
-

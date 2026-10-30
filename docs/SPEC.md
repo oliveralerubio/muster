@@ -480,6 +480,23 @@ Antigravity or experimental adapters. Vault encryption protects keys in the
 repository; resolved keys still reside in the agent's native config on each
 machine, as MCP keys do today.
 
+## Toggles
+
+`[agents.toggles]` accepts `disable` and `enable` arrays of
+`kind:name[@adapter]`. Kinds are `skill`, `mcp`, and `subagent`. Unknown kinds
+and adapters are configuration errors. Unknown names produce a
+`toggle_unknown_item` warning. Muster evaluates each layer in precedence order,
+with adapter-specific entries taking priority within a layer. At the same
+specificity, enable takes priority over disable. A disabled item is omitted from
+the adapter's desired state and its managed output is removed on sync. The
+plan reports each disabled item and the layer that disabled it. Toggles do not
+modify `skills.lock`.
+
+`muster enable` and `muster disable` edit the team manifest by default.
+`--profile NAME` edits a profile and `--project DIR` edits the project manifest.
+Project sync applies toggles to project-scope output; it cannot remove an
+agent's separately loaded user-scope configuration.
+
 ## Local usage report
 
 `usage` reads local session transcripts without network access and reports

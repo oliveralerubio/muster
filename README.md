@@ -265,6 +265,27 @@ Agent installs keep an installed CLI newer than its `muster.lock` pin and warn
 `agent_newer_than_pin`; bump the pin to match. Status reports `kept_newer` and a
 note, and treats that agent as converged when its platform artifact is available.
 
+## Toggles
+
+Use toggles to choose which skills, MCP servers, and subagents Muster installs.
+An item has the form `kind:name` or `kind:name@adapter`.
+
+```toml
+[agents.toggles]
+disable = ["skill:pdf", "mcp:figma@codex"]
+enable = ["skill:pdf@claude"]
+```
+
+Muster evaluates the team, group, member, machine, and project layers in that
+order. Within a layer, adapter-specific entries take precedence over entries
+without an adapter. `enable` wins over `disable` at the same specificity.
+
+Run `muster disable skill:pdf` or `muster enable skill:pdf@claude` to edit the
+team manifest. Use `--profile NAME` for a profile or `--project DIR` for a
+project. Run `muster plan --format json` to see disabled items and their layers.
+A toggle does not change `skills.lock`. Sync removes disabled managed copies;
+re-enabling a skill still requires a valid lock entry.
+
 ## Usage
 
 `muster usage [--since 14d] [--agent ID] [--project DIR] [--max-file-bytes N]`
