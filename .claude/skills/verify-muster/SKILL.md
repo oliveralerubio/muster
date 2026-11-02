@@ -80,18 +80,21 @@ echo '{"name":"verify/api","confirm":true}' | $H api $RUN POST secret/reveal -  
 Exit 0 on 2xx. The helper handles the session cookie and `Host` header. Rules: POST bodies are JSON, at most
 64KB; `confirm:true` stands for `--yes` and mutating routes without it answer 400; `dry_run:true` stands for
 `--dry-run`. Every response carries `cli`, the equivalent CLI command, which is a good cross-check.
-Routes (prefix `/api/`): GET `status machines members groups profiles secrets plan proposals doctor skills`;
-POST `doctor sync rollback approve revoke machine/assign machine/rm member/{add,approve,role,profile,rm}
-group/{create,grant,revoke} secret/{add,rotate,rm,reveal} proposal/{create,accept}
-skills/{check,add,update,rm}`. Secret add/rotate bodies: `{path|(group,name), value, confirm}`; reveal:
-`{name, confirm}`. Authoritative list: `ROUTES` in `src/web/mod.rs`; reference client: `tests/test_ui.rs`.
+Routes (prefix `/api/`): GET `status why effective machines members groups profiles providers profile
+secrets secret/requests secret/leases plan proposals mcp-servers schedule doctor skills usage`;
+POST `doctor sync rollback approve revoke machine/assign machine/rm member/{add,approve,reject,role,profile,rm}
+group/{create,grant,revoke} secret/{add,rotate,rm,reveal,approve,deny,revoke} proposal/{create,accept}
+skills/{check,add,update,rm} schedule/{enable,disable} provider/{add,rm,use} mcp-server/{add,rm}
+profile/{set,rm} enable disable`. Secret add/rotate bodies: `{path|(group,name), value, confirm}`; reveal:
+`{name, confirm}`. Mutating routes need `confirm:true`; `enable`/`disable` take `{item:"kind:name[@adapter]"}`.
+Authoritative list: `ROUTES` in `src/web/mod.rs`; reference client: `tests/test_ui.rs`.
 Raw curl, if you must: `GET /?token=<T>` once, read `Set-Cookie: muster_session=...`, then send
 `Cookie:` and `Host: 127.0.0.1:<port>` on every call.
 
 ### Browser (headless Chrome, real panel)
 
 ```bash
-$H screenshot $RUN secrets secrets-view.png        # view = dashboard|machines|team|secrets|skills|profiles|history|doctor
+$H screenshot $RUN secrets secrets-view.png        # view = dashboard|machines|team|providers|secrets|skills|effective|profiles|history|doctor
 $H screenshot $RUN secrets after.png --eval "document.querySelector('#view button').click()"
 ```
 
@@ -158,6 +161,7 @@ Also remove any extra scratch you made yourself (e.g. a local upstream git repo)
 | `$H screenshot RUN VIEW OUT.png [--eval JS]` | headless Chrome screenshot of a panel view |
 | `$H tree RUN [label]` | hash sandbox files into evidence |
 | `$H leakcheck RUN NEEDLE` | assert a string is absent from sandbox files |
+| `$H mcp RUN initialize\|tools-list\|tools-call NAME [JSON]` | one JSON-RPC 2.0 message to `muster mcp` over stdio (tool envelope; exit 1 on JSON-RPC error). stdout prints the REAL reply — a successful `secret_reveal` shows the value; the evidence file gets the redacted form and never holds plaintext (failed reveals keep their diagnostics in evidence) |
 | `$H cleanup RUN [--keep-scratch]` | stop our processes, remove scratch, keep evidence |
 
 ## Feature journeys

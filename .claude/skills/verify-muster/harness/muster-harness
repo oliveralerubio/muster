@@ -8,6 +8,7 @@ Python 3 standard library only. Subcommands (run `muster-harness -h`):
   api <run-id> GET|POST PATH [JSON|@file|-]   call the web API with the session cookie
   tree <run-id> [label]                   hash config/state files into evidence
   leakcheck <run-id> NEEDLE               fail if NEEDLE appears in any sandbox file
+  mcp <run-id> initialize|tools-list|tools-call NAME [JSON]   speak JSON-RPC 2.0 to `muster mcp` over stdio
   screenshot <run-id> VIEW OUT.png [--eval JS]   headless Chrome shot of a panel view
   cleanup <run-id> [--keep-scratch]       stop ONLY our UI process, remove scratch (never evidence)
 
@@ -26,6 +27,7 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.parse
 from pathlib import Path
 
@@ -55,8 +57,10 @@ def git_head(root):
 
 class Run:
     def __init__(self, run_id):
-        if not re.fullmatch(r"[A-Za-z0-9._-]+", run_id or ""):
-            die("run-id must match [A-Za-z0-9._-]+")
+        # Strict: no dots at all, so ".", "..", "."-prefixed names and path
+        # separators are all rejected up front.
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", run_id or ""):
+            die("run-id must match [A-Za-z0-9_-]+ (letters, digits, _, -)")
         self.id = run_id
         self.scratch = SCRATCH_ROOT / run_id
         self.evidence = EVIDENCE_ROOT / run_id
@@ -219,10 +223,65 @@ def pid_alive(pid):
         return True
 
 
-def stop_pid(pid, muster_bin):
-    """SIGINT then SIGKILL, only if the pid still looks like our `muster ui`."""
+def pid_start_time(pid):
+    """Process start time (field 22 of /proc/<pid>/stat, ticks since boot) or None."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            # The comm field may contain spaces/parens; split after the last ')'.
+            after = f.read().rsplit(b")", 1)[1].split()
+        return after[19].decode()  # field 22 overall; 20 after state, -1 indexing
+    except (OSError, IndexError):
+        return None
+
+
+def pid_exe(pid):
+    try:
+        return os.path.realpath(f"/proc/{pid}/exe")
+    except OSError:
+        return None
+
+
+def process_identity(pid, muster_bin):
+    """Snapshot (pid, pid_start, exe) for a process we just spawned, so cleanup
+    can verify it later even though the pid file alone would be ambiguous."""
+    return {"pid": pid, "pid_start": pid_start_time(pid),
+            "bin": str(Path(muster_bin).resolve())}
+
+
+def read_pid_file(path):
+    """Read a pid file as (pid, recorded_start, exe) with graceful fallback."""
+    text = None
+    try:
+        text = path.read_text().strip()
+    except OSError:
+        return None, None, None
+    try:
+        raw = json.loads(text)
+    except ValueError:
+        raw = None
+    if isinstance(raw, dict):
+        return raw.get("pid"), raw.get("pid_start"), raw.get("bin")
+    try:
+        return int(text), None, None
+    except ValueError:
+        return None, None, None
+
+
+def stop_pid(pid, muster_bin, expected_start=None):
+    """SIGINT then SIGKILL, but ONLY if the pid is verifiably the process we
+    launched: the exact executable must be MUSTER_BIN and, when known, the
+    recorded start time must match (so a recycled pid is never killed)."""
     if not pid_alive(pid):
         return "already-gone"
+    bin_path = str(Path(muster_bin).resolve())
+    exe = pid_exe(pid)
+    if exe != bin_path:
+        return f"refused (pid {pid} exe {exe!r} != {bin_path!r})"
+    if expected_start is not None:
+        started = pid_start_time(pid)
+        if started != expected_start:
+            return (f"refused (pid {pid} start time {started!r} != recorded "
+                    f"{expected_start!r}: pid was recycled)")
     cmd = ps_command(pid)
     if not cmd or " ui" not in cmd or "muster" not in cmd:
         return f"refused (pid {pid} is no longer our muster ui: {cmd!r})"
@@ -259,6 +318,10 @@ def cmd_launch(a):
         die(f"muster init failed ({r.returncode}): {r.stderr.strip()[:500]}")
     pid, port, token = start_ui(run, muster_bin, "ui.log")
     meta = {"run_id": run.id, "pid": pid, "port": port, "bin": str(muster_bin),
+            "pid_start": pid_start_time(pid),
+            # Per-process identity so cleanup never mixes the main UI's start
+            # time with the screenshot UI's pid (they are different processes).
+            "processes": {"ui": process_identity(pid, muster_bin)},
             "repo_root": str(root), "head": git_head(root), "started": time.time()}
     (run.scratch / "ui.pid").write_text(str(pid))
     (run.scratch / "ui.port").write_text(str(port))
@@ -368,7 +431,10 @@ def cmd_api(a):
             body = Path(a.body[1:]).read_text()
         else:
             body = a.body
-        json.loads(body)  # fail early on malformed JSON
+        try:
+            json.loads(body)  # fail early on malformed JSON
+        except ValueError as e:
+            die(f"request body is not valid JSON: {e}")
     status, _, raw = http(meta["port"], method, path, cookie, body)
     shown = "<withheld: reveal response holds plaintext>" if "reveal" in path else redact_text(raw)
     ev = (f"{method} {path}\n"
@@ -515,7 +581,8 @@ def cmd_screenshot(a):
         out = run.evidence / out
     out.parent.mkdir(parents=True, exist_ok=True)
     pid, port, token = start_ui(run, Path(meta["bin"]), f"ui-shot-{int(time.time())}.log")
-    (run.scratch / "ui-shot.pid").write_text(str(pid))
+    (run.scratch / "ui-shot.pid").write_text(json.dumps(
+        process_identity(pid, Path(meta["bin"]))))
     profile = run.scratch / f"chrome-{int(time.time())}"
     profile.mkdir()
     chrome = None
@@ -580,6 +647,99 @@ def cmd_screenshot(a):
             pass
 
 
+def cmd_mcp(a):
+    """Run `muster mcp` in the sandbox and exchange one JSON-RPC message over stdio.
+    `initialize` is sent first (unless it IS the request) so the client agent id is known."""
+    run = Run(a.run_id)
+    meta = run.meta()
+    init = json.dumps({"jsonrpc": "2.0", "id": 0, "method": "initialize",
+                       "params": {"protocolVersion": "2025-06-18",
+                                  "clientInfo": {"name": "claude-code (muster-harness)"}}})
+    msg_id = 1
+    if a.action == "initialize":
+        body = {"method": "initialize",
+                "params": {"protocolVersion": "2025-06-18",
+                           "clientInfo": {"name": "claude-code (muster-harness)"}}}
+    elif a.action == "tools-list":
+        body = {"method": "tools/list", "params": {}}
+    elif a.action == "tools-call":
+        if not a.name:
+            die("usage: mcp <run-id> tools-call <tool-name> [JSON-arguments]")
+        try:
+            arguments = json.loads(a.body) if a.body else {}
+        except ValueError as e:
+            die(f"MCP arguments are not valid JSON: {e}")
+        if not isinstance(arguments, dict):
+            die("MCP arguments must be a JSON object")
+        body = {"method": "tools/call",
+                "params": {"name": a.name, "arguments": arguments}}
+    else:
+        die(f"unknown mcp action {a.action!r}")
+    msg = json.dumps({"jsonrpc": "2.0", "id": msg_id, **body})
+    stdin = (init + "\n" if a.action != "initialize" else "") + msg + "\n"
+    r = subprocess.run([meta["bin"], "--format", "json", "mcp"], env=run.env(),
+                       input=stdin, capture_output=True, text=True, timeout=60,
+                       cwd=str(run.home))
+    lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
+    replies = []
+    for ln in lines:
+        try:
+            replies.append(json.loads(ln))
+        except ValueError:
+            pass
+    reply = next((m for m in replies if m.get("id") == msg_id), None)
+    # A tools/call reply carries the tool envelope inside result.content[0].text.
+    envelope = None
+    if reply and a.action == "tools-call" and "error" not in reply:
+        try:
+            blocks = reply["result"]["content"]
+            envelope = json.loads(blocks[0]["text"])
+        except (KeyError, IndexError, TypeError, ValueError):
+            envelope = None
+    result = reply.get("result") if reply else None
+    failed = (reply is None
+              or "error" in reply
+              or (isinstance(result, dict) and result.get("isError") is True)
+              or (isinstance(envelope, dict) and envelope.get("ok") is False))
+    # stdout always shows the real reply (so the calling agent can see the
+    # revealed dummy value and secret_approval_required diagnostics); the
+    # evidence file gets the redacted form. In redaction only the secret VALUE
+    # payload of a SUCCESSFUL secret_reveal is withheld: error diagnostics
+    # (code, message, hint, request id) stay in evidence so the lease flow can
+    # be followed. Evidence NEVER holds reveal plaintext.
+    if a.action == "tools-call" and a.name == "secret_reveal":
+        revealed_ok = envelope is not None and envelope.get("ok") is True
+        if revealed_ok:
+            ev_shown = json.dumps({**redact(reply),
+                                   "result": "<withheld: secret_reveal value>"},
+                                  indent=2) if reply else r.stdout
+        else:
+            # A failed reveal carries only diagnostics (code, message, hint,
+            # request id) — keep them whole in evidence.
+            ev_shown = json.dumps(reply, indent=2) if reply else r.stdout
+        ev_envelope = ("<withheld: secret_reveal value>" if revealed_ok else
+                       (json.dumps(envelope, indent=2) if envelope is not None else None))
+    else:
+        ev_shown = json.dumps(reply, indent=2) if reply else r.stdout
+        ev_envelope = json.dumps(envelope, indent=2) if envelope is not None else None
+    shown = json.dumps(reply, indent=2) if reply else r.stdout
+    env_summary = ev_envelope
+    ev = (f"stdin: {msg}\nexit={r.returncode}\n--- response\n{ev_shown}\n"
+          + (f"--- tool envelope\n{env_summary}\n" if env_summary is not None else "")
+          + f"--- outcome\n{'FAIL' if failed else 'PASS'}\n"
+          f"--- stderr\n{r.stderr}")
+    path = run.evidence_write("mcp", ev)
+    print(shown)
+    if r.stderr:
+        sys.stderr.write(r.stderr)
+    print(f"[exit={1 if failed else 0} evidence={path}]", file=sys.stderr)
+    if reply is None:
+        die(f"no JSON-RPC reply with id {msg_id}", 1)
+    if failed:
+        sys.exit(1)
+    sys.exit(0)
+
+
 def cmd_cleanup(a):
     run = Run(a.run_id)
     if not run.scratch.exists():
@@ -591,16 +751,51 @@ def cmd_cleanup(a):
     for name in ("ui.pid", "ui-shot.pid"):
         f = run.scratch / name
         if f.exists():
-            pids.append(int(f.read_text().strip()))
-    for pid in pids:
-        print(f"pid {pid}: {stop_pid(pid, muster_bin)}")
+            pid, start, exe = read_pid_file(f)
+            if pid is None:
+                print(f"warning: unparseable pid file {f}")
+                continue
+            # Prefer the per-process identity recorded at spawn time; fall back
+            # to the main UI's meta for old pid files.
+            bin_path = exe or meta.get("bin", "muster")
+            if start is None and name == "ui.pid":
+                start = meta.get("pid_start")
+            pids.append((pid, start, bin_path, name))
+    stuck = []
+    for pid, start, bin_path, name in pids:
+        outcome = stop_pid(pid, bin_path, start)
+        print(f"pid {pid} ({name}): {outcome}")
+        if pid_alive(pid) and outcome not in ("stopped", "killed", "already-gone"):
+            stuck.append((pid, outcome))
     port = meta.get("port")
     if port:
-        print(f"port {port} open after stop: {port_open(port)}")
+        still_open = port_open(port)
+        print(f"port {port} open after stop: {still_open}")
+        if still_open:
+            stuck.append((port, "port still open"))
     if a.keep_scratch:
         print(f"scratch kept: {run.scratch}")
     else:
-        shutil.rmtree(run.scratch, ignore_errors=True)
+        target = run.scratch
+        # Refuse to follow a symlinked run dir: the run dir must be a real
+        # directory directly under the scratch root, or its target could be an
+        # unrelated path outside our control.
+        try:
+            st = os.lstat(target)
+        except OSError as e:
+            die(f"cannot stat {target}: {e}")
+        if not (SCRATCH_ROOT in target.parents and target.parent == SCRATCH_ROOT):
+            die(f"refusing cleanup: {target} is not inside scratch root {SCRATCH_ROOT}")
+        if os.path.islink(target) or not os.path.isdir(target):
+            die(f"refusing cleanup: {target} is not a real directory (symlink or other)")
+        evidence = run.evidence.resolve()
+        if target == evidence or evidence in target.parents or target in evidence.parents:
+            die(f"refusing cleanup: evidence {evidence} is inside removal target {target}")
+        if stuck:
+            die(f"NOT removing scratch {target}: could not stop owned process(es) "
+                + ", ".join(f"pid {p}: {o}" for p, o in stuck)
+                + "; kill it manually, then re-run cleanup")
+        shutil.rmtree(target, ignore_errors=True)
         print(f"scratch removed: {run.scratch} exists={run.scratch.exists()}")
     print(f"evidence kept: {run.evidence}")
 
@@ -612,7 +807,8 @@ def main():
     sub = p.add_subparsers(dest="cmd", required=True)
     for name, fn in (("launch", cmd_launch), ("doctor", cmd_doctor), ("cleanup", cmd_cleanup),
                      ("cli", cmd_cli), ("api", cmd_api), ("tree", cmd_tree),
-                     ("leakcheck", cmd_leakcheck), ("screenshot", cmd_screenshot)):
+                     ("leakcheck", cmd_leakcheck), ("screenshot", cmd_screenshot),
+                     ("mcp", cmd_mcp)):
         s = sub.add_parser(name)
         s.add_argument("run_id")
         s.set_defaults(fn=fn)
@@ -630,6 +826,10 @@ def main():
             s.add_argument("view")
             s.add_argument("out")
             s.add_argument("--eval", default=None)
+        elif name == "mcp":
+            s.add_argument("action", choices=["initialize", "tools-list", "tools-call"])
+            s.add_argument("name", nargs="?", default=None)
+            s.add_argument("body", nargs="?")
         elif name == "cleanup":
             s.add_argument("--keep-scratch", action="store_true")
     argv = sys.argv[1:]
@@ -640,7 +840,18 @@ def main():
     a = p.parse_args(argv)
     if a.cmd == "cli":
         a.args = tail
-    a.fn(a)
+    try:
+        a.fn(a)
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        sys.exit(130)
+    except (OSError, json.JSONDecodeError, subprocess.SubprocessError,
+            urllib.error.URLError) as e:
+        # Expected operational failure: one clean line, never a traceback.
+        print(f"error: {type(e).__name__}: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
