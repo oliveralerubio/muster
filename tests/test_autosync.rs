@@ -73,3 +73,65 @@ fn dry_run_sync_does_not_write_state() {
     assert!(!dir.join("sync.lock").exists());
     assert!(!dir.join("sync-status.json").exists());
 }
+
+#[test]
+fn schedule_pull_runs_sync_pull_and_status_reports_it() {
+    let env = support::MusterEnv::new();
+    env.fake_exe("systemctl", "exit 0");
+    let (_, plain) = env.run_json(&[
+        "--format",
+        "json",
+        "--dry-run",
+        "schedule",
+        "enable",
+        "--backend",
+        "systemd",
+    ]);
+    assert!(!plain.result()["command"].to_string().contains("--pull"));
+    env.run(&[
+        "schedule",
+        "enable",
+        "--backend",
+        "systemd",
+        "--pull",
+        "--yes",
+    ])
+    .assert()
+    .success();
+    let service =
+        std::fs::read_to_string(env.path().join(".config/systemd/user/muster-sync.service"))
+            .unwrap();
+    assert!(
+        service.contains("\"sync\" \"--pull\" \"--quiet\""),
+        "{service}"
+    );
+    assert!(!service.contains("--yes"));
+    let (_, status) = env.run_json(&["--format", "json", "schedule", "status"]);
+    assert_eq!(status.result()["pull"], true);
+}
+
+#[test]
+fn schedule_pull_is_written_to_the_launchd_plist() {
+    let env = support::MusterEnv::new();
+    env.fake_exe("launchctl", "exit 0");
+    env.run(&[
+        "schedule",
+        "enable",
+        "--backend",
+        "launchd",
+        "--pull",
+        "--yes",
+    ])
+    .assert()
+    .success();
+    let plist = std::fs::read_to_string(
+        env.path()
+            .join("Library/LaunchAgents/dev.muster.sync.plist"),
+    );
+    let plist = plist.unwrap_or_else(|_| {
+        let dir = env.path().join("Library/LaunchAgents");
+        let entry = std::fs::read_dir(dir).unwrap().next().unwrap().unwrap();
+        std::fs::read_to_string(entry.path()).unwrap()
+    });
+    assert!(plist.contains("<string>--pull</string>"), "{plist}");
+}

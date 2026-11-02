@@ -114,6 +114,16 @@ The new read-only tools use global scope: `project` is hidden, as is `usage`'s `
 - Team mode: `add`, `update`, `rm` need an admin (exit 5 otherwise); `list` and `check` are open to members.
 - Web API: `GET /api/skills`, `POST /api/skills/check|add|update|rm` (`{"confirm": true}` for update/rm).
 
+## Scheduled sync and adding machines
+
+- `muster schedule enable [--pull]` installs the systemd timer / launchd agent. With `--pull` the scheduled command is `sync --pull --quiet` (fetch and apply, never push). Scheduled runs never pass `--yes`, so new hooks/MCP servers wait for a human. `schedule status` reports `pull`.
+- `muster machine add <ssh-host> [--name N] [--role R] [--profile P] [--recovery-key-stdin]` enrolls a remote machine in one go (mutating; needs `--yes` without a terminal). It runs, over `ssh -o BatchMode=yes`: probe platform/hostname, ensure `muster` exists on the host (copied to `~/.local/bin/muster` only if OS and architecture match this machine, else it fails with an install hint), `sync --remote <origin> --pull` on the host (skipped if it already has a config repo), `enroll`, then here: pull, approve, push; finally `sync --pull` on the host.
+- Requirements: the config repo has a git remote, this machine is a fleet member (or gives the recovery key), a clean config repo, and the host has its own git access to the remote (read, plus write for the enrollment request). Muster never copies credentials, and refuses remote URLs with embedded passwords.
+- The host sync runs without `--yes`: agent installs stay pending and new hooks/MCP servers make it exit 2. The result then has `status: "enrolled_needs_approval"`, `applied: false` and `pending_approvals`; the human runs `muster sync` on the host. Nothing is auto-approved.
+- `--dry-run` prints the steps without running ssh. Tests (and unusual setups) can replace the programs with `MUSTER_SSH` / `MUSTER_SCP`.
+- Result: `machine`, `host`, `recipient`, `platform`, `status`, `steps`, `applied`, `pending_approvals`.
+- A host with no config yet can also join by hand: `muster sync --remote <url> --pull` fetches the repo without applying anything.
+
 ## Proposal Flow (Agents Proposing Changes)
 
 When an agent needs to adjust Muster configuration (e.g. adding an MCP server, tuning agent instructions, modifying dotfiles):

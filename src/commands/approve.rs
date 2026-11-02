@@ -63,6 +63,21 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     ctx.confirm(&format!("Approve enrollment of machine '{name}'?"))?;
 
     let manifest = Manifest::load(&ctx.config_dir)?;
+    let recovery = team::recovery_identity(ctx, params, &manifest)?;
+    approve_with_identity(ctx, params, recovery)
+}
+
+/// Shared approval after confirmation and recovery-key input have been handled.
+pub(super) fn approve_with_identity(
+    ctx: &mut Context,
+    params: &Params,
+    recovery: Option<Identity>,
+) -> Result<Value, MusterError> {
+    let name = params
+        .get_string("name")
+        .ok_or_else(|| MusterError::Usage("machine name is required".into()))?;
+    machine::validate_name(name)?;
+    let manifest = Manifest::load(&ctx.config_dir)?;
     if manifest.machines.contains_key(name) {
         return Err(MusterError::Usage(format!(
             "machine '{name}' is already a member of the fleet"
@@ -71,7 +86,6 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let mut req = EnrollmentRequest::load(&ctx.config_dir, name)?;
 
     // Authorization: either via caller machine identity or via recovery key.
-    let recovery = team::recovery_identity(ctx, params, &manifest)?;
     let by_recovery = recovery.is_some();
     let approver_identity = match recovery {
         Some(recovery_id) => recovery_id,

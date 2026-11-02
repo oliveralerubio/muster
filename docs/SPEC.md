@@ -311,7 +311,8 @@ Comandos de primer nivel:
 | `init` | Crear repo, identidad y bóveda |
 | `import` | Traer configuración desde BWS o chezmoi |
 | `enroll` / `approve` / `reject` / `revoke` | Altas y bajas de máquinas (`reject` descarta una solicitud de alta pendiente, sin revocar) |
-| `machine` | Gestionar máquinas |
+| `machine` | Gestionar máquinas; `machine add <host-ssh>` da de alta una máquina remota por SSH en un solo paso (une al repo, `enroll`, `approve`, `sync --pull`) |
+| `schedule` | Sincronización periódica (`enable [--pull]`: solo bajar y aplicar, nunca subir) |
 | `member` / `group` | Gestionar miembros y grupos (equipos) |
 | `secret` | Gestionar secretos |
 | `profile` | Gestionar perfiles de agentes |
