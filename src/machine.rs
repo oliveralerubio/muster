@@ -8,7 +8,7 @@ use crate::errors::MusterError;
 const NAME_FILE: &str = "machine";
 
 /// Agent CLIs Muster knows how to manage.
-pub const KNOWN_AGENTS: &[&str] = &["claude", "codex", "opencode"];
+pub const KNOWN_AGENTS: &[&str] = &["claude", "codex", "opencode", "gemini", "pi", "hermes"];
 
 /// `<os>-<arch>`, e.g. `linux-x86_64`.
 pub fn platform() -> String {

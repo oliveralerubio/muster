@@ -11,7 +11,10 @@
 pub mod claude;
 pub mod codex;
 pub mod config;
+pub mod gemini;
+pub mod hermes;
 pub mod opencode;
+pub mod pi;
 
 use std::collections::BTreeMap;
 
@@ -225,23 +228,14 @@ impl Adapter {
     }
 }
 
-static GEMINI: Adapter = Adapter {
-    id: "gemini",
-    name: "Gemini CLI",
-    experimental: true,
-    platforms: &["linux", "macos", "windows"],
-    min_version: "",
-    capabilities: &[],
-    files: &[],
-    render: None,
-};
-
 /// Every adapter Muster knows, stable ones first.
 pub static ADAPTERS: &[&Adapter] = &[
     &claude::ADAPTER,
     &codex::ADAPTER,
     &opencode::ADAPTER,
-    &GEMINI,
+    &gemini::ADAPTER,
+    &pi::ADAPTER,
+    &hermes::ADAPTER,
 ];
 
 pub fn find(id: &str) -> Option<&'static Adapter> {
@@ -410,6 +404,85 @@ mod tests {
         assert_eq!(markdown_block(Some(&second), "v2"), second, "idempotent");
         assert_eq!(strip_markdown_block(&second), "# Mine\n\ntrailing notes\n");
         assert_eq!(strip_markdown_block(&markdown_block(None, "v1")), "");
+    }
+
+    #[test]
+    fn new_adapters_render_native_files_without_overwriting_user_content() {
+        let mut agents = AgentsConfig::default();
+        agents.models.insert("pi".into(), "test-model".into());
+        let mcp = BTreeMap::from([
+            (
+                "local".into(),
+                McpServer {
+                    command: Some("node".into()),
+                    args: vec!["server.js".into()],
+                    ..Default::default()
+                },
+            ),
+            (
+                "remote".into(),
+                McpServer {
+                    url: Some("https://example.test/mcp".into()),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let secrets = BTreeMap::new();
+        let desired = Desired {
+            agents: &agents,
+            mcp: &mcp,
+            instructions: Some("Shared instructions"),
+            secrets: &secrets,
+        };
+        let current = Current::from([
+            (
+                ".gemini/config/mcp_config.json",
+                r#"{"custom":true,"mcpServers":{"manual":{"command":"keep"}}}"#.into(),
+            ),
+            (".gemini/config/AGENTS.md", "# My notes\n".into()),
+            (".pi/agent/settings.json", r#"{"theme":"dark"}"#.into()),
+            (".pi/agent/AGENTS.md", "# My notes\n".into()),
+            (".hermes/SOUL.md", "# My notes\n".into()),
+        ]);
+
+        let gemini = gemini::ADAPTER.render(&desired, &current).unwrap();
+        let config: Value = serde_json::from_str(&gemini.files[0].contents).unwrap();
+        assert_eq!(config["custom"], true);
+        assert_eq!(config["mcpServers"]["manual"]["command"], "keep");
+        assert_eq!(config["mcpServers"]["local"]["args"][0], "server.js");
+        assert_eq!(
+            config["mcpServers"]["remote"]["url"],
+            "https://example.test/mcp"
+        );
+        assert!(gemini.files[1].contents.starts_with("# My notes\n"));
+        assert!(gemini.files[1].contents.contains("Shared instructions"));
+
+        let pi = pi::ADAPTER.render(&desired, &current).unwrap();
+        let settings: Value = serde_json::from_str(&pi.files[0].contents).unwrap();
+        assert_eq!(settings["defaultModel"], "test-model");
+        assert_eq!(settings["theme"], "dark");
+        assert!(pi.files[1].contents.starts_with("# My notes\n"));
+
+        let hermes = hermes::ADAPTER.render(&desired, &current).unwrap();
+        assert_eq!(hermes.files.len(), 1);
+        assert!(hermes.files[0].contents.starts_with("# My notes\n"));
+        assert!(hermes.files[0].contents.contains("Shared instructions"));
+    }
+
+    #[test]
+    fn pi_does_not_write_settings_without_a_model() {
+        let agents = AgentsConfig::default();
+        let mcp = BTreeMap::new();
+        let secrets = BTreeMap::new();
+        let desired = Desired {
+            agents: &agents,
+            mcp: &mcp,
+            instructions: Some("Rules"),
+            secrets: &secrets,
+        };
+        let plan = pi::ADAPTER.render(&desired, &Current::new()).unwrap();
+        assert_eq!(plan.files.len(), 1);
+        assert_eq!(plan.files[0].file.path, ".pi/agent/AGENTS.md");
     }
 
     #[test]
