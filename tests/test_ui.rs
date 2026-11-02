@@ -202,6 +202,9 @@ fn ui_status_api_matches_cli_status() {
 #[test]
 fn ui_secret_reveal_requires_confirmation_and_is_recorded() {
     let env = support::MusterEnv::new();
+    env.fake_exe("claude", "echo '2.1.0 (Claude Code)'");
+    env.fake_exe("codex", "echo 'codex-cli 1.4.2'");
+    env.fake_exe("opencode", "echo '0.5.0'");
     env.run(&["--yes", "init"]).assert().success();
     let sentinel = "ui-test-secret-never-leak";
     env.run(&["--yes", "secret", "add", "ui/test", "--value-stdin"])
