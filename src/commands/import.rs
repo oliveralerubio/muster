@@ -89,6 +89,21 @@ fn conflict(ctx: &mut Context, message: String, path: String) {
 // bws
 // ---------------------------------------------------------------------------
 
+/// Normalizes a raw Bitwarden secret key into a valid Muster secret name.
+/// Replaces unsupported separators (like `/`) and strips leading non-alphanumeric chars.
+pub fn normalize_secret_name(raw: &str) -> Option<String> {
+    let trimmed = raw.trim_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let normalized = trimmed.replace('/', ".");
+    if secrets::is_name(&normalized) {
+        Some(normalized)
+    } else {
+        None
+    }
+}
+
 fn import_bws(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let project = params.get_string("project");
     let group = params.get_string("group").unwrap_or("bws").to_string();
@@ -105,10 +120,12 @@ fn import_bws(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> 
 
     let mut accepted = Vec::new();
     let mut skipped = Vec::new();
-    for (name, value) in bws_list(project)? {
-        let reason = if !secrets::is_name(&name) {
+    for (raw_name, value) in bws_list(project)? {
+        let normalized = normalize_secret_name(&raw_name);
+        let name = normalized.as_deref().unwrap_or(&raw_name);
+        let reason = if !secrets::is_name(name) {
             Some("not a valid secret name (letters, digits, `_`, `-`, `.`)")
-        } else if existing.contains(&name) || accepted.iter().any(|(n, _)| *n == name) {
+        } else if existing.contains(&name.to_string()) || accepted.iter().any(|(n, _)| n == name) {
             Some("already in the vault; use `muster secret rotate` to replace it")
         } else {
             None
@@ -119,13 +136,13 @@ fn import_bws(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> 
                     Diagnostic::new(
                         Severity::Warning,
                         "secret_skipped",
-                        format!("{group}/{name}: {reason}"),
+                        format!("{group}/{raw_name}: {reason}"),
                     )
-                    .with_path(format!("native://{group}/{name}")),
+                    .with_path(format!("native://{group}/{raw_name}")),
                 );
-                skipped.push(json!({ "name": name, "reason": reason }));
+                skipped.push(json!({ "name": raw_name, "reason": reason }));
             }
-            None => accepted.push((name, value)),
+            None => accepted.push((name.to_string(), value)),
         }
     }
     let imported: Vec<Value> = accepted
@@ -509,4 +526,27 @@ fn write(path: &Path, contents: &str) -> Result<(), MusterError> {
         std::fs::create_dir_all(parent).map_err(|e| io(parent, e))?;
     }
     std::fs::write(path, contents).map_err(|e| io(path, e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_secret_name() {
+        assert_eq!(
+            normalize_secret_name("claude/env/ANTHROPIC_AUTH_TOKEN"),
+            Some("claude.env.ANTHROPIC_AUTH_TOKEN".to_string())
+        );
+        assert_eq!(
+            normalize_secret_name("/env/marketingai/api/API_DOMAIN/"),
+            Some("env.marketingai.api.API_DOMAIN".to_string())
+        );
+        assert_eq!(
+            normalize_secret_name("SIMPLE_KEY"),
+            Some("SIMPLE_KEY".to_string())
+        );
+        assert_eq!(normalize_secret_name(""), None);
+        assert_eq!(normalize_secret_name("///"), None);
+    }
 }
