@@ -107,6 +107,23 @@ fn sync_io(e: std::io::Error) -> MusterError {
 /// The lock file remains in place: unlinking it would allow a second inode
 /// to be locked while a waiting process still owns the first one.
 fn sync(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
+    // A machine with no config yet can join a fleet with `--remote <url> --pull`:
+    // it only fetches the repo. Nothing is applied until it is enrolled, since
+    // it cannot read the fleet's secrets before that.
+    let joining = !ctx.dry_run
+        && params.get_string("remote").is_some()
+        && params.get_bool("pull")
+        && !ctx.config_dir.join(crate::manifest::FILE_NAME).exists();
+    if joining {
+        git::init_repo(&ctx.config_dir)?;
+        let joined = transport(ctx, params)?;
+        if !ctx.config_dir.join(crate::manifest::FILE_NAME).exists() {
+            return Err(MusterError::Operational(
+                "the remote has no Muster config yet; run `muster init` on the first machine and `muster sync --push`".into(),
+            ));
+        }
+        return Ok(json!({"joined": true, "applied": false, "transport": joined}));
+    }
     Manifest::load(&ctx.config_dir)?;
     let target = target(params)?;
     let transport = if ctx.dry_run {

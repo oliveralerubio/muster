@@ -879,7 +879,7 @@ fn mcp_provider_mutations_follow_the_propose_change_policy() {
         .iter()
         .map(|tool| tool["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names.len(), 7);
+    assert_eq!(names.len(), 10);
     assert!(names.contains(&"provider_list"));
     assert!(names.contains(&"propose_change"));
     for name in [

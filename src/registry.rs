@@ -104,6 +104,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     crate::commands::reject::SPEC,
     crate::commands::revoke::SPEC,
     crate::commands::machine::LIST,
+    crate::commands::machine::ADD,
     crate::commands::machine::ASSIGN,
     crate::commands::machine::RM,
     crate::commands::secret::ADD,

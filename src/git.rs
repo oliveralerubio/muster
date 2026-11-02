@@ -55,6 +55,29 @@ pub fn has_remote(dir: &Path) -> bool {
     is_repo(dir) && run(dir, &["remote", "get-url", REMOTE]).is_ok_and(|o| o.status.success())
 }
 
+/// URL of the `origin` remote.
+pub fn remote_url(dir: &Path) -> Result<String, MusterError> {
+    require_repo(dir)?;
+    let out = run(dir, &["remote", "get-url", REMOTE])?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        Err(MusterError::Usage(
+            "no remote configured; run `muster sync --remote <url>` first".into(),
+        ))
+    }
+}
+
+/// Creates `dir` and a git repository in it when there is none yet.
+pub fn init_repo(dir: &Path) -> Result<(), MusterError> {
+    std::fs::create_dir_all(dir)
+        .map_err(|e| MusterError::Operational(format!("{}: {e}", dir.display())))?;
+    if is_repo(dir) {
+        return Ok(());
+    }
+    check(dir, &["init", "--quiet"])
+}
+
 /// Adds or updates the `origin` remote.
 pub fn set_remote(dir: &Path, url: &str) -> Result<(), MusterError> {
     require_repo(dir)?;

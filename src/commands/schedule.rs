@@ -34,6 +34,13 @@ pub const ENABLE: CommandSpec = CommandSpec {
             positional: false,
         },
         ParamSpec {
+            name: "pull",
+            about: "Only pull from the remote during scheduled sync (no push)",
+            kind: ParamKind::Bool,
+            required: false,
+            positional: false,
+        },
+        ParamSpec {
             name: "backend",
             about: "auto (default), systemd, launchd or manual",
             kind: ParamKind::String,
@@ -132,18 +139,22 @@ impl Units {
 }
 
 /// The scheduled command line: this binary, this config repo, `sync`.
-fn sync_command(ctx: &Context) -> Result<Vec<String>, MusterError> {
+fn sync_command(ctx: &Context, params: &Params) -> Result<Vec<String>, MusterError> {
     let exe = std::env::current_exe()
         .map_err(|e| MusterError::Operational(format!("cannot locate the muster binary: {e}")))?;
     let config = std::path::absolute(&ctx.config_dir)
         .map_err(|e| MusterError::Operational(format!("{}: {e}", ctx.config_dir.display())))?;
-    Ok(vec![
+    let mut command = vec![
         exe.display().to_string(),
         "--config".into(),
         config.display().to_string(),
         "sync".into(),
-        "--quiet".into(),
-    ])
+    ];
+    if params.get_bool("pull") {
+        command.push("--pull".into());
+    }
+    command.push("--quiet".into());
+    Ok(command)
 }
 
 fn enable(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
@@ -156,7 +167,7 @@ fn enable(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         ));
     }
     let backend = Backend::parse(params.get_string("backend"))?;
-    let command = sync_command(ctx)?;
+    let command = sync_command(ctx, params)?;
     let units = Units::locate()?;
 
     // A dry run only previews the units; installing them needs `--yes`.
@@ -242,10 +253,16 @@ fn status(_ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
     let installed = Units::locate()?.installed();
     let backend = installed.first().map(|(b, _)| b.as_str());
     let files: Vec<&PathBuf> = installed.iter().map(|(_, p)| p).collect();
+    let pull = installed.iter().any(|(_, path)| {
+        std::fs::read_to_string(path)
+            .map(|s| s.contains("--pull"))
+            .unwrap_or(false)
+    });
     Ok(json!({
         "enabled": !installed.is_empty(),
         "backend": backend,
         "files": files,
+        "pull": pull,
     }))
 }
 
@@ -428,13 +445,26 @@ mod tests {
     }
 
     #[test]
+    fn systemd_service_preserves_pull_flag() {
+        let service = systemd_service(&[
+            "muster".into(),
+            "sync".into(),
+            "--pull".into(),
+            "--quiet".into(),
+        ]);
+        assert!(service.contains("ExecStart=\"muster\" \"sync\" \"--pull\" \"--quiet\""));
+        assert!(systemd_timer(15).contains("Unit=muster-sync.service"));
+    }
+
+    #[test]
     fn launchd_runs_hourly_and_escapes_arguments() {
         let plist = launchd_plist(
-            &["/bin/muster&test".into(), "sync".into()],
+            &["/bin/muster&test".into(), "sync".into(), "--pull".into()],
             60,
             Path::new("/tmp/state"),
         );
         assert!(plist.contains("<integer>3600</integer>"));
         assert!(plist.contains("/bin/muster&amp;test"));
+        assert!(plist.contains("<string>--pull</string>"));
     }
 }
