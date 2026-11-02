@@ -15,7 +15,14 @@ journey is never weakened.
 | `sync-schedule.md` | sync, status, periodic schedule | CLI, API, dashboard |
 | `history-rollback.md` | generations history, audit log, rollback to generation | panel, API, CLI |
 | `agents-apply.md` | write skills and config into claude / codex / opencode / antigravity | CLI, API plan |
+| `toggles.md` | enable / disable skills, MCP servers, subagents (global, per-adapter, profile, project) | panel, API, CLI |
+| `effective-why.md` | effective merged config per adapter; `why` provenance search of instructions & overlays | panel, API, CLI, MCP |
+| `usage-telemetry.md` | local transcript usage telemetry: item counts, unused items, coverage | CLI, API, panel Skills tab, MCP |
+| `mcp-server.md` | `muster mcp` stdio JSON-RPC server: read-only tools + propose_change | MCP (stdio), CLI |
+| `secret-leases.md` | runtime secret requests, human approvals, time-boxed leases, revoke | panel, API, CLI, MCP |
+| `provider-sync.md` | AI providers (kind, key as secret reference), per-agent use, native login, fleet sync | panel, API, CLI |
 
 > [!NOTE]
 > **Surfaces not in the web panel**:
 > - `import`: The `muster import` command suite (`bws`, `chezmoi`, `cuartel`) is currently CLI-only. No web panel route or tab exists for import.
+> - `usage`/`why`/`effective` (CLI-first, panel `Effective` tab for effective/why, Skills tab usage section): see `effective-why.md` and `usage-telemetry.md`.
