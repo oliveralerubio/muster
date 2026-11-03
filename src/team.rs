@@ -349,6 +349,11 @@ pub fn pending_rekeys(
         let old: BTreeSet<String> = group_recipients(before, &group).into_iter().collect();
         let desired: BTreeSet<String> = group_recipients(after, &group).into_iter().collect();
         let current: BTreeSet<String> = vault.readers(&group)?.into_iter().collect();
+        if !current.is_subset(&old) {
+            return Err(MusterError::Security(format!(
+                "unexpected vault readers for group '{group}'; review reader drift before rekeying"
+            )));
+        }
         let mut planned = current.clone();
         for removed in old.difference(&desired) {
             planned.remove(removed);
@@ -459,6 +464,7 @@ pub fn check_can_rekey(
                  run from a reader or pass --recovery-key"
             )));
         }
+        vault.verify_readers(group, identity)?;
     }
     Ok(())
 }

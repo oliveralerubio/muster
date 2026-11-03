@@ -190,12 +190,7 @@ pub const RM: CommandSpec = CommandSpec {
 
 /// Skill names follow the Agent Skills convention: lowercase, digits, '-'.
 fn validate_skill_name(name: &str) -> Result<String, MusterError> {
-    let valid = !name.is_empty()
-        && !name.starts_with('-')
-        && name
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
-    if valid {
+    if lock::is_valid_name(name) {
         Ok(name.to_string())
     } else {
         Err(MusterError::Usage(format!(
@@ -274,13 +269,55 @@ fn io_error(path: &Path, e: std::io::Error) -> MusterError {
     MusterError::Operational(format!("{}: {e}", path.display()))
 }
 
-/// Replace `dir` with exactly `files`.
-fn write_skill(dir: &Path, files: &BTreeMap<String, String>) -> Result<(), MusterError> {
-    if dir.exists() {
-        std::fs::remove_dir_all(dir).map_err(|e| io_error(dir, e))?;
+/// `<skills_dir>/<name>[/<rel>]`, refusing any path that could leave
+/// `skills_dir`: `name` must be a valid skill name and `rel` (a file inside the
+/// skill, from an upstream checkout or the lock) must be relative and made only
+/// of plain components (no `..`, root, or drive prefix).
+fn contained(skills_dir: &Path, name: &str, rel: Option<&str>) -> Result<PathBuf, MusterError> {
+    let name = validate_skill_name(name)?;
+    let mut path = skills_dir.join(name);
+    if let Some(rel) = rel {
+        let rel_path = Path::new(rel);
+        let plain = !rel.is_empty()
+            && !rel.contains('\\')
+            && !rel.chars().any(char::is_control)
+            && rel_path
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)));
+        if !plain {
+            return Err(MusterError::Security(format!(
+                "skill '{}' file path {rel:?} escapes the skill directory",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            )));
+        }
+        path = path.join(rel_path);
     }
-    for (rel, contents) in files {
-        let path = dir.join(rel);
+    if !path.starts_with(skills_dir) {
+        return Err(MusterError::Security(format!(
+            "{} is outside the skills directory {}",
+            path.display(),
+            skills_dir.display()
+        )));
+    }
+    Ok(path)
+}
+
+/// Replace `<skills_dir>/<name>` with exactly `files`. Every path is checked to
+/// stay inside `skills_dir` before anything is removed or written.
+fn write_skill(
+    skills_dir: &Path,
+    name: &str,
+    files: &BTreeMap<String, String>,
+) -> Result<(), MusterError> {
+    let dir = contained(skills_dir, name, None)?;
+    let targets = files
+        .iter()
+        .map(|(rel, contents)| Ok((contained(skills_dir, name, Some(rel))?, contents)))
+        .collect::<Result<Vec<_>, MusterError>>()?;
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).map_err(|e| io_error(&dir, e))?;
+    }
+    for (path, contents) in targets {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| io_error(parent, e))?;
         }
@@ -671,7 +708,7 @@ fn add_local(
     if ctx.dry_run {
         return Ok(result);
     }
-    write_skill(&skill_dir, &files)?;
+    write_skill(&dir, &name, &files)?;
     lock.upsert(entry);
     lock.save(&ctx.config_dir)?;
     edit_manifest(ctx, |_| Ok(()))?;
@@ -806,7 +843,7 @@ fn add_remote(
     let updated_at = now();
     let mut cache = StatusCache::load(&ctx.state_dir);
     for (name, skill) in &vendored {
-        write_skill(&dir.join(name), &skill.files)?;
+        write_skill(&dir, name, &skill.files)?;
         lock.upsert(LockEntry {
             name: name.clone(),
             origin: source_name.clone(),
@@ -1050,6 +1087,7 @@ fn update_with(
     let mut planned = Vec::new();
     let mut skipped = Vec::new();
     for entry in targets {
+        let skill_dir = contained(&dir, &entry.name, None)?;
         let refuse = |ctx: &mut Context, code: &str, message: String| -> Result<(), MusterError> {
             if named.is_some() {
                 return Err(MusterError::Usage(message));
@@ -1084,7 +1122,7 @@ fn update_with(
             skipped.push(json!({ "name": entry.name, "reason": "upstream_removed" }));
             continue;
         };
-        let disk = read_skill_files(&dir.join(&entry.name))?;
+        let disk = read_skill_files(&skill_dir)?;
         let modified = content_hash(&disk) != entry.content_hash;
         if skill.hash == content_hash(&disk)
             && skill.hash == entry.content_hash
@@ -1155,8 +1193,9 @@ fn update_with(
     let updated_at = now();
     let mut cache = StatusCache::load(&ctx.state_dir);
     for p in &planned {
-        if content_hash(&read_skill_files(&dir.join(&p.name))?) != p.skill.hash {
-            write_skill(&dir.join(&p.name), &p.skill.files)?;
+        let skill_dir = contained(&dir, &p.name, None)?;
+        if content_hash(&read_skill_files(&skill_dir)?) != p.skill.hash {
+            write_skill(&dir, &p.name, &p.skill.files)?;
         }
         lock.upsert(LockEntry {
             name: p.name.clone(),
@@ -1292,6 +1331,29 @@ fn forget_status(ctx: &mut Context, name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_skill_refuses_paths_outside_the_skills_dir() {
+        let root = tempfile::TempDir::new().unwrap();
+        let skills = root.path().join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        let ok = BTreeMap::from([("refs/a.md".to_string(), "x".to_string())]);
+        for name in ["../escape", "a/b", "..", ""] {
+            assert!(write_skill(&skills, name, &ok).is_err(), "{name:?}");
+        }
+        for rel in ["../../escape.md", "/etc/passwd", "a/../../b", "a\\b", ""] {
+            let files = BTreeMap::from([(rel.to_string(), "x".to_string())]);
+            assert!(write_skill(&skills, "good", &files).is_err(), "{rel:?}");
+        }
+        assert!(!root.path().join("escape.md").exists());
+        // A rejected file set leaves an existing skill untouched.
+        assert!(!skills.join("good").exists());
+        write_skill(&skills, "good", &ok).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(skills.join("good/refs/a.md")).unwrap(),
+            "x"
+        );
+    }
 
     #[test]
     fn source_name_defaults_from_url() {

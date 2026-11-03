@@ -10,7 +10,7 @@
 //! ```
 
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -62,6 +62,21 @@ impl Pin {
             })
         })
     }
+}
+
+/// Stable identity for an approval, scoped to the caller's target in its state.
+pub fn approval_identity(agent: &str, pin: &Pin) -> Option<String> {
+    let platform = crate::machine::platform();
+    let artifact = pin.resolve_artifact(&platform)?;
+    let identity = serde_json::to_vec(&(
+        agent,
+        &platform,
+        &pin.version,
+        &artifact.url,
+        artifact.sha256.to_ascii_lowercase(),
+    ))
+    .expect("serializing strings cannot fail");
+    Some(sha256_hex(&identity))
 }
 
 impl Lock {
@@ -331,9 +346,20 @@ pub fn installed_version(
 
 /// `file://` is read directly; `https://` goes through `curl` (exit 4 if missing).
 fn fetch(url: &str) -> Result<Vec<u8>, MusterError> {
+    const MAX_BYTES: u64 = 512 * 1024 * 1024;
     if let Some(path) = url.strip_prefix("file://") {
-        return std::fs::read(path)
-            .map_err(|e| MusterError::Operational(format!("cannot read {url}: {e}")));
+        let file = std::fs::File::open(path)
+            .map_err(|e| MusterError::Operational(format!("cannot read {url}: {e}")))?;
+        let mut bytes = Vec::new();
+        file.take(MAX_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| MusterError::Operational(format!("cannot read {url}: {e}")))?;
+        if bytes.len() as u64 > MAX_BYTES {
+            return Err(MusterError::Operational(format!(
+                "artifact from {url} exceeds size limit"
+            )));
+        }
+        return Ok(bytes);
     }
     if !url.starts_with("https://") {
         return Err(MusterError::Usage(format!(
@@ -343,19 +369,54 @@ fn fetch(url: &str) -> Result<Vec<u8>, MusterError> {
     let curl = crate::machine::find_executable("curl").ok_or_else(|| {
         MusterError::Unavailable(format!("downloading {url} needs `curl` on PATH"))
     })?;
-    let output = std::process::Command::new(curl)
-        .args(["--fail", "--silent", "--show-error", "--location", url])
+    let mut child = std::process::Command::new(curl)
+        .args([
+            "--fail",
+            "--silent",
+            "--location",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "300",
+            "--speed-limit",
+            "1024",
+            "--speed-time",
+            "30",
+            "--max-filesize",
+            "536870912",
+            "--",
+            url,
+        ])
         .stdin(std::process::Stdio::null())
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
         .map_err(|e| MusterError::Unavailable(format!("cannot run curl: {e}")))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut bytes = Vec::new();
+    let read = child
+        .stdout
+        .take()
+        .expect("piped stdout")
+        .take(MAX_BYTES + 1)
+        .read_to_end(&mut bytes);
+    if read.is_err() || bytes.len() as u64 > MAX_BYTES {
+        let _ = child.kill();
+    }
+    let status = child
+        .wait()
+        .map_err(|e| MusterError::Operational(format!("download of {url} failed: {e}")))?;
+    read.map_err(|e| MusterError::Operational(format!("download of {url} failed: {e}")))?;
+    if bytes.len() as u64 > MAX_BYTES {
         return Err(MusterError::Operational(format!(
-            "download of {url} failed: {}",
-            stderr.trim()
+            "artifact from {url} exceeds size limit"
         )));
     }
-    Ok(output.stdout)
+    if !status.success() {
+        return Err(MusterError::Operational(format!(
+            "download of {url} failed ({status})"
+        )));
+    }
+    Ok(bytes)
 }
 
 /// Atomic write (temp file + rename) with mode 0755.
@@ -382,6 +443,24 @@ fn write_executable(path: &Path, bytes: &[u8]) -> Result<(), MusterError> {
 #[cfg(test)]
 mod version_order_tests {
     use super::is_newer;
+
+    #[test]
+    fn approval_identity_changes_with_artifact() {
+        use super::{approval_identity, Pin};
+        let mut pin = Pin {
+            version: "1.0.0".into(),
+            url: Some("https://example.com/a".into()),
+            sha256: Some("a".repeat(64)),
+            bin: None,
+            artifacts: Default::default(),
+        };
+        let original = approval_identity("agent", &pin);
+        pin.url = Some("https://example.com/b".into());
+        assert_ne!(original, approval_identity("agent", &pin));
+        pin.url = Some("https://example.com/a".into());
+        pin.sha256 = Some("b".repeat(64));
+        assert_ne!(original, approval_identity("agent", &pin));
+    }
 
     #[test]
     fn compares_versions_conservatively() {

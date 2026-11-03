@@ -40,7 +40,8 @@ pub struct Record {
     pub contents: String,
 }
 
-/// Hooks, MCP server definitions and agent versions the user approved, per target.
+/// Hooks, MCP server definitions, project agent permissions and agent
+/// versions the user approved, per target.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Approved {
     #[serde(default)]
@@ -49,6 +50,9 @@ pub struct Approved {
     pub mcp: BTreeMap<String, Value>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub agents: BTreeMap<String, String>,
+    /// `[agents.permissions]` of a project layer the user approved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<Value>,
 }
 
 /// Applied state of a machine as of one generation.
