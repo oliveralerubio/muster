@@ -199,7 +199,7 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
             }
         }
     }
-    let (skills, skipped_skills) = read_skills(ctx, &merged)?;
+    let (skills, skipped_skills) = read_skills(ctx, &merged, &options.target)?;
     let (subagents, skipped_subagents) = read_subagents(ctx, &merged)?;
     let mut disabled = Vec::new();
     let known: BTreeSet<(&str, &str)> = skills
@@ -1656,6 +1656,23 @@ fn user_scope_names(merged: &layer::Merged) -> BTreeSet<(&'static str, String)> 
 /// Files of every skill under `[agents.skills] source`: one subdirectory per
 /// skill, regular files only (any depth), keyed by `/`-separated relative path.
 fn read_skills(
+    ctx: &mut Context,
+    merged: &layer::Merged,
+    target: &Target,
+) -> Result<(adapters::Skills, Vec<String>), MusterError> {
+    let (mut skills, skipped) = read_user_skills(ctx, merged)?;
+    if matches!(target, Target::Global) {
+        // Built-ins are trusted (embedded); a user skill of the same name wins.
+        for (name, files) in crate::skills::builtin::builtin_skills() {
+            if !skills.contains_key(&name) && !skipped.contains(&name) {
+                skills.insert(name, files);
+            }
+        }
+    }
+    Ok((skills, skipped))
+}
+
+fn read_user_skills(
     ctx: &mut Context,
     merged: &layer::Merged,
 ) -> Result<(adapters::Skills, Vec<String>), MusterError> {

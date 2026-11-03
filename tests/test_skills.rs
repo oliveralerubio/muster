@@ -555,3 +555,58 @@ fn edited_local_skill_warning_suggests_pin_command() {
     );
     assert!(output.contains("muster skill pin review"), "{output}");
 }
+
+const BUILTIN_MUSTER: &str = include_str!("../assets/skills/muster/SKILL.md");
+
+#[test]
+fn builtin_muster_skill_syncs_for_default_agents_without_skills_section() {
+    let env = MusterEnv::new();
+    std::fs::create_dir_all(env.config_dir()).unwrap();
+    std::fs::write(env.config_dir().join("AGENTS.md"), INSTRUCTIONS).unwrap();
+    std::fs::write(
+        env.config_dir().join("muster.toml"),
+        "version = 1\n\n[agents]\nenabled = [\"claude\", \"codex\", \"opencode\", \"antigravity\"]\n\n[agents.instructions]\nsource = \"AGENTS.md\"\n",
+    )
+    .unwrap();
+    env.run(&["agents", "apply", "--yes"]).assert().code(0);
+    for adapter in ["claude", "codex", "opencode", "antigravity"] {
+        let file = user_skills_dir(&env, adapter).join("muster/SKILL.md");
+        assert_eq!(read(&file), BUILTIN_MUSTER, "{adapter}");
+    }
+}
+
+#[test]
+fn builtin_muster_skill_syncs_alongside_user_skills() {
+    let env = MusterEnv::new();
+    seed_manifest(&env.config_dir(), &["claude"]);
+    env.run(&["agents", "apply", "--yes"]).assert().code(0);
+    let base = user_skills_dir(&env, "claude");
+    assert_eq!(read(&base.join("muster/SKILL.md")), BUILTIN_MUSTER);
+    assert_eq!(read(&base.join("review/SKILL.md")), SKILL_MD);
+}
+
+#[test]
+fn user_muster_skill_overrides_builtin() {
+    let env = MusterEnv::new();
+    seed_manifest(&env.config_dir(), &["claude"]);
+    let custom = "---\nname: muster\ndescription: Custom muster\n---\nMine.\n";
+    let dir = env.config_dir().join("skills/muster");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("SKILL.md"), custom).unwrap();
+    let files = muster::skills::read_skill_files(&dir).unwrap();
+    let mut lock = muster::skills::lock::SkillsLock::load(&env.config_dir()).unwrap();
+    lock.upsert(muster::skills::lock::LockEntry {
+        name: "muster".into(),
+        origin: "local".into(),
+        commit: None,
+        content_hash: muster::skills::content_hash(&files),
+        version: None,
+        updated_at: "2026-01-01T00:00:00Z".into(),
+    });
+    lock.save(&env.config_dir()).unwrap();
+    env.run(&["agents", "apply", "--yes"]).assert().code(0);
+    assert_eq!(
+        read(&user_skills_dir(&env, "claude").join("muster/SKILL.md")),
+        custom
+    );
+}
