@@ -83,6 +83,7 @@ pub enum Capability {
     Hooks,
     Skills,
     Subagents,
+    Packages,
 }
 
 impl Capability {
@@ -97,6 +98,7 @@ impl Capability {
             Self::Hooks => "hooks",
             Self::Skills => "skills",
             Self::Subagents => "subagents",
+            Self::Packages => "packages",
         }
     }
 }
@@ -193,6 +195,9 @@ impl Desired<'_> {
         }
         if !self.subagents.is_empty() {
             used.push(Capability::Subagents);
+        }
+        if !self.agents.packages.is_empty() {
+            used.push(Capability::Packages);
         }
         used
     }
@@ -292,8 +297,11 @@ impl Adapter {
         let mut plan = RenderPlan::default();
         for feature in desired.features() {
             if !self.supports(feature)
-                && (feature != Capability::AiProviders
-                    || desired.agents.ai_providers.contains_key(self.id))
+                && match feature {
+                    Capability::AiProviders => desired.agents.ai_providers.contains_key(self.id),
+                    Capability::Packages => desired.agents.packages.contains_key(self.id),
+                    _ => true,
+                }
             {
                 plan.diagnostics.push(
                     Diagnostic::new(

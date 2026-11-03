@@ -1,16 +1,21 @@
-//! Experimental Pi coding agent adapter (Pi 1.2.0).
+//! Pi coding agent adapter (Pi 1.2.0+).
 //!
 //! Native paths and schemas: upstream `packages/coding-agent/docs/`
 //! `configuration.md`, `mcp.md`, `settings.md` and `skills.md`.
-//! Subagents require third-party extensions, so canonical definitions, hooks
-//! and Claude-style permissions are unsupported. See docs/SPEC.md.
+//! Subagents are installed byte-exact where Pi's subagent extension discovers
+//! them (`~/.pi/agent/agents`, `.pi/agents`); the extension itself can be
+//! installed with `[agents.packages]`, which Muster writes to the `packages`
+//! array of `settings.json`. Hooks and Claude-style permissions have no native
+//! mapping and stay unsupported. See docs/SPEC.md.
+
+use std::path::Path;
 
 use serde_json::{Map, Value};
 
 use super::{
-    child_object, json_object, json_text, markdown_block, push_skills, resolve_mcp_map, transport,
-    Adapter, Base, Capability, Current, Desired, FileFormat, ManagedFile, RenderPlan, RenderedFile,
-    Scope, Transport,
+    child_object, json_object, json_text, markdown_block, push_skills, push_subagents_raw,
+    resolve_mcp_map, transport, Adapter, Base, Capability, Current, Desired, FileFormat,
+    ManagedFile, RenderPlan, RenderedFile, Scope, Transport,
 };
 use crate::errors::MusterError;
 
@@ -20,7 +25,7 @@ const MCP: ManagedFile = ManagedFile {
     project: Some(".pi/mcp.json"),
     scope: Scope::User,
     format: FileFormat::Json,
-    purpose: "Experimental Pi MCP servers (Pi 1.2.0)",
+    purpose: "Pi MCP servers",
 };
 const SETTINGS: ManagedFile = ManagedFile {
     base: Base::Home,
@@ -28,7 +33,7 @@ const SETTINGS: ManagedFile = ManagedFile {
     project: Some(".pi/settings.json"),
     scope: Scope::User,
     format: FileFormat::Json,
-    purpose: "Experimental Pi default model/provider",
+    purpose: "Pi default model/provider and packages",
 };
 const INSTRUCTIONS: ManagedFile = ManagedFile {
     base: Base::Home,
@@ -43,7 +48,7 @@ pub static ADAPTER: Adapter = Adapter {
     id: "pi",
     name: "Pi",
     binary: "pi",
-    experimental: true,
+    experimental: false,
     platforms: &["linux", "macos"],
     min_version: "1.2.0",
     capabilities: &[
@@ -52,6 +57,8 @@ pub static ADAPTER: Adapter = Adapter {
         Capability::McpRemote,
         Capability::Models,
         Capability::Skills,
+        Capability::Subagents,
+        Capability::Packages,
     ],
     files: &[MCP, SETTINGS, INSTRUCTIONS],
     render: Some(render),
@@ -88,17 +95,28 @@ fn render(desired: &Desired, current: &Current, plan: &mut RenderPlan) -> Result
         contents: json_text(object),
     });
 
-    if let Some(model) = desired.agents.models.get(ADAPTER.id) {
+    let model = desired.agents.models.get(ADAPTER.id);
+    let packages = desired.agents.packages.get(ADAPTER.id);
+    if model.is_some() || packages.is_some() {
         let mut settings = json_object(current.get(SETTINGS.path), SETTINGS.path)?;
-        // Qualified identifiers select a provider explicitly. Bare IDs keep
-        // the user's existing provider (Pi accepts both provider/model and ID).
-        let model = if let Some((provider, model)) = model.split_once('/') {
-            settings.insert("defaultProvider".into(), Value::String(provider.into()));
-            model
-        } else {
-            model
-        };
-        settings.insert("defaultModel".into(), Value::String(model.into()));
+        if let Some(model) = model {
+            // Qualified identifiers select a provider explicitly. Bare IDs keep
+            // the user's existing provider (Pi accepts both provider/model and ID).
+            let model = if let Some((provider, model)) = model.split_once('/') {
+                settings.insert("defaultProvider".into(), Value::String(provider.into()));
+                model
+            } else {
+                model
+            };
+            settings.insert("defaultModel".into(), Value::String(model.into()));
+        }
+        if let Some(packages) = packages {
+            let entries = packages
+                .iter()
+                .map(|p| Value::String(package_source(p, desired.config_dir)))
+                .collect();
+            settings.insert("packages".into(), Value::Array(entries));
+        }
         plan.files.push(RenderedFile {
             file: &SETTINGS,
             contents: json_text(settings),
@@ -111,5 +129,17 @@ fn render(desired: &Desired, current: &Current, plan: &mut RenderPlan) -> Result
         });
     }
     push_skills(desired, Base::Home, ".pi/agent/skills", ".pi/skills", plan);
+    push_subagents_raw(desired, Base::Home, ".pi/agent/agents", ".pi/agents", plan);
     Ok(())
+}
+
+/// Local `./` and `../` sources resolve against the config repository and are
+/// written absolute (Pi would resolve them against the settings file).
+/// Everything else (`npm:`, `git:`, URLs, absolute paths) is verbatim.
+fn package_source(entry: &str, config_dir: &Path) -> String {
+    if entry.starts_with("./") || entry.starts_with("../") {
+        config_dir.join(entry).to_string_lossy().into_owned()
+    } else {
+        entry.to_owned()
+    }
 }

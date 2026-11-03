@@ -21,6 +21,7 @@ warning, never silently lost.
 | Codex | `codex` | instructions, MCP (stdio + remote), models, skills, subagents | `~/.agents/skills/<skill>/` | `.agents/skills/<skill>/` |
 | OpenCode | `opencode` | instructions, MCP (stdio + remote), models, skills, subagents | `$XDG_CONFIG_HOME/opencode/skills/<skill>/` | `.opencode/skills/<skill>/` |
 | Antigravity CLI | `agy` | instructions, MCP (stdio + remote), skills, subagents | `~/.gemini/antigravity-cli/skills/<skill>/` | `.agents/skills/<skill>/` |
+| Pi | `pi` | instructions, MCP (stdio + remote), models, skills, subagents, packages | `~/.pi/agent/skills/<skill>/` | `.pi/skills/<skill>/` |
 
 - Instructions are written once in `AGENTS.md`; each agent gets its native copy (Claude Code's `CLAUDE.md` imports it through a managed block).
 - MCP servers, models, permissions and hooks are merged into the agent's own config files, rewriting only the keys Muster manages.
@@ -91,8 +92,20 @@ Declare a subagents folder in `muster.toml` (`[agents.subagents] source = "subag
 | Codex | `~/.codex/agents/<name>.toml` | `.codex/agents/<name>.toml` |
 | OpenCode | `$XDG_CONFIG_HOME/opencode/agents/<name>.md` | `.opencode/agents/<name>.md` |
 | Antigravity CLI | `~/.gemini/antigravity-cli/agents/<name>.md` | `.agents/agents/<name>.md` |
+| Pi | `~/.pi/agent/agents/<name>.md` | `.pi/agents/<name>.md` |
 
-Codex gets a TOML custom-agent file (`developer_instructions`); OpenCode gets a Markdown agent file with `mode: subagent` (the file name is the agent name); generated frontmatter is serialized as proper YAML/TOML, so descriptions with colons, quotes or line breaks stay valid. Fields a target cannot express (`tools`, and any other non-canonical frontmatter key, for Codex and OpenCode) are skipped with a `subagent_field_untranslated` warning. Subagents removed from the source are deleted on the next apply; files you add by hand are left alone. A file without valid frontmatter (missing fields or malformed YAML) is skipped with a `subagent_invalid` warning.
+Pi has no built-in subagents: its subagent extension (for example Pi's official example) discovers these files, so install it with `[agents.packages]` (below). Codex gets a TOML custom-agent file (`developer_instructions`); OpenCode gets a Markdown agent file with `mode: subagent` (the file name is the agent name); generated frontmatter is serialized as proper YAML/TOML, so descriptions with colons, quotes or line breaks stay valid. Fields a target cannot express (`tools`, and any other non-canonical frontmatter key, for Codex and OpenCode) are skipped with a `subagent_field_untranslated` warning. Subagents removed from the source are deleted on the next apply; files you add by hand are left alone. A file without valid frontmatter (missing fields or malformed YAML) is skipped with a `subagent_invalid` warning.
+
+### Pi packages
+
+Only Pi supports `[agents.packages]`. List package sources per adapter id:
+
+```toml
+[agents.packages]
+pi = ["npm:some-extension@1.0.0", "git:github.com/acme/ext@v1", "./pi/my-ext"]
+```
+
+Muster writes them to the `packages` array of Pi's `settings.json` (`~/.pi/agent/settings.json`, or `.pi/settings.json` in a project). Entries starting with `./` or `../` are resolved against the config repository and written as absolute paths; everything else is written as-is. Empty entries are rejected. While `[agents.packages].pi` is declared, Muster owns the whole `packages` list, so packages added with `pi install` are replaced on the next apply; remove the declaration and the key is removed. Declaring packages for an agent that does not support them gives an `unsupported_feature` warning.
 
 ## Platforms
 

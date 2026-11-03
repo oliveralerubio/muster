@@ -64,11 +64,11 @@ expiry or revocation. It does not invalidate credentials already delivered.
 The configuration selected for a machine or project after layers are merged, together with its origins and per-adapter state on disk.
 
 **Adapter**:
-The per-agent translator (Claude Code, Codex, OpenCode, Antigravity CLI) that renders the canonical configuration into the agent's native files, declaring which files, capabilities, platforms and minimum version it supports. It rewrites only the keys it manages.
+The per-agent translator (Claude Code, Codex, OpenCode, Antigravity CLI, Pi) that renders the canonical configuration into the agent's native files, declaring which files, capabilities, platforms and minimum version it supports. It rewrites only the keys it manages.
 _Avoid_: plugin, driver
 
 **Capability**:
-A canonical feature an adapter may support: instructions, stdio MCP servers, remote MCP servers, models, permissions, hooks, skills, subagents, AI providers (`providers`). Configuration using a capability an adapter lacks is applied only where supported, with an `unsupported_feature` warning.
+A canonical feature an adapter may support: instructions, stdio MCP servers, remote MCP servers, models, permissions, hooks, skills, subagents, packages (Pi only; `[agents.packages]`), AI providers (`providers`). Configuration using a capability an adapter lacks is applied only where supported, with an `unsupported_feature` warning.
 _Avoid_: feature flag
 
 **AI provider**:

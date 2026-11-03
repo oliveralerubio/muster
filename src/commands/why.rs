@@ -147,7 +147,7 @@ fn why(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
             }
         }
         // Native skills/subagents directories, matching what the adapters
-        // render (global and project scopes; pi and hermes have no native
+        // render (global and project scopes; hermes has no native
         // subagent directory).
         let (base, skills, subagents) = match (adapter.id, &target) {
             ("claude", Target::Global) => (
@@ -170,7 +170,11 @@ fn why(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
                 "opencode/skills",
                 Some("opencode/agents"),
             ),
-            ("pi", Target::Global) => (roots.base(adapters::Base::Home), ".pi/agent/skills", None),
+            ("pi", Target::Global) => (
+                roots.base(adapters::Base::Home),
+                ".pi/agent/skills",
+                Some(".pi/agent/agents"),
+            ),
             ("hermes", Target::Global) => {
                 (roots.base(adapters::Base::Home), ".hermes/skills", None)
             }
@@ -186,7 +190,7 @@ fn why(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
             ("opencode", Target::Project(dir)) => {
                 (dir.as_path(), ".opencode/skills", Some(".opencode/agents"))
             }
-            ("pi", Target::Project(dir)) => (dir.as_path(), ".pi/skills", None),
+            ("pi", Target::Project(dir)) => (dir.as_path(), ".pi/skills", Some(".pi/agents")),
             ("hermes", Target::Project(dir)) => (dir.as_path(), ".hermes/skills", None),
             _ => continue,
         };

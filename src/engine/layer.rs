@@ -214,7 +214,7 @@ pub fn project_layers(project: &Path) -> Result<Vec<Layer>, MusterError> {
 }
 
 /// Merge layers, lowest precedence first: later scalars and lists replace
-/// earlier ones; maps (models, hooks, MCP servers) merge by key.
+/// earlier ones; maps (models, packages, hooks, MCP servers) merge by key.
 pub fn merge(layers: &[Layer]) -> Merged {
     let mut agents = AgentsConfig::default();
     let mut mcp = BTreeMap::new();
@@ -246,6 +246,7 @@ pub fn merge(layers: &[Layer]) -> Merged {
             agents.permissions = over.permissions.clone();
         }
         agents.models.extend(over.models.clone());
+        agents.packages.extend(over.packages.clone());
         agents.ai_providers.extend(over.ai_providers.clone());
         agents.hooks.extend(over.hooks.clone());
         mcp.extend(layer.mcp.clone());

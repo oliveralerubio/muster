@@ -41,6 +41,7 @@ fn healthy_machine() -> MusterEnv {
     env.fake_exe("codex", "echo 'codex-cli 1.4.2'");
     env.fake_exe("opencode", "echo '0.5.0'");
     env.fake_exe("agy", "echo 'agy 1.3.0'");
+    env.fake_exe("pi", "echo '1.5.0'");
     env.run_isolated(&["--format", "json", "--yes", "init"])
         .assert()
         .code(0);

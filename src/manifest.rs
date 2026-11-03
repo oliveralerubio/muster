@@ -441,6 +441,13 @@ impl Manifest {
                     crate::adapters::config::parse_toggle(item).map_err(invalid)?;
                 }
             }
+            for (agent, entries) in &agents.packages {
+                if entries.iter().any(|e| e.trim().is_empty()) {
+                    return Err(invalid(format!(
+                        "agents.packages.{agent}: package entries must not be empty"
+                    )));
+                }
+            }
             for (agent, id) in &agents.ai_providers {
                 let known = manifest.ai_providers.contains_key(id)
                     || manifest
