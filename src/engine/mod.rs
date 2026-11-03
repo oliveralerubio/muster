@@ -1624,6 +1624,9 @@ fn read_instructions(
 /// inherited toggle names something that exists in either scope.
 fn user_scope_names(merged: &layer::Merged) -> BTreeSet<(&'static str, String)> {
     let mut names = BTreeSet::new();
+    for name in crate::skills::builtin::builtin_skills().keys() {
+        names.insert(("skill", name.clone()));
+    }
     if let Ok(Some(dir)) = merged.skills_path() {
         for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
             if entry.file_type().is_ok_and(|t| t.is_dir()) {

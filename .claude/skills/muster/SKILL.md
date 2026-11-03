@@ -18,7 +18,7 @@ Muster is a local-first configuration, secret and agent synchronizer. A config r
 Never print, log or paste secret values in chat or command output.
 
 - `muster secret list`: names and paths only, safe to show.
-- `muster secret reveal <path>`: prints the value. Only use it piped into the command that needs it; do not echo it.
+- `muster secret get <ref> --reveal --yes` (e.g. `muster secret get native://app/api --reveal --yes`): prints the value. Pipe it straight into the command that needs it; never echo it. With `--format json`, extract `.result` from the envelope.
 - `muster secret add <path> --value-stdin`: read the value from stdin, e.g. `printf %s "$VALUE" | muster secret add <path> --value-stdin`. Do not put the value in argv or shell history.
 
 ## Apply changes
@@ -29,7 +29,8 @@ After editing the config repo, run `muster sync` to apply it to every enabled ag
 
 - `muster status`: overview of the config repo and sync state.
 - `muster doctor`: health checks with fix hints.
-- `muster why <setting>`: which layer defines a setting and why it has its value.
+- `muster why <needle>`: where a text string appears in agent context ("why does the agent know X").
+- `muster effective`: the resolved configuration and where each setting came from.
 
 ## MCP servers
 

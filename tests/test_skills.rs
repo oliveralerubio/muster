@@ -576,6 +576,45 @@ fn builtin_muster_skill_syncs_for_default_agents_without_skills_section() {
 }
 
 #[test]
+fn builtin_muster_skill_syncs_for_pi() {
+    let env = MusterEnv::new();
+    seed_manifest(&env.config_dir(), &["pi"]);
+    env.run(&["agents", "apply", "--yes"]).assert().code(0);
+    let file = env.path().join(".pi/agent/skills/muster/SKILL.md");
+    assert_eq!(read(&file), BUILTIN_MUSTER);
+}
+
+#[test]
+fn toggle_disables_builtin_muster_skill_without_warning() {
+    let env = MusterEnv::new();
+    seed_manifest(&env.config_dir(), &["claude"]);
+    let manifest = env.config_dir().join("muster.toml");
+    let mut text = read(&manifest);
+    text.push_str("\n[agents.toggles]\ndisable = [\"skill:muster\"]\n");
+    std::fs::write(&manifest, text).unwrap();
+    let result = env.run(&["agents", "apply", "--yes"]).output().unwrap();
+    assert!(result.status.success());
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(!output.contains("toggle_unknown_item"), "{output}");
+    assert!(!user_skills_dir(&env, "claude").join("muster").exists());
+}
+
+#[test]
+fn project_scope_apply_does_not_install_builtin_skills() {
+    let env = MusterEnv::new();
+    let project = project_with_manifest(&env, &["claude"]);
+    env.run(&["sync", "--project", project.to_str().unwrap(), "--yes"])
+        .assert()
+        .code(0);
+    assert_installed_in(&project, ".claude/skills");
+    assert!(!project.join(".claude/skills/muster").exists());
+}
+
+#[test]
 fn builtin_muster_skill_syncs_alongside_user_skills() {
     let env = MusterEnv::new();
     seed_manifest(&env.config_dir(), &["claude"]);
