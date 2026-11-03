@@ -615,6 +615,8 @@ fn scope(
                 .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
                 .filter_map(|entry| entry.file_name().into_string().ok())
                 .filter(|name| !names.contains(name.as_str()))
+                // Built-in skills are installed in user scope and are managed.
+                .filter(|name| project.is_some() || !crate::skills::builtin::is_builtin(name))
                 .collect();
             extra.sort();
             (id, extra)

@@ -4,6 +4,7 @@
 //! config repo, versioned and vendored. Upstream sources are declared in
 //! `[agents.skills.remote]` and pinned in `skills.lock`.
 
+pub mod builtin;
 pub mod lock;
 pub mod upstream;
 
