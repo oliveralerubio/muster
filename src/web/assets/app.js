@@ -79,12 +79,23 @@ async function busy(node, run, gate) {
   }
 }
 
-function diagnostics(data) {
+// A response's diagnostics, with a failed request added as an error row.
+function collectDiagnostics(data) {
   const list = (data.diagnostics || []).slice();
   if (data.error) list.push({ severity: "error", code: "http", message: data.error });
-  if (!list.length) return null;
+  return list;
+}
+
+function diagnosticsTable(list) {
+  const tone = { error: "danger", warning: "warning" };
   return table(["Severity", "Code", "Message", "Suggestion"],
-    list.map((d) => [d.severity, d.code, d.message, d.suggestion || ""]));
+    list.map((d) => [el("span", { class: "badge " + (tone[d.severity] || "") }, d.severity),
+      el("code", { class: "diag-code" }, d.code), d.message, d.suggestion || ""]));
+}
+
+function diagnostics(data) {
+  const list = collectDiagnostics(data);
+  return list.length ? diagnosticsTable(list) : null;
 }
 
 function table(headers, rows, empty) {
@@ -143,66 +154,99 @@ const views = {
     const pending = (r.pending && r.pending.members) || [];
     const drift = r.drift || {};
     const driftCount = (drift.members || []).length + (drift.machines || []).length;
+    const diags = [...collectDiagnostics(data), ...collectDiagnostics(schedule)];
+    const flagged = diags.filter((d) => d.severity === "warning" || d.severity === "error").length;
+    const attentionCount = pending.length + driftCount + flagged;
     const s = schedule.result || {};
     const defaultInterval = s.interval_minutes || 60;
     const interval = el("input", { type: "number", min: "1", value: String(defaultInterval), "aria-label": "Minutes between syncs" });
-    const stamp = (ts) => {
-      const date = new Date(ts);
-      return Number.isNaN(date.getTime())
-        ? String(ts)
-        : date.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
-    };
-    const tone = (text) => (/^(ok|success|synced|applied|current)/i.test(text) ? "success"
-      : /fail|error|drift|denied|revoked/i.test(text) ? "danger"
-        : /pending|waiting/i.test(text) ? "warning" : "");
-    const statusTone = { current: "success", enrolled: "info", pending: "warning", drifted: "danger", revoked: "danger" };
-    const lastSync = r.sync
-      ? el("span", { class: "control-value" },
-        el("time", { datetime: r.sync.ts, title: r.sync.ts }, stamp(r.sync.ts)),
-        " ", el("span", { class: "badge " + tone(String(r.sync.result)) }, r.sync.result))
-      : el("span", { class: "control-value muted" }, "Never");
+    const state = (kind, label) => el("span", { class: "state state-" + kind }, label);
+    const resultKind = (text) => (/^(ok|success|synced|applied|current)/i.test(text) ? "live"
+      : /fail|error|drift|denied|revoked/i.test(text) ? "alert"
+        : /pending|waiting/i.test(text) ? "wait" : "idle");
+    const statusKind = { current: "live", enrolled: "idle", pending: "wait", drifted: "alert", revoked: "alert" };
+    const plate = (label, figure, sub, signal) => el("div", { class: "plate" + (signal ? " plate-signal" : "") },
+      el("dt", { class: "plate-label" }, label),
+      el("dd", { class: "plate-figure num" }, figure),
+      el("dd", { class: "plate-sub" }, sub));
+
+    // Last sync: the local time of r.sync.ts as the figure, the date and result as its state.
+    const syncDate = r.sync ? new Date(r.sync.ts) : null;
+    const syncValid = Boolean(syncDate) && !Number.isNaN(syncDate.getTime());
+    const syncFigure = !r.sync ? "Never"
+      : el("time", { datetime: r.sync.ts, title: r.sync.ts },
+        syncValid ? syncDate.toLocaleTimeString(undefined, { timeStyle: "short" }) : String(r.sync.ts));
+    const syncSub = !r.sync ? "No sync recorded"
+      : [syncValid ? syncDate.toLocaleDateString(undefined, { dateStyle: "medium" }) : "",
+        r.sync.result ? state(resultKind(String(r.sync.result)), r.sync.result) : null];
+
+    const byStatus = {};
+    for (const m of machines) byStatus[m.status] = (byStatus[m.status] || 0) + 1;
+    const fleetSub = machines.length
+      ? Object.entries(byStatus).map(([status, count]) => `${count} ${status}`).join(", ")
+      : "None enrolled";
+    const attentionSub = attentionCount
+      ? [pending.length ? `${pending.length} pending` : null,
+        driftCount ? `${driftCount} drifted` : null,
+        flagged ? `${flagged} ${flagged === 1 ? "diagnostic" : "diagnostics"}` : null].filter(Boolean).join(", ")
+      : "Nothing to review";
+
+    const fleet = machines.length
+      ? table(["Machine", "Platform", "Version", "Last sync", "Status"],
+        machines.map((m) => [
+          el("span", { class: "board-name" }, m.name), m.platform || "", m.version || "",
+          m.last_sync || "never",
+          state(statusKind[m.status] || "idle", m.status)]))
+      : el("div", { class: "empty-state" },
+        el("p", {}, "No machines in fleet. Run ", el("code", {}, "muster machine add"), " to enroll one, or open the Machines tab."),
+        button("Open Machines", () => show("machines")));
+    if (machines.length) fleet.setAttribute("class", "table-wrap board");
+
+    const periodic = s.enabled
+      ? (s.interval_minutes ? `Every ${s.interval_minutes} min` : "Enabled") + (s.backend ? ` via ${s.backend}` : "")
+      : "Off";
+
     const driftRows = [
       ...(drift.members || []).map((d) => ["member", el("code", {}, d.name), d.reason]),
       ...(drift.machines || []).map((d) => ["machine", el("code", {}, d.name), d.reason]),
     ];
-    const clean = driftCount === 0 && pending.length === 0;
-    const attention = clean
-      ? el("p", { class: "status-banner", role: "status" },
-        el("span", { class: "badge success" }, "OK"), " Fleet synchronized · No drift or pending approvals")
-      : [
-        pending.length
-          ? [el("h2", {}, `Pending approvals (${pending.length})`),
-            table(["Name"], pending.map((p) => [el("code", {}, typeof p === "string" ? p : p.name)]))]
-          : null,
-        driftCount
-          ? [el("h2", {}, `Drift (${driftCount})`), table(["Kind", "Name", "Reason"], driftRows)]
-          : null,
-      ];
+    const attentionBlocks = [
+      pending.length
+        ? [el("h3", {}, `Pending approvals (${pending.length})`),
+          table(["Name"], pending.map((p) => [el("code", {}, typeof p === "string" ? p : p.name)]))]
+        : null,
+      driftCount
+        ? [el("h3", {}, `Drift (${driftCount})`), table(["Kind", "Name", "Reason"], driftRows)]
+        : null,
+      diags.length
+        ? [el("h3", {}, `Diagnostics (${diags.length})`), diagnosticsTable(diags)]
+        : null,
+    ].filter(Boolean);
+
     render("Dashboard", [],
-      el("section", { class: "control-bar", "aria-label": "Sync and schedule" },
-        el("div", { class: "control-group" },
-          el("span", { class: "control-label" }, "Last sync"), lastSync),
-        el("div", { class: "control-group" },
-          el("span", { class: "control-label" }, "Periodic sync"),
-          el("span", { class: "control-value" },
-            s.enabled
-              ? [el("span", { class: "badge success" }, "Enabled"), s.backend ? ` via ${s.backend}` : ""]
-              : el("span", { class: "muted" }, "Off")),
-          interval, el("span", { class: "muted" }, "min"),
-          button(s.enabled ? "Update" : "Enable", () => act(`Enable periodic sync every ${interval.value} minute(s)?`, "schedule/enable", { interval: Number(interval.value) || undefined })),
-          s.enabled ? button("Disable", () => act("Disable periodic sync?", "schedule/disable")) : ""),
-        el("div", { class: "control-group control-end" },
-          button("Sync now", () => act("Pull, plan and apply now?", "sync"), "primary"))),
-      diagnostics(schedule),
+      el("dl", { class: "plates", "aria-label": "Fleet status" },
+        plate("Machines", String(machines.length), fleetSub),
+        plate("Needs attention", String(attentionCount), attentionSub, attentionCount > 0),
+        plate("Last sync", syncFigure, syncSub)),
       el("h2", {}, `Fleet (${machines.length})`),
-      table(["Name", "Platform", "Version", "Status", "Last sync"],
-        machines.map((m) => [
-          el("code", {}, m.name), m.platform || "", m.version || "",
-          el("span", { class: "badge " + (statusTone[m.status] || "") }, m.status),
-          m.last_sync || "never"]),
-        "No machines in fleet."),
-      attention,
-      diagnostics(data));
+      fleet,
+      el("h2", { id: "ops-title" }, "Sync operations"),
+      el("section", { class: "ops", "aria-labelledby": "ops-title" },
+        el("div", { class: "ops-primary" },
+          button("Sync now", () => act("Pull, plan and apply now?", "sync"), "primary")),
+        el("div", { class: "ops-periodic" },
+          el("div", { class: "ops-state" },
+            el("span", { class: "ops-label" }, "Periodic sync"),
+            el("span", { class: "ops-value" }, periodic)),
+          el("label", { class: "ops-interval" }, interval, el("span", { class: "muted" }, "min")),
+          el("div", { class: "ops-controls" },
+            button(s.enabled ? "Update" : "Enable", () => act(`Enable periodic sync every ${interval.value} minute(s)?`, "schedule/enable", { interval: Number(interval.value) || undefined })),
+            s.enabled ? button("Disable", () => act("Disable periodic sync?", "schedule/disable")) : ""))),
+      el("section", { class: "attention", "aria-labelledby": "attention-title" },
+        el("h2", { id: "attention-title" }, "Needs attention"),
+        attentionBlocks.length
+          ? attentionBlocks
+          : el("p", { class: "quiet", role: "status" }, "Nothing needs attention: no pending approvals, no drift and no diagnostics.")));
   },
 
   async providers(token) {
@@ -596,6 +640,24 @@ let current = "dashboard";
 let navToken = 0;
 const tabs = Array.from(document.querySelectorAll("#nav [role=tab]"));
 
+// Under 60rem the sidebar is a top bar: a menu button opens and closes the list.
+const menuBtn = $("#menu");
+const sidePanel = $("#side-body");
+function setMenu(open) {
+  if (!menuBtn || !sidePanel) return;
+  menuBtn.setAttribute("aria-expanded", String(open));
+  sidePanel.classList.toggle("open", open);
+}
+if (menuBtn) {
+  menuBtn.addEventListener("click", () => setMenu(menuBtn.getAttribute("aria-expanded") !== "true"));
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && menuBtn.getAttribute("aria-expanded") === "true") {
+      setMenu(false);
+      menuBtn.focus();
+    }
+  });
+}
+
 async function show(name) {
   current = name;
   const token = ++navToken;
@@ -606,6 +668,7 @@ async function show(name) {
     // On narrow screens the tab row scrolls: keep the active tab fully visible.
     if (selected && tab.scrollIntoView) tab.scrollIntoView({ block: "nearest", inline: "nearest" });
   }
+  setMenu(false);
   viewEl.setAttribute("aria-labelledby", "tab-" + name);
   // The previous content stays in place while loading, so the layout holds still.
   viewEl.setAttribute("aria-busy", "true");
@@ -625,11 +688,11 @@ async function show(name) {
   if (token === navToken) viewEl.setAttribute("aria-busy", "false");
 }
 
-// Keyboard: arrows/Home/End move between tabs; digits 1-9 jump to a view.
+// Keyboard: arrows (the list is vertical)/Home/End move between tabs; digits 1-9 jump to a view.
 $("#nav").addEventListener("keydown", (e) => {
   const i = tabs.indexOf(document.activeElement);
   if (i < 0) return;
-  const next = { ArrowRight: i + 1, ArrowLeft: i - 1, Home: 0, End: tabs.length - 1 }[e.key];
+  const next = { ArrowRight: i + 1, ArrowDown: i + 1, ArrowLeft: i - 1, ArrowUp: i - 1, Home: 0, End: tabs.length - 1 }[e.key];
   if (next === undefined) return;
   e.preventDefault();
   const tab = tabs[(next + tabs.length) % tabs.length];
