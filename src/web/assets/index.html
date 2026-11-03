@@ -4,39 +4,47 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Muster admin panel</title>
+  <meta name="description" content="Local admin panel for a Muster fleet: machines, members, secrets, skills and sync.">
   <link rel="icon" href="data:,">
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
   <a class="skip" href="#main">Skip to content</a>
-  <header class="top">
-    <span class="brand">Muster</span>
-    <nav aria-label="Views">
-      <ul id="nav" role="tablist" aria-orientation="horizontal">
-        <li role="presentation"><button type="button" role="tab" id="tab-dashboard" aria-controls="view" data-view="dashboard" aria-selected="true">Dashboard</button></li>
-        <li role="presentation"><button type="button" role="tab" id="tab-machines" aria-controls="view" data-view="machines" aria-selected="false" tabindex="-1">Machines</button></li>
-        <li role="presentation"><button type="button" role="tab" id="tab-team" aria-controls="view" data-view="team" aria-selected="false" tabindex="-1">Members &amp; groups</button></li>
-        <li role="presentation"><button type="button" role="tab" id="tab-providers" aria-controls="view" data-view="providers" aria-selected="false" tabindex="-1">AI providers</button></li>
-        <li role="presentation"><button type="button" role="tab" id="tab-secrets" aria-controls="view" data-view="secrets" aria-selected="false" tabindex="-1">Secrets &amp; approvals</button></li>
-        <li role="presentation"><button type="button" role="tab" id="tab-skills" aria-controls="view" data-view="skills" aria-selected="false" tabindex="-1">Skills <span id="skills-dot" class="dot" role="img" aria-label="Needs attention" hidden title="Needs attention"></span></button></li>
-        <li role="presentation"><button type="button" role="tab" id="tab-effective" aria-controls="view" data-view="effective" aria-selected="false" tabindex="-1">Effective</button></li>
-        <li role="presentation"><button type="button" role="tab" id="tab-profiles" aria-controls="view" data-view="profiles" aria-selected="false" tabindex="-1">Profiles &amp; diff</button></li>
-        <li role="presentation"><button type="button" role="tab" id="tab-history" aria-controls="view" data-view="history" aria-selected="false" tabindex="-1">History</button></li>
-        <li role="presentation"><button type="button" role="tab" id="tab-doctor" aria-controls="view" data-view="doctor" aria-selected="false" tabindex="-1">Doctor</button></li>
-      </ul>
-    </nav>
-    <button type="button" id="theme" class="btn" aria-label="Toggle light or dark theme">Theme</button>
+  <header class="side">
+    <div class="side-head">
+      <span class="brand">Muster</span>
+      <button type="button" id="menu" class="btn menu" aria-expanded="false" aria-controls="side-body">Menu</button>
+    </div>
+    <div id="side-body" class="side-body">
+      <nav aria-label="Views">
+        <ul id="nav" role="tablist" aria-orientation="vertical">
+          <li role="presentation"><button type="button" role="tab" id="tab-dashboard" aria-controls="view" data-view="dashboard" aria-selected="true">Dashboard</button></li>
+          <li role="presentation"><button type="button" role="tab" id="tab-machines" aria-controls="view" data-view="machines" aria-selected="false" tabindex="-1">Machines</button></li>
+          <li role="presentation"><button type="button" role="tab" id="tab-team" aria-controls="view" data-view="team" aria-selected="false" tabindex="-1">Members &amp; groups</button></li>
+          <li role="presentation"><button type="button" role="tab" id="tab-providers" aria-controls="view" data-view="providers" aria-selected="false" tabindex="-1">AI providers</button></li>
+          <li role="presentation"><button type="button" role="tab" id="tab-secrets" aria-controls="view" data-view="secrets" aria-selected="false" tabindex="-1">Secrets &amp; approvals</button></li>
+          <li role="presentation"><button type="button" role="tab" id="tab-skills" aria-controls="view" data-view="skills" aria-selected="false" tabindex="-1">Skills <span id="skills-dot" class="dot" role="img" aria-label="Needs attention" hidden title="Needs attention"></span></button></li>
+          <li role="presentation"><button type="button" role="tab" id="tab-effective" aria-controls="view" data-view="effective" aria-selected="false" tabindex="-1">Effective</button></li>
+          <li role="presentation"><button type="button" role="tab" id="tab-profiles" aria-controls="view" data-view="profiles" aria-selected="false" tabindex="-1">Profiles &amp; diff</button></li>
+          <li role="presentation"><button type="button" role="tab" id="tab-history" aria-controls="view" data-view="history" aria-selected="false" tabindex="-1">History</button></li>
+          <li role="presentation"><button type="button" role="tab" id="tab-doctor" aria-controls="view" data-view="doctor" aria-selected="false" tabindex="-1">Doctor</button></li>
+        </ul>
+      </nav>
+      <button type="button" id="theme" class="btn" aria-label="Toggle light or dark theme">Theme</button>
+    </div>
   </header>
 
-  <main id="main" tabindex="-1">
-    <h1 id="title">Dashboard</h1>
-    <div id="actions" class="actions"></div>
-    <div id="view" role="tabpanel" aria-labelledby="tab-dashboard" aria-live="polite"></div>
-  </main>
+  <div class="page">
+    <main id="main" tabindex="-1">
+      <h1 id="title">Dashboard</h1>
+      <div id="actions" class="actions"></div>
+      <div id="view" role="tabpanel" aria-labelledby="tab-dashboard" aria-live="polite"></div>
+    </main>
 
-  <footer class="cli" aria-live="polite">
-    <span>CLI equivalent:</span> <code id="cli">muster status</code>
-  </footer>
+    <footer class="cli" aria-live="polite">
+      <span>CLI equivalent:</span> <code id="cli">muster status</code>
+    </footer>
+  </div>
 
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 
