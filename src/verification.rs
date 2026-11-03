@@ -19,10 +19,17 @@ fn is_valid_name_blocks_path_traversal() {
     kani::assume(len <= N);
     if let Some(s) = bounded_str(&bytes, len) {
         if is_valid_name(s) {
-            assert!(!s.contains(".."));
-            assert!(!s.contains('/'));
-            assert!(!s.contains('\\'));
-            assert!(!s.contains('\0'));
+            let b = s.as_bytes();
+            let mut i = 0;
+            while i < b.len() {
+                assert!(b[i] != b'/');
+                assert!(b[i] != b'\\');
+                assert!(b[i] != b'\0');
+                if i + 1 < b.len() {
+                    assert!(!(b[i] == b'.' && b[i + 1] == b'.'));
+                }
+                i += 1;
+            }
         }
     }
 }
