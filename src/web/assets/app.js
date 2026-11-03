@@ -144,29 +144,64 @@ const views = {
     const drift = r.drift || {};
     const driftCount = (drift.members || []).length + (drift.machines || []).length;
     const s = schedule.result || {};
-    const interval = el("input", { type: "number", min: "1", value: "60", "aria-label": "Minutes between syncs" });
-    render("Dashboard (fleet panel)", [button("Sync now", () => act("Pull, plan and apply now?", "sync"), "primary")],
-      el("h2", {}, "Last sync"),
-      el("p", {}, r.sync ? `${r.sync.ts} · ${r.sync.result}` : "Never"),
-      table(["Machines", "Pending members", "Drift"], [[machines.length, pending.length, driftCount]]),
-      el("h2", {}, "Periodic sync"),
-      el("p", {}, s.enabled ? `Enabled via ${s.backend}.` : "Not scheduled on this machine."),
-      el("div", { class: "skill-form" },
-        interval,
-        button("Enable", () => act(`Enable periodic sync every ${interval.value} minute(s)?`, "schedule/enable", { interval: Number(interval.value) || undefined })),
-        s.enabled ? button("Disable", () => act("Disable periodic sync?", "schedule/disable"), "danger") : ""),
+    const defaultInterval = s.interval_minutes || 60;
+    const interval = el("input", { type: "number", min: "1", value: String(defaultInterval), "aria-label": "Minutes between syncs" });
+    const stamp = (ts) => {
+      const date = new Date(ts);
+      return Number.isNaN(date.getTime())
+        ? String(ts)
+        : date.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+    };
+    const tone = (text) => (/^(ok|success|synced|applied|current)/i.test(text) ? "success"
+      : /fail|error|drift|denied|revoked/i.test(text) ? "danger"
+        : /pending|waiting/i.test(text) ? "warning" : "");
+    const statusTone = { current: "success", enrolled: "info", pending: "warning", drifted: "danger", revoked: "danger" };
+    const lastSync = r.sync
+      ? el("span", { class: "control-value" },
+        el("time", { datetime: r.sync.ts, title: r.sync.ts }, stamp(r.sync.ts)),
+        " ", el("span", { class: "badge " + tone(String(r.sync.result)) }, r.sync.result))
+      : el("span", { class: "control-value muted" }, "Never");
+    const driftRows = [
+      ...(drift.members || []).map((d) => ["member", el("code", {}, d.name), d.reason]),
+      ...(drift.machines || []).map((d) => ["machine", el("code", {}, d.name), d.reason]),
+    ];
+    const clean = driftCount === 0 && pending.length === 0;
+    const attention = clean
+      ? el("p", { class: "status-banner", role: "status" },
+        el("span", { class: "badge success" }, "OK"), " Fleet synchronized · No drift or pending approvals")
+      : [
+        pending.length
+          ? [el("h2", {}, `Pending approvals (${pending.length})`),
+            table(["Name"], pending.map((p) => [el("code", {}, typeof p === "string" ? p : p.name)]))]
+          : null,
+        driftCount
+          ? [el("h2", {}, `Drift (${driftCount})`), table(["Kind", "Name", "Reason"], driftRows)]
+          : null,
+      ];
+    render("Dashboard", [],
+      el("section", { class: "control-bar", "aria-label": "Sync and schedule" },
+        el("div", { class: "control-group" },
+          el("span", { class: "control-label" }, "Last sync"), lastSync),
+        el("div", { class: "control-group" },
+          el("span", { class: "control-label" }, "Periodic sync"),
+          el("span", { class: "control-value" },
+            s.enabled
+              ? [el("span", { class: "badge success" }, "Enabled"), s.backend ? ` via ${s.backend}` : ""]
+              : el("span", { class: "muted" }, "Off")),
+          interval, el("span", { class: "muted" }, "min"),
+          button(s.enabled ? "Update" : "Enable", () => act(`Enable periodic sync every ${interval.value} minute(s)?`, "schedule/enable", { interval: Number(interval.value) || undefined })),
+          s.enabled ? button("Disable", () => act("Disable periodic sync?", "schedule/disable")) : ""),
+        el("div", { class: "control-group control-end" },
+          button("Sync now", () => act("Pull, plan and apply now?", "sync"), "primary"))),
       diagnostics(schedule),
-      el("h2", {}, "Fleet"),
+      el("h2", {}, `Fleet (${machines.length})`),
       table(["Name", "Platform", "Version", "Status", "Last sync"],
-        machines.map((m) => [m.name, m.platform || "", m.version || "", m.status, m.last_sync || "never"]),
+        machines.map((m) => [
+          el("code", {}, m.name), m.platform || "", m.version || "",
+          el("span", { class: "badge " + (statusTone[m.status] || "") }, m.status),
+          m.last_sync || "never"]),
         "No machines in fleet."),
-      el("h2", {}, "Pending members"),
-      table(["Name"], pending.map((p) => [typeof p === "string" ? p : p.name]), "No pending members."),
-      el("h2", {}, "Drift"),
-      table(["Kind", "Name", "Reason"], [
-        ...(drift.members || []).map((d) => ["member", d.name, d.reason]),
-        ...(drift.machines || []).map((d) => ["machine", d.name, d.reason]),
-      ], "No drift detected."),
+      attention,
       diagnostics(data));
   },
 
