@@ -108,7 +108,10 @@ pub fn bws_list(project: Option<&str>) -> Result<Vec<(String, SecretValue)>, Mus
 }
 
 pub fn validate_bws_project(project: &str) -> Result<(), MusterError> {
-    if project.starts_with('-') || project.chars().any(char::is_control) {
+    if project.starts_with('-')
+        || project.len() > 64
+        || project.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
         return Err(MusterError::Usage("invalid Bitwarden project ID".into()));
     }
     Ok(())

@@ -6,6 +6,10 @@ Welcome to the Muster documentation directory. Below is the index of available d
 
 - [Guía del Modo Equipo (Team Mode)](guides/team-mode.md) — Guía paso a paso para configurar repositorios compartidos, flujos de invitación, enrolamiento de máquinas, quórum de administradores, revocación y rotación de secretos.
 
+## Security
+
+- [Security verification](security/verification.md) — Property tests, fuzzing, Kani proofs and the TLA+ team-revocation model.
+
 ## Specifications & Concepts
 
 - [Muster Specification](SPEC.md) — The comprehensive product and design specification.

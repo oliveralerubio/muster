@@ -67,6 +67,24 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     approve_with_identity(ctx, params, recovery)
 }
 
+/// Every recorded approver must be a distinct, active admin of the manifest;
+/// anyone else (pending, revoked, non-admin, unknown, duplicate) is rejected.
+pub fn validate_recorded_approvals(
+    admins: &std::collections::BTreeSet<String>,
+    approvals: &[String],
+) -> Result<(), MusterError> {
+    let mut seen = std::collections::BTreeSet::new();
+    if approvals
+        .iter()
+        .any(|name| !admins.contains(name) || !seen.insert(name))
+    {
+        return Err(MusterError::Security(
+            "enrollment request contains invalid or duplicate admin approvals".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Shared approval after confirmation and recovery-key input have been handled.
 pub(super) fn approve_with_identity(
     ctx: &mut Context,
@@ -164,16 +182,7 @@ pub(super) fn approve_with_identity(
                 })
                 .map(|(name, _)| name)
                 .collect();
-            let mut seen = std::collections::BTreeSet::new();
-            if req
-                .approvals
-                .iter()
-                .any(|name| !admins.contains(name) || !seen.insert(name))
-            {
-                return Err(MusterError::Security(
-                    "enrollment request contains invalid or duplicate admin approvals".into(),
-                ));
-            }
+            validate_recorded_approvals(&admins, &req.approvals)?;
             let mut approvals = req.approvals.clone();
             let quorum = team::add_approval(ctx, &before, &mut approvals, &actor.member)?;
             req.approvals = approvals;
@@ -295,5 +304,30 @@ fn proposal(
             Ok(recorded.clone())
         }
         (None, _) => Ok(recorded.clone()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_recorded_approvals;
+    use std::collections::BTreeSet;
+
+    fn admins() -> BTreeSet<String> {
+        ["alice", "bob"].iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn rejects_non_admin_pending_revoked_and_duplicate_approvers() {
+        let a = admins();
+        for bad in [
+            vec!["mallory".to_string()],
+            vec!["alice".into(), "mallory".into()],
+            vec!["alice".into(), "alice".into()],
+            vec![String::new()],
+        ] {
+            assert!(validate_recorded_approvals(&a, &bad).is_err(), "{bad:?}");
+        }
+        assert!(validate_recorded_approvals(&a, &["alice".into(), "bob".into()]).is_ok());
+        assert!(validate_recorded_approvals(&a, &[]).is_ok());
     }
 }

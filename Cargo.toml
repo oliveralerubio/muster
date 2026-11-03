@@ -27,4 +27,8 @@ yaml-rust2 = "0.13"
 assert_cmd = "2.0"
 insta = "1.49.0"
 predicates = "3.1"
+proptest = "1.5"
 tempfile = "3.10"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }

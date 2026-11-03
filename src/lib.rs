@@ -28,3 +28,6 @@ pub mod team;
 pub mod usage;
 pub mod vault;
 pub mod web;
+
+#[cfg(kani)]
+mod verification;
