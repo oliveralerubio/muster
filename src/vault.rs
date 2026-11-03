@@ -229,9 +229,27 @@ impl Vault {
         new_recipients: &[String],
         id: &Identity,
     ) -> Result<(), MusterError> {
-        let mut data = self.read(group, id)?;
+        let mut data = self.read_verified_readers(group, id)?;
         data.recipients = new_recipients.to_vec();
         self.write(&data)
+    }
+
+    fn read_verified_readers(&self, group: &str, id: &Identity) -> Result<GroupData, MusterError> {
+        let data = self.read(group, id)?;
+        let meta = self.read_meta(group)?;
+        if meta.group != group
+            || data.group != group
+            || meta.recipients.iter().collect::<BTreeSet<_>>() != data.recipients.iter().collect()
+        {
+            return Err(MusterError::Security(format!(
+                "vault metadata reader mismatch for group '{group}'"
+            )));
+        }
+        Ok(data)
+    }
+
+    pub(crate) fn verify_readers(&self, group: &str, id: &Identity) -> Result<(), MusterError> {
+        self.read_verified_readers(group, id).map(|_| ())
     }
 
     /// Resolves `native://<group>/<name>` from local files only.
@@ -450,12 +468,31 @@ fn validate_segment(kind: &str, value: &str) -> Result<(), MusterError> {
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), MusterError> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
     let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
+    tmp.push(format!(
+        ".tmp-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
     let tmp = PathBuf::from(tmp);
-    fs::write(&tmp, bytes)
-        .and_then(|()| fs::rename(&tmp, path))
-        .map_err(|e| io_err(path, e))
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&tmp).map_err(|e| io_err(path, e))?;
+    let result = file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| fs::rename(&tmp, path));
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result.map_err(|e| io_err(path, e))
 }
 
 fn now() -> String {

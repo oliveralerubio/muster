@@ -4,7 +4,7 @@
 //! with `x-` (free extension space, preserved but ignored by Muster).
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -354,7 +354,7 @@ impl Manifest {
         let path = config_dir.join(FILE_NAME);
         let text = toml::to_string_pretty(self)
             .map_err(|e| MusterError::Operational(format!("cannot serialize manifest: {e}")))?;
-        std::fs::write(&path, text)
+        write_atomic(&path, text.as_bytes())
             .map_err(|e| MusterError::Operational(format!("{}: {e}", path.display())))
     }
 
@@ -490,6 +490,31 @@ impl Manifest {
 /// JSON Schema of `muster.toml`, as exported by `muster schema`.
 pub fn json_schema() -> Value {
     serde_json::to_value(schemars::schema_for!(Manifest)).expect("schema serializes")
+}
+
+/// Write `contents` to `path` atomically: a sibling `<path>.tmp.<pid>` is
+/// written, synced to disk and renamed over `path`, so readers never observe a
+/// truncated file and a crash leaves the previous version intact.
+pub fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".tmp.{}", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    let result = (|| {
+        let mut file = std::fs::File::create(&tmp)?;
+        if let Ok(meta) = std::fs::metadata(path) {
+            // Keep the existing file mode (e.g. a private manifest).
+            file.set_permissions(meta.permissions())?;
+        }
+        file.write_all(contents)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 #[cfg(test)]

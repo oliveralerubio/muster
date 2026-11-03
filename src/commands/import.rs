@@ -91,6 +91,9 @@ fn conflict(ctx: &mut Context, message: String, path: String) {
 
 fn import_bws(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let project = params.get_string("project");
+    if let Some(project) = project {
+        crate::providers::cli::validate_bws_project(project)?;
+    }
     let group = params.get_string("group").unwrap_or("bws").to_string();
     if !secrets::is_name(&group) {
         return Err(MusterError::Usage(format!("invalid vault group `{group}`")));

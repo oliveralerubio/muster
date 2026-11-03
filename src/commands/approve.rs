@@ -156,6 +156,24 @@ pub(super) fn approve_with_identity(
     // The recovery key is break-glass and counts as a full approval.
     let quorum = match &actor {
         Some(actor) => {
+            let admins: std::collections::BTreeSet<_> = team::members(&before)
+                .into_iter()
+                .filter(|(_, member)| {
+                    member.role == crate::manifest::Role::Admin
+                        && member.status == crate::manifest::MemberStatus::Active
+                })
+                .map(|(name, _)| name)
+                .collect();
+            let mut seen = std::collections::BTreeSet::new();
+            if req
+                .approvals
+                .iter()
+                .any(|name| !admins.contains(name) || !seen.insert(name))
+            {
+                return Err(MusterError::Security(
+                    "enrollment request contains invalid or duplicate admin approvals".into(),
+                ));
+            }
             let mut approvals = req.approvals.clone();
             let quorum = team::add_approval(ctx, &before, &mut approvals, &actor.member)?;
             req.approvals = approvals;

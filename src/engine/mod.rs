@@ -548,8 +548,11 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
                     }
                     match read_optional(&path) {
                         Ok(before) => {
-                            if let Some(entry) = unmanaged_entry(adapter.id, &path, before, record)
-                            {
+                            let (entry, diag) = unmanaged_entry(adapter.id, &path, before, record);
+                            if let Some(d) = diag {
+                                ctx.diag(d);
+                            }
+                            if let Some(entry) = entry {
                                 merge_entry(&mut entries, entry);
                             }
                         }
@@ -588,7 +591,11 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
             };
             match read_optional(&path) {
                 Ok(before) => {
-                    if let Some(entry) = unmanaged_entry(agent, &path, before, record) {
+                    let (entry, diag) = unmanaged_entry(agent, &path, before, record);
+                    if let Some(d) = diag {
+                        ctx.diag(d);
+                    }
+                    if let Some(entry) = entry {
                         merge_entry(&mut entries, entry);
                     }
                     agents.entry(agent).or_insert(None);
@@ -625,7 +632,8 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
         }
     }
     for entry in entries.values_mut() {
-        entry.private |= holds_secret(entry.before.as_deref(), &secrets)
+        entry.private |= is_agent_config(entry.format)
+            || holds_secret(entry.before.as_deref(), &secrets)
             || holds_secret(entry.after.as_deref(), &secrets);
         if entry.drift {
             ctx.diag(
@@ -648,11 +656,16 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
         .and_then(|(_, s)| s.approved.get(&key))
         .cloned()
         .unwrap_or_default();
-    let (mut approvals, approved) = approvals(&selected, &merged, previous);
+    let (mut approvals, approved) = approvals(&selected, &merged, previous, &options.target);
     let bin_dir = installer::bin_dir()?;
     let installs = agent_installs(ctx, options.agent, &bin_dir)?;
     for (agent, pin) in &installs {
-        if approved.agents.get(agent) != Some(&pin.version) || (!ctx.is_tty && !ctx.yes) {
+        let expected_identity = installer::approval_identity(agent, pin);
+        let is_approved = match &expected_identity {
+            Some(id) => approved.agents.get(agent) == Some(id),
+            None => approved.agents.get(agent) == Some(&pin.version),
+        };
+        if !is_approved || (!ctx.is_tty && !ctx.yes) {
             approvals.push(Approval {
                 kind: "agent",
                 name: agent.clone(),
@@ -878,32 +891,56 @@ fn plan_adapter(
 }
 
 /// Entry for a file whose adapter is no longer enabled: drop its owned keys.
+/// If a text file (like a skill) was created by Muster but modified by the user
+/// outside Muster, keep it as unmanaged rather than deleting it.
 fn unmanaged_entry(
     agent: &'static str,
     path: &Path,
     before: Option<String>,
     record: &Record,
-) -> Option<Entry> {
-    let text = before.as_ref()?;
+) -> (Option<Entry>, Option<Diagnostic>) {
+    let Some(text) = before.as_ref() else {
+        return (None, None);
+    };
+    let drift = before.as_deref() != Some(record.contents.as_str());
     let pruned = ownership::prune(record.format, text, &record.owned);
+    let mut diag = None;
     let after = if record.created && ownership::is_empty(record.format, &pruned) {
-        None
+        if record.format == FileFormat::Text && drift {
+            diag = Some(
+                Diagnostic::new(
+                    Severity::Warning,
+                    "orphaned_modified_file",
+                    format!(
+                        "{} was edited outside Muster after it created the file; it is no longer                          managed but was kept instead of deleted",
+                        path.display()
+                    ),
+                )
+                .with_path(path.display().to_string()),
+            );
+            Some(text.clone())
+        } else {
+            None
+        }
     } else {
         Some(pruned)
     };
-    Some(Entry {
-        path: path.to_path_buf(),
-        agents: vec![agent],
-        format: record.format,
-        drift: before.as_deref() != Some(record.contents.as_str()),
-        before,
-        after,
-        managed: false,
-        owned: Vec::new(),
-        private: record.private,
-        executable: false,
-        created: record.created,
-    })
+    (
+        Some(Entry {
+            path: path.to_path_buf(),
+            agents: vec![agent],
+            format: record.format,
+            drift,
+            before,
+            after,
+            managed: false,
+            owned: Vec::new(),
+            private: record.private,
+            executable: false,
+            created: record.created,
+        }),
+        diag,
+    )
 }
 
 fn merge_entry(entries: &mut BTreeMap<PathBuf, Entry>, entry: Entry) {
@@ -925,12 +962,15 @@ fn merge_entry(entries: &mut BTreeMap<PathBuf, Entry>, entry: Entry) {
     }
 }
 
-/// New or changed hooks / MCP servers since the last approval for this target.
-/// Only kinds some selected adapter can install are gated (and recorded).
+/// New or changed hooks / MCP servers since the last approval for this target,
+/// and, for a project target, agent permissions the project grants beyond
+/// what was last approved. Only kinds some selected adapter can install are
+/// gated (and recorded).
 fn approvals(
     selected: &[&'static Adapter],
     merged: &layer::Merged,
     previous: Approved,
+    target: &Target,
 ) -> (Vec<Approval>, Approved) {
     let supports = |caps: &[Capability]| {
         selected
@@ -983,6 +1023,40 @@ fn approvals(
             }
             next.mcp.insert(name.clone(), value);
         }
+    }
+    // A project layer comes from the repository, which may not be trusted:
+    // `[agents.permissions] allow = ["Bash"]` would let its agent run commands
+    // without asking. Any newly allowed rule needs the user's consent.
+    if matches!(target, Target::Project(_)) && supports(&[Capability::Permissions]) {
+        let value = merged
+            .agents
+            .permissions
+            .as_ref()
+            .map(|p| serde_json::to_value(p).expect("permissions serialize"));
+        let approved_allow: BTreeSet<&str> = previous
+            .permissions
+            .as_ref()
+            .and_then(|v| v["allow"].as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        if let Some(perms) = &merged.agents.permissions {
+            let added: Vec<&str> = perms
+                .allow
+                .iter()
+                .map(String::as_str)
+                .filter(|rule| !approved_allow.contains(rule))
+                .collect();
+            if !added.is_empty() {
+                approvals.push(Approval {
+                    kind: "permissions",
+                    name: "allow".into(),
+                    detail: added.join(", "),
+                });
+            }
+        }
+        next.permissions = value;
     }
     (approvals, next)
 }
@@ -1130,9 +1204,9 @@ pub fn apply(ctx: &mut Context, mut plan: Plan) -> Result<Value, MusterError> {
             ctx.progress(&format!("Installing {agent} {}", pin.version));
             match installer::install(agent, pin, &plan.bin_dir, false) {
                 Ok(_) => {
-                    plan.approved
-                        .agents
-                        .insert(agent.clone(), pin.version.clone());
+                    let identity = installer::approval_identity(agent, pin)
+                        .unwrap_or_else(|| pin.version.clone());
+                    plan.approved.agents.insert(agent.clone(), identity);
                 }
                 Err(error) => {
                     ctx.diag(Diagnostic::error(
@@ -1168,6 +1242,10 @@ pub fn apply(ctx: &mut Context, mut plan: Plan) -> Result<Value, MusterError> {
     if let Target::Project(dir) = &plan.target {
         keep.push(dir.clone());
     }
+    let confine = match &plan.target {
+        Target::Project(dir) => Some(dir.as_path()),
+        Target::Global => None,
+    };
     let mut pending = store::begin(&ctx.state_dir)?;
     let mut failed: BTreeSet<&'static str> = BTreeSet::new();
     for entry in &plan.entries {
@@ -1183,7 +1261,9 @@ pub fn apply(ctx: &mut Context, mut plan: Plan) -> Result<Value, MusterError> {
                 pending.backup(&entry.path, before)?;
             }
             match &entry.after {
-                Some(after) => write_file(&entry.path, after, entry.private, entry.executable),
+                Some(after) => {
+                    write_file(&entry.path, after, entry.private, entry.executable, confine)
+                }
                 None => {
                     std::fs::remove_file(&entry.path).map_err(|e| io_error(&entry.path, e))?;
                     // Whole files (skills) leave no empty skill directories.
@@ -1319,7 +1399,16 @@ pub fn rollback(ctx: &mut Context, n: u64) -> Result<Value, MusterError> {
             pending.backup(path, before)?;
         }
         match record {
-            Some(record) => write_file(path, &record.contents, record.private, record.executable)?,
+            Some(record) => {
+                let confine = (record.target != "global").then(|| Path::new(&record.target));
+                write_file(
+                    path,
+                    &record.contents,
+                    record.private,
+                    record.executable,
+                    confine,
+                )?
+            }
             None => std::fs::remove_file(path).map_err(|e| io_error(path, e))?,
         }
     }
@@ -1972,20 +2061,85 @@ fn parse_frontmatter(text: &str) -> ParsedFrontmatter {
         Err(e) => ParsedFrontmatter::Invalid(e.to_string()),
     }
 }
+/// Structured agent configuration (JSON/TOML/YAML) carries MCP server `env`
+/// and `headers`, provider settings and API keys. It is always written 0600,
+/// not only when it happens to hold a secret Muster resolved this run: a value
+/// the user pasted in, or a credential a provider later rotates, is just as
+/// sensitive. Instructions (Markdown) and whole-file text stay as they are.
+fn is_agent_config(format: FileFormat) -> bool {
+    matches!(
+        format,
+        FileFormat::Json | FileFormat::Toml | FileFormat::Yaml
+    )
+}
+
+/// Refuse to write through a symlink Muster did not create.
+///
+/// - `path` itself must not be a symlink: renaming over it would silently
+///   replace a link the user (or a repository) set up, and reading it would
+///   follow it somewhere else entirely.
+/// - Inside `confine` (a project directory, which comes from a repository
+///   that may be untrusted), no directory between `confine` and `path` may be
+///   a symlink, so `.claude -> ~/.ssh` cannot redirect a write out of the
+///   project. User-scope paths are not confined: `$HOME` belongs to the user,
+///   and symlinked dotfile directories there are a normal setup.
+fn check_symlinks(path: &Path, confine: Option<&Path>) -> Result<(), MusterError> {
+    let is_link = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink());
+    if is_link(path) {
+        return Err(MusterError::Security(format!(
+            "{} is a symlink; refusing to write through it (replace it with a regular file)",
+            path.display()
+        )));
+    }
+    let Some(root) = confine else {
+        return Ok(());
+    };
+    let rel = path.strip_prefix(root).map_err(|_| {
+        MusterError::Security(format!(
+            "{} is outside the project {}",
+            path.display(),
+            root.display()
+        ))
+    })?;
+    let mut current = root.to_path_buf();
+    let mut parents = rel.components().collect::<Vec<_>>();
+    parents.pop();
+    for component in parents {
+        let std::path::Component::Normal(part) = component else {
+            return Err(MusterError::Security(format!(
+                "{} escapes the project {}",
+                path.display(),
+                root.display()
+            )));
+        };
+        current.push(part);
+        if is_link(&current) {
+            return Err(MusterError::Security(format!(
+                "{} is a symlink inside the project; refusing to write {} through it",
+                current.display(),
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Write via a sibling temp file + rename, keeping the existing file mode, or
-/// forcing 0600 when `private` (the file holds resolved secrets). `executable`
-/// adds the execute bits (0755, or 0700 when private).
+/// forcing 0600 when `private`. `executable` adds the execute bits (0755, or
+/// 0700 when private). See [`check_symlinks`] for `confine`.
 fn write_file(
     path: &Path,
     contents: &str,
     private: bool,
     executable: bool,
+    confine: Option<&Path>,
 ) -> Result<(), MusterError> {
+    check_symlinks(path, confine)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| io_error(parent, e))?;
     }
     let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".muster-tmp");
+    tmp.push(format!(".muster-tmp.{}", std::process::id()));
     let tmp = PathBuf::from(tmp);
     let _ = std::fs::remove_file(&tmp);
     let mut options = std::fs::OpenOptions::new();
@@ -1998,6 +2152,7 @@ fn write_file(
     }
     let mut file = options.open(&tmp).map_err(|e| io_error(&tmp, e))?;
     std::io::Write::write_all(&mut file, contents.as_bytes()).map_err(|e| io_error(&tmp, e))?;
+    file.sync_all().map_err(|e| io_error(&tmp, e))?;
     drop(file);
     if !private {
         if let Ok(meta) = std::fs::metadata(path) {
@@ -2118,4 +2273,148 @@ fn has_valid_frontmatter(content: &str) -> bool {
     }
 
     has_name && has_desc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapters::config::Permissions;
+
+    fn merged_with(permissions: Option<Permissions>) -> layer::Merged {
+        let mut merged = layer::merge(&[]);
+        merged.agents.permissions = permissions;
+        merged
+    }
+
+    fn allow(rules: &[&str]) -> Option<Permissions> {
+        Some(Permissions {
+            allow: rules.iter().map(|r| (*r).to_string()).collect(),
+            ask: Vec::new(),
+            deny: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn project_permission_expansions_require_approval() {
+        let claude = adapters::find("claude").unwrap();
+        let project = Target::Project(PathBuf::from("/tmp/repo"));
+
+        // A project that grants itself rules must ask first.
+        let merged = merged_with(allow(&["Bash", "Edit"]));
+        let (asks, approved) = approvals(&[claude], &merged, Approved::default(), &project);
+        assert_eq!(asks.len(), 1);
+        assert_eq!(asks[0].kind, "permissions");
+        assert_eq!(asks[0].detail, "Bash, Edit");
+
+        // Once approved, the same rules do not ask again.
+        let (asks, approved) = approvals(&[claude], &merged, approved, &project);
+        assert!(
+            asks.is_empty(),
+            "{:?}",
+            asks.iter().map(|a| &a.detail).collect::<Vec<_>>()
+        );
+
+        // Expanding asks for the new rule only.
+        let merged = merged_with(allow(&["Bash", "Edit", "*"]));
+        let (asks, approved) = approvals(&[claude], &merged, approved, &project);
+        assert_eq!(asks.len(), 1);
+        assert_eq!(asks[0].detail, "*");
+
+        // Narrowing never asks.
+        let merged = merged_with(allow(&["Edit"]));
+        let (asks, _) = approvals(&[claude], &merged, approved, &project);
+        assert!(asks.is_empty());
+
+        // The user's own (global) configuration is not gated.
+        let merged = merged_with(allow(&["Bash"]));
+        let (asks, _) = approvals(&[claude], &merged, Approved::default(), &Target::Global);
+        assert!(asks.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_file_refuses_a_symlink_destination() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "keep\n").unwrap();
+        let link = dir.path().join("settings.json");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+
+        let err = write_file(&link, "{}", false, false, None).unwrap_err();
+        assert!(matches!(err, MusterError::Security(_)), "{err}");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep\n");
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_file_refuses_a_symlinked_directory_inside_a_project() {
+        let project = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), project.path().join(".claude")).unwrap();
+        let file = project.path().join(".claude/settings.json");
+
+        let err = write_file(&file, "{}", false, false, Some(project.path())).unwrap_err();
+        assert!(matches!(err, MusterError::Security(_)), "{err}");
+        assert!(!outside.path().join("settings.json").exists());
+
+        // User scope is not confined: a symlinked dotfiles directory is fine.
+        write_file(&file, "{}", false, false, None).unwrap();
+        assert!(outside.path().join("settings.json").exists());
+    }
+
+    #[test]
+    fn prune_keeps_a_created_skill_the_user_edited() {
+        let path = PathBuf::from("/home/u/.claude/skills/pdf/SKILL.md");
+        let record = Record {
+            agent: "claude".into(),
+            target: "global".into(),
+            format: FileFormat::Text,
+            owned: ownership::owned_keys(FileFormat::Text, "original\n"),
+            private: false,
+            created: true,
+            executable: false,
+            contents: "original\n".into(),
+        };
+
+        let (entry, diag) = unmanaged_entry("claude", &path, Some("original\n".into()), &record);
+        assert_eq!(entry.unwrap().after, None, "an untouched file is removed");
+        assert!(diag.is_none());
+
+        let (entry, diag) = unmanaged_entry("claude", &path, Some("my notes\n".into()), &record);
+        let entry = entry.unwrap();
+        assert_eq!(
+            entry.after.as_deref(),
+            Some("my notes\n"),
+            "an edited file is kept"
+        );
+        assert_eq!(entry.action(), Action::Unchanged);
+        assert!(!entry.managed);
+        assert_eq!(diag.unwrap().code, "orphaned_modified_file");
+    }
+
+    #[test]
+    fn structured_agent_configs_are_always_private() {
+        assert!(is_agent_config(FileFormat::Json));
+        assert!(is_agent_config(FileFormat::Toml));
+        assert!(is_agent_config(FileFormat::Yaml));
+        assert!(!is_agent_config(FileFormat::Markdown));
+        assert!(!is_agent_config(FileFormat::Text));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_write_tightens_a_loose_existing_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = dir.path().join("settings.json");
+        std::fs::write(&cfg, "{}").unwrap();
+        std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_file(&cfg, "{\"a\":1}", true, false, None).unwrap();
+        let mode = std::fs::metadata(&cfg).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
 }

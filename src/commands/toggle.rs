@@ -131,7 +131,7 @@ fn edit(ctx: &mut Context, params: &Params, action: &str) -> Result<Value, Muste
         return Ok(result);
     }
     ctx.confirm(&format!("{action} {item}?"))?;
-    std::fs::write(&path, output)
+    crate::manifest::write_atomic(&path, output.as_bytes())
         .map_err(|e| MusterError::Operational(format!("{}: {e}", path.display())))?;
     if project.is_none() {
         if let Some(actor) = actor {

@@ -80,9 +80,18 @@ pub fn bws_list(project: Option<&str>) -> Result<Vec<(String, SecretValue)>, Mus
         key: String,
         value: String,
     }
-    let mut args = vec!["secret".to_string(), "list".to_string()];
-    args.extend(project.map(str::to_string));
-    args.extend(["--output".to_string(), "json".to_string()]);
+    if let Some(project) = project {
+        validate_bws_project(project)?;
+    }
+    let mut args = vec![
+        "secret".to_string(),
+        "list".to_string(),
+        "--output".to_string(),
+        "json".to_string(),
+    ];
+    if let Some(project) = project {
+        args.extend(["--".to_string(), project.to_string()]);
+    }
     let mut stdout = Cli::new(&BWS).run(&args)?;
     let parsed = serde_json::from_str::<Vec<Item>>(&stdout);
     stdout.zeroize();
@@ -96,6 +105,13 @@ pub fn bws_list(project: Option<&str>) -> Result<Vec<(String, SecretValue)>, Mus
         .into_iter()
         .map(|item| (item.key, SecretValue::new(item.value)))
         .collect())
+}
+
+pub fn validate_bws_project(project: &str) -> Result<(), MusterError> {
+    if project.starts_with('-') || project.chars().any(char::is_control) {
+        return Err(MusterError::Usage("invalid Bitwarden project ID".into()));
+    }
+    Ok(())
 }
 
 /// `doppler://<project>/<config>/<NAME>` selects exactly one config secret.
@@ -356,5 +372,18 @@ fn is_executable(path: &Path) -> bool {
     #[cfg(not(unix))]
     {
         path.is_file()
+    }
+}
+
+#[cfg(test)]
+mod project_argument_security_tests {
+    use super::validate_bws_project;
+
+    #[test]
+    fn rejects_options_and_control_characters() {
+        assert!(validate_bws_project("project-123").is_ok());
+        assert!(validate_bws_project("--help").is_err());
+        assert!(validate_bws_project("project\nother").is_err());
+        assert!(validate_bws_project("project\0other").is_err());
     }
 }

@@ -62,7 +62,7 @@ fn bws_import_migrates_secrets_without_exposing_values() {
     }
     let args = std::fs::read_to_string(env.path().join("bws-args")).unwrap();
     assert!(
-        args.contains("secret list project-1"),
+        args.contains("secret list --output json -- project-1"),
         "unexpected bws call: {args}"
     );
 

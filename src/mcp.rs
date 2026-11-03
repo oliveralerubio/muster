@@ -265,17 +265,12 @@ struct Server {
 
 /// Map an MCP client name to the adapter id its secrets are granted to.
 fn client_agent(name: &str) -> Option<&'static str> {
-    let name = name.to_ascii_lowercase();
-    if name.contains("claude") {
-        Some("claude")
-    } else if name.contains("codex") {
-        Some("codex")
-    } else if name.contains("opencode") {
-        Some("opencode")
-    } else if name.contains("antigravity") || name.contains("agy") {
-        Some("antigravity")
-    } else {
-        None
+    match name.to_ascii_lowercase().as_str() {
+        "claude" | "claude-code" => Some("claude"),
+        "codex" => Some("codex"),
+        "opencode" => Some("opencode"),
+        "antigravity" | "agy" => Some("antigravity"),
+        _ => None,
     }
 }
 
@@ -412,4 +407,16 @@ fn initialize(params: &Value) -> Value {
 
 fn error(id: Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
+}
+
+#[cfg(test)]
+mod client_identity_security_tests {
+    use super::client_agent;
+
+    #[test]
+    fn client_names_must_match_exactly() {
+        assert_eq!(client_agent("claude-code"), Some("claude"));
+        assert_eq!(client_agent("not-claude-code"), None);
+        assert_eq!(client_agent("codex-impersonator"), None);
+    }
 }
