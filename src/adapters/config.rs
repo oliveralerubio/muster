@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentsConfig {
-    /// Adapter ids to apply (`claude`, `codex`, `opencode`, `antigravity`). Default: every stable adapter.
+    /// Adapter ids to apply (`claude`, `codex`, `opencode`, `antigravity`, `pi`). Default: every stable adapter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<Vec<String>>,
     /// Adapter ids that skip shared instructions at user scope.
@@ -25,6 +25,12 @@ pub struct AgentsConfig {
     /// Model per adapter id (model identifiers are not portable between agents).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub models: BTreeMap<String, String>,
+    /// Extension packages per adapter id (only Pi supports them). Entries are
+    /// package sources (`npm:name@1.0.0`, `git:host/repo@ref`, URLs) or local
+    /// paths; `./` and `../` paths resolve against the config repository.
+    /// Muster owns the whole list when declared.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub packages: BTreeMap<String, Vec<String>>,
     /// Selected provider id per adapter.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     #[serde(rename = "providers")]

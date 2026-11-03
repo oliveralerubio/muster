@@ -150,30 +150,45 @@ fn experimental_adapters_are_available_detected_and_opt_in() {
     env.fake_exe("hermes", "echo Hermes");
     let (_, envelope) = support::json(env.run_isolated(&["agents", "--format", "json"]));
     let list = envelope.result()["agents"].as_array().unwrap();
-    for id in ["pi", "hermes"] {
-        let agent = list.iter().find(|a| a["id"] == id).unwrap();
-        assert_eq!(agent["experimental"], true);
-        assert_eq!(agent["available"], true);
-        assert_eq!(agent["detected"], true);
-        assert_eq!(agent["enabled"], false);
-        assert_eq!(
-            agent["capabilities"],
-            serde_json::json!([
-                "instructions",
-                "mcp_stdio",
-                "mcp_remote",
-                "models",
-                "skills"
-            ])
-        );
-    }
+    let pi = list.iter().find(|a| a["id"] == "pi").unwrap();
+    assert_eq!(pi["experimental"], false);
+    assert_eq!(pi["available"], true);
+    assert_eq!(pi["detected"], true);
+    assert_eq!(pi["enabled"], true);
+    assert_eq!(
+        pi["capabilities"],
+        serde_json::json!([
+            "instructions",
+            "mcp_stdio",
+            "mcp_remote",
+            "models",
+            "skills",
+            "subagents",
+            "packages"
+        ])
+    );
+    let agent = list.iter().find(|a| a["id"] == "hermes").unwrap();
+    assert_eq!(agent["experimental"], true);
+    assert_eq!(agent["available"], true);
+    assert_eq!(agent["detected"], true);
+    assert_eq!(agent["enabled"], false);
+    assert_eq!(
+        agent["capabilities"],
+        serde_json::json!([
+            "instructions",
+            "mcp_stdio",
+            "mcp_remote",
+            "models",
+            "skills"
+        ])
+    );
     env.link_system_exe("git");
     support::json(env.run_isolated(&["init", "--yes", "--format", "json"]));
     let (_, status) = support::json(env.run_isolated(&["status", "--format", "json"]));
     let machine = &status.result()["machines"][0];
     assert_eq!(
         machine["experimental_agents"],
-        serde_json::json!(["pi", "hermes"])
+        serde_json::json!(["hermes"])
     );
     let (_, after_init) = support::json(env.run_isolated(&["agents", "--format", "json"]));
     for a in after_init.result()["agents"].as_array().unwrap() {
@@ -278,7 +293,12 @@ fn unsupported_features_and_unresolved_or_denied_credentials_warn() {
     let result = apply(&env);
     let diagnostics = result.diagnostics().as_array().unwrap();
     for id in ["pi", "hermes"] {
-        for feature in ["hooks", "permissions", "subagents"] {
+        let features: &[&str] = if id == "pi" {
+            &["hooks", "permissions"]
+        } else {
+            &["hooks", "permissions", "subagents"]
+        };
+        for feature in features {
             assert!(diagnostics
                 .iter()
                 .any(|d| d["code"] == "unsupported_feature"
@@ -301,7 +321,7 @@ fn unsupported_features_and_unresolved_or_denied_credentials_warn() {
         assert!(!text.contains("env://"));
         assert!(text.contains("PLAIN"));
     }
-    assert!(!env.path().join(".pi/agent/agents").exists());
+    assert!(env.path().join(".pi/agent/agents/reviewer.md").is_file());
     assert!(!env.path().join(".hermes/agents").exists());
 }
 
@@ -459,6 +479,7 @@ fn project_scope_uses_confirmed_paths_and_warns_for_hermes_user_only_settings() 
         ".pi/settings.json",
         "AGENTS.md",
         ".pi/skills/review/SKILL.md",
+        ".pi/agents/reviewer.md",
         ".hermes/skills/review/SKILL.md",
     ] {
         assert!(project.join(rel).is_file(), "{rel}");
@@ -566,6 +587,7 @@ fn disabling_experimental_adapters_removes_only_files_they_created() {
         ".hermes/config.yaml",
         ".hermes/SOUL.md",
         ".pi/agent/skills/review/SKILL.md",
+        ".pi/agent/agents/reviewer.md",
         ".hermes/skills/review/SKILL.md",
     ] {
         assert!(!env.path().join(path).exists(), "{path}");
