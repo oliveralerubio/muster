@@ -1,0 +1,46 @@
+[package]
+name = "muster-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+toml = "1.1.8"
+
+[dependencies.muster]
+path = ".."
+
+# Standalone workspace: keeps libFuzzer out of the main build.
+[workspace]
+
+[[bin]]
+name = "fuzz_skill_name"
+path = "fuzz_targets/fuzz_skill_name.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_bws_project"
+path = "fuzz_targets/fuzz_bws_project.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_manifest"
+path = "fuzz_targets/fuzz_manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_lockfile"
+path = "fuzz_targets/fuzz_lockfile.rs"
+test = false
+doc = false
+bench = false

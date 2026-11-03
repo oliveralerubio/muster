@@ -2332,6 +2332,37 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(unix)]
+    #[test]
+    fn check_symlinks_rejects_traversal_and_symlinked_parents() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        // `..` components escape the project.
+        let escape = root.join("..").join("evil");
+        assert!(check_symlinks(&escape, Some(&root)).is_err());
+        let escape = root.join("a").join("..").join("..").join("evil");
+        assert!(check_symlinks(&escape, Some(&root)).is_err());
+        // A path outside the project is refused.
+        assert!(check_symlinks(&dir.path().join("other"), Some(&root)).is_err());
+        // A symlinked parent directory is refused.
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join(".claude")).unwrap();
+        assert!(check_symlinks(&root.join(".claude").join("x"), Some(&root)).is_err());
+        assert!(write_file(
+            &root.join(".claude").join("x"),
+            "d",
+            false,
+            false,
+            Some(&root)
+        )
+        .is_err());
+        assert!(!outside.join("x").exists());
+        // A plain nested path is fine.
+        assert!(check_symlinks(&root.join("ok").join("x"), Some(&root)).is_ok());
+    }
+
     #[test]
     fn write_file_refuses_a_symlink_destination() {
         let dir = tempfile::TempDir::new().unwrap();

@@ -467,7 +467,7 @@ fn validate_segment(kind: &str, value: &str) -> Result<(), MusterError> {
     }
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), MusterError> {
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), MusterError> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let mut tmp = path.as_os_str().to_owned();

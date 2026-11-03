@@ -189,7 +189,7 @@ pub const RM: CommandSpec = CommandSpec {
 // ---------------------------------------------------------------------------
 
 /// Skill names follow the Agent Skills convention: lowercase, digits, '-'.
-fn validate_skill_name(name: &str) -> Result<String, MusterError> {
+pub fn validate_skill_name(name: &str) -> Result<String, MusterError> {
     if lock::is_valid_name(name) {
         Ok(name.to_string())
     } else {

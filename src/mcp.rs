@@ -264,7 +264,7 @@ struct Server {
 }
 
 /// Map an MCP client name to the adapter id its secrets are granted to.
-fn client_agent(name: &str) -> Option<&'static str> {
+pub fn client_agent(name: &str) -> Option<&'static str> {
     match name.to_ascii_lowercase().as_str() {
         "claude" | "claude-code" => Some("claude"),
         "codex" => Some("codex"),
