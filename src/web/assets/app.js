@@ -114,7 +114,9 @@ function timeCell(value) {
 let toastTimer = null;
 function hideToast() {
   const toast = $("#toast");
-  if (toast) toast.hidden = true;
+  if (!toast) return;
+  toast.hidden = true;
+  try { if (toast.hidePopover) toast.hidePopover(); } catch (err) { /* not open */ }
 }
 function toast(message, kind) {
   const box = $("#toast");
@@ -122,6 +124,13 @@ function toast(message, kind) {
   box.setAttribute("class", "toast " + (kind || "error"));
   box.replaceChildren(el("span", {}, message), button("Dismiss", hideToast));
   box.hidden = false;
+  // A modal <dialog> lives in the top layer, above any z-index; a manual
+  // popover joins the top layer too so the toast stays visible over it.
+  try {
+    box.setAttribute("popover", "manual");
+    if (box.hidePopover) box.hidePopover();
+    if (box.showPopover) box.showPopover();
+  } catch (err) { /* popover unsupported: z-index fallback applies */ }
   clearTimeout(toastTimer);
   toastTimer = setTimeout(hideToast, 6000);
 }
@@ -461,7 +470,7 @@ const views = {
         return act(`Set ${useProv.value} as default provider for ${useAgent.value}?`, "provider/use", { id: useProv.value, agent: useAgent.value });
       }, "primary"),
       button("Clear default", () => {
-        return act(`Clear default provider for ${useAgent.value}?`, "provider/use", { id: useProv.value || "default", agent: useAgent.value, clear: true });
+        return act(`Clear default provider for ${useAgent.value}?`, "provider/use", { agent: useAgent.value, clear: true });
       }));
 
     render("AI providers", [],
@@ -562,6 +571,11 @@ const views = {
         actions.push(button("Reject", () => act(`Reject member ${m.name}? Their invitation and recorded approvals are discarded.`, "member/reject", { name: m.name }), "danger"));
       } else {
         const nextRole = m.role === "admin" ? "member" : "admin";
+        actions.push(button("Set profile", () => {
+          const next = prompt(`Profile for ${m.name} (empty to clear):`, m.profile || "");
+          if (next === null) return undefined;
+          return act(`${next.trim() ? "Assign profile " + next.trim() : "Clear profile"} for ${m.name}?`, "member/profile", { name: m.name, profile: next.trim() });
+        }));
         actions.push(button(`Make ${nextRole}`, () => act(`Change role of ${m.name} to ${nextRole}?`, "member/role", { name: m.name, role: nextRole })));
         actions.push(button("Remove", () => act(`Revoke member ${m.name} and all their machines?`, "member/rm", { name: m.name }), "danger"));
       }
@@ -606,9 +620,18 @@ const views = {
       button("Invite member", () => {
         const name = newMemberName.value.trim();
         if (!name) return toast("Enter a member name.");
-        const body = { name, role: newMemberRole.value };
-        if (newMemberProfile.value.trim()) body.profile = newMemberProfile.value.trim();
-        return act(`Invite ${name} as ${body.role}?`, "member/add", body);
+        const role = newMemberRole.value;
+        const profile = newMemberProfile.value.trim();
+        return (async () => {
+          if (!confirm(`Invite ${name} as ${role}${profile ? " with profile " + profile : ""}?`)) return;
+          const added = await api("member/add", { confirm: true, name, role });
+          if (!added.ok) toast(failMessage(added));
+          else if (profile) {
+            const set = await api("member/profile", { confirm: true, name, profile });
+            if (!set.ok) toast(failMessage(set));
+          }
+          await show(current);
+        })();
       }, "primary"));
 
     // Create group form
@@ -627,14 +650,14 @@ const views = {
 
     // Grant / revoke reader form
     const grantGroup = selectInput("Group", gList.map((g) => g.name || g.group || ""));
-    const grantReader = textInput("Reader", { placeholder: "alice or machine:work" });
+    const grantReader = textInput("Reader", { placeholder: "alice or vps (member, machine or group)" });
     const grantForm = gList.length
       ? el("div", { class: "skill-form" },
         labelled("Group", grantGroup),
         labelled("Reader", grantReader),
         button("Grant access", () => {
           const reader = grantReader.value.trim();
-          if (!reader) return toast("Enter a reader (member name or machine:name).");
+          if (!reader) return toast("Enter a reader (member, machine or group name).");
           return act(`Grant ${reader} access to group ${grantGroup.value}?`, "group/grant", { group: grantGroup.value, reader });
         }, "primary"),
         button("Revoke access", () => {
@@ -665,7 +688,16 @@ const views = {
       button("Check providers", async () => {
         const check = await api("secret/check");
         if (!check.ok) toast(failMessage(check));
-        else toast("Secret providers checked.", "info");
+        else {
+          const list = (check.result && check.result.providers) || [];
+          const bad = list.filter((p) => p.available === false);
+          const summary = `${list.length - bad.length} of ${list.length} secret providers available.`;
+          if (bad.length) {
+            toast(summary + "\n" + bad.map((p) => `${p.provider}: ${p.message || p.code || "unavailable"}`).join("\n"));
+          } else {
+            toast(summary, "info");
+          }
+        }
       }),
     ],
       el("p", {}, "Metadata only. Revealing a value needs explicit confirmation and is recorded."),
@@ -1050,7 +1082,8 @@ const VIEW_CLI = {
   effective: "muster effective",
   profiles: "muster profile list",
   proposals: "muster proposal list",
-  history: "muster history",
+  why: 'muster why "<query>"',
+  history: "muster rollback",
   doctor: "muster doctor",
 };
 
@@ -1528,6 +1561,7 @@ const skillFileEl = $("#skill-file");
 if (skillFileEl) skillFileEl.addEventListener("change", () => loadSkillFile(skillFileEl.value));
 const skillCloseEl = $("#skill-close");
 if (skillCloseEl) skillCloseEl.addEventListener("click", () => skillDialog && skillDialog.close());
+if (skillDialog) skillDialog.addEventListener("close", () => { if (current === "skills") show("skills"); });
 const skillFormEl = $("#skill-form");
 if (skillFormEl) skillFormEl.addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -1541,6 +1575,7 @@ if (skillFormEl) skillFormEl.addEventListener("submit", async (event) => {
     if (data.ok) {
       $("#skill-error").textContent = "";
       toast(`Saved ${skillFileLoaded}.`, "info");
+      await show("skills");
     } else {
       $("#skill-error").textContent = failMessage(data);
     }
