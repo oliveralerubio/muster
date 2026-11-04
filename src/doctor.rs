@@ -936,5 +936,7 @@ mod tests {
         assert_eq!(parse_version("no version here"), None);
         assert_eq!(parse_version("1.2.3.4"), None);
         assert!(parse_version("0.9.3").unwrap() < parse_version("1.0.0").unwrap());
+        let codex = crate::adapters::find("codex").unwrap();
+        assert!(parse_version("codex-cli 0.166.0").unwrap() >= parse_version(codex.min_version).unwrap());
     }
 }
