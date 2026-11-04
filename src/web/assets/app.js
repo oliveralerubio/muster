@@ -125,7 +125,7 @@ function hideToast() {
   toast.hidden = true;
   try { if (toast.hidePopover) toast.hidePopover(); } catch (err) { /* not open */ }
 }
-function toast(message, kind) {
+function toast(message, kind, sticky) {
   const box = $("#toast");
   if (!box) return;
   box.setAttribute("class", "toast " + (kind || "error"));
@@ -139,17 +139,32 @@ function toast(message, kind) {
     if (box.showPopover) box.showPopover();
   } catch (err) { /* popover unsupported: z-index fallback applies */ }
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(hideToast, 6000);
+  // Errors and actionable instructions stay until dismissed.
+  if (!sticky && (kind || "error") === "info") toastTimer = setTimeout(hideToast, 6000);
 }
 
 // Disable a control while its request is in flight; `gate` says whether it
 // must stay disabled afterwards (preview-gated Save buttons).
+const pendingLabels = { "Sync now": "Syncing...", "Enable": "Enabling..." };
 async function busy(node, run, gate) {
+  const wasFocused = document.activeElement === node;
+  const plain = node.children && node.children.length === 0;
+  const original = plain ? node.textContent : null;
   node.disabled = true;
+  node.setAttribute("aria-busy", "true");
+  if (plain && original) node.textContent = pendingLabels[original.trim()] || "Working...";
   try {
     return await run();
   } finally {
+    node.setAttribute("aria-busy", "false");
+    if (plain && original && node.textContent !== original) node.textContent = original;
     node.disabled = gate ? gate() : false;
+    // A re-render may have replaced the button: keep keyboard focus in the page.
+    if (wasFocused && !node.isConnected) {
+      const replacement = document.activeElement === document.body || !document.activeElement;
+      const main = $("#main");
+      if (replacement && main) main.focus();
+    }
   }
 }
 
@@ -177,7 +192,7 @@ function table(headers, rows, empty, cls) {
   const isActions = (cell) => cell instanceof Node
     && (cell.tagName === "BUTTON" || (cell.getAttribute("class") || "").includes("actions"));
   const label = headers.filter(Boolean).join(", ");
-  return el("div", { class: "table-wrap" + (cls ? " " + cls : ""), role: "region", tabindex: "0", "aria-label": label },
+  return el("div", { class: "table-wrap" + (cls ? " " + cls : ""), role: "region", "aria-label": label },
     el("table", {},
       el("thead", {}, el("tr", {}, headers.map((h) =>
         el("th", { scope: "col" }, h || el("span", { class: "sr-only" }, "Actions"))))),
@@ -197,24 +212,107 @@ function failMessage(data) {
 // Every panel button is disabled while its handler is in flight, so a double
 // click cannot submit twice. `gate` keeps preview-gated Save buttons locked.
 function button(label, onclick, cls, gate) {
-  const node = el("button", { type: "button", class: "btn " + (cls || "") }, label);
-  node.addEventListener("click", () => {
-    if (node.disabled) return undefined;
-    return busy(node, () => onclick(), gate);
+  const node = el("button", { type: "button", class: "btn " + (cls || ""),
+    "data-action": String(label).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") }, label);
+  node.addEventListener("click", async () => {
+    if (node.disabled || node.dataset.locked === "1") return undefined;
+    // A handler that asks for confirmation (act) claims the trigger and shows
+    // progress only once the request is really in flight.
+    const ctx = { node, gate, claimed: false };
+    node.dataset.locked = "1";
+    triggerCtx = ctx;
+    let pending;
+    try {
+      pending = onclick();
+    } catch (err) {
+      pending = Promise.reject(err);
+    } finally {
+      triggerCtx = null;
+    }
+    try {
+      if (ctx.claimed) return await pending;
+      return await busy(node, () => pending, gate);
+    } finally {
+      delete node.dataset.locked;
+    }
   });
   return node;
 }
+let triggerCtx = null;
+
+// In-app confirmation: an accessible modal <dialog> (focus trapped on Confirm, Escape cancels).
+function askConfirm(message, title, actionLabel) {
+  if (typeof document === "undefined" || !document.body || typeof document.body.appendChild !== "function") {
+    return Promise.resolve(typeof confirm === "function" ? confirm(message) : true);
+  }
+  return new Promise((resolve) => {
+    const opener = document.activeElement;
+    const ok = el("button", { type: "button", class: "btn primary", id: "confirm-ok" }, actionLabel || "Confirm");
+    const cancel = el("button", { type: "button", class: "btn", id: "confirm-cancel" }, "Cancel");
+    const dlg = el("dialog", { class: "confirm-dialog", "aria-labelledby": "confirm-title", "aria-describedby": "confirm-desc" },
+      el("h2", { id: "confirm-title" }, title || "Please confirm"),
+      el("p", { class: "confirm-message", id: "confirm-desc" }, message),
+      el("div", { class: "actions confirm-actions" }, cancel, ok));
+    let result = false;
+    ok.addEventListener("click", () => { result = true; dlg.close(); });
+    cancel.addEventListener("click", () => dlg.close());
+    dlg.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") { e.preventDefault(); dlg.close(); return; }
+      if (e.key !== "Tab") return;
+      const first = e.shiftKey ? ok : cancel;
+      const last = e.shiftKey ? cancel : ok;
+      if (document.activeElement === last) { e.preventDefault(); first.focus(); }
+    });
+    dlg.addEventListener("close", () => {
+      dlg.remove();
+      if (opener && opener.isConnected && typeof opener.focus === "function") opener.focus();
+      resolve(result);
+    });
+    document.body.appendChild(dlg);
+    if (typeof dlg.showModal === "function") dlg.showModal();
+    ok.focus();
+  });
+}
+async function openConfirm({ title, message, onConfirm }) {
+  const confirmed = await askConfirm(message, title);
+  if (confirmed && onConfirm) return onConfirm();
+  return confirmed;
+}
+
+// Stable identity of the focused control, so focus can return to its replacement.
+function focusKey() {
+  const a = document.activeElement;
+  if (!a || a === document.body) return null;
+  if (a.id) return "#" + CSS.escape(a.id);
+  if (a.dataset && a.dataset.action) return `[data-action="${a.dataset.action}"]`;
+  return null;
+}
+function restoreFocus(key) {
+  const target = key && document.querySelector(key);
+  if (target && typeof target.focus === "function") { target.focus(); return; }
+  const main = $("#main");
+  if (main) main.focus();
+}
 
 // Run a state-changing command after an explicit confirmation, then reload.
-async function act(question, path, body) {
-  if (!confirm(question)) return;
-  const data = await api(path, Object.assign({ confirm: true }, body || {}));
-  if (!data.ok) toast(failMessage(data));
-  await show(current);
-  // The reload shows the view's own command; the action just run is what the
-  // user wants to learn from, so it takes the footer back.
-  if (data.cli) showCli(data.cli);
-  return data;
+async function act(question, path, body, trigger) {
+  const ctx = trigger ? { node: trigger } : triggerCtx;
+  triggerCtx = null;
+  if (ctx && !trigger) ctx.claimed = true;
+  const key = focusKey();
+  const label = ctx && ctx.node.textContent ? ctx.node.textContent.trim() : "";
+  if (!(await askConfirm(question, label || undefined, label || undefined))) return;
+  const run = async () => {
+    const data = await api(path, Object.assign({ confirm: true }, body || {}));
+    if (!data.ok) toast(failMessage(data));
+    await show(current);
+    restoreFocus(key);
+    // The reload shows the view's own command; the action just run is what the
+    // user wants to learn from, so it takes the footer back.
+    if (data.cli) showCli(data.cli);
+    return data;
+  };
+  return ctx ? busy(ctx.node, run, ctx.gate) : run();
 }
 
 // A labelled form control used by the inline admin forms.
@@ -261,7 +359,18 @@ function render(title, actions, ...blocks) {
   setCount("");
   actionsEl.replaceChildren(...actions.flat(Infinity).filter(Boolean));
   viewEl.replaceChildren(...blocks.flat(Infinity).filter(Boolean));
+  syncScrollRegions();
 }
+
+// A table wrapper joins the tab order only while it really scrolls sideways.
+function syncScrollRegions() {
+  if (typeof viewEl.querySelectorAll !== "function") return;
+  for (const wrap of viewEl.querySelectorAll(".table-wrap")) {
+    if (wrap.scrollWidth > wrap.clientWidth) wrap.setAttribute("tabindex", "0");
+    else wrap.removeAttribute("tabindex");
+  }
+}
+if (typeof addEventListener === "function") addEventListener("resize", syncScrollRegions);
 
 // Last sync as clean tabular text (the coloured pill is reserved for the Status column).
 function lastSyncCell(value) {
@@ -341,6 +450,28 @@ const views = {
     const s = schedule.result || {};
     const defaultInterval = s.interval_minutes || 60;
     const interval = el("input", { type: "number", min: "1", value: String(defaultInterval), "aria-label": "Minutes between syncs" });
+    const intervalError = el("span", { id: "ops-interval-error", class: "error-text", role: "alert" });
+    const clearIntervalError = () => {
+      interval.removeAttribute("aria-invalid");
+      interval.removeAttribute("aria-errormessage");
+      intervalError.textContent = "";
+    };
+    interval.addEventListener("input", clearIntervalError);
+    const enableBtn = button(s.enabled ? "Update" : "Enable", () => {
+      const raw = interval.value.trim();
+      const val = Number(raw);
+      if (!raw || !Number.isInteger(val) || val < 1) {
+        interval.setAttribute("aria-invalid", "true");
+        interval.setAttribute("aria-errormessage", "ops-interval-error");
+        intervalError.textContent = "Enter a whole number of minutes, 1 or more.";
+        interval.focus();
+        toast("Please enter a valid interval of 1 or more minutes", "error", true);
+        return undefined;
+      }
+      clearIntervalError();
+      return act(`Enable periodic sync every ${val} minute(s)?`, "schedule/enable", { interval: val });
+    });
+    enableBtn.id = "ops-enable";
     const state = (kind, label) => el("span", { class: "state state-" + kind },
       el("span", { class: "state-dot", "aria-hidden": "true" }), sentenceCase(label));
     const resultKind = (text) => (/^(ok|success|synced|applied|current)/i.test(text) ? "live"
@@ -389,8 +520,8 @@ const views = {
       : "Off";
 
     const driftRows = [
-      ...(drift.members || []).map((d) => [sentenceCase("member"), el("code", {}, d.name), state("wait", driftReasonLabel(d.reason))]),
-      ...(drift.machines || []).map((d) => [sentenceCase("machine"), el("code", {}, d.name), state("wait", driftReasonLabel(d.reason))]),
+      ...(drift.members || []).map((d) => [sentenceCase("member"), el("code", {}, d.name), el("span", { class: "reason" }, driftReasonLabel(d.reason))]),
+      ...(drift.machines || []).map((d) => [sentenceCase("machine"), el("code", {}, d.name), el("span", { class: "reason" }, driftReasonLabel(d.reason))]),
     ];
     const attentionBlocks = [
       pending.length
@@ -405,11 +536,19 @@ const views = {
         : null,
     ].filter(Boolean);
 
+    const attentionSection = el("section", { class: "attention", "aria-labelledby": "attention-title" },
+        sectionHead("Needs attention", "attention-title",
+          attentionCount ? el("span", { class: "badge warning count", "aria-label": `${attentionCount} items` }, String(attentionCount)) : null),
+        el("p", { class: "section-desc" }, attentionBlocks.length ? "Drift, pending approvals and diagnostics that need a decision." : "Pending approvals, drift and diagnostics appear here."),
+        attentionBlocks.length
+          ? attentionBlocks
+          : el("p", { class: "quiet", role: "status" }, "Nothing needs attention: no pending approvals, no drift and no diagnostics."));
     render("Dashboard", [button("Sync now", () => act("Pull, plan and apply now?", "sync"), "primary")],
       el("dl", { class: "plates", "aria-label": "Fleet status" },
         plate("Machines", String(machines.length), fleetSub),
         plate("Needs attention", String(attentionCount), attentionSub, attentionCount > 0),
         plate("Last sync", syncFigure, syncSub, false, !r.sync)),
+      driftCount > 0 ? attentionSection : null,
       sectionHead("Fleet"),
       fleet,
       sectionHead("Sync operations", "ops-title"),
@@ -423,18 +562,11 @@ const views = {
          el("div", { class: "ops-form" },
           el("label", { class: "ops-interval" },
             interval, el("span", { class: "muted" }, "min")),
+          intervalError,
           el("div", { class: "ops-controls" },
-            button(s.enabled ? "Update" : "Enable", () => {
-              return act(`Enable periodic sync every ${interval.value} minute(s)?`, "schedule/enable", { interval: Number(interval.value) || undefined });
-            }),
+            enableBtn,
             s.enabled ? button("Disable", () => act("Disable periodic sync?", "schedule/disable")) : "")))),
-      el("section", { class: "attention", "aria-labelledby": "attention-title" },
-        sectionHead("Needs attention", "attention-title",
-          attentionCount ? el("span", { class: "badge warning count", "aria-label": `${attentionCount} items` }, String(attentionCount)) : null),
-        el("p", { class: "section-desc" }, attentionBlocks.length ? "Drift, pending approvals and diagnostics that need a decision." : "Pending approvals, drift and diagnostics appear here."),
-        attentionBlocks.length
-          ? attentionBlocks
-          : el("p", { class: "quiet", role: "status" }, "Nothing needs attention: no pending approvals, no drift and no diagnostics.")));
+      driftCount > 0 ? null : attentionSection);
     setCount(`${machines.length} ${machines.length === 1 ? "machine" : "machines"}`);
   },
 
@@ -463,7 +595,7 @@ const views = {
         if (value) body[name] = value;
       }
       const submit = form.querySelector("button");
-      await busy(submit, () => act("Add or replace this AI provider?", "provider/add", body));
+      await act("Add or replace this AI provider?", "provider/add", body, submit);
     });
 
     const agentList = ["claude", "codex", "opencode", "pi", "hermes", "antigravity"];
@@ -513,13 +645,13 @@ const views = {
     const nameCell = (m, current) => machineIdentity(m, current);
     const statusCell = (m) => (m.status ? machineState(m.status) : el("span", { class: "muted" }, "—"));
     const enrollCommand = "muster machine add <host>";
-    const enroll = button("Enroll machine", async () => {
+    const enroll = button("Copy enroll command", async () => {
       let copied = false;
       try {
         await navigator.clipboard.writeText(enrollCommand);
         copied = true;
       } catch (err) { /* clipboard unavailable: the command is still shown in the toast */ }
-      toast((copied ? "Copied: " : "Run on the new machine: ") + enrollCommand, "info");
+      toast((copied ? "Copied: " : "Run on the new machine: ") + enrollCommand, "info", true);
     }, "primary");
     enroll.title = "Copies " + enrollCommand;
     const assignMachine = selectInput("Machine", machines.map((m) => m.name));
@@ -1044,8 +1176,8 @@ async function confirmUpdate(body) {
   await act("Apply these updates?\n\n" + lines.join("\n"), "skills/update", body);
 }
 
-function updateSkill(skill) {
-  if (skill.modified && !confirm(`${skill.name} was edited locally. Overwrite the local changes?`)) return;
+async function updateSkill(skill) {
+  if (skill.modified && !(await askConfirm(`${skill.name} was edited locally. Overwrite the local changes?`))) return;
   return confirmUpdate(skill.modified ? { name: skill.name, force: true } : { name: skill.name });
 }
 
@@ -1094,7 +1226,7 @@ const VIEW_CLI = {
   doctor: "muster doctor",
 };
 
-async function show(name) {
+async function show(name, opts) {
   current = name;
   const token = ++navToken;
   for (const tab of tabs) {
@@ -1104,10 +1236,26 @@ async function show(name) {
     // On narrow screens the tab row scrolls: keep the active tab fully visible.
     if (selected && tab.scrollIntoView) tab.scrollIntoView({ block: "nearest", inline: "nearest" });
   }
-  setMenu(false);
+  const menuWasOpen = menuBtn && menuBtn.getAttribute("aria-expanded") === "true";
+  const keepMenu = Boolean(opts && opts.keepMenu);
+  if (!keepMenu) setMenu(false);
+  if (menuWasOpen && !keepMenu) { const main = $("#main"); if (main) main.focus(); }
   viewEl.setAttribute("aria-labelledby", "tab-" + name);
+  const announcer = $("#status-announcer");
+  if (announcer) {
+    const label = tabs.find((tab) => tab.dataset.view === name);
+    announcer.textContent = label ? label.textContent.trim() + " view" : "";
+  }
   // The previous content stays in place while loading, so the layout holds still.
   viewEl.setAttribute("aria-busy", "true");
+  actionsEl.setAttribute("aria-busy", "true");
+  viewEl.inert = true;
+  actionsEl.inert = true;
+  // Name the destination right away; the old content stays dimmed until replaced.
+  const destTab = tabs.find((tab) => tab.dataset.view === name);
+  const destName = destTab && destTab.textContent ? destTab.textContent.trim() : "";
+  const titleEl = $("#title");
+  if (destName && titleEl) titleEl.textContent = destName;
   const attempt = loadAttempt = { failure: null };
   const title = tabs.find((tab) => tab.dataset.view === name);
   const failed = (message) => render(title ? title.textContent.trim() : name, [],
@@ -1124,10 +1272,10 @@ async function show(name) {
     if (token !== navToken) return;
     failed("Failed to load: " + err.message);
   }
-  if (token === navToken) viewEl.setAttribute("aria-busy", "false");
+  if (token === navToken) { viewEl.setAttribute("aria-busy", "false"); actionsEl.setAttribute("aria-busy", "false"); viewEl.inert = false; actionsEl.inert = false; }
 }
 
-// Keyboard: arrows (the list is vertical)/Home/End move between tabs; digits 1-9 jump to a view.
+// Keyboard: arrows (the list is vertical)/Home/End move between tabs; Alt+digits 1-9 jump to a view.
 $("#nav").addEventListener("keydown", (e) => {
   const i = tabs.indexOf(document.activeElement);
   if (i < 0) return;
@@ -1136,15 +1284,23 @@ $("#nav").addEventListener("keydown", (e) => {
   e.preventDefault();
   const tab = tabs[(next + tabs.length) % tabs.length];
   tab.focus();
-  show(tab.dataset.view);
+  show(tab.dataset.view, { keepMenu: true });
+});
+// Enter/Space on a tab commits the choice: close the mobile menu, focus the page.
+$("#nav").addEventListener("keydown", (e) => {
+  if ((e.key !== "Enter" && e.key !== " ") || !tabs.includes(document.activeElement)) return;
+  if (!menuBtn || menuBtn.getAttribute("aria-expanded") !== "true") return;
+  e.preventDefault();
+  show(document.activeElement.dataset.view);
 });
 for (const tab of tabs) tab.addEventListener("click", () => show(tab.dataset.view));
 document.addEventListener("keydown", (e) => {
   const typing = e.target && typeof e.target.closest === "function"
     && e.target.closest("input, textarea, select, dialog, [contenteditable]");
-  if (typing || e.altKey || e.ctrlKey || e.metaKey) return;
+  if (typing || e.metaKey || !e.altKey) return;
   const n = Number(e.key);
   if (n >= 1 && n <= tabs.length) {
+    e.preventDefault();
     tabs[n - 1].focus();
     show(tabs[n - 1].dataset.view);
   }
@@ -1176,12 +1332,15 @@ themeEl.addEventListener("click", (event) => {
 // Secret reveal: a dialog, then an explicit {"confirm": true} POST.
 const dialog = $("#reveal");
 let revealName = null;
+let revealOpener = null;
 function openReveal(reference) {
+  revealOpener = document.activeElement;
   revealName = reference;
   $("#reveal-name").textContent = reference;
   $("#reveal-value").textContent = "";
   showCli(`muster secret get ${reference} --reveal --yes`);
   dialog.showModal();
+  $("#reveal-confirm").focus();
 }
 $("#reveal-confirm").addEventListener("click", async () => {
   const confirmBtn = $("#reveal-confirm");
@@ -1195,7 +1354,11 @@ $("#reveal-confirm").addEventListener("click", async () => {
     }
   });
 });
-dialog.addEventListener("close", () => { $("#reveal-value").textContent = ""; });
+dialog.addEventListener("close", () => {
+  $("#reveal-value").textContent = "";
+  if (revealOpener && revealOpener.isConnected && typeof revealOpener.focus === "function") revealOpener.focus();
+  else { const main = $("#main"); if (main) main.focus(); }
+});
 
 const editDialog = $("#secret-edit");
 let secretAction = "add";
@@ -1334,7 +1497,7 @@ $("#profile-form").addEventListener("submit", async (event) => {
     return;
   }
   const body = profileBody(false);
-  if (!confirm(`Save profile ${body.name}?`)) return;
+  if (!(await askConfirm(`Save profile ${body.name}?`))) return;
   // Locked while saving; afterwards only a still-previewed payload may unlock it.
   await busy(saveBtn, async () => {
     const data = await api("profile/set", body);
@@ -1490,9 +1653,9 @@ async function saveMcp() {
     return;
   }
   if (looksLikeSecretValue(body)
-    && !confirm("Some values look like secret values, not references (e.g. native://group/name). "
-      + "Muster stores them verbatim and only resolves references at apply time. Save anyway?")) return;
-  if (!confirm(`Save MCP server ${body.name}?`)) return;
+    && !(await askConfirm("Some values look like secret values, not references (e.g. native://group/name). "
+      + "Muster stores them verbatim and only resolves references at apply time. Save anyway?"))) return;
+  if (!(await askConfirm(`Save MCP server ${body.name}?`))) return;
   const data = await api("mcp-server/add", Object.assign({ confirm: true }, body));
   if (data.ok) {
     mcpPreviewToken = null;
@@ -1612,7 +1775,7 @@ show("dashboard");
 
 
 async function secretApproval(action, id) {
-  if (!confirm(`${action === "approve" ? "Approve secret use" : action === "deny" ? "Deny secret request" : "Revoke secret approval"}?`)) return;
+  if (!(await askConfirm(`${action === "approve" ? "Approve secret use" : action === "deny" ? "Deny secret request" : "Revoke secret approval"}?`))) return;
   const data = await api("secret/" + action, { id, confirm: true });
   if (!data.ok) { toast(failMessage(data)); return; }
   await show("secrets");

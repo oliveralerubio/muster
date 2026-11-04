@@ -56,14 +56,15 @@
         </div>
         <div id="actions" class="actions"></div>
       </div>
-      <div id="view" role="tabpanel" aria-labelledby="tab-dashboard" aria-live="polite"></div>
+      <div id="view" role="tabpanel" aria-labelledby="tab-dashboard" tabindex="0"></div>
     </main>
 
-    <footer class="cli" aria-live="polite">
+    <footer class="cli">
       <span>CLI equivalent:</span> <code id="cli">muster status</code>
     </footer>
   </div>
 
+  <div id="status-announcer" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
   <div id="conn" class="toast error" role="status" aria-live="polite" hidden></div>
 
