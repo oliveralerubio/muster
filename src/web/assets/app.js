@@ -179,7 +179,10 @@ function toast(message, kind, sticky) {
 
 // Disable a control while its request is in flight; `gate` says whether it
 // must stay disabled afterwards (preview-gated Save buttons).
-const pendingLabels = { "Sync now": "Syncing...", "Enable": "Enabling..." };
+const pendingLabels = {
+  "Sync now": "Syncing...", "Enable": "Enabling...",
+  "Turn on": "Turning on...", "Save": "Saving...", "Turn off": "Turning off...",
+};
 async function busy(node, run, gate) {
   const wasFocused = document.activeElement === node;
   const plain = node.children && node.children.length === 0;
@@ -496,20 +499,30 @@ const views = {
       intervalError.textContent = "";
     };
     interval.addEventListener("input", clearIntervalError);
-    const enableBtn = button(s.enabled ? "Update" : "Enable", () => {
+    const everyText = (n) => (n === 1 ? "every minute" : `every ${n} minutes`);
+    const enableBtn = button(s.enabled ? "Save" : "Turn on", () => {
       const raw = interval.value.trim();
       const val = Number(raw);
       if (!raw || !Number.isInteger(val) || val < 1) {
         interval.setAttribute("aria-invalid", "true");
         interval.setAttribute("aria-errormessage", "ops-interval-error");
-        intervalError.textContent = "Enter a whole number of minutes, 1 or more.";
+        intervalError.textContent = "Enter a whole number of minutes (1 or more).";
         interval.focus();
         toast("Please enter a valid interval of 1 or more minutes", "error", true);
         return undefined;
       }
       clearIntervalError();
-      return act(`Enable periodic sync every ${val} minute(s)?`, "schedule/enable", { interval: val });
+      return act(s.enabled
+        ? `Change automatic sync to ${everyText(val)}?`
+        : `Turn on automatic sync? This machine will check for changes ${everyText(val)}.`,
+      "schedule/enable", { interval: val });
     });
+    if (s.enabled) {
+      // Nothing to save until the number differs from the running schedule.
+      const syncSave = () => { enableBtn.disabled = interval.value.trim() === String(defaultInterval); };
+      interval.addEventListener("input", syncSave);
+      syncSave();
+    }
     enableBtn.id = "ops-enable";
     const state = (kind, label) => el("span", { class: "state state-" + kind },
       el("span", { class: "state-dot", "aria-hidden": "true" }), sentenceCase(label));
@@ -554,9 +567,12 @@ const views = {
         button("Open Machines", () => show("machines")));
     if (machines.length) fleet.setAttribute("class", "table-wrap board fleet-table");
 
-    const periodicText = s.enabled
-      ? (s.interval_minutes ? `Every ${s.interval_minutes} min` : "Enabled") + (s.backend ? ` via ${s.backend}` : "")
-      : "Off";
+    const statusPill = state(s.enabled ? "live" : "idle", s.enabled ? "On" : "Off");
+    if (s.enabled && s.backend) statusPill.setAttribute("title", `Runs in the background using ${s.backend}`);
+    const statusText = !s.enabled ? "This machine only syncs when you click Sync now."
+      : !s.interval_minutes ? "Checks for changes on a schedule"
+        : s.interval_minutes === 60 ? "Checks for changes every hour"
+          : `Checks for changes ${everyText(s.interval_minutes)}`;
 
     const driftRows = [
       ...(drift.members || []).map((d) => [sentenceCase("member"), el("code", {}, d.name), el("span", { class: "reason" }, driftReasonLabel(d.reason))]),
@@ -582,7 +598,7 @@ const views = {
         attentionBlocks.length
           ? attentionBlocks
           : el("p", { class: "quiet", role: "status" }, "Nothing needs attention: no pending approvals, no drift and no diagnostics."));
-    render("Dashboard", [button("Sync now", () => act("Pull, plan and apply now?", "sync"), "primary")],
+    render("Dashboard", [],
       el("dl", { class: "plates", "aria-label": "Fleet status" },
         plate("Machines", String(machines.length), fleetSub),
         plate("Needs attention", String(attentionCount), attentionSub, attentionCount > 0),
@@ -590,21 +606,23 @@ const views = {
       driftCount > 0 ? attentionSection : null,
       sectionHead("Fleet"),
       fleet,
-      sectionHead("Sync operations", "ops-title"),
+      sectionHead("Automatic sync", "ops-title"),
+      el("p", { class: "ops-intro" }, "Keeps this machine's AI agent setup (instructions, skills, MCP servers and secrets) matching your shared Muster setup."),
       el("section", { class: "ops", "aria-labelledby": "ops-title" },
-        el("div", { class: "ops-periodic" },
-         el("div", { class: "ops-info" },
-          el("div", { class: "ops-heading" },
-            el("span", { class: "ops-title" }, "Periodic sync"),
-            state(s.enabled ? "live" : "idle", periodicText)),
-          el("span", { class: "ops-desc" }, "Run periodic background sync on this machine")),
-         el("div", { class: "ops-form" },
-          el("label", { class: "ops-interval" },
-            interval, el("span", { class: "muted" }, "min")),
-          intervalError,
-          el("div", { class: "ops-controls" },
-            enableBtn,
-            s.enabled ? button("Disable", () => act("Disable periodic sync?", "schedule/disable")) : "")))),
+        el("div", { class: "ops-row ops-manual" },
+          el("div", { class: "ops-info" },
+            el("span", { class: "ops-desc" }, "Get the latest shared setup and apply it to this machine now.")),
+          button("Sync now", () => act("Sync this machine now? Muster will get the latest shared setup and apply it.", "sync"), "primary")),
+        el("div", { class: "ops-row ops-periodic" },
+          el("div", { class: "ops-info" },
+            el("div", { class: "ops-heading" }, statusPill, el("span", { class: "ops-title" }, statusText))),
+          el("div", { class: "ops-form" },
+            el("label", { class: "ops-interval" },
+              "Check every ", interval, " minutes"),
+            intervalError,
+            el("div", { class: "ops-controls" },
+              enableBtn,
+              s.enabled ? button("Turn off", () => act("Turn off automatic sync? This machine will only sync when you click Sync now.", "schedule/disable")) : "")))),
       driftCount > 0 ? null : attentionSection);
     setCount(`${machines.length} ${machines.length === 1 ? "machine" : "machines"}`);
   },
