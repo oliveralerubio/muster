@@ -369,7 +369,7 @@ const descriptions = {
   "Dashboard": "Fleet health, periodic sync and anything that needs a decision.",
   "Machines": "Devices enrolled in this fleet and requests waiting for approval.",
   "Members & groups": "People who can read the vault, and the groups that scope access.",
-  "AI providers": "Endpoints and keys that agents on this fleet receive.",
+  "AI providers": "Subscription sign-in status on this machine, and optional custom endpoints for agents.",
   "Secrets": "Vault entries by reference. Values stay encrypted until you reveal them.",
   "Skills": "Skills installed for your agents, their sources and update status.",
   "Effective": "The configuration each agent actually receives on this machine.",
@@ -609,6 +609,7 @@ const views = {
     if (token !== undefined && token !== navToken) return;
     showCli("muster provider list");
     const providers = (data.result || {}).providers || [];
+    const subscriptions = (data.result || {}).subscriptions || [];
     const field = (id, label, attrs) => el("label", { class: "field", for: id }, label + " ",
       el("input", Object.assign({ id, type: "text", autocomplete: "off" }, attrs || {})));
     const kind = el("select", { id: "provider-kind" },
@@ -646,15 +647,30 @@ const views = {
         return act(`Clear default provider for ${useAgent.value}?`, "provider/use", { agent: useAgent.value, clear: true });
       }));
 
-    render("AI providers", [],
+    const agentName = { claude: "Claude", codex: "Codex" };
+    const subscriptionRows = subscriptions.map((sub) => {
+      const status = !sub.installed ? "Not installed" : sub.logged_in ? "Signed in" : "Not signed in";
+      const tone = !sub.installed ? "" : sub.logged_in ? "success" : "warning";
+      return [agentName[sub.agent] || sub.agent,
+        el("span", { class: "badge " + tone }, status),
+        sub.installed && !sub.logged_in ? el("code", {}, "muster provider login " + sub.agent) : ""];
+    });
+    const custom = el("details", Object.assign({ class: "custom-endpoints" }, providers.length ? { open: "" } : {}),
+      el("summary", {}, "Custom endpoints (advanced)"),
+      el("p", { class: "muted" }, "Only needed for API keys, proxies (LiteLLM, OpenRouter, Bedrock gateways), local models (Ollama), or agents without their own subscription (OpenCode, Pi)."),
       table(["ID", "Kind", "Base URL", "Default model", "Key reference", "Receiving agents", ""],
         providers.map((p) => [p.id, p.kind, p.base_url || "", p.default_model || "", p.key || "", (p.agents || []).join(", "),
           button("Remove", () => act(`Remove provider ${p.id}?`, "provider/rm", { id: p.id }), "danger")]),
         "No providers configured."),
       el("h2", {}, "Default provider for agent"),
       useForm,
-      el("h2", {}, "Add provider"), form,
-      el("p", {}, "Subscription logins stay on this machine. Run muster provider login claude or muster provider login codex in your terminal."),
+      el("h2", {}, "Add provider"), form);
+
+    render("AI providers", [],
+      el("h2", {}, "Subscriptions on this machine"),
+      el("p", { class: "muted" }, "Claude Pro/Max and ChatGPT plan logins stay on this machine and need no setup here. To sign in, run the command in a terminal."),
+      table(["Agent", "Status", "Sign in"], subscriptionRows, "No subscription agents found."),
+      custom,
       diagnostics(data));
   },
 

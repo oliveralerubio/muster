@@ -1730,3 +1730,31 @@ input[aria-invalid="true"] {
   pointer-events: none;
   transition: opacity var(--dur-fast) ease;
 }
+
+/* Collapsible advanced section on the AI providers page. */
+details.custom-endpoints {
+  margin-top: var(--space-lg);
+  padding: var(--space-sm) var(--space-md);
+  border: var(--rule-hair) solid var(--border);
+  border-radius: var(--radius-card);
+  background: var(--surface-subtle);
+}
+details.custom-endpoints[open] {
+  background: var(--surface);
+}
+details.custom-endpoints summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: var(--text);
+  border-radius: var(--radius-sm);
+}
+details.custom-endpoints summary:hover {
+  color: var(--primary-text);
+}
+details.custom-endpoints summary:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+details.custom-endpoints[open] > summary {
+  margin-bottom: var(--space-sm);
+}
