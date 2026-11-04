@@ -37,6 +37,8 @@ let loadAttempt = { failure: null };
 // is different: the server is up but the session is gone, so retrying cannot
 // help and the message tells the user to reopen the panel.
 let reconnectTimer = null;
+let countdownTimer = null;
+let reconnecting = false;
 let reconnectDelay = 1000;
 const RECONNECT_MAX = 15000;
 
@@ -47,29 +49,66 @@ function setConnBanner(message) {
   banner.textContent = message || "";
 }
 
-function startReconnect() {
-  if (reconnectTimer !== null) return;
-  reconnectDelay = 1000;
-  setConnBanner("Reconnecting to Muster…");
-  const probe = async () => {
+function stopReconnect() {
+  reconnecting = false;
+  if (reconnectTimer !== null) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  if (countdownTimer !== null) {
+    clearInterval(countdownTimer);
+    countdownTimer = null;
+  }
+  setConnBanner("");
+}
+
+function scheduleNextProbe(delayMs) {
+  if (countdownTimer !== null) clearInterval(countdownTimer);
+  const targetTime = Date.now() + delayMs;
+  const updateCountdown = () => {
+    const left = Math.max(1, Math.round((targetTime - Date.now()) / 1000));
+    setConnBanner(`Muster is not reachable. Retrying in ${left}s…`);
+  };
+  updateCountdown();
+  countdownTimer = setInterval(() => {
+    if (Date.now() >= targetTime) {
+      clearInterval(countdownTimer);
+      countdownTimer = null;
+    } else {
+      updateCountdown();
+    }
+  }, 1000);
+
+  reconnectTimer = setTimeout(async () => {
+    if (countdownTimer !== null) {
+      clearInterval(countdownTimer);
+      countdownTimer = null;
+    }
     reconnectTimer = null;
     let status = 0;
     try {
       status = (await fetch("/api/status")).status;
-    } catch (err) {
+    } catch {
       reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX);
-      setConnBanner(`Muster is not reachable. Retrying in ${Math.round(reconnectDelay / 1000)}s…`);
-      reconnectTimer = setTimeout(probe, reconnectDelay);
+      scheduleNextProbe(reconnectDelay);
       return;
     }
     if (status === 401 || status === 403) {
+      reconnecting = false;
       setConnBanner("Session expired. Reopen the panel with `muster ui`.");
       return;
     }
-    setConnBanner("");
+    stopReconnect();
     await show(current);
-  };
-  reconnectTimer = setTimeout(probe, reconnectDelay);
+  }, delayMs);
+}
+
+function startReconnect() {
+  if (reconnecting) return;
+  reconnecting = true;
+  reconnectDelay = 1000;
+  setConnBanner("Reconnecting to Muster…");
+  scheduleNextProbe(reconnectDelay);
 }
 
 // Background calls pass `quiet` so they never rewrite the "CLI equivalent"
@@ -87,13 +126,8 @@ async function api(path, body, quiet) {
     startReconnect();
     return { ok: false, error: attempt.failure, diagnostics: [] };
   }
-  // Any answer means the server is back: drop a pending probe and its banner
-  // (e.g. the user pressed Retry before the backoff timer fired).
-  if (reconnectTimer !== null) {
-    clearTimeout(reconnectTimer);
-    reconnectTimer = null;
-    setConnBanner("");
-  }
+  // Any answer means the server is back: stop reconnecting and drop the banner.
+  stopReconnect();
   const data = await response.json().catch(() => ({ ok: false, diagnostics: [] }));
   if (response.status === 401 || response.status === 403) {
     attempt.failure = "Session expired. Reopen the panel with `muster ui`.";
