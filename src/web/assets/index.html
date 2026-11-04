@@ -28,6 +28,8 @@
           <li class="nav-group" role="presentation" aria-hidden="true">System</li>
           <li role="presentation"><button type="button" role="tab" id="tab-effective" aria-controls="view" data-view="effective" aria-selected="false" tabindex="-1">Effective</button></li>
           <li role="presentation"><button type="button" role="tab" id="tab-profiles" aria-controls="view" data-view="profiles" aria-selected="false" tabindex="-1">Profiles &amp; diff</button></li>
+          <li role="presentation"><button type="button" role="tab" id="tab-proposals" aria-controls="view" data-view="proposals" aria-selected="false" tabindex="-1">Proposals</button></li>
+          <li role="presentation"><button type="button" role="tab" id="tab-why" aria-controls="view" data-view="why" aria-selected="false" tabindex="-1">Find context</button></li>
           <li role="presentation"><button type="button" role="tab" id="tab-history" aria-controls="view" data-view="history" aria-selected="false" tabindex="-1">History</button></li>
           <li role="presentation"><button type="button" role="tab" id="tab-doctor" aria-controls="view" data-view="doctor" aria-selected="false" tabindex="-1">Doctor</button></li>
         </ul>
@@ -63,6 +65,21 @@
   </div>
 
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  <div id="conn" class="toast error" role="status" aria-live="polite" hidden></div>
+
+  <dialog id="skill-edit" aria-labelledby="skill-edit-title">
+    <form id="skill-form">
+      <h2 id="skill-edit-title">Edit skill</h2>
+      <p><label>File <select id="skill-file"></select></label></p>
+      <p><label for="skill-text">Contents</label>
+        <textarea id="skill-text" rows="14" spellcheck="false"></textarea></p>
+      <div class="actions">
+        <button id="skill-save" type="submit" class="btn primary">Save</button>
+        <button id="skill-close" type="button" class="btn">Close</button>
+      </div>
+      <p id="skill-error" class="form-error" role="alert"></p>
+    </form>
+  </dialog>
 
   <dialog id="reveal" aria-labelledby="reveal-title">
     <form method="dialog">

@@ -19,9 +19,11 @@
 //!   responses or history; the CLI equivalent uses `--value-stdin`.
 
 use std::io::{IsTerminal, Read, Write};
-use std::path::PathBuf;
+use std::net::{SocketAddr, TcpStream};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Map, Value};
 use tiny_http::{Header, Method, Request, Response, Server};
@@ -37,6 +39,25 @@ const APP_JS: &str = include_str!("assets/app.js");
 
 const COOKIE: &str = "muster_session";
 const MAX_BODY: u64 = 64 * 1024;
+/// `POST /api/skills/file` carries a whole file (up to 256 KB, JSON-escaped).
+const MAX_FILE_BODY: u64 = 600 * 1024;
+
+/// Port `muster ui` uses unless `--port` says otherwise, so a browser tab
+/// keeps pointing at the same address across restarts.
+pub const DEFAULT_PORT: u16 = 47821;
+
+/// State files (all 0600, in the state dir):
+/// - `ui-instance.json`: port and config of the running server, so a second
+///   `muster ui` can find it instead of failing with "address in use".
+/// - `ui-login-token`: a one-time login a second invocation leaves for the
+///   running server (valid for `HANDOFF_TTL`, consumed on use).
+/// - `ui-sessions`: accepted session cookies, so open tabs survive a restart.
+const INSTANCE_FILE: &str = "ui-instance.json";
+const LOGIN_FILE: &str = "ui-login-token";
+const SESSIONS_FILE: &str = "ui-sessions";
+const HANDOFF_TTL: Duration = Duration::from_secs(600);
+const MAX_SESSIONS: usize = 32;
+const SESSION_MAX_AGE: u64 = 30 * 24 * 60 * 60;
 
 /// One API route: `GET|POST /api/<path>` runs `command`. Commands that read
 /// stdin, bootstrap identities or start servers (`init`, `ui`, `mcp`) are
@@ -139,6 +160,11 @@ const ROUTES: &[Route] = &[
     post("skills/add", "skill.add"),
     post("skills/update", "skill.update"),
     post("skills/rm", "skill.rm"),
+    post("skills/pin", "skill.pin"),
+    get("skills/files", "skill.files"),
+    get("skills/file", "skill.file.get"),
+    post("skills/file", "skill.file.set"),
+    get("secret/check", "secret.check"),
     post("schedule/enable", "schedule.enable"),
     post("schedule/disable", "schedule.disable"),
     // `--project` would let the panel edit any directory's `muster.toml`;
@@ -161,9 +187,31 @@ const CONFIRM: &str = "confirm";
 const DRY_RUN: &str = "dry_run";
 
 /// Serve until SIGINT (or end of input on an interactive stdin).
-pub fn serve(ctx: &Context, port: u16, open: bool) -> Result<(), MusterError> {
-    let server = Server::http(("127.0.0.1", port))
-        .map_err(|e| MusterError::Operational(format!("cannot listen on 127.0.0.1:{port}: {e}")))?;
+///
+/// `port` is `None` for "the default": `DEFAULT_PORT`, falling back to a random
+/// port when another program holds it. If a `muster ui` for this same config
+/// already serves the port, nothing new is started: a fresh one-time login for
+/// the running server is printed (and opened) instead.
+pub fn serve(ctx: &Context, port: Option<u16>, open: bool) -> Result<(), MusterError> {
+    let wanted = port.unwrap_or(DEFAULT_PORT);
+    let server = match Server::http(("127.0.0.1", wanted)) {
+        Ok(server) => server,
+        Err(bind_error) => {
+            if running_instance(&ctx.state_dir, &ctx.config_dir, wanted) {
+                return hand_off(ctx, wanted, open);
+            }
+            if port.is_some() {
+                return Err(MusterError::Operational(format!(
+                    "cannot listen on 127.0.0.1:{wanted}: {bind_error}"
+                )));
+            }
+            ctx.progress(&format!(
+                "Port {wanted} is in use by another program; using a random port."
+            ));
+            Server::http(("127.0.0.1", 0u16))
+                .map_err(|e| MusterError::Operational(format!("cannot listen on 127.0.0.1: {e}")))?
+        }
+    };
     let port = server
         .server_addr()
         .to_ip()
@@ -171,15 +219,12 @@ pub fn serve(ctx: &Context, port: u16, open: bool) -> Result<(), MusterError> {
         .ok_or_else(|| MusterError::Operational("server has no TCP address".into()))?;
     let token = random_hex()?;
     let url = format!("http://127.0.0.1:{port}/?token={token}");
+    let _ = write_private(
+        &ctx.state_dir.join(INSTANCE_FILE),
+        &json!({ "port": port, "pid": std::process::id(), "config": ctx.config_dir }).to_string(),
+    );
 
-    let line = match ctx.format {
-        Format::Json => json!({ "url": url, "port": port, "token": token }).to_string(),
-        Format::Text => url.clone(),
-    };
-    let mut stdout = std::io::stdout().lock();
-    let _ = writeln!(stdout, "{line}");
-    let _ = stdout.flush();
-    drop(stdout);
+    announce(ctx, &url, port, &token, false);
     ctx.progress("Muster UI is running; press Ctrl-C to stop.");
     if open {
         open_browser(&url);
@@ -202,7 +247,7 @@ pub fn serve(ctx: &Context, port: u16, open: bool) -> Result<(), MusterError> {
         state_dir: ctx.state_dir.clone(),
         port,
         token: Some(token),
-        sessions: Vec::new(),
+        sessions: load_sessions(&ctx.state_dir),
     };
     while !stop.load(Ordering::SeqCst) {
         match server.recv() {
@@ -210,7 +255,100 @@ pub fn serve(ctx: &Context, port: u16, open: bool) -> Result<(), MusterError> {
             Err(_) => break,
         }
     }
+    let _ = std::fs::remove_file(ctx.state_dir.join(INSTANCE_FILE));
     Ok(())
+}
+
+/// Print the login line (`url` alone as text, an object as JSON).
+fn announce(ctx: &Context, url: &str, port: u16, token: &str, handoff: bool) {
+    let line = match ctx.format {
+        Format::Json => {
+            json!({ "url": url, "port": port, "token": token, "handoff": handoff }).to_string()
+        }
+        Format::Text => url.to_owned(),
+    };
+    let mut stdout = std::io::stdout().lock();
+    let _ = writeln!(stdout, "{line}");
+    let _ = stdout.flush();
+}
+
+/// A server for this config is answering on `port` (not merely a busy port):
+/// the instance file names this port and config, and the listener says it is
+/// a `muster ui`.
+fn running_instance(state_dir: &Path, config_dir: &Path, port: u16) -> bool {
+    let Ok(text) = std::fs::read_to_string(state_dir.join(INSTANCE_FILE)) else {
+        return false;
+    };
+    let Ok(info) = serde_json::from_str::<Value>(&text) else {
+        return false;
+    };
+    info["port"].as_u64() == Some(u64::from(port))
+        && info["config"].as_str().map(Path::new) == Some(config_dir)
+        && probe_muster(port)
+}
+
+/// Ask the listener on `port` (without credentials) whether it is a Muster UI.
+fn probe_muster(port: u16) -> bool {
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_secs(1)) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let request = format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+    let mut reply = String::new();
+    stream.write_all(request.as_bytes()).is_ok()
+        && stream.read_to_string(&mut reply).is_ok()
+        && reply.contains("`muster ui`")
+}
+
+/// Leave a one-time login for the running server and print/open its URL.
+fn hand_off(ctx: &Context, port: u16, open: bool) -> Result<(), MusterError> {
+    let token = random_hex()?;
+    std::fs::create_dir_all(&ctx.state_dir)
+        .and_then(|()| write_private(&ctx.state_dir.join(LOGIN_FILE), &token))
+        .map_err(|e| MusterError::Operational(format!("cannot hand off the login: {e}")))?;
+    let url = format!("http://127.0.0.1:{port}/?token={token}");
+    announce(ctx, &url, port, &token, true);
+    ctx.progress(&format!(
+        "Muster UI is already running on port {port}; this is a fresh login for it."
+    ));
+    if open {
+        open_browser(&url);
+    }
+    Ok(())
+}
+
+/// Write `contents` to `path` with mode 0600, atomically.
+fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".tmp.{}", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        file.write_all(contents.as_bytes())?;
+        drop(file);
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Sessions saved by an earlier run (32 lowercase hex characters per line).
+fn load_sessions(state_dir: &Path) -> Vec<String> {
+    let text = std::fs::read_to_string(state_dir.join(SESSIONS_FILE)).unwrap_or_default();
+    text.lines()
+        .map(str::trim)
+        .filter(|l| l.len() == 32 && l.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(str::to_owned)
+        .collect()
 }
 
 struct Ui {
@@ -278,22 +416,20 @@ impl Ui {
         let mut cookie = None;
         if !self.has_session(request) {
             let presented = query.iter().find(|(k, _)| k == "token").map(|(_, v)| v);
-            match (&self.token, presented) {
-                (Some(token), Some(given))
-                    if method == Method::Get && constant_time_eq(token, given) =>
-                {
-                    self.token = None;
-                    let session = match random_hex() {
-                        Ok(session) => session,
-                        Err(e) => return Reply::error(500, &e.to_string()),
-                    };
-                    cookie = Some(format!(
-                        "{COOKIE}={session}; Path=/; HttpOnly; SameSite=Strict"
-                    ));
-                    self.sessions.push(session);
-                }
-                _ => return Reply::error(401, "unauthorized: open the URL printed by `muster ui`"),
+            let valid =
+                method == Method::Get && presented.is_some_and(|given| self.take_token(given));
+            if !valid {
+                return Reply::error(401, "unauthorized: open the URL printed by `muster ui`");
             }
+            let session = match random_hex() {
+                Ok(session) => session,
+                Err(e) => return Reply::error(500, &e.to_string()),
+            };
+            cookie = Some(format!(
+                "{COOKIE}={session}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_MAX_AGE}"
+            ));
+            self.sessions.push(session);
+            self.persist_sessions();
         }
         let mut reply = self.route(request, &method, &path, &query);
         reply.cookie = cookie;
@@ -324,7 +460,14 @@ impl Ui {
                             .collect();
                         self.api(&name, false, body)
                     }
-                    Method::Post => match read_json(request) {
+                    Method::Post => match read_json(
+                        request,
+                        if name == "skills/file" {
+                            MAX_FILE_BODY
+                        } else {
+                            MAX_BODY
+                        },
+                    ) {
                         Ok(body) => self.api(&name, true, body),
                         Err(reply) => reply,
                     },
@@ -527,6 +670,44 @@ impl Ui {
         }
     }
 
+    /// Consume a login token: the one printed at startup, or the one a second
+    /// `muster ui` left in `ui-login-token` (fresh, single use).
+    fn take_token(&mut self, given: &str) -> bool {
+        if self
+            .token
+            .as_deref()
+            .is_some_and(|token| constant_time_eq(token, given))
+        {
+            self.token = None;
+            return true;
+        }
+        let path = self.state_dir.join(LOGIN_FILE);
+        let fresh = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| SystemTime::now().duration_since(t).ok())
+            .is_some_and(|age| age <= HANDOFF_TTL);
+        let matches = fresh
+            && std::fs::read_to_string(&path)
+                .is_ok_and(|saved| constant_time_eq(saved.trim(), given));
+        if matches {
+            let _ = std::fs::remove_file(&path);
+        }
+        matches
+    }
+
+    /// Keep the newest sessions on disk so tabs survive a restart.
+    fn persist_sessions(&mut self) {
+        if self.sessions.len() > MAX_SESSIONS {
+            let excess = self.sessions.len() - MAX_SESSIONS;
+            self.sessions.drain(..excess);
+        }
+        let _ = write_private(
+            &self.state_dir.join(SESSIONS_FILE),
+            &(self.sessions.join("\n") + "\n"),
+        );
+    }
+
     fn has_session(&self, request: &Request) -> bool {
         request
             .headers()
@@ -658,7 +839,12 @@ fn cli_line(spec: &CommandSpec, params: &[(String, Value)], flags: Flags) -> Str
             other if p.positional => words.push(shell_quote(&scalar(other))),
             other => {
                 words.push(flag);
-                words.push(shell_quote(&scalar(other)));
+                let mut text = scalar(other);
+                // File bodies are shown abbreviated; the footer is a hint, not a transcript.
+                if p.name == "content" && text.chars().count() > 80 {
+                    text = text.chars().take(80).collect::<String>() + "…";
+                }
+                words.push(shell_quote(&text));
             }
         }
     }
@@ -721,7 +907,7 @@ fn http_status(exit_code: i32) -> u16 {
     }
 }
 
-fn read_json(request: &mut Request) -> Result<Map<String, Value>, Reply> {
+fn read_json(request: &mut Request, max: u64) -> Result<Map<String, Value>, Reply> {
     let json_type = request
         .headers()
         .iter()
@@ -733,11 +919,14 @@ fn read_json(request: &mut Request) -> Result<Map<String, Value>, Reply> {
     let mut text = secrecy::zeroize::Zeroizing::new(Vec::new());
     request
         .as_reader()
-        .take(MAX_BODY + 1)
+        .take(max + 1)
         .read_to_end(&mut text)
         .map_err(|_| Reply::error(400, "unreadable body"))?;
-    if text.len() as u64 > MAX_BODY {
-        return Err(Reply::error(413, "body exceeds 64 KB"));
+    if text.len() as u64 > max {
+        return Err(Reply::error(
+            413,
+            &format!("body exceeds {} KB", max / 1024),
+        ));
     }
     if text.iter().all(u8::is_ascii_whitespace) {
         return Ok(Map::new());

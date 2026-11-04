@@ -336,7 +336,13 @@ pub const USE: CommandSpec = CommandSpec {
     name: "provider.use",
     about: "Select or clear an AI provider for one agent",
     params: &[
-        ID,
+        ParamSpec {
+            name: "id",
+            about: "AI provider id (optional with --clear)",
+            kind: ParamKind::String,
+            required: false,
+            positional: true,
+        },
         option("agent", "Agent id", true),
         ParamSpec {
             name: "clear",
@@ -351,7 +357,12 @@ pub const USE: CommandSpec = CommandSpec {
 };
 
 fn use_provider(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
-    let id = id(params)?;
+    let clear = params.get_bool("clear");
+    let id = if clear {
+        params.get_string("id").unwrap_or_default().to_owned()
+    } else {
+        id(params)?
+    };
     let agent = params
         .get_string("agent")
         .ok_or_else(|| MusterError::Usage("--agent required".into()))?;
@@ -361,10 +372,9 @@ fn use_provider(ctx: &mut Context, params: &Params) -> Result<Value, MusterError
     let mut manifest = Manifest::load(&ctx.config_dir)?;
     let actor = actor(ctx, &manifest)?;
     let merged = crate::engine::layer::global_merge(&ctx.config_dir, &ctx.state_dir, &manifest);
-    if !merged.ai_providers.contains_key(&id) {
+    if !clear && !merged.ai_providers.contains_key(&id) {
         return Err(MusterError::Usage("unknown provider".into()));
     }
-    let clear = params.get_bool("clear");
     let agents = manifest.agents.get_or_insert_with(Default::default);
     if clear {
         agents.ai_providers.remove(agent);

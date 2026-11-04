@@ -24,6 +24,7 @@ fn run(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
     let local_recipient = local_identity.as_ref().map(|id| id.recipient());
     let local_name = machine::load_name(&ctx.state_dir);
 
+    let local_sync = machine::local_last_sync(&ctx.state_dir);
     let mut machines = Vec::new();
     for (name, m) in &manifest.machines {
         let is_current = match (&local_name, &local_recipient) {
@@ -31,9 +32,13 @@ fn run(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
             (_, Some(lr)) if lr == &m.recipient => true,
             _ => false,
         };
+        let last_sync = m
+            .last_sync
+            .clone()
+            .or_else(|| is_current.then(|| local_sync.clone()).flatten());
         let status = if is_current {
             "current"
-        } else if m.last_sync.is_some() {
+        } else if last_sync.is_some() {
             "active"
         } else {
             "enrolled"
@@ -47,7 +52,7 @@ fn run(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
             "experimental_agents": m.agents.iter().filter(|id| {
                 crate::adapters::find(id).is_some_and(|a| a.experimental)
             }).collect::<Vec<_>>(),
-            "last_sync": m.last_sync,
+            "last_sync": last_sync,
             "status": status,
             "is_current": is_current,
         }));

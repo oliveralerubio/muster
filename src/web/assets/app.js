@@ -31,7 +31,50 @@ function showCli(cli) {
 // wrongly read as "nothing configured".
 let loadAttempt = { failure: null };
 
-async function api(path, body) {
+// While the server is unreachable (restarting, laptop asleep) the panel shows
+// a "Reconnecting" banner and probes with exponential backoff; once the server
+// answers, the banner goes away and the current view reloads by itself. A 401
+// is different: the server is up but the session is gone, so retrying cannot
+// help and the message tells the user to reopen the panel.
+let reconnectTimer = null;
+let reconnectDelay = 1000;
+const RECONNECT_MAX = 15000;
+
+function setConnBanner(message) {
+  const banner = $("#conn");
+  if (!banner) return;
+  banner.hidden = !message;
+  banner.textContent = message || "";
+}
+
+function startReconnect() {
+  if (reconnectTimer !== null) return;
+  reconnectDelay = 1000;
+  setConnBanner("Reconnecting to Muster…");
+  const probe = async () => {
+    reconnectTimer = null;
+    let status = 0;
+    try {
+      status = (await fetch("/api/status")).status;
+    } catch (err) {
+      reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX);
+      setConnBanner(`Muster is not reachable. Retrying in ${Math.round(reconnectDelay / 1000)}s…`);
+      reconnectTimer = setTimeout(probe, reconnectDelay);
+      return;
+    }
+    if (status === 401 || status === 403) {
+      setConnBanner("Session expired. Reopen the panel with `muster ui`.");
+      return;
+    }
+    setConnBanner("");
+    await show(current);
+  };
+  reconnectTimer = setTimeout(probe, reconnectDelay);
+}
+
+// Background calls pass `quiet` so they never rewrite the "CLI equivalent"
+// footer that belongs to the view or the action the user is looking at.
+async function api(path, body, quiet) {
   const options = body === undefined
     ? {}
     : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
@@ -41,22 +84,46 @@ async function api(path, body) {
     response = await fetch("/api/" + path, options);
   } catch (err) {
     attempt.failure = "Muster is not reachable. Is `muster ui` still running? (" + err.message + ")";
+    startReconnect();
     return { ok: false, error: attempt.failure, diagnostics: [] };
+  }
+  // Any answer means the server is back: drop a pending probe and its banner
+  // (e.g. the user pressed Retry before the backoff timer fired).
+  if (reconnectTimer !== null) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+    setConnBanner("");
   }
   const data = await response.json().catch(() => ({ ok: false, diagnostics: [] }));
   if (response.status === 401 || response.status === 403) {
     attempt.failure = "Session expired. Reopen the panel with `muster ui`.";
+    setConnBanner(attempt.failure);
     return { ok: false, error: attempt.failure, diagnostics: [] };
   }
-  showCli(data.cli);
+  if (!quiet && body !== undefined) showCli(data.cli);
   return data;
+}
+
+// Backends send RFC 3339 stamps with nanoseconds; show them as local time.
+function formatTime(value) {
+  if (value === null || value === undefined || value === "") return "";
+  const text = String(value);
+  const d = new Date(text.replace(/(\.\d{3})\d+/, "$1"));
+  return Number.isNaN(d.getTime()) ? text : d.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+}
+
+function timeCell(value) {
+  if (!value) return el("span", { class: "muted" }, "—");
+  return el("time", { class: "data", datetime: String(value), title: String(value) }, formatTime(value));
 }
 
 // Non-blocking status message; replaces alert() for failures.
 let toastTimer = null;
 function hideToast() {
   const toast = $("#toast");
-  if (toast) toast.hidden = true;
+  if (!toast) return;
+  toast.hidden = true;
+  try { if (toast.hidePopover) toast.hidePopover(); } catch (err) { /* not open */ }
 }
 function toast(message, kind) {
   const box = $("#toast");
@@ -64,6 +131,13 @@ function toast(message, kind) {
   box.setAttribute("class", "toast " + (kind || "error"));
   box.replaceChildren(el("span", {}, message), button("Dismiss", hideToast));
   box.hidden = false;
+  // A modal <dialog> lives in the top layer, above any z-index; a manual
+  // popover joins the top layer too so the toast stays visible over it.
+  try {
+    box.setAttribute("popover", "manual");
+    if (box.hidePopover) box.hidePopover();
+    if (box.showPopover) box.showPopover();
+  } catch (err) { /* popover unsupported: z-index fallback applies */ }
   clearTimeout(toastTimer);
   toastTimer = setTimeout(hideToast, 6000);
 }
@@ -137,10 +211,29 @@ async function act(question, path, body) {
   const data = await api(path, Object.assign({ confirm: true }, body || {}));
   if (!data.ok) toast(failMessage(data));
   await show(current);
+  // The reload shows the view's own command; the action just run is what the
+  // user wants to learn from, so it takes the footer back.
+  if (data.cli) showCli(data.cli);
+  return data;
+}
+
+// A labelled form control used by the inline admin forms.
+function labelled(label, control) {
+  return el("label", { class: "field" }, label + " ", control);
+}
+
+function textInput(label, attrs) {
+  return el("input", Object.assign({ type: "text", autocomplete: "off", "aria-label": label }, attrs || {}));
+}
+
+function selectInput(label, values) {
+  return el("select", { "aria-label": label }, values.map((v) => el("option", { value: v }, v || "(none)")));
 }
 
 // One-line description under each page title.
 const descriptions = {
+  "Proposals": "Configuration changes proposed for review before they touch the config repository.",
+  "Find context": "Search the text agents receive, to see which file and layer it comes from.",
   "Dashboard": "Fleet health, periodic sync and anything that needs a decision.",
   "Machines": "Devices enrolled in this fleet and requests waiting for approval.",
   "Members & groups": "People who can read the vault, and the groups that scope access.",
@@ -348,6 +441,7 @@ const views = {
   async providers(token) {
     const data = await api("providers");
     if (token !== undefined && token !== navToken) return;
+    showCli("muster provider list");
     const providers = (data.result || {}).providers || [];
     const field = (id, label, attrs) => el("label", { class: "field", for: id }, label + " ",
       el("input", Object.assign({ id, type: "text", autocomplete: "off" }, attrs || {})));
@@ -371,11 +465,28 @@ const views = {
       const submit = form.querySelector("button");
       await busy(submit, () => act("Add or replace this AI provider?", "provider/add", body));
     });
+
+    const agentList = ["claude", "codex", "opencode", "pi", "hermes", "antigravity"];
+    const useProv = selectInput("Provider", providers.map((p) => p.id));
+    const useAgent = selectInput("Agent", agentList);
+    const useForm = el("div", { class: "skill-form" },
+      labelled("Provider", useProv),
+      labelled("Agent", useAgent),
+      button("Set as default", () => {
+        if (!useProv.value) return toast("Select a provider.");
+        return act(`Set ${useProv.value} as default provider for ${useAgent.value}?`, "provider/use", { id: useProv.value, agent: useAgent.value });
+      }, "primary"),
+      button("Clear default", () => {
+        return act(`Clear default provider for ${useAgent.value}?`, "provider/use", { agent: useAgent.value, clear: true });
+      }));
+
     render("AI providers", [],
       table(["ID", "Kind", "Base URL", "Default model", "Key reference", "Receiving agents", ""],
         providers.map((p) => [p.id, p.kind, p.base_url || "", p.default_model || "", p.key || "", (p.agents || []).join(", "),
           button("Remove", () => act(`Remove provider ${p.id}?`, "provider/rm", { id: p.id }), "danger")]),
         "No providers configured."),
+      el("h2", {}, "Default provider for agent"),
+      useForm,
       el("h2", {}, "Add provider"), form,
       el("p", {}, "Subscription logins stay on this machine. Run muster provider login claude or muster provider login codex in your terminal."),
       diagnostics(data));
@@ -411,6 +522,20 @@ const views = {
       toast((copied ? "Copied: " : "Run on the new machine: ") + enrollCommand, "info");
     }, "primary");
     enroll.title = "Copies " + enrollCommand;
+    const assignMachine = selectInput("Machine", machines.map((m) => m.name));
+    const assignRole = textInput("Role", { placeholder: "role (optional)" });
+    const assignProfile = textInput("Profile", { placeholder: "profile (optional)" });
+    const assignForm = machines.length
+      ? el("div", { class: "skill-form" },
+        labelled("Machine", assignMachine), labelled("Role", assignRole), labelled("Profile", assignProfile),
+        button("Assign", () => {
+          const body = { name: assignMachine.value };
+          if (assignRole.value.trim()) body.role = assignRole.value.trim();
+          if (assignProfile.value.trim()) body.profile = assignProfile.value.trim();
+          if (!body.role && !body.profile) return toast("Enter a role or a profile to assign.");
+          return act(`Assign ${[body.role && "role " + body.role, body.profile && "profile " + body.profile].filter(Boolean).join(" and ")} to ${body.name}?`, "machine/assign", body);
+        }, "primary"))
+      : null;
     render("Machines", [enroll],
       sectionHead("Enrolled"),
       table(["Machine", "Version", hasRole ? "Role" : null, hasProfile ? "Profile" : null, "Agents", "Status", "Last sync", hasActions ? "Actions" : null].filter((h) => h !== null),
@@ -424,6 +549,7 @@ const views = {
           hasActions ? (m.is_current ? "" : button("Remove", () => act(`Remove machine ${m.name}?`, "machine/rm", { name: m.name }), "danger")) : null].filter((c) => c !== null)),
         emptyCard("No machines enrolled yet", "Run ", el("code", {}, "muster init"), " on this machine, then ", el("code", {}, "muster machine add"), " to enroll more."),
         "machines-table" + (!hasRole && !hasProfile ? " machines-basic" : "") + (hasActions ? " actions-end" : "")),
+      assignForm ? [sectionHead("Assign role or profile"), assignForm] : null,
       sectionHead("Pending enrollment requests"),
       el("p", { class: "section-desc" }, "Machines waiting for approval before they can join."),
       table(["Machine", "Version", "Agents", "Approvals", ""],
@@ -441,14 +567,31 @@ const views = {
   async team(token) {
     const [members, groups] = await Promise.all([api("members"), api("groups")]);
     if (token !== undefined && token !== navToken) return;
-    const memberRows = ((members.result && members.result.members) || []).map((m) => [
-      m.name, m.role, m.status, (m.groups || []).join(", "), m.profile || "",
-      m.status === "pending"
-        ? el("span", { class: "actions" },
-            button("Approve", () => act(`Approve member ${m.name}?`, "member/approve", { name: m.name })),
-            button("Reject", () => act(`Reject member ${m.name}? Their invitation and recorded approvals are discarded.`, "member/reject", { name: m.name }), "danger"))
-        : "",
-    ]);
+    showCli("muster member list");
+    const mList = (members.result && members.result.members) || [];
+    const gList = (groups.result && groups.result.groups) || [];
+
+    const memberRows = mList.map((m) => {
+      const actions = [];
+      if (m.status === "pending") {
+        actions.push(button("Approve", () => act(`Approve member ${m.name}?`, "member/approve", { name: m.name })));
+        actions.push(button("Reject", () => act(`Reject member ${m.name}? Their invitation and recorded approvals are discarded.`, "member/reject", { name: m.name }), "danger"));
+      } else {
+        const nextRole = m.role === "admin" ? "member" : "admin";
+        actions.push(button("Set profile", () => {
+          const next = prompt(`Profile for ${m.name} (empty to clear):`, m.profile || "");
+          if (next === null) return undefined;
+          return act(`${next.trim() ? "Assign profile " + next.trim() : "Clear profile"} for ${m.name}?`, "member/profile", { name: m.name, profile: next.trim() });
+        }));
+        actions.push(button(`Make ${nextRole}`, () => act(`Change role of ${m.name} to ${nextRole}?`, "member/role", { name: m.name, role: nextRole })));
+        actions.push(button("Remove", () => act(`Revoke member ${m.name} and all their machines?`, "member/rm", { name: m.name }), "danger"));
+      }
+      return [
+        m.name, m.role, m.status, (m.groups || []).join(", "), m.profile || "",
+        el("span", { class: "actions" }, actions),
+      ];
+    });
+
     const formatReaders = (readers) => {
       if (!readers || typeof readers !== "object") return "";
       const parts = [];
@@ -465,12 +608,78 @@ const views = {
       }
       return parts.join("; ") || "none";
     };
-    const groupRows = ((groups.result && groups.result.groups) || []).map((g) => [
-      g.name || g.group || "", formatReaders(g.readers), g.profile || "",
-    ]);
+
+    const groupRows = gList.map((g) => {
+      const gName = g.name || g.group || "";
+      return [
+        gName, formatReaders(g.readers), g.profile || "",
+      ];
+    });
+
+    // Add member form
+    const newMemberName = textInput("Member name", { placeholder: "alice", pattern: "[a-z0-9-]+" });
+    const newMemberRole = selectInput("Role", ["member", "admin"]);
+    const newMemberProfile = textInput("Profile (optional)", { placeholder: "profile (optional)" });
+    const addMemberForm = el("div", { class: "skill-form" },
+      labelled("Name", newMemberName),
+      labelled("Role", newMemberRole),
+      labelled("Profile", newMemberProfile),
+      button("Invite member", () => {
+        const name = newMemberName.value.trim();
+        if (!name) return toast("Enter a member name.");
+        const role = newMemberRole.value;
+        const profile = newMemberProfile.value.trim();
+        return (async () => {
+          if (!confirm(`Invite ${name} as ${role}${profile ? " with profile " + profile : ""}?`)) return;
+          const added = await api("member/add", { confirm: true, name, role });
+          if (!added.ok) toast(failMessage(added));
+          else if (profile) {
+            const set = await api("member/profile", { confirm: true, name, profile });
+            if (!set.ok) toast(failMessage(set));
+          }
+          await show(current);
+        })();
+      }, "primary"));
+
+    // Create group form
+    const newGroupName = textInput("Group name", { placeholder: "dev", pattern: "[a-z0-9-]+" });
+    const newGroupProfile = textInput("Profile (optional)", { placeholder: "profile (optional)" });
+    const createGroupForm = el("div", { class: "skill-form" },
+      labelled("Group", newGroupName),
+      labelled("Profile", newGroupProfile),
+      button("Create group", () => {
+        const name = newGroupName.value.trim();
+        if (!name) return toast("Enter a group name.");
+        const body = { group: name };
+        if (newGroupProfile.value.trim()) body.profile = newGroupProfile.value.trim();
+        return act(`Create group ${name}?`, "group/create", body);
+      }, "primary"));
+
+    // Grant / revoke reader form
+    const grantGroup = selectInput("Group", gList.map((g) => g.name || g.group || ""));
+    const grantReader = textInput("Reader", { placeholder: "alice or vps (member, machine or group)" });
+    const grantForm = gList.length
+      ? el("div", { class: "skill-form" },
+        labelled("Group", grantGroup),
+        labelled("Reader", grantReader),
+        button("Grant access", () => {
+          const reader = grantReader.value.trim();
+          if (!reader) return toast("Enter a reader (member, machine or group name).");
+          return act(`Grant ${reader} access to group ${grantGroup.value}?`, "group/grant", { group: grantGroup.value, reader });
+        }, "primary"),
+        button("Revoke access", () => {
+          const reader = grantReader.value.trim();
+          if (!reader) return toast("Enter a reader to revoke.");
+          return act(`Revoke ${reader} access from group ${grantGroup.value}?`, "group/revoke", { group: grantGroup.value, reader });
+        }, "danger"))
+      : null;
+
     render("Members & groups", [],
       el("h2", {}, "Members"), table(["Name", "Role", "Status", "Groups", "Profile", ""], memberRows, "No members configured."),
+      el("h3", {}, "Invite member"), addMemberForm,
       el("h2", {}, "Groups"), table(["Group", "Readers", "Profile"], groupRows, "No groups configured."),
+      el("h3", {}, "Create group"), createGroupForm,
+      grantForm ? [el("h3", {}, "Grant or revoke group access"), grantForm] : null,
       diagnostics(members), diagnostics(groups));
   },
 
@@ -479,26 +688,45 @@ const views = {
       api("secrets"), api("secret/requests"), api("secret/leases"),
     ]);
     if (token !== undefined && token !== navToken) return;
+    showCli("muster secret list");
     const secrets = Array.isArray(data.result) ? data.result : [];
-    render("Secrets", [button("New secret", () => openSecretEdit(), "primary")],
+    render("Secrets", [
+      button("New secret", () => openSecretEdit(), "primary"),
+      button("Check providers", async () => {
+        const check = await api("secret/check");
+        if (!check.ok) toast(failMessage(check));
+        else {
+          const list = (check.result && check.result.providers) || [];
+          const bad = list.filter((p) => p.available === false);
+          const summary = `${list.length - bad.length} of ${list.length} secret providers available.`;
+          if (bad.length) {
+            toast(summary + "\n" + bad.map((p) => `${p.provider}: ${p.message || p.code || "unavailable"}`).join("\n"));
+          } else {
+            toast(summary, "info");
+          }
+        }
+      }),
+    ],
       el("p", {}, "Metadata only. Revealing a value needs explicit confirmation and is recorded."),
       table(["Reference", "Updated", "By", "Readers", ""],
-        secrets.map((s) => [s.reference, s.updated_at || "", s.updated_by || "",
+        secrets.map((s) => [s.reference, timeCell(s.updated_at), s.updated_by || "",
           (s.readers || []).map((r) => r.machine || r.recipient).join(", "),
-          el("div", { class: "actions" }, button("Reveal…", () => openReveal(s.reference)),
-            button("Change value", () => openSecretEdit(s.reference)))]),
+          el("div", { class: "actions" },
+            button("Reveal…", () => openReveal(s.reference)),
+            button("Change value", () => openSecretEdit(s.reference)),
+            button("Delete", () => act(`Delete secret ${s.reference}?`, "secret/rm", { path: s.reference }), "danger"))]),
         "No secrets yet. Use New secret to add one."),
       el("h2", {}, "Secret approvals"),
       el("p", {}, "Approve access for the configured duration. Revoking prevents new reveals; agents may retain keys already received."),
       table(["Pending reference", "Agent", "Requested", ""],
-        (requests.result || []).map((r) => [r.reference, r.agent, new Date(r.requested_at * 1000).toISOString(),
+        (requests.result || []).map((r) => [r.reference, r.agent, timeCell(new Date(r.requested_at * 1000).toISOString()),
           el("div", { class: "actions" },
             button("Approve", () => secretApproval("approve", r.id)),
             button("Deny", () => secretApproval("deny", r.id), "danger"))]),
         "No pending requests."),
       el("h3", {}, "Active approvals"),
       table(["Approved reference", "Agent", "Expires", ""],
-        (leases.result || []).map((l) => [l.reference, l.agent, new Date(l.expires_at * 1000).toISOString(),
+        (leases.result || []).map((l) => [l.reference, l.agent, timeCell(new Date(l.expires_at * 1000).toISOString()),
           button("Revoke", () => secretApproval("revoke", l.id))]),
         "No active approvals."),
       diagnostics(data), diagnostics(requests), diagnostics(leases));
@@ -563,10 +791,17 @@ const views = {
     const rows = skills.map((s) => {
       const status = el("span", { class: "badge " + (badgeClass[s.status] || "") }, statusLabel[s.status] || s.status);
       if (s.reason) status.setAttribute("title", s.reason);
+      // `enabled` is absent from older payloads: treat that as enabled.
+      const enabled = s.enabled !== false;
       const actions = [
-        button("Disable", () => act(`Disable skill ${s.name}?`, "disable", { item: `skill:${s.name}` })),
-        button("Enable", () => act(`Enable skill ${s.name}?`, "enable", { item: `skill:${s.name}` })),
+        enabled
+          ? button("Disable", () => act(`Disable skill ${s.name}?`, "disable", { item: `skill:${s.name}` }))
+          : button("Enable", () => act(`Enable skill ${s.name}?`, "enable", { item: `skill:${s.name}` })),
+        button("Edit", () => openSkillEdit(s.name)),
       ];
+      if (s.origin === "local" && (!s.locked || s.modified)) {
+        actions.push(button("Pin", () => act(`Approve the current contents of ${s.name} (pin in skills.lock)?`, "skills/pin", { name: s.name })));
+      }
       if (s.status === "upstream_removed") {
         actions.push(button("Keep as own", () => act(`Keep ${s.name} as an own skill and stop following ${s.origin}?`, "skills/rm", { name: s.name, detach: true })));
         actions.push(button("Delete", () => act(`Delete skill ${s.name} and its files?`, "skills/rm", { name: s.name }), "danger"));
@@ -578,7 +813,9 @@ const views = {
         s.name,
         el("span", { class: "badge" + (s.origin === "local" ? "" : " info") }, s.origin === "local" ? "own" : s.origin),
         s.version || "",
-        s.updated_at || "",
+        timeCell(s.updated_at),
+        el("span", { class: "state state-" + (enabled ? "live" : "idle") },
+          el("span", { class: "state-dot", "aria-hidden": "true" }), enabled ? "Enabled" : "Disabled"),
         status,
         s.modified ? el("span", { class: "badge warning", title: "Edited locally since it was vendored" }, "modified") : "",
         el("span", { class: "actions" }, actions),
@@ -597,8 +834,8 @@ const views = {
       }, "primary"),
       button("Update all", () => updateAll()),
     ],
-      el("p", {}, r.checked_at ? `Last upstream check: ${r.checked_at}.` : "Upstream sources not checked yet on this machine."),
-      table(["Name", "Origin", "Version", "Updated", "Status", "", ""], rows, "No skills yet. Add one below."),
+      el("p", {}, r.checked_at ? `Last upstream check: ${formatTime(r.checked_at)}.` : "Upstream sources not checked yet on this machine."),
+      table(["Name", "Origin", "Version", "Updated", "State", "Status", "", ""], rows, "No skills yet. Add one below."),
       el("h2", {}, "Usage"),
       (() => {
         const u = usage.result || {};
@@ -612,7 +849,7 @@ const views = {
         const coverageMsg = (Object.values(u.sessions_scanned || {}).reduce((a, b) => a + b, 0) === 0)
           ? "No transcript sessions scanned yet on this machine."
           : `Sessions scanned: ${scanned || "none"}${unsupp ? ` (unsupported: ${unsupp})` : ""}.`;
-        const items = (u.items || []).filter((it) => it.uses > 0).map((it) => [it.kind, it.name, String(it.uses), it.last_used || "—"]);
+        const items = (u.items || []).filter((it) => it.uses > 0).map((it) => [it.kind, it.name, String(it.uses), timeCell(it.last_used)]);
         const unused = (u.unused || []).map((it) => [it.kind, it.name, it.suggestion || "—"]);
         return el("div", { class: "usage-section" },
           el("p", { class: "coverage-note" }, coverageMsg),
@@ -671,16 +908,22 @@ const views = {
       ]), "No profiles yet."),
       diagnostics(listData),
       el("h2", {}, "MCP servers"),
-      table(["Name", "Transport", "Target", "Env / headers", ""], servers.map((s) => {
+      table(["Name", "Transport", "Target", "Env / headers", "State", ""], servers.map((s) => {
         const server = s.server || {};
         const settings = Object.entries(server.env || {}).map(([k, v]) => `${k}=${v}`)
           .concat(Object.entries(server.headers || {}).map(([k, v]) => `${k}=${v}`));
+        const enabled = s.enabled !== false;
+        const actions = [
+          enabled
+            ? button("Disable", () => act(`Disable MCP server ${s.name}?`, "disable", { item: `mcp:${s.name}` }))
+            : button("Enable", () => act(`Enable MCP server ${s.name}?`, "enable", { item: `mcp:${s.name}` })),
+          button("Edit", () => openMcpEdit(s)),
+          button("Remove", () => act(`Remove MCP server ${s.name}?`, "mcp-server/rm", { name: s.name }), "danger"),
+        ];
         return [s.name, s.transport, server.command || server.url || "", settings.join(", "),
-          el("span", { class: "actions" },
-            button("Disable", () => act(`Disable MCP server ${s.name}?`, "disable", { item: `mcp:${s.name}` })),
-            button("Enable", () => act(`Enable MCP server ${s.name}?`, "enable", { item: `mcp:${s.name}` })),
-            button("Edit", () => openMcpEdit(s)),
-            button("Remove", () => act(`Remove MCP server ${s.name}?`, "mcp-server/rm", { name: s.name }), "danger"))];
+          el("span", { class: "state state-" + (enabled ? "live" : "idle") },
+            el("span", { class: "state-dot", "aria-hidden": "true" }), enabled ? "Enabled" : "Disabled"),
+          el("span", { class: "actions" }, actions)];
       }), "No MCP servers declared."),
       mcpForm(),
       el("pre", { id: "mcp-diff", hidden: true }, ""),
@@ -700,12 +943,67 @@ const views = {
     render("History & generations", [],
       el("h2", {}, "Generations"),
       table(["#", "Created", "Kind", "Files", ""], generations.map((g) => [
-        g.number, g.created_at, g.rollback_of ? `${g.kind} of ${g.rollback_of}` : g.kind, (g.files || []).length,
+        g.number, timeCell(g.created_at), g.rollback_of ? `${g.kind} of ${g.rollback_of}` : g.kind, (g.files || []).length,
         button("Roll back", () => act(`Restore generation ${g.number}?`, "rollback", { generation: g.number })),
       ]), "No generations yet."),
       el("h2", {}, "Events"),
-      table(["When", "Action", "Subject"], (r.events || []).slice().reverse().map((e) => [e.at, e.action, e.subject]), "No events recorded."),
+      table(["When", "Action", "Subject"], (r.events || []).slice().reverse().map((e) => [timeCell(e.at), e.action, e.subject]), "No events recorded."),
       diagnostics(data));
+  },
+
+  async proposals(token) {
+    const data = await api("proposals");
+    if (token !== undefined && token !== navToken) return;
+    const list = Array.isArray(data.result) ? data.result : [];
+    const path = textInput("File path", { placeholder: "skills/review/SKILL.md" });
+    const message = textInput("Message", { placeholder: "Why this change (optional)" });
+    const contents = el("textarea", { rows: "6", spellcheck: "false", "aria-label": "Proposed file contents", placeholder: "Proposed file contents" });
+    const form = el("div", { class: "skill-form" },
+      labelled("Path", path), labelled("Message", message), labelled("Contents", contents),
+      button("Propose change", () => {
+        if (!path.value.trim()) return toast("Enter the file path in the config repository.");
+        const body = { path: path.value.trim(), contents: contents.value };
+        if (message.value.trim()) body.message = message.value.trim();
+        return act(`Record a proposal for ${body.path}?`, "proposal/create", body);
+      }, "primary"));
+    render("Proposals", [],
+      table(["ID", "Path", "Message", "Created", ""], list.map((p) => [
+        el("code", {}, p.id || ""), p.path || "", p.message || "", timeCell(p.created_at),
+        button("Accept", () => act(`Apply proposal ${p.id} to the config repository?`, "proposal/accept", { id: p.id }), "primary"),
+      ]), "No pending proposals."),
+      el("h2", {}, "New proposal"), form,
+      diagnostics(data));
+    setCount(list.length ? `${list.length} pending` : "");
+  },
+
+  async why(token) {
+    const query = textInput("Text to find", { placeholder: "text or regular expression" });
+    const regex = el("input", { type: "checkbox", "aria-label": "Regular expression" });
+    const results = el("div", { class: "why-results" }, el("p", { class: "quiet" }, "Enter text to find where agents get it from."));
+    const run = async () => {
+      const text = query.value.trim();
+      if (!text) return;
+      const params = new URLSearchParams({ text });
+      if (regex.checked) params.set("regex", "true");
+      const data = await api("why?" + params.toString());
+      showCli(data.cli || `muster why ${text}`);
+      const matches = ((data.result || {}).matches) || [];
+      results.replaceChildren(...[
+        data.ok ? null : el("p", { class: "form-error", role: "alert" }, failMessage(data)),
+        table(["File", "Line", "Layer", "Agents", "Excerpt"], matches.map((m) => [
+          el("code", {}, m.file || ""), String(m.line || ""), m.layer || m.kind || "",
+          (m.agents || []).join(", "), el("code", {}, m.excerpt || "")]),
+        data.ok ? "No matches." : ""),
+      ].filter(Boolean));
+    };
+    query.addEventListener("keydown", (event) => { if (event.key === "Enter") run(); });
+    if (token !== undefined && token !== navToken) return;
+    render("Find context", [],
+      el("div", { class: "skill-form" },
+        labelled("Search", query),
+        el("label", { class: "check" }, regex, " Regular expression"),
+        button("Search", run, "primary")),
+      results);
   },
 
   async doctor(token) {
@@ -755,7 +1053,7 @@ function updateAll() {
   return confirmUpdate({ all: true });
 }
 
-api("skills").then((data) => updateSkillsDot(data.result)).catch(() => {});
+api("skills", undefined, true).then((data) => updateSkillsDot(data.result)).catch(() => {});
 
 let current = "dashboard";
 // Navigation token: guards against tab-switch races where slow inflight
@@ -781,6 +1079,21 @@ if (menuBtn) {
   });
 }
 
+const VIEW_CLI = {
+  dashboard: "muster status",
+  machines: "muster machine list",
+  team: "muster member list",
+  secrets: "muster secret list",
+  providers: "muster provider list",
+  skills: "muster skill list",
+  effective: "muster effective",
+  profiles: "muster profile list",
+  proposals: "muster proposal list",
+  why: 'muster why "<query>"',
+  history: "muster rollback",
+  doctor: "muster doctor",
+};
+
 async function show(name) {
   current = name;
   const token = ++navToken;
@@ -804,6 +1117,9 @@ async function show(name) {
   try {
     await views[name](token);
     if (token === navToken && attempt.failure) failed(attempt.failure);
+    // The footer names the command behind the view on screen, whatever
+    // background requests finished last.
+    else if (token === navToken && VIEW_CLI[name]) showCli(VIEW_CLI[name]);
   } catch (err) {
     if (token !== navToken) return;
     failed("Failed to load: " + err.message);
@@ -1206,6 +1522,91 @@ function openMcpEdit(server) {
   $("#mcp-save").disabled = true;
   $("#mcp-name").focus();
 }
+
+// Skill editor: pick a file inside the skill, edit it, save. The server
+// confines every path to the skills directory and caps the size; the panel only
+// ever sends the relative path it was given by `skills/files`.
+const skillDialog = $("#skill-edit");
+let skillEditing = null;
+let skillFileLoaded = null;
+let skillFileSaved = "";
+
+async function loadSkillFile(path) {
+  $("#skill-error").textContent = "";
+  const data = await api(`skills/file?name=${encodeURIComponent(skillEditing)}&path=${encodeURIComponent(path)}`);
+  if (!data.ok) {
+    $("#skill-error").textContent = failMessage(data);
+    $("#skill-text").value = "";
+    skillFileLoaded = null;
+    return;
+  }
+  skillFileLoaded = path;
+  skillFileSaved = (data.result && data.result.content) || "";
+  $("#skill-text").value = skillFileSaved;
+}
+
+// Unsaved edits are lost on file switch or close; ask first.
+function skillEditsDiscardable() {
+  return skillFileLoaded === null
+    || $("#skill-text").value === skillFileSaved
+    || confirm(`Discard unsaved changes to ${skillFileLoaded}?`);
+}
+
+async function openSkillEdit(name) {
+  skillEditing = name;
+  skillFileLoaded = null;
+  $("#skill-edit-title").textContent = `Edit skill ${name}`;
+  $("#skill-error").textContent = "";
+  $("#skill-text").value = "";
+  const data = await api(`skills/files?name=${encodeURIComponent(name)}`);
+  const select = $("#skill-file");
+  const files = ((data.result || {}).files || []).map((f) => f.path);
+  select.replaceChildren(...files.map((path) => el("option", { value: path }, path)));
+  if (!data.ok || !files.length) {
+    $("#skill-error").textContent = data.ok ? "This skill has no files." : failMessage(data);
+    skillDialog.showModal();
+    return;
+  }
+  const first = files.includes("SKILL.md") ? "SKILL.md" : files[0];
+  select.value = first;
+  skillDialog.showModal();
+  await loadSkillFile(first);
+}
+
+const skillFileEl = $("#skill-file");
+if (skillFileEl) skillFileEl.addEventListener("change", () => {
+  if (!skillEditsDiscardable()) { skillFileEl.value = skillFileLoaded; return; }
+  loadSkillFile(skillFileEl.value);
+});
+const skillCloseEl = $("#skill-close");
+if (skillCloseEl) skillCloseEl.addEventListener("click", () => {
+  if (skillDialog && skillEditsDiscardable()) skillDialog.close();
+});
+// Escape closes a <dialog> via "cancel"; guard it the same way.
+if (skillDialog) skillDialog.addEventListener("cancel", (event) => {
+  if (!skillEditsDiscardable()) event.preventDefault();
+});
+if (skillDialog) skillDialog.addEventListener("close", () => { if (current === "skills") show("skills"); });
+const skillFormEl = $("#skill-form");
+if (skillFormEl) skillFormEl.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const saveBtn = $("#skill-save");
+  if (!saveBtn || saveBtn.disabled || skillFileLoaded === null) return;
+  if (!confirm(`Save ${skillFileLoaded} in skill ${skillEditing}?`)) return;
+  await busy(saveBtn, async () => {
+    const data = await api("skills/file", {
+      name: skillEditing, path: skillFileLoaded, content: $("#skill-text").value, confirm: true,
+    });
+    if (data.ok) {
+      $("#skill-error").textContent = "";
+      skillFileSaved = $("#skill-text").value;
+      toast(`Saved ${skillFileLoaded}.`, "info");
+      await show("skills");
+    } else {
+      $("#skill-error").textContent = failMessage(data);
+    }
+  });
+});
 
 show("dashboard");
 

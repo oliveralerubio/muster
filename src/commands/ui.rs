@@ -8,11 +8,11 @@ use crate::registry::{CommandSpec, ParamKind, ParamSpec, Params};
 
 pub const SPEC: CommandSpec = CommandSpec {
     name: "ui",
-    about: "Serve the web admin interface on 127.0.0.1 with a one-time login token",
+    about: "Serve the web admin interface on 127.0.0.1 with a one-time login token (a second call reuses the running panel)",
     params: &[
         ParamSpec {
             name: "port",
-            about: "Port to listen on (0 = random free port)",
+            about: "Port to listen on (default 47821; 0 = random free port)",
             kind: ParamKind::Int,
             required: false,
             positional: false,
@@ -30,9 +30,13 @@ pub const SPEC: CommandSpec = CommandSpec {
 };
 
 fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
-    let port = params.get_int("port").unwrap_or(0);
-    let port = u16::try_from(port)
-        .map_err(|_| MusterError::Usage(format!("invalid port {port}: expected 0-65535")))?;
+    let port = params
+        .get_int("port")
+        .map(|port| {
+            u16::try_from(port)
+                .map_err(|_| MusterError::Usage(format!("invalid port {port}: expected 0-65535")))
+        })
+        .transpose()?;
     crate::web::serve(ctx, port, !params.get_bool("no-open"))?;
     Ok(Value::Null)
 }

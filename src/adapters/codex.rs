@@ -50,7 +50,7 @@ pub static ADAPTER: Adapter = Adapter {
     binary: "codex",
     experimental: false,
     platforms: &["linux", "macos", "windows"],
-    min_version: "1.0.0",
+    min_version: "0.100.0",
     capabilities: &[
         Capability::Instructions,
         Capability::McpStdio,

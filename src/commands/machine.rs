@@ -514,6 +514,7 @@ fn list(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
     let local_identity = Identity::load(&ctx.state_dir).ok();
     let local_recipient = local_identity.as_ref().map(|id| id.recipient());
     let local_name = machine::load_name(&ctx.state_dir);
+    let local_sync = machine::local_last_sync(&ctx.state_dir);
 
     let mut machines = Vec::new();
     for (name, m) in &manifest.machines {
@@ -522,6 +523,10 @@ fn list(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
             (_, Some(lr)) if lr == &m.recipient => true,
             _ => false,
         };
+        let last_sync = m
+            .last_sync
+            .clone()
+            .or_else(|| is_current.then(|| local_sync.clone()).flatten());
         machines.push(json!({
             "name": name,
             "status": "active",
@@ -529,7 +534,7 @@ fn list(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
             "platform": m.platform,
             "version": m.muster_version,
             "agents": m.agents,
-            "last_sync": m.last_sync,
+            "last_sync": last_sync,
             "role": m.role,
             "profile": m.profile,
             "is_current": is_current,

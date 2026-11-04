@@ -184,6 +184,187 @@ pub const RM: CommandSpec = CommandSpec {
     handler: rm,
 };
 
+pub const FILE_GET: CommandSpec = CommandSpec {
+    name: "skill.file.get",
+    about: "Read a UTF-8 file inside a skill",
+    params: &[
+        param("name", "Skill name", ParamKind::String, true, true),
+        param(
+            "path",
+            "Relative file path inside the skill",
+            ParamKind::String,
+            true,
+            false,
+        ),
+    ],
+    mutating: false,
+    handler: file_get,
+};
+
+pub const FILE_SET: CommandSpec = CommandSpec {
+    name: "skill.file.set",
+    about: "Write a UTF-8 file inside a skill (at most 256 KB)",
+    params: &[
+        param("name", "Skill name", ParamKind::String, true, true),
+        param(
+            "path",
+            "Relative file path inside the skill",
+            ParamKind::String,
+            true,
+            false,
+        ),
+        param(
+            "content",
+            "UTF-8 file content",
+            ParamKind::String,
+            true,
+            false,
+        ),
+    ],
+    mutating: true,
+    handler: file_set,
+};
+
+pub const FILES_LIST: CommandSpec = CommandSpec {
+    name: "skill.files",
+    about: "List all files inside a skill with sizes",
+    params: &[param("name", "Skill name", ParamKind::String, true, true)],
+    mutating: false,
+    handler: files_list,
+};
+
+const MAX_SKILL_FILE_BYTES: usize = 256 * 1024;
+
+fn file_get(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
+    let manifest = Manifest::load(&ctx.config_dir)?;
+    let name = required_name(params)?;
+    let rel = params
+        .get_string("path")
+        .ok_or_else(|| MusterError::Usage("path is required".into()))?;
+    let (dir, _) = skills_dir(ctx, &manifest)?;
+    let target = contained_skill_file(&dir, &name, rel)?;
+    let metadata = std::fs::symlink_metadata(&target).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            MusterError::Usage(format!("{rel:?} does not exist in skill '{name}'"))
+        } else {
+            io_error(&target, e)
+        }
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(MusterError::Usage(
+            "symlinks inside skills are forbidden".into(),
+        ));
+    }
+    if metadata.len() as usize > MAX_SKILL_FILE_BYTES {
+        return Err(MusterError::Usage(format!(
+            "file exceeds maximum allowed size of {MAX_SKILL_FILE_BYTES} bytes"
+        )));
+    }
+    let content = std::fs::read_to_string(&target).map_err(|e| io_error(&target, e))?;
+    Ok(json!({ "name": name, "path": rel, "content": content, "size": metadata.len() }))
+}
+
+fn file_set(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
+    let manifest = Manifest::load(&ctx.config_dir)?;
+    let actor = admin(ctx, &manifest)?;
+    let name = required_name(params)?;
+    let rel = params
+        .get_string("path")
+        .ok_or_else(|| MusterError::Usage("path is required".into()))?;
+    let content = params
+        .get_string("content")
+        .ok_or_else(|| MusterError::Usage("content is required".into()))?;
+    if content.len() > MAX_SKILL_FILE_BYTES {
+        return Err(MusterError::Usage(format!(
+            "content exceeds maximum allowed size of {MAX_SKILL_FILE_BYTES} bytes"
+        )));
+    }
+    ctx.confirm(&format!("Save {rel} in skill '{name}'?"))?;
+    let (dir, _) = skills_dir(ctx, &manifest)?;
+    let target = contained_skill_file(&dir, &name, rel)?;
+    // `symlink_metadata` also sees dangling symlinks, which `exists()` misses.
+    if let Ok(meta) = std::fs::symlink_metadata(&target) {
+        if meta.file_type().is_symlink() {
+            return Err(MusterError::Usage("cannot overwrite symlinks".into()));
+        }
+    }
+    if !ctx.dry_run {
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| io_error(parent, e))?;
+        }
+        crate::manifest::write_atomic(&target, content.as_bytes())
+            .map_err(|e| io_error(&target, e))?;
+        commit(
+            ctx,
+            actor.as_ref(),
+            &format!("feat(skills): edit {name}/{rel}"),
+        )?;
+    }
+    Ok(json!({ "name": name, "path": rel, "saved": !ctx.dry_run, "size": content.len() }))
+}
+
+fn files_list(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
+    let manifest = Manifest::load(&ctx.config_dir)?;
+    let name = required_name(params)?;
+    let (dir, _) = skills_dir(ctx, &manifest)?;
+    let skill_dir = contained(&dir, &name, None)?;
+    if !skill_dir.is_dir() {
+        return Err(MusterError::Usage(format!(
+            "skill '{name}' does not exist on disk"
+        )));
+    }
+    let files = read_skill_files(&skill_dir)?;
+    let list: Vec<Value> = files
+        .into_iter()
+        .map(|(path, content)| json!({ "path": path, "size": content.len() }))
+        .collect();
+    Ok(json!({ "name": name, "files": list }))
+}
+
+pub fn contained_skill_file(
+    skills_dir: &Path,
+    name: &str,
+    rel: &str,
+) -> Result<PathBuf, MusterError> {
+    let escape = || MusterError::Usage("path escapes the skill directory".into());
+    let skill_dir = contained(skills_dir, name, None).map_err(|_| escape())?;
+    let target = contained(skills_dir, name, Some(rel)).map_err(|_| escape())?;
+
+    let canonical_root = match skills_dir.canonicalize() {
+        Ok(p) => p,
+        // Nothing exists yet, so nothing can be redirected.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(target),
+        Err(e) => return Err(io_error(skills_dir, e)),
+    };
+    // The skill directory itself must be a real directory inside the skills root.
+    match std::fs::symlink_metadata(&skill_dir) {
+        Ok(meta) if meta.file_type().is_symlink() => return Err(escape()),
+        Ok(_) => {
+            let canonical_dir = skill_dir
+                .canonicalize()
+                .map_err(|e| io_error(&skill_dir, e))?;
+            if !canonical_dir.starts_with(canonical_root.join(name)) {
+                return Err(escape());
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(target),
+        Err(e) => return Err(io_error(&skill_dir, e)),
+    }
+    // Walk every component below the skill directory: none may be a symlink.
+    let mut current = skill_dir;
+    for component in Path::new(rel).components() {
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => return Err(escape()),
+            Ok(_) => {}
+            // The rest does not exist yet, so it cannot be a symlink.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(_) => return Err(escape()),
+        }
+    }
+    Ok(target)
+}
+
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
@@ -507,6 +688,7 @@ fn skill_view(
     entry: Option<&LockEntry>,
     disk: Option<&BTreeMap<String, String>>,
     cache: &StatusCache,
+    disabled: bool,
 ) -> Value {
     let is_local = entry.is_none_or(LockEntry::is_local);
     let cached = cache.skills.get(name);
@@ -537,6 +719,7 @@ fn skill_view(
         "locked": entry.is_some(),
         "missing": disk.is_none(),
         "needs_attention": status.needs_attention(),
+        "enabled": !disabled,
     })
 }
 
@@ -569,13 +752,22 @@ fn list(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
     let lock = SkillsLock::load(&ctx.config_dir)?;
     let cache = StatusCache::load(&ctx.state_dir);
     let disk = disk_skills(&dir)?;
+    let layers = crate::engine::layer::global_layers(
+        &ctx.config_dir,
+        &manifest,
+        crate::machine::load_name(&ctx.state_dir).as_deref(),
+    );
+    let merged = crate::engine::layer::merge(&layers);
     let names: BTreeSet<&String> = disk
         .keys()
         .chain(lock.skills.iter().map(|e| &e.name))
         .collect();
     let skills: Vec<Value> = names
         .into_iter()
-        .map(|name| skill_view(name, lock.get(name), disk.get(name), &cache))
+        .map(|name| {
+            let disabled = merged.disabled("skill", name, "").is_some();
+            skill_view(name, lock.get(name), disk.get(name), &cache, disabled)
+        })
         .collect();
     let attention = skills
         .iter()
@@ -1330,7 +1522,60 @@ fn forget_status(ctx: &mut Context, name: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn contained_skill_file_prevents_escape_and_symlinks() {
+        let root = tempfile::TempDir::new().unwrap();
+        let skills = root.path().join("skills");
+        let my_skill = skills.join("test-skill");
+        std::fs::create_dir_all(&my_skill).unwrap();
+        std::fs::write(my_skill.join("SKILL.md"), "name: test-skill").unwrap();
+
+        // Safe relative path works
+        assert!(contained_skill_file(&skills, "test-skill", "SKILL.md").is_ok());
+        assert!(contained_skill_file(&skills, "test-skill", "sub/file.txt").is_ok());
+
+        // Traversal attempts fail
+        assert!(contained_skill_file(&skills, "test-skill", "../other.txt").is_err());
+        assert!(contained_skill_file(&skills, "test-skill", "/etc/passwd").is_err());
+        assert!(contained_skill_file(&skills, "test-skill", "sub/../../escape.txt").is_err());
+
+        // Symlink pointing outside escapes
+        let outside = root.path().join("outside.txt");
+        std::fs::write(&outside, "secret").unwrap();
+        #[cfg(unix)]
+        {
+            let sym = my_skill.join("link_outside");
+            std::os::unix::fs::symlink(&outside, &sym).unwrap();
+            assert!(contained_skill_file(&skills, "test-skill", "link_outside").is_err());
+        }
+    }
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn contained_skill_file_rejects_symlinked_skill_dirs_and_dangling_links() {
+        let root = tempfile::TempDir::new().unwrap();
+        let skills = root.path().join("skills");
+        let skill = skills.join("my-skill");
+        std::fs::create_dir_all(&skill).unwrap();
+        // A skill directory that is a symlink to `/` must not make everything pass.
+        std::os::unix::fs::symlink("/", skills.join("esc")).unwrap();
+        for rel in ["etc/passwd", "nonexistent-file"] {
+            let err = contained_skill_file(&skills, "esc", rel).unwrap_err();
+            assert!(matches!(err, MusterError::Usage(_)), "{rel}: {err:?}");
+        }
+        // A dangling leaf symlink is refused too.
+        std::os::unix::fs::symlink("/nonexistent", skill.join("dangling")).unwrap();
+        let err = contained_skill_file(&skills, "my-skill", "dangling").unwrap_err();
+        assert!(matches!(err, MusterError::Usage(_)), "{err:?}");
+        // An intermediate directory symlink is refused.
+        std::os::unix::fs::symlink("/", skill.join("dir")).unwrap();
+        let err = contained_skill_file(&skills, "my-skill", "dir/etc/passwd").unwrap_err();
+        assert!(matches!(err, MusterError::Usage(_)), "{err:?}");
+        // Traversal to a nonexistent target is a usage error, not an I/O error.
+        let err = contained_skill_file(&skills, "my-skill", "../../nope").unwrap_err();
+        assert!(matches!(err, MusterError::Usage(_)), "{err:?}");
+    }
 
     #[test]
     fn write_skill_refuses_paths_outside_the_skills_dir() {
