@@ -20,20 +20,30 @@ jobs:
   test:
     name: test
     if: >-
-      vars.CI_RUNNER != '' && vars.CI_RUNNER != 'none' &&
-      (github.event_name != 'pull_request' ||
-      github.event.pull_request.head.repo.full_name == github.repository)
-    # CI_RUNNER is maintained by scripts/ci-runner-select.sh (ordered self-hosted
-    # runners if online, else ubuntu-latest if hosted minutes work, else "none" = skip).
-    # Unset or empty also skips: jobs only run when the selector has decided.
-    runs-on: ${{ fromJSON(vars.CI_RUNNER || '["ubuntu-latest"]') }}
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    # runner-up pool: fresh container per job (no docker daemon, no preinstalled
+    # rust/jq/gh). The fork guard above is kept: this repository is public.
+    runs-on: ci-docker
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install C toolchain (linker)
+        run: |
+          command -v cc >/dev/null || {
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends build-essential
+          }
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+
+      - name: Install Node.js (web asset tests run node)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
 
       - name: Cache cargo dependencies
         uses: Swatinem/rust-cache@v2
@@ -50,26 +60,21 @@ jobs:
   install-script:
     name: scripts
     if: >-
-      vars.CI_RUNNER != '' && vars.CI_RUNNER != 'none' &&
-      (github.event_name != 'pull_request' ||
-      github.event.pull_request.head.repo.full_name == github.repository)
-    runs-on: ${{ fromJSON(vars.CI_RUNNER || '["ubuntu-latest"]') }}
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ci-docker
     steps:
       - uses: actions/checkout@v4
 
       - name: Test install.sh
         run: bash tests/test_install_script.sh
 
-      - name: Test ci-runner-select.sh
-        run: bash tests/test_ci_runner_select.sh
-
   gitleaks:
     name: gitleaks
     if: >-
-      vars.CI_RUNNER != '' && vars.CI_RUNNER != 'none' &&
-      (github.event_name != 'pull_request' ||
-      github.event.pull_request.head.repo.full_name == github.repository)
-    runs-on: ${{ fromJSON(vars.CI_RUNNER || '["ubuntu-latest"]') }}
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ci-docker
     permissions:
       contents: read
       pull-requests: read
@@ -83,6 +88,3 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITLEAKS_ENABLE_COMMENTS: "false"
-          # The action downloads to $TMPDIR/gitleaks.tmp; on the shared
-          # self-hosted runner a leftover file there breaks every later run.
-          TMPDIR: ${{ runner.temp }}

@@ -74,10 +74,7 @@ Outside the installed binary, `install.sh` uses curl or wget to resolve the
 latest release and download the platform tarball and `SHA256SUMS` from
 GitHub (`MUSTER_REPO`/`MUSTER_VERSION` select the repository/version). It runs
 only when invoked and installs after checking the checksum. It does not
-add a background updater. `scripts/ci-runner-select.sh` uses `gh` to query
-GitHub Actions runners/runs/jobs, dispatch a runner probe and set the
-repository's `CI_RUNNER` variable; this is maintainer infrastructure.
-`.github/workflows/` downloads build tools/dependencies/actions, exchanges
+add a background updater. `.github/workflows/` downloads build tools/dependencies/actions, exchanges
 GitHub caches/artifacts, runs the secret scanner and publishes releases and
 provenance. These are build/release operations, not runtime reporting from
 users' installations.
