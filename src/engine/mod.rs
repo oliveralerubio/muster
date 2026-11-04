@@ -1270,17 +1270,34 @@ pub fn apply(ctx: &mut Context, mut plan: Plan) -> Result<Value, MusterError> {
                     if entry.format == FileFormat::Text {
                         remove_empty_parents(&entry.path, &keep);
                     }
-                    Ok(())
+                    Ok(Written::File)
                 }
             }
         })();
-        if let Err(err) = result {
-            for agent in &entry.agents {
-                failed.insert(agent);
-                ctx.diag(adapter_failure(agent, agent, &err.to_string()));
-                plan.agents.insert(agent, Some(err.to_string()));
+        match result {
+            Ok(Written::ReplacedSymlink { target }) => {
+                ctx.diag(
+                    Diagnostic::new(
+                        Severity::Warning,
+                        "symlink_replaced",
+                        format!(
+                            "{} was a symlink to {}; Muster replaced it with a regular file it manages (the target was not modified). If a dotfiles manager (chezmoi, stow, yadm) owns this path, stop managing it there.",
+                            entry.path.display(),
+                            target.display(),
+                        ),
+                    )
+                    .with_path(entry.path.display().to_string()),
+                );
             }
-            restore_record(&mut next, &base_state, entry);
+            Ok(Written::File) => {}
+            Err(err) => {
+                for agent in &entry.agents {
+                    failed.insert(agent);
+                    ctx.diag(adapter_failure(agent, agent, &err.to_string()));
+                    plan.agents.insert(agent, Some(err.to_string()));
+                }
+                restore_record(&mut next, &base_state, entry);
+            }
         }
     }
     let generation = pending.commit("sync", None, &next)?;
@@ -1401,13 +1418,13 @@ pub fn rollback(ctx: &mut Context, n: u64) -> Result<Value, MusterError> {
         match record {
             Some(record) => {
                 let confine = (record.target != "global").then(|| Path::new(&record.target));
-                write_file(
+                let _ = write_file(
                     path,
                     &record.contents,
                     record.private,
                     record.executable,
                     confine,
-                )?
+                )?;
             }
             None => std::fs::remove_file(path).map_err(|e| io_error(path, e))?,
         }
@@ -2093,17 +2110,20 @@ fn is_agent_config(format: FileFormat) -> bool {
     )
 }
 
-/// Refuse to write through a symlink Muster did not create.
+/// Refuse symlinks that would let a project write escape or replace links.
 ///
-/// - `path` itself must not be a symlink: renaming over it would silently
-///   replace a link the user (or a repository) set up, and reading it would
-///   follow it somewhere else entirely.
 /// - Inside `confine` (a project directory, which comes from a repository
-///   that may be untrusted), no directory between `confine` and `path` may be
-///   a symlink, so `.claude -> ~/.ssh` cannot redirect a write out of the
-///   project. User-scope paths are not confined: `$HOME` belongs to the user,
-///   and symlinked dotfile directories there are a normal setup.
+///   that may be untrusted), `path` itself must not be a symlink and no
+///   directory between `confine` and `path` may be a symlink, so `.claude -> ~/.ssh`
+///   cannot redirect a write out of the project.
+/// - User-scope paths (`confine == None`) are not confined: `$HOME` belongs to
+///   the user, and symlinked dotfile directories there are a normal setup.
+///   Destination symlinks in user scope are adopted by replacing the symlink
+///   with a regular file in [`write_file`], leaving the link target untouched.
 fn check_symlinks(path: &Path, confine: Option<&Path>) -> Result<(), MusterError> {
+    let Some(root) = confine else {
+        return Ok(());
+    };
     let is_link = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink());
     if is_link(path) {
         return Err(MusterError::Security(format!(
@@ -2111,9 +2131,6 @@ fn check_symlinks(path: &Path, confine: Option<&Path>) -> Result<(), MusterError
             path.display()
         )));
     }
-    let Some(root) = confine else {
-        return Ok(());
-    };
     let rel = path.strip_prefix(root).map_err(|_| {
         MusterError::Security(format!(
             "{} is outside the project {}",
@@ -2144,6 +2161,16 @@ fn check_symlinks(path: &Path, confine: Option<&Path>) -> Result<(), MusterError
     Ok(())
 }
 
+/// How [`write_file`] put the contents in place.
+#[derive(Debug, PartialEq, Eq)]
+enum Written {
+    /// A regular file was created or replaced.
+    File,
+    /// `path` was a symlink; it is now a regular file and the link's old
+    /// `target` was left untouched.
+    ReplacedSymlink { target: PathBuf },
+}
+
 /// Write via a sibling temp file + rename, keeping the existing file mode, or
 /// forcing 0600 when `private`. `executable` adds the execute bits (0755, or
 /// 0700 when private). See [`check_symlinks`] for `confine`.
@@ -2153,8 +2180,13 @@ fn write_file(
     private: bool,
     executable: bool,
     confine: Option<&Path>,
-) -> Result<(), MusterError> {
+) -> Result<Written, MusterError> {
     check_symlinks(path, confine)?;
+    let symlink_target = std::fs::symlink_metadata(path)
+        .ok()
+        .filter(|m| m.file_type().is_symlink())
+        .map(|_| std::fs::read_link(path).map_err(|e| io_error(path, e)))
+        .transpose()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| io_error(parent, e))?;
     }
@@ -2174,7 +2206,7 @@ fn write_file(
     std::io::Write::write_all(&mut file, contents.as_bytes()).map_err(|e| io_error(&tmp, e))?;
     file.sync_all().map_err(|e| io_error(&tmp, e))?;
     drop(file);
-    if !private {
+    if !private && symlink_target.is_none() {
         if let Ok(meta) = std::fs::metadata(path) {
             std::fs::set_permissions(&tmp, meta.permissions()).map_err(|e| io_error(&tmp, e))?;
         }
@@ -2191,6 +2223,10 @@ fn write_file(
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         io_error(path, e)
+    })?;
+    Ok(match symlink_target {
+        Some(target) => Written::ReplacedSymlink { target },
+        None => Written::File,
     })
 }
 
@@ -2383,21 +2419,56 @@ mod tests {
         assert!(check_symlinks(&root.join("ok").join("x"), Some(&root)).is_ok());
     }
 
+    #[cfg(unix)]
     #[test]
-    fn write_file_refuses_a_symlink_destination() {
+    fn write_file_in_user_scope_replaces_a_symlink_and_leaves_its_target_alone() {
         let dir = tempfile::TempDir::new().unwrap();
-        let victim = dir.path().join("victim");
+        let target = dir.path().join("AGENTS.md");
+        std::fs::write(&target, "dotfiles copy\n").unwrap();
+        let link = dir.path().join("CLAUDE.md");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let outcome = write_file(&link, "managed\n", false, false, None).unwrap();
+
+        assert_eq!(
+            outcome,
+            Written::ReplacedSymlink {
+                target: target.clone()
+            }
+        );
+        let meta = std::fs::symlink_metadata(&link).unwrap();
+        assert!(meta.file_type().is_file(), "the link became a regular file");
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "managed\n");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "dotfiles copy\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_file_reports_a_plain_write_when_the_destination_is_not_a_symlink() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join("CLAUDE.md");
+
+        assert_eq!(
+            write_file(&file, "managed\n", false, false, None).unwrap(),
+            Written::File
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "managed\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_file_in_a_project_still_refuses_a_symlink_destination() {
+        let project = tempfile::TempDir::new().unwrap();
+        let victim = project.path().join("victim");
         std::fs::write(&victim, "keep\n").unwrap();
-        let link = dir.path().join("settings.json");
+        let link = project.path().join("CLAUDE.md");
         std::os::unix::fs::symlink(&victim, &link).unwrap();
 
-        let err = write_file(&link, "{}", false, false, None).unwrap_err();
+        let err = write_file(&link, "{}", false, false, Some(project.path())).unwrap_err();
+
         assert!(matches!(err, MusterError::Security(_)), "{err}");
         assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep\n");
-        assert!(std::fs::symlink_metadata(&link)
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        assert_eq!(std::fs::read_link(&link).unwrap(), victim);
     }
 
     #[cfg(unix)]
