@@ -658,7 +658,52 @@ async function testUsageWithoutSessionsExplainsNoCoverage() {
   setResponder();
 }
 
+
+async function testSkillsViewRendersUnmanagedSectionAndEscapesNames() {
+  setResponder((call) => ({
+    ok: true,
+    diagnostics: [],
+    result: call.path === "skills" ? {
+      skills: [],
+      unmanaged: [
+        {
+          name: "<script>alert('xss')</script>",
+          adapters: ["claude", "codex"],
+          adapter: "claude",
+          valid: true,
+          description: "A dangerous skill",
+        },
+        {
+          name: "broken",
+          adapters: ["opencode"],
+          adapter: "opencode",
+          valid: false,
+          problem: "missing SKILL.md frontmatter",
+        },
+      ],
+    } : {},
+  }));
+  await sandbox.show("skills");
+  const nodes = [];
+  const walk = (node) => { if (node instanceof FakeElement) { nodes.push(node); node.children.forEach(walk); } };
+  walk(view);
+  const text = nodes.flatMap((node) => [node.textContent, ...node.children.filter((c) => typeof c === "string")]).join(" ");
+  assert.ok(text.includes("On disk, not managed by Muster"), "renders unmanaged section");
+  assert.ok(text.includes("<script>alert('xss')</script>"), "escapes name safely");
+  assert.ok(text.includes("claude, codex"), "lists adapters");
+  assert.ok(text.includes("A dangerous skill"), "shows valid description");
+  assert.ok(text.includes("broken"), "lists invalid skill name");
+  assert.ok(text.includes("missing SKILL.md frontmatter"), "shows invalid problem");
+  assert.ok(!nodes.some((node) => node.tagName === "SCRIPT"), "no script tags injected");
+  const buttons = nodes.filter((node) => node.tagName === "BUTTON" && node.children.includes("Import"));
+  assert.equal(buttons.length, 2, "renders import buttons");
+  assert.equal(buttons[0].disabled, false, "valid skill has enabled button");
+  assert.equal(buttons[1].disabled, true, "invalid skill has disabled button");
+  setResponder();
+}
+
 const tests = {
+  testSkillsViewRendersUnmanagedSectionAndEscapesNames,
   testEffectiveViewShowsStatesAndEscapesNames,
   testDashboardSyncOperationsRedesign,
   testSkillToggleControls,

@@ -90,6 +90,10 @@ _Avoid_: heredoc, section
 An Agent Skills folder (`SKILL.md` with `name`/`description` frontmatter plus any files) installed for every capable agent. Own skills live in the config repository's skills folder; subscribed skills are copied there too.
 _Avoid_: plugin, extension
 
+**Unmanaged skill**:
+A skill folder found in an enabled agent's own skills folder (for example `~/.claude/skills/<name>`) that is neither in the config repository nor built in. `muster skill list` reports it under `unmanaged`; `muster skill import` copies it into the config repository as an own skill and pins it, leaving the original untouched.
+_Avoid_: orphan skill, foreign skill
+
 **Vendored skill**:
 A skill copied from an external Git repository into the config repository's skills folder, so the engine and adapters treat it exactly like an own skill and every machine receives it through the normal sync.
 _Avoid_: downloaded skill, cached skill

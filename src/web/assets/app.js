@@ -1026,6 +1026,18 @@ const views = {
         el("span", { class: "actions" }, actions),
       ];
     });
+    const unmanagedRows = (r.unmanaged || []).map((u) => {
+      const btn = button("Import", () => act(`Import skill ${u.name} into Muster?`, "skills/import", { name: u.name, adapter: u.adapter }));
+      if (!u.valid) {
+        btn.disabled = true;
+      }
+      return [
+        u.name,
+        (u.adapters || []).join(", "),
+        u.valid ? (u.description || "") : el("span", { class: "badge warning" }, u.problem || "missing SKILL.md frontmatter"),
+        btn,
+      ];
+    });
     const name = el("input", { type: "text", placeholder: "new-skill", "aria-label": "Skill name" });
     const description = el("input", { type: "text", placeholder: "Description", "aria-label": "Skill description" });
     const url = el("input", { type: "url", placeholder: "https://github.com/org/skills", "aria-label": "Repository URL" });
@@ -1041,6 +1053,9 @@ const views = {
     ],
       el("p", {}, r.checked_at ? `Last upstream check: ${formatTime(r.checked_at)}.` : "Upstream sources not checked yet on this machine."),
       table(["Name", "Origin", "Version", "Updated", "State", "Status", "", ""], rows, "No skills yet. Add one below."),
+      el("h2", {}, "On disk, not managed by Muster"),
+      el("p", {}, "Skills installed directly in an agent's skills folder. Importing copies one into your config repo as an own skill; the original stays untouched."),
+      table(["Name", "Found in", "Description", ""], unmanagedRows, "No unmanaged skills found on disk."),
       el("h2", {}, "Usage"),
       (() => {
         const u = usage.result || {};

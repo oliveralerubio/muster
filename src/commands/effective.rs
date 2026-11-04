@@ -456,40 +456,7 @@ fn scope(
         }
     }
     let mut skill_views = Vec::new();
-    let mut skill_dirs = BTreeMap::new();
-    let sentinel = BTreeMap::from([(
-        "__muster_probe__".to_owned(),
-        BTreeMap::from([("SKILL.md".to_owned(), String::new())]),
-    )]);
-    let empty_agents = Default::default();
-    let providers = BTreeMap::new();
-    let mcp = BTreeMap::new();
-    let secrets = BTreeMap::new();
-    let subagents = BTreeMap::new();
-    let access = SecretAccess::new(BTreeMap::new(), None);
-    let desired = Desired {
-        config_dir: &ctx.config_dir,
-        agents: &empty_agents,
-        ai_providers: &providers,
-        mcp: &mcp,
-        instructions: None,
-        secrets: &secrets,
-        access: &access,
-        skills: &sentinel,
-        subagents: &subagents,
-    };
-    for &adapter in &selected {
-        let rendered = adapter.render(&desired, &Current::new())?;
-        if let Some(file) = rendered.tree.first() {
-            if project.is_some() && file.project.is_none() {
-                continue;
-            }
-            let path = locate_tree(&roots, file, project);
-            if let Some(dir) = path.parent().and_then(|p| p.parent()) {
-                skill_dirs.insert(adapter.id, dir.to_path_buf());
-            }
-        }
-    }
+    let mut skill_dirs = skill_roots(&ctx.config_dir, &selected, &roots, project)?;
     let skill_layer = layers
         .iter()
         .rev()
@@ -944,6 +911,52 @@ fn locate_file(
         .and_then(|p| file.project.map(|path| p.join(path)))
         .unwrap_or_else(|| roots.resolve(file))
 }
+/// Skills directory of each adapter in user scope (or in `project`), found by
+/// rendering a sentinel skill and taking the parent of its path. Adapters
+/// without a skills directory in that scope are absent.
+pub fn skill_roots(
+    config_dir: &std::path::Path,
+    adapters: &[&'static adapters::Adapter],
+    roots: &Roots,
+    project: Option<&std::path::Path>,
+) -> Result<BTreeMap<&'static str, std::path::PathBuf>, MusterError> {
+    let sentinel = BTreeMap::from([(
+        "__muster_probe__".to_owned(),
+        BTreeMap::from([("SKILL.md".to_owned(), String::new())]),
+    )]);
+    let empty_agents = Default::default();
+    let providers = BTreeMap::new();
+    let mcp = BTreeMap::new();
+    let secrets = BTreeMap::new();
+    let subagents = BTreeMap::new();
+    let access = SecretAccess::new(BTreeMap::new(), None);
+    let desired = Desired {
+        config_dir,
+        agents: &empty_agents,
+        ai_providers: &providers,
+        mcp: &mcp,
+        instructions: None,
+        secrets: &secrets,
+        access: &access,
+        skills: &sentinel,
+        subagents: &subagents,
+    };
+    let mut dirs = BTreeMap::new();
+    for &adapter in adapters {
+        let rendered = adapter.render(&desired, &Current::new())?;
+        if let Some(file) = rendered.tree.first() {
+            if project.is_some() && file.project.is_none() {
+                continue;
+            }
+            let path = locate_tree(roots, file, project);
+            if let Some(dir) = path.parent().and_then(|p| p.parent()) {
+                dirs.insert(adapter.id, dir.to_path_buf());
+            }
+        }
+    }
+    Ok(dirs)
+}
+
 fn locate_tree(
     roots: &Roots,
     file: &adapters::RenderedTreeFile,

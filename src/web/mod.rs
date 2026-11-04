@@ -161,6 +161,9 @@ const ROUTES: &[Route] = &[
     post("skills/update", "skill.update"),
     post("skills/rm", "skill.rm"),
     post("skills/pin", "skill.pin"),
+    // The panel names an agent and a skill; the command resolves the folder
+    // itself, so a request can never point it at an arbitrary directory.
+    post("skills/import", "skill.import"),
     get("skills/files", "skill.files"),
     get("skills/file", "skill.file.get"),
     post("skills/file", "skill.file.set"),
