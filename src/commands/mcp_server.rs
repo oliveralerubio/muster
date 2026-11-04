@@ -148,6 +148,12 @@ fn transport_of(server: &McpServer) -> &'static str {
 
 fn list(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
     let manifest = Manifest::load(&ctx.config_dir)?;
+    let layers = crate::engine::layer::global_layers(
+        &ctx.config_dir,
+        &manifest,
+        crate::machine::load_name(&ctx.state_dir).as_deref(),
+    );
+    let merged = crate::engine::layer::merge(&layers);
     let servers: Vec<_> = manifest
         .mcp
         .iter()
@@ -156,6 +162,7 @@ fn list(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
                 "name": name,
                 "server": server,
                 "transport": transport_of(server),
+                "enabled": merged.disabled("mcp", name, "").is_none(),
             })
         })
         .collect();

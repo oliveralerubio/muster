@@ -1336,3 +1336,109 @@ fn usage_api_rejects_project_and_max_file_bytes() {
         assert!(body.contains("unknown parameter"), "{query}: {body}");
     }
 }
+
+#[test]
+fn ui_sessions_persist_across_restarts_on_the_same_port() {
+    let env = support::MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    let mut ui = Ui::start(&env);
+    let cookie = ui.session();
+    let (status, _, body) = ui.request("GET", "/api/status", Some(&cookie), None);
+    assert_eq!(status, 200);
+    assert!(body.contains("\"ok\":true"));
+
+    let port: u16 = ui.address.split(':').nth(1).unwrap().parse().unwrap();
+    let _ = ui.child.kill();
+    let _ = ui.child.wait();
+
+    let mut command = Command::new(assert_cmd::cargo::cargo_bin("muster"));
+    command
+        .args(["ui", "--no-open", "--port", &port.to_string()])
+        .env("HOME", env.home.path())
+        .env("XDG_CONFIG_HOME", env.home.path().join(".config"))
+        .env("XDG_STATE_HOME", env.home.path().join(".local/state"))
+        .env("XDG_DATA_HOME", env.home.path().join(".local/share"))
+        .env("XDG_CACHE_HOME", env.home.path().join(".cache"))
+        .env("PATH", &env.bin)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (key, _) in std::env::vars() {
+        if key.starts_with("MUSTER_") {
+            command.env_remove(key);
+        }
+    }
+    let mut child = command.spawn().expect("restart muster ui");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read startup line");
+
+    let mut restarted = Ui {
+        child,
+        token: String::new(),
+        address: format!("127.0.0.1:{port}"),
+    };
+    let (status, _, body) = restarted.request("GET", "/api/status", Some(&cookie), None);
+    assert_eq!(status, 200);
+    assert!(body.contains("\"ok\":true"));
+}
+
+#[test]
+fn ui_second_invocation_hands_off_fresh_login_to_running_server() {
+    let env = support::MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    let mut ui = Ui::start(&env);
+    let port: u16 = ui.address.split(':').nth(1).unwrap().parse().unwrap();
+
+    let mut second = Command::new(assert_cmd::cargo::cargo_bin("muster"));
+    second
+        .args(["ui", "--no-open", "--port", &port.to_string()])
+        .env("HOME", env.home.path())
+        .env("XDG_CONFIG_HOME", env.home.path().join(".config"))
+        .env("XDG_STATE_HOME", env.home.path().join(".local/state"))
+        .env("XDG_DATA_HOME", env.home.path().join(".local/share"))
+        .env("XDG_CACHE_HOME", env.home.path().join(".cache"))
+        .env("PATH", &env.bin);
+    for (key, _) in std::env::vars() {
+        if key.starts_with("MUSTER_") {
+            second.env_remove(key);
+        }
+    }
+    let output = second.output().expect("second invocation");
+    assert!(
+        output.status.success(),
+        "exit={:?}, stderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let handed_token = stdout
+        .split("token=")
+        .nth(1)
+        .expect("URL token")
+        .trim()
+        .to_string();
+
+    let (status, headers, _) = ui.request("GET", &format!("/?token={handed_token}"), None, None);
+    assert_eq!(status, 200);
+    let cookie = headers
+        .lines()
+        .find(|h| h.to_ascii_lowercase().starts_with("set-cookie:"))
+        .expect("Set-Cookie header on handed-off login")
+        .split_once(':')
+        .unwrap()
+        .1
+        .trim()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    let (status, _, body) = ui.request("GET", "/api/status", Some(&cookie), None);
+    assert_eq!(status, 200);
+    assert!(body.contains("\"ok\":true"));
+
+    let (status, _, _) = ui.request("GET", &format!("/?token={handed_token}"), None, None);
+    assert_eq!(status, 401);
+}
