@@ -1154,7 +1154,10 @@ fn claude_settings_block_is_pruned_when_removed_and_keeps_user_keys() {
         .code(0);
 
     let settings = read_claude_settings(&env);
-    assert!(settings.get("outputStyle").is_none(), "stale key: {settings}");
+    assert!(
+        settings.get("outputStyle").is_none(),
+        "stale key: {settings}"
+    );
     assert!(settings.get("model").is_none(), "stale model: {settings}");
     assert_eq!(settings["theme"], "dark", "user key must survive pruning");
 }
