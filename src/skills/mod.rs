@@ -5,6 +5,7 @@
 //! `[agents.skills.remote]` and pinned in `skills.lock`.
 
 pub mod builtin;
+pub mod lifecycle;
 pub mod lock;
 pub mod upstream;
 
@@ -16,6 +17,7 @@ use sha2::{Digest, Sha256};
 use crate::errors::MusterError;
 use crate::hash::sha256_hex;
 
+pub use lifecycle::{evaluate_update_action, read_upstream, Sources, UpdateAction, UpstreamSkill};
 pub use lock::{LockEntry, SkillsLock};
 pub use upstream::{SkillStatus, UpstreamFetcher};
 

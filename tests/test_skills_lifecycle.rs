@@ -1152,3 +1152,214 @@ fn editing_an_own_skill_repins_it_but_subscribed_skills_are_not_pinned() {
         Some(pinned.as_str())
     );
 }
+
+// ---------------------------------------------------------------------------
+// Domain lifecycle unit tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn evaluate_update_action_matrix() {
+    use muster::skills::lifecycle::{evaluate_update_action, UpdateAction};
+
+    let lock = "sha256:1111";
+    let disk = "sha256:1111";
+    let up = "sha256:1111";
+
+    // 1. Upstream removed always takes precedence over hashes
+    assert_eq!(
+        evaluate_update_action(lock, disk, None, false),
+        UpdateAction::SkipUpstreamRemoved
+    );
+    assert_eq!(
+        evaluate_update_action(lock, "sha256:diff", None, true),
+        UpdateAction::SkipUpstreamRemoved
+    );
+
+    // 2. Everything in sync -> UpToDate
+    assert_eq!(
+        evaluate_update_action(lock, disk, Some(up), false),
+        UpdateAction::UpToDate
+    );
+    assert_eq!(
+        evaluate_update_action(lock, disk, Some(up), true),
+        UpdateAction::UpToDate
+    );
+
+    // 3. Upstream changed, local disk clean -> ApplyUpdate
+    let up_new = "sha256:2222";
+    assert_eq!(
+        evaluate_update_action(lock, disk, Some(up_new), false),
+        UpdateAction::ApplyUpdate
+    );
+    assert_eq!(
+        evaluate_update_action(lock, disk, Some(up_new), true),
+        UpdateAction::ApplyUpdate
+    );
+
+    // 4. Local modifications exist, force = false -> SkipModified
+    let disk_modified = "sha256:3333";
+    assert_eq!(
+        evaluate_update_action(lock, disk_modified, Some(up_new), false),
+        UpdateAction::SkipModified
+    );
+
+    // 5. Local modifications exist, force = true -> ApplyUpdate
+    assert_eq!(
+        evaluate_update_action(lock, disk_modified, Some(up_new), true),
+        UpdateAction::ApplyUpdate
+    );
+
+    // 6. Disk already matches upstream (e.g. manually synced), lock stale -> ApplyUpdate
+    assert_eq!(
+        evaluate_update_action(lock, up_new, Some(up_new), false),
+        UpdateAction::ApplyUpdate
+    );
+
+    // 7. Disk edited, upstream unchanged since lock: edits are kept unless forced
+    assert_eq!(
+        evaluate_update_action(lock, disk_modified, Some(lock), false),
+        UpdateAction::SkipModified
+    );
+    assert_eq!(
+        evaluate_update_action(lock, disk_modified, Some(lock), true),
+        UpdateAction::ApplyUpdate
+    );
+}
+
+#[test]
+fn upstream_skill_and_read_upstream() {
+    use muster::manifest::SkillRemote;
+    use muster::skills::lifecycle::read_upstream;
+    use muster::skills::upstream::{Checkout, Upstream};
+
+    let temp = tempfile::TempDir::new().unwrap();
+    let root = temp.path().join("skills");
+    let skill_dir = root.join("my-skill");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+
+    let skill_md =
+        "---\nname: my-skill\nversion: 1.2.3\ndeprecated: use v2\n---\nPrompt instructions\n";
+    std::fs::write(skill_dir.join("SKILL.md"), skill_md).unwrap();
+    std::fs::write(skill_dir.join("helper.py"), "print('hello')\n").unwrap();
+
+    let remote = SkillRemote {
+        name: "test-origin".into(),
+        url: "https://example.com/repo.git".into(),
+        git_ref: None,
+        path: Some("skills".into()),
+        include: vec![],
+    };
+
+    let checkout = Checkout {
+        dir: temp.path().to_path_buf(),
+        commit: "abcdef123456".into(),
+    };
+
+    // Read present skill
+    let skill = read_upstream(&checkout, &remote, "my-skill")
+        .expect("read succeeds")
+        .expect("skill found");
+
+    assert_eq!(skill.version.as_deref(), Some("1.2.3"));
+    assert_eq!(skill.deprecated.as_deref(), Some("use v2"));
+    assert_eq!(skill.files.len(), 2);
+    assert_eq!(
+        skill.files.get("SKILL.md").map(String::as_str),
+        Some(skill_md)
+    );
+    assert_eq!(
+        skill.files.get("helper.py").map(String::as_str),
+        Some("print('hello')\n")
+    );
+    assert_eq!(skill.hash, muster::skills::content_hash(&skill.files));
+    assert!(skill.hash.starts_with("sha256:"));
+
+    match skill.upstream() {
+        Upstream::Present {
+            content_hash,
+            deprecated,
+        } => {
+            assert_eq!(content_hash, skill.hash);
+            assert_eq!(deprecated.as_deref(), Some("use v2"));
+        }
+        other => panic!("expected Upstream::Present, got {other:?}"),
+    }
+
+    // Read missing skill returns Ok(None)
+    let missing = read_upstream(&checkout, &remote, "nonexistent").expect("read succeeds");
+    assert!(missing.is_none());
+}
+
+#[test]
+fn sources_caching_and_remote_lookup() {
+    use muster::errors::MusterError;
+    use muster::manifest::{Manifest, SkillRemote};
+    use muster::skills::lifecycle::Sources;
+    use muster::skills::upstream::{Checkout, UpstreamFetcher};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingFetcher {
+        calls: AtomicUsize,
+        temp: tempfile::TempDir,
+    }
+
+    impl UpstreamFetcher for CountingFetcher {
+        fn fetch(&self, remote: &SkillRemote) -> Result<Checkout, MusterError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if remote.url == "fail://test" {
+                return Err(MusterError::Operational("network down".into()));
+            }
+            Ok(Checkout {
+                dir: self.temp.path().to_path_buf(),
+                commit: "abc1234".into(),
+            })
+        }
+    }
+
+    let fetcher = CountingFetcher {
+        calls: AtomicUsize::new(0),
+        temp: tempfile::TempDir::new().unwrap(),
+    };
+
+    let manifest_toml = r#"
+version = 1
+[agents.skills]
+source = "skills"
+
+[[agents.skills.remote]]
+name = "origin-a"
+url = "https://example.com/a.git"
+
+[[agents.skills.remote]]
+name = "origin-failing"
+url = "fail://test"
+"#;
+    let manifest = Manifest::parse(manifest_toml, "muster.toml").expect("parse manifest");
+    let mut sources = Sources::new(&manifest, &fetcher);
+
+    // Initial fetch
+    let (remote, checkout) = sources.checkout("origin-a").expect("fetch origin-a");
+    assert_eq!(remote.name, "origin-a");
+    assert_eq!(checkout.commit, "abc1234");
+    assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
+
+    // Second call for same origin is cached
+    let (remote2, checkout2) = sources
+        .checkout("origin-a")
+        .expect("fetch origin-a second time");
+    assert_eq!(remote2.name, "origin-a");
+    assert_eq!(checkout2.commit, "abc1234");
+    assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
+
+    // Failing fetch is cached too
+    let err1 = sources.checkout("origin-failing").unwrap_err();
+    assert!(err1.contains("network down"));
+    assert_eq!(fetcher.calls.load(Ordering::SeqCst), 2);
+    let err2 = sources.checkout("origin-failing").unwrap_err();
+    assert!(err2.contains("network down"));
+    assert_eq!(fetcher.calls.load(Ordering::SeqCst), 2);
+
+    // Undeclared origin returns Err
+    let err3 = sources.checkout("unknown-origin").unwrap_err();
+    assert!(err3.contains("no longer declared"));
+}
