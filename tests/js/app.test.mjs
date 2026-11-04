@@ -453,7 +453,10 @@ async function testProvidersViewListsReferencesAndAddsAndRemoves() {
   setResponder((call) => ({ ok: true, result: call.path === "providers" ? { providers: [{
     id: "gateway", kind: "anthropic", base_url: "https://example.invalid",
     default_model: "example-model", key: "env://EXAMPLE_KEY", agents: ["claude"]
-  }] } : {}, diagnostics: [] }));
+  }], subscriptions: [
+    { agent: "claude", installed: true, logged_in: true },
+    { agent: "codex", installed: true, logged_in: false }
+  ] } : {}, diagnostics: [] }));
   const mark = baseline();
   tabs.find((t) => t.dataset.view === "providers").fire("click");
   await flush();
@@ -463,6 +466,19 @@ async function testProvidersViewListsReferencesAndAddsAndRemoves() {
   for (const expected of ["gateway", "anthropic", "https://example.invalid", "example-model", "env://EXAMPLE_KEY", "claude"]) {
     assert.ok(text(view).includes(expected), `provider table includes ${expected}`);
   }
+  const body = text(view);
+  for (const expected of ["Subscriptions on this machine", "Signed in", "Not signed in", "muster provider login codex", "Custom endpoints (advanced)"]) {
+    assert.ok(body.includes(expected), `providers view includes ${expected}`);
+  }
+  assert.ok(!body.includes("muster provider login claude"), "signed-in agent shows no login command");
+  const details = (function find(node) {
+    if (!(node instanceof FakeElement)) return null;
+    if (node.tagName === "DETAILS") return node;
+    for (const kid of node.children) { const f = find(kid); if (f) return f; }
+    return null;
+  })(view);
+  assert.ok(details, "custom endpoints are in a details element");
+  assert.equal(details.getAttribute("open"), "", "details open when a provider is configured");
   need("provider-id").value = "local";
   need("provider-kind").value = "ollama";
   need("provider-url").value = "http://localhost:11434/v1";

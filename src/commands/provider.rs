@@ -141,7 +141,25 @@ fn list(ctx: &mut Context, _: &Params) -> Result<Value, MusterError> {
             entry
         })
         .collect();
-    Ok(json!({ "providers": ai_providers }))
+    Ok(json!({ "providers": ai_providers, "subscriptions": subscriptions() }))
+}
+
+/// Subscription sign-in state per agent. Runs only the documented native
+/// status command; credential files are never read.
+fn subscriptions() -> Vec<Value> {
+    ["claude", "codex"]
+        .into_iter()
+        .filter_map(|agent| {
+            let (status_args, _) = login_commands(agent)?;
+            let adapter = crate::adapters::find(agent)?;
+            let binary = crate::machine::find_executable(adapter.binary);
+            Some(json!({
+                "agent": agent,
+                "installed": binary.is_some(),
+                "logged_in": binary.map(|binary| logged_in(&binary, status_args)),
+            }))
+        })
+        .collect()
 }
 fn add(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let id = id(params)?;
@@ -264,13 +282,31 @@ pub(crate) fn login_commands(
 }
 
 pub(crate) fn logged_in(binary: &std::path::Path, args: &[&str]) -> bool {
-    std::process::Command::new(binary)
+    use std::time::{Duration, Instant};
+    let Ok(mut child) = std::process::Command::new(binary)
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+        .spawn()
+    else {
+        return false;
+    };
+    // A hung status command must never stall callers such as `provider list`.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
 }
 
 fn login(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {

@@ -258,6 +258,45 @@ fn provider_login_delegates_to_native_cli_and_preserves_credentials() {
 }
 
 #[test]
+fn provider_list_reports_subscription_status_from_native_status_command() {
+    let env = MusterEnv::new();
+    seed(&env, "version = 1\n");
+    env.fake_exe(
+        "claude",
+        "if [ \"$*\" = 'auth status' ]; then exit 0; fi\nexit 9",
+    );
+    env.fake_exe(
+        "codex",
+        "if [ \"$*\" = 'login status' ]; then exit 1; fi\nexit 9",
+    );
+    let (_, list) = env.run_json(&["provider", "list", "--format", "json"]);
+    let subs = &list.result()["subscriptions"];
+    assert_eq!(
+        subs[0],
+        serde_json::json!({"agent": "claude", "installed": true, "logged_in": true})
+    );
+    assert_eq!(
+        subs[1],
+        serde_json::json!({"agent": "codex", "installed": true, "logged_in": false})
+    );
+
+    let empty = MusterEnv::new();
+    seed(&empty, "version = 1\n");
+    let out = empty
+        .run_isolated(&["provider", "list", "--format", "json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(
+        json["result"]["subscriptions"][0],
+        serde_json::json!({"agent": "claude", "installed": false, "logged_in": null})
+    );
+}
+
+#[test]
 fn provider_list_matches_mcp_registry_surface() {
     let env = MusterEnv::new();
     seed(&env, "version = 1\n[agents]\nenabled = ['claude']\n[agents.providers]\nclaude = 'gateway'\n[providers.gateway]\nkind = 'anthropic'\n");

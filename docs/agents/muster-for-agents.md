@@ -162,6 +162,8 @@ optional `base_url`, `default_model`, and a secret reference `key`; select it
 with `muster provider use <id> --agent <agent> --yes`. Add `--clear` to unset
 the base selection. Profile fields override individually and `plan --explain`
 shows their sources. A per-agent model wins over the provider default.
+The result also has `subscriptions`: per `claude`/`codex`, `installed` and
+`logged_in` (null when not installed), from the agent's native status command.
 
 Use `provider add ... --value-stdin` with a `native://` key to vault a piped
 value. Do not use `--value` in scripts; it can leak through shell history and
