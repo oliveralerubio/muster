@@ -77,6 +77,57 @@ fn collect_files(
     Ok(())
 }
 
+/// Directory under a config root holding file overlays, one folder per skill.
+pub const OVERLAY_DIR: &str = "skill-overlays";
+/// Overlay file whose text is appended to the skill's `SKILL.md`.
+pub const APPEND_FILE: &str = "SKILL.append.md";
+
+/// Whether `name` has a file overlay under any of `roots` or a manifest entry.
+pub fn is_customized(
+    name: &str,
+    roots: &[std::path::PathBuf],
+    customize: &BTreeMap<String, crate::adapters::config::SkillCustomization>,
+) -> bool {
+    customize.get(name).is_some_and(|c| c.append.is_some())
+        || roots
+            .iter()
+            .any(|r| r.join(OVERLAY_DIR).join(name).is_dir())
+}
+
+/// Stitch overlays on top of a verified skill's files, in memory only: file
+/// overlays of each root first (add or replace files, `SKILL.append.md`
+/// appended to `SKILL.md`), then the manifest `append`. The vendored files and
+/// their lock pin are never touched.
+pub fn apply_overlays(
+    name: &str,
+    files: &mut BTreeMap<String, String>,
+    roots: &[std::path::PathBuf],
+    customize: &BTreeMap<String, crate::adapters::config::SkillCustomization>,
+) -> Result<(), MusterError> {
+    let mut appends = Vec::new();
+    for root in roots {
+        let mut overlay = read_skill_files(&root.join(OVERLAY_DIR).join(name))?;
+        if let Some(text) = overlay.remove(APPEND_FILE) {
+            appends.push(text);
+        }
+        files.extend(overlay);
+    }
+    if let Some(text) = customize.get(name).and_then(|c| c.append.clone()) {
+        appends.push(text);
+    }
+    for text in appends {
+        if let Some(md) = files.get_mut("SKILL.md") {
+            *md = stitch_skill_append(md, &text);
+        }
+    }
+    Ok(())
+}
+
+/// Join the base `SKILL.md` and an appended section.
+pub fn stitch_skill_append(base: &str, append: &str) -> String {
+    crate::engine::stitch_skill_append(base, append)
+}
+
 /// Compute `sha256:<hex>` over sorted relative paths and LF-normalized contents.
 pub fn content_hash(files: &BTreeMap<String, String>) -> String {
     let mut hasher = Sha256::new();

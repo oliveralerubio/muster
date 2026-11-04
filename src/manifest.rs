@@ -10,7 +10,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub use crate::adapters::config::{AgentsConfig, AiProvider, McpServer, SkillRemote, SkillsConfig};
+pub use crate::adapters::config::{
+    AgentsConfig, AiProvider, McpServer, SkillCustomization, SkillRemote, SkillsConfig,
+};
 use crate::errors::MusterError;
 
 pub const FILE_NAME: &str = "muster.toml";

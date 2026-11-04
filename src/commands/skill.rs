@@ -168,6 +168,30 @@ pub const AUTO_UPDATE: CommandSpec = CommandSpec {
     handler: auto_update_cmd,
 };
 
+pub const CUSTOMIZE: CommandSpec = CommandSpec {
+    name: "skill.customize",
+    about: "Customize a skill with text appended to its SKILL.md at render time (upstream stays untouched)",
+    params: &[
+        param("name", "Skill to customize", ParamKind::String, true, true),
+        param(
+            "append",
+            "Markdown appended to SKILL.md after a divider",
+            ParamKind::String,
+            false,
+            false,
+        ),
+        param(
+            "clear",
+            "Remove the customization of this skill",
+            ParamKind::Bool,
+            false,
+            false,
+        ),
+    ],
+    mutating: true,
+    handler: customize_cmd,
+};
+
 pub const PIN: CommandSpec = CommandSpec {
     name: "skill.pin",
     about: "Approve the current contents of an own skill in skills.lock",
@@ -757,6 +781,7 @@ fn skill_view(
     disk: Option<&BTreeMap<String, String>>,
     cache: &StatusCache,
     disabled: bool,
+    customized: bool,
 ) -> Value {
     let is_local = entry.is_none_or(LockEntry::is_local);
     let cached = cache.skills.get(name);
@@ -788,6 +813,7 @@ fn skill_view(
         "missing": disk.is_none(),
         "needs_attention": status.needs_attention(),
         "enabled": !disabled,
+        "customized": customized,
     })
 }
 
@@ -834,7 +860,16 @@ fn list(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
         .iter()
         .map(|&name| {
             let disabled = merged.disabled("skill", name, "").is_some();
-            skill_view(name, lock.get(name), disk.get(name), &cache, disabled)
+            let customized =
+                crate::skills::is_customized(name, &merged.overlay_roots, &merged.customize);
+            skill_view(
+                name,
+                lock.get(name),
+                disk.get(name),
+                &cache,
+                disabled,
+                customized,
+            )
         })
         .collect();
     let attention = skills
@@ -2167,6 +2202,72 @@ fn update_inner(
         ctx,
         actor.as_ref(),
         &format!("feat(skills): update {}", names.join(", ")),
+    )?;
+    Ok(result)
+}
+
+// ---------------------------------------------------------------------------
+// customize
+// ---------------------------------------------------------------------------
+
+fn customize_cmd(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
+    let name = params
+        .get_string("name")
+        .ok_or_else(|| MusterError::Usage("skill name required".into()))?
+        .to_owned();
+    if !crate::adapters::config::is_valid_item_name(&name) {
+        return Err(MusterError::Usage(format!("invalid skill name `{name}`")));
+    }
+    let clear = params.get_bool("clear");
+    let append = params.get_string("append").map(str::to_owned);
+    if clear == append.is_some() {
+        return Err(MusterError::Usage(
+            "pass exactly one of --append <text> or --clear".into(),
+        ));
+    }
+    let manifest = Manifest::load(&ctx.config_dir)?;
+    let actor = admin(ctx, &manifest)?;
+    let result =
+        json!({ "name": name, "cleared": clear, "append": append, "dry_run": ctx.dry_run });
+    if ctx.dry_run {
+        return Ok(result);
+    }
+    ctx.confirm(&if clear {
+        format!("Remove the customization of skill `{name}`?")
+    } else {
+        format!("Customize skill `{name}` with the given text?")
+    })?;
+    edit_manifest(ctx, |skills| {
+        if !skills.contains_key("customize") {
+            let mut t = Table::new();
+            t.set_implicit(true);
+            skills.insert("customize", Item::Table(t));
+        }
+        let custom = skills["customize"]
+            .as_table_mut()
+            .ok_or_else(|| MusterError::Usage("`agents.skills.customize` is not a table".into()))?;
+        match &append {
+            Some(text) => {
+                let mut t = Table::new();
+                t.insert("append", toml_edit::value(text.as_str()));
+                custom.insert(&name, Item::Table(t));
+            }
+            None => {
+                custom.remove(&name);
+            }
+        }
+        if custom.is_empty() {
+            skills.remove("customize");
+        }
+        Ok(())
+    })?;
+    commit(
+        ctx,
+        actor.as_ref(),
+        &format!(
+            "feat(skills): {} customization of {name}",
+            if clear { "clear" } else { "set" }
+        ),
     )?;
     Ok(result)
 }

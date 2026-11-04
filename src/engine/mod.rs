@@ -1696,6 +1696,22 @@ fn read_skills(
     Ok((skills, skipped))
 }
 
+pub fn stitch_skill_append(base: &str, append: &str) -> String {
+    let base = base.trim_end();
+    let append = append.trim();
+    if append.is_empty() {
+        if base.is_empty() {
+            String::new()
+        } else {
+            format!("{base}\n")
+        }
+    } else if base.is_empty() {
+        format!("{append}\n")
+    } else {
+        format!("{base}\n\n---\n\n{append}\n")
+    }
+}
+
 fn read_user_skills(
     ctx: &mut Context,
     merged: &layer::Merged,
@@ -1733,7 +1749,7 @@ fn read_user_skills(
         if !file_type.is_dir() || crate::skills::is_ignored_skill_name(&name, true) {
             continue;
         }
-        let files = match crate::skills::read_skill_files(&entry.path()) {
+        let mut files = match crate::skills::read_skill_files(&entry.path()) {
             Ok(files) => files,
             Err(error) => {
                 ctx.diag(
@@ -1785,6 +1801,8 @@ fn read_user_skills(
         if !valid {
             continue;
         }
+        // Overlays go on after the pin check so upstream hashes stay clean.
+        crate::skills::apply_overlays(&name, &mut files, &merged.overlay_roots, &merged.customize)?;
         skills.insert(name, files);
     }
     skipped.sort();
