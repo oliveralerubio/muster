@@ -249,6 +249,13 @@ pub fn merge(layers: &[Layer]) -> Merged {
         agents.packages.extend(over.packages.clone());
         agents.ai_providers.extend(over.ai_providers.clone());
         agents.hooks.extend(over.hooks.clone());
+        for (adapter, values) in &over.settings {
+            agents
+                .settings
+                .entry(adapter.clone())
+                .or_default()
+                .extend(values.clone());
+        }
         mcp.extend(layer.mcp.clone());
         for (id, provider) in &layer.ai_providers {
             if let Some(current) = ai_providers.get_mut(id) {

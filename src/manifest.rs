@@ -448,6 +448,21 @@ impl Manifest {
                     )));
                 }
             }
+            for (agent, values) in &agents.settings {
+                if crate::adapters::find(agent).is_none() {
+                    return Err(invalid(format!("agents.settings.{agent}: unknown agent")));
+                }
+                if agent == "claude" {
+                    for key in values.keys() {
+                        if crate::adapters::config::CLAUDE_RESERVED_SETTINGS.contains(&key.as_str())
+                        {
+                            return Err(invalid(format!(
+                                "agents.settings.claude.{key}: managed by Muster; use its dedicated config"
+                            )));
+                        }
+                    }
+                }
+            }
             for (agent, id) in &agents.ai_providers {
                 let known = manifest.ai_providers.contains_key(id)
                     || manifest

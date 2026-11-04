@@ -35,6 +35,10 @@ pub struct AgentsConfig {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     #[serde(rename = "providers")]
     pub ai_providers: BTreeMap<String, String>,
+    /// Extra native settings per adapter id (`[agents.settings.claude]`), written
+    /// verbatim as top-level keys. Keys Muster manages itself are rejected.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub settings: BTreeMap<String, BTreeMap<String, serde_json::Value>>,
     /// Tool permission rules (Claude Code syntax).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permissions: Option<Permissions>,
@@ -58,6 +62,11 @@ pub struct Toggles {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub enable: Vec<String>,
 }
+
+/// Claude `settings.json` keys Muster manages through dedicated config; generic
+/// `[agents.settings.claude]` entries must not touch them.
+pub const CLAUDE_RESERVED_SETTINGS: &[&str] =
+    &["apiKeyHelper", "env", "model", "permissions", "hooks"];
 
 pub fn parse_toggle(item: &str) -> Result<(&str, &str, Option<&str>), String> {
     let (kind, rest) = item
