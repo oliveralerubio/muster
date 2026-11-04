@@ -922,6 +922,10 @@ fn unmanaged_entry(
         } else {
             None
         }
+    } else if record.format == FileFormat::Text && !record.created {
+        // Skill tree files that pre-existed on disk were not created by Muster;
+        // pruning Text format would truncate them to 0 bytes. Leave untouched.
+        Some(text.clone())
     } else {
         Some(pruned)
     };
@@ -2445,6 +2449,32 @@ mod tests {
         assert_eq!(entry.action(), Action::Unchanged);
         assert!(!entry.managed);
         assert_eq!(diag.unwrap().code, "orphaned_modified_file");
+    }
+
+    #[test]
+    fn unmanaged_entry_leaves_preexisting_text_file_untouched() {
+        let path = PathBuf::from("/home/u/.claude/skills/pdf/SKILL.md");
+        let record = Record {
+            agent: "claude".into(),
+            target: "global".into(),
+            format: FileFormat::Text,
+            owned: ownership::owned_keys(FileFormat::Text, "original\n"),
+            private: false,
+            created: false,
+            executable: false,
+            contents: "original\n".into(),
+        };
+
+        let (entry, diag) = unmanaged_entry("claude", &path, Some("original\n".into()), &record);
+        let entry = entry.unwrap();
+        assert_eq!(
+            entry.after.as_deref(),
+            Some("original\n"),
+            "a text file Muster did not create is kept untouched"
+        );
+        assert_eq!(entry.action(), Action::Unchanged);
+        assert!(!entry.managed);
+        assert!(diag.is_none());
     }
 
     #[test]

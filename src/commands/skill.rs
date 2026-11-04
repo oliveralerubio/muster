@@ -115,6 +115,29 @@ pub const ADD: CommandSpec = CommandSpec {
     handler: add,
 };
 
+pub const IMPORT: CommandSpec = CommandSpec {
+    name: "skill.import",
+    about: "Import a skill found in an agent's skills folder as an own skill",
+    params: &[
+        param(
+            "name",
+            "Name of the skill folder to import",
+            ParamKind::String,
+            true,
+            true,
+        ),
+        param(
+            "adapter",
+            "Agent whose skills folder holds it (default: the only one that has it)",
+            ParamKind::String,
+            false,
+            false,
+        ),
+    ],
+    mutating: true,
+    handler: import,
+};
+
 pub const PIN: CommandSpec = CommandSpec {
     name: "skill.pin",
     about: "Approve the current contents of an own skill in skills.lock",
@@ -763,8 +786,8 @@ fn list(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
         .chain(lock.skills.iter().map(|e| &e.name))
         .collect();
     let skills: Vec<Value> = names
-        .into_iter()
-        .map(|name| {
+        .iter()
+        .map(|&name| {
             let disabled = merged.disabled("skill", name, "").is_some();
             skill_view(name, lock.get(name), disk.get(name), &cache, disabled)
         })
@@ -777,9 +800,12 @@ fn list(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
         .iter()
         .map(|r| json!({ "name": r.name, "url": r.url, "ref": r.git_ref, "path": r.path, "include": r.include }))
         .collect();
+    let managed: BTreeSet<&str> = names.iter().map(|n| n.as_str()).collect();
+    let unmanaged = unmanaged_skills(ctx, &merged.agents, &managed);
     Ok(json!({
         "source": source,
         "skills": skills,
+        "unmanaged": unmanaged,
         "sources": sources,
         "attention": attention,
         "checked_at": cache.checked_at,
@@ -905,6 +931,205 @@ fn add_local(
     lock.save(&ctx.config_dir)?;
     edit_manifest(ctx, |_| Ok(()))?;
     commit(ctx, actor, &format!("feat(skills): add skill {name}"))?;
+    Ok(result)
+}
+
+// ---------------------------------------------------------------------------
+// import: skills installed directly in agent folders
+// ---------------------------------------------------------------------------
+
+/// A skill folder found in an enabled agent's user-scope skills directory.
+struct OnDisk {
+    adapter: &'static str,
+    /// Canonical directory holding the skill's files.
+    dir: PathBuf,
+}
+
+/// Skill folders (symlinks to folders included) in the enabled agents' user
+/// skills directories that Muster neither manages nor ships built in, by name.
+/// Paths never leave this module: callers choose an adapter id, not a path.
+fn find_on_disk(
+    config_dir: &Path,
+    agents: &crate::manifest::AgentsConfig,
+    managed: &BTreeSet<&str>,
+) -> Result<BTreeMap<String, Vec<OnDisk>>, MusterError> {
+    let enabled = crate::engine::enabled_adapters(Some(agents))?;
+    let roots = crate::engine::Roots::from_env()?;
+    let dirs = crate::commands::effective::skill_roots(config_dir, &enabled, &roots, None)?;
+    let mut found: BTreeMap<String, Vec<OnDisk>> = BTreeMap::new();
+    for (adapter, root) in dirs {
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if crate::skills::is_ignored_skill_name(&name, true)
+                || crate::skills::builtin::is_builtin(&name)
+                || managed.contains(name.as_str())
+                || !lock::is_valid_name(&name)
+            {
+                continue;
+            }
+            // Follows a symlink; only one that lands on a directory counts.
+            let Ok(dir) = entry.path().canonicalize() else {
+                continue;
+            };
+            if dir.is_dir() {
+                found.entry(name).or_default().push(OnDisk { adapter, dir });
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// Why a skill's files cannot be imported, or `None` when they can.
+fn import_problem(name: &str, files: &BTreeMap<String, String>) -> Option<String> {
+    let Some(skill_md) = files.get("SKILL.md") else {
+        return Some("missing SKILL.md".into());
+    };
+    let metadata = parse_frontmatter(skill_md);
+    match metadata {
+        Some(m) if m.description.is_some() && m.name.as_deref() == Some(name) => None,
+        Some(m) if m.name.is_some() && m.description.is_some() => Some(format!(
+            "SKILL.md name `{}` does not match the folder name `{name}`",
+            m.name.unwrap_or_default()
+        )),
+        _ => Some("SKILL.md needs frontmatter with a name and a description".into()),
+    }
+}
+
+/// Unmanaged skills for the dashboard: one entry per name, listing every
+/// agent that has it. Best effort: an unreadable HOME just yields none.
+fn unmanaged_skills(
+    ctx: &Context,
+    agents: &crate::manifest::AgentsConfig,
+    managed: &BTreeSet<&str>,
+) -> Vec<Value> {
+    let Ok(found) = find_on_disk(&ctx.config_dir, agents, managed) else {
+        return Vec::new();
+    };
+    found
+        .into_iter()
+        .map(|(name, places)| {
+            let checked: Vec<_> = places
+                .iter()
+                .map(|place| {
+                    let md = place.dir.join("SKILL.md");
+                    let files = std::fs::read_to_string(&md)
+                        .ok()
+                        .filter(|_| md.is_file())
+                        .map(|text| BTreeMap::from([("SKILL.md".to_string(), text)]))
+                        .unwrap_or_default();
+                    let problem = import_problem(&name, &files);
+                    let description = files
+                        .get("SKILL.md")
+                        .and_then(|text| parse_frontmatter(text))
+                        .and_then(|m| m.description);
+                    (place.adapter, problem, description)
+                })
+                .collect();
+            let best = checked
+                .iter()
+                .find(|(_, problem, _)| problem.is_none())
+                .or(checked.first());
+            json!({
+                "name": name,
+                "adapters": checked.iter().map(|c| c.0).collect::<Vec<_>>(),
+                "adapter": best.map(|c| c.0),
+                "valid": best.is_some_and(|c| c.1.is_none()),
+                "problem": best.and_then(|c| c.1.clone()),
+                "description": best.and_then(|c| c.2.clone()),
+            })
+        })
+        .collect()
+}
+
+fn import(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
+    let manifest = Manifest::load(&ctx.config_dir)?;
+    let actor = admin(ctx, &manifest)?;
+    let name = required_name(params)?;
+    let (dir, source) = skills_dir(ctx, &manifest)?;
+    let mut lock = SkillsLock::load(&ctx.config_dir)?;
+    if dir.join(&name).exists() || lock.get(&name).is_some() {
+        return Err(MusterError::Usage(format!("skill '{name}' already exists")));
+    }
+    if crate::skills::builtin::is_builtin(&name) {
+        return Err(MusterError::Usage(format!(
+            "'{name}' is a built-in skill and cannot be imported"
+        )));
+    }
+    let layers = crate::engine::layer::global_layers(
+        &ctx.config_dir,
+        &manifest,
+        crate::machine::load_name(&ctx.state_dir).as_deref(),
+    );
+    let merged = crate::engine::layer::merge(&layers);
+    let mut places = find_on_disk(&ctx.config_dir, &merged.agents, &BTreeSet::new())?
+        .remove(&name)
+        .unwrap_or_default();
+    if let Some(wanted) = params.get_string("adapter") {
+        places.retain(|p| p.adapter == wanted);
+        if places.is_empty() {
+            return Err(MusterError::Usage(format!(
+                "skill '{name}' was not found in the skills folder of agent '{wanted}'"
+            )));
+        }
+    } else if places.is_empty() {
+        return Err(MusterError::Usage(format!(
+            "skill '{name}' was not found in any enabled agent's skills folder"
+        )));
+    }
+    let mut candidates = Vec::new();
+    for place in &places {
+        candidates.push((place.adapter, read_skill_files(&place.dir)?));
+    }
+    let (adapter, files) = candidates.remove(0);
+    if let Some((other, _)) = candidates
+        .iter()
+        .find(|(_, other)| content_hash(other) != content_hash(&files))
+    {
+        return Err(MusterError::Usage(format!(
+            "skill '{name}' differs between agents ({adapter}, {other}); pass --adapter to choose one"
+        )));
+    }
+    if let Some(problem) = import_problem(&name, &files) {
+        return Err(MusterError::Usage(format!(
+            "cannot import '{name}': {problem}"
+        )));
+    }
+    let version = files
+        .get("SKILL.md")
+        .and_then(|text| parse_frontmatter(text))
+        .and_then(|m| m.version);
+    let entry = LockEntry {
+        name: name.clone(),
+        origin: lock::LOCAL.into(),
+        commit: None,
+        content_hash: content_hash(&files),
+        version,
+        updated_at: now(),
+    };
+    let result = json!({
+        "name": name,
+        "origin": lock::LOCAL,
+        "adapter": adapter,
+        "path": format!("{source}/{name}/SKILL.md"),
+        "files": files.len(),
+    });
+    if ctx.dry_run {
+        return Ok(result);
+    }
+    write_skill(&dir, &name, &files)?;
+    lock.upsert(entry);
+    lock.save(&ctx.config_dir)?;
+    edit_manifest(ctx, |_| Ok(()))?;
+    commit(
+        ctx,
+        actor.as_ref(),
+        &format!("feat(skills): import skill {name}"),
+    )?;
     Ok(result)
 }
 

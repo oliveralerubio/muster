@@ -10,6 +10,7 @@ skills, see whether upstream moved, pull updates, detach or remove. Provenance i
 - Check upstream (`skill check`, `POST /api/skills/check`) writes `$XDG_CACHE_HOME/muster/skills-status.json`.
 - Update (`skill update --all|NAME [--force]`), never removes.
 - Remove or detach (`skill rm NAME [--detach]`).
+- Import a skill installed directly in an agent folder (`skill import NAME [--adapter ID]`, `POST /api/skills/import`); `skill list` / `GET /api/skills` report candidates under `unmanaged`.
 
 ## How to get to it (user POV)
 

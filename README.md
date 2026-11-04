@@ -26,7 +26,7 @@ warning, never silently lost.
 - Instructions are written once in `AGENTS.md`; each agent gets its native copy (Claude Code's `CLAUDE.md` imports it through a managed block).
 - MCP servers, models, permissions and hooks are merged into the agent's own config files, rewriting only the keys Muster manages.
 - Project scope comes from `<project>/.muster/muster.toml`. Codex and Antigravity share `.agents/skills` in a project; the file is written once.
-- Skills removed from the source are deleted on the next apply; skills you add by hand are left alone.
+- Skills removed from the source are deleted on the next apply; skills you add by hand are left alone (bring them under Muster with `muster skill import`).
 
 ## Effective configuration
 
@@ -69,6 +69,7 @@ include = ["pdf"]                          # optional: only these skills
 | `muster skill list` | List every skill with origin, version, last update and status. Offline. |
 | `muster skill add <name> [--description <text>]` | Scaffold an own skill at `skills/<name>/SKILL.md`. |
 | `muster skill add --url <git-url> [--ref <ref>] [--path <dir>] [--include <skill>]` | Subscribe to a Git repository of skills and vendor them. |
+| `muster skill import <name> [--adapter <id>]` | Copy a skill installed directly in an agent's skills folder (not managed by Muster) into the config repo as an own skill and pin it. The original folder is left untouched; `skill list` shows these under `unmanaged`. |
 | `muster skill pin <name>` | Record the reviewed files of an own skill in `skills.lock` after editing. |
 | `muster skill check [name]` | Query upstream repositories for updates, deprecations and removals. |
 | `muster skill update [name] [--all] [--force]` | Apply upstream changes, showing files added, changed or removed (`--force` overwrites local edits). |
@@ -80,7 +81,7 @@ Every command accepts `--format json`, `--dry-run` and `--yes`.
 
 Statuses: `local`, `up_to_date`, `update_available`, `deprecated` (upstream `SKILL.md` has `deprecated: true` or `deprecated: "<reason>"`), `upstream_removed`, `unknown` (not checked yet, or the source could not be reached). Nothing is applied or deleted on its own: updates need `muster skill update`, and a skill removed upstream stays until you run `muster skill rm` (with or without `--detach`). A skill edited by hand shows `modified` and `update` refuses to overwrite it without `--force`. In a team, only admins add, update or remove skills; members can list and check.
 
-The web admin panel (`muster ui`) includes a **Skills** tab showing installed skills, upstream status, and an attention indicator when updates are available, with buttons to check sources and update a skill.
+The web admin panel (`muster ui`) includes a **Skills** tab showing installed skills, upstream status, and an attention indicator when updates are available, with buttons to check sources and update a skill. A section "On disk, not managed by Muster" lists skills found in the agents' skills folders and imports them with one click.
 
 ## Subagents
 

@@ -1600,3 +1600,64 @@ fn web_skill_files_reject_symlink_escapes_with_400() {
     assert_eq!(status, 400, "{refused}");
     assert!(!std::path::Path::new("/nonexistent").exists());
 }
+
+#[test]
+fn web_skill_import_matches_cli_and_rejects_path_param() {
+    let env = support::MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+
+    let claude_skills = env.home.path().join(".claude/skills/local-tool");
+    std::fs::create_dir_all(&claude_skills).unwrap();
+    let skill_md = "---
+name: local-tool
+description: Test tool
+---
+Hello.
+";
+    std::fs::write(claude_skills.join("SKILL.md"), skill_md).unwrap();
+
+    let mut ui = Ui::start(&env);
+    let cookie = ui_session_cookie(&mut ui);
+
+    for key in ["path", "dir", "file", "source_path"] {
+        let (status, reply) = ui_post(
+            &mut ui,
+            &cookie,
+            "/api/skills/import",
+            &serde_json::json!({
+                "name": "local-tool",
+                key: "/etc/passwd",
+                "confirm": true,
+            }),
+        );
+        assert_eq!(status, 400, "{key}: {reply}");
+        assert!(
+            reply
+                .to_string()
+                .contains(&format!("unknown parameter '{key}'")),
+            "{key}: {reply}"
+        );
+    }
+
+    let (status, reply) = ui_post(
+        &mut ui,
+        &cookie,
+        "/api/skills/import",
+        &serde_json::json!({
+            "name": "local-tool",
+            "confirm": true,
+        }),
+    );
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["ok"], true);
+    assert_eq!(reply["result"]["name"], "local-tool");
+    assert_eq!(reply["result"]["origin"], "local");
+    assert!(
+        reply["cli"]
+            .as_str()
+            .is_some_and(|cli| cli.contains("muster skill import local-tool")),
+        "action response must include CLI equivalent: {reply}"
+    );
+
+    assert!(env.config_dir().join("skills/local-tool/SKILL.md").exists());
+}
