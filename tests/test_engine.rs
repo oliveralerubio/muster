@@ -563,3 +563,61 @@ fn removed_mcp_server_is_pruned_but_user_servers_are_kept() {
         "user server must be kept:\n{after}"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn sync_adopts_a_dotfiles_symlink_instead_of_failing_and_warns() {
+    let env = MusterEnv::new();
+    init_and_seed(&env, "");
+    // A dotfiles manager (chezmoi, stow, yadm) linked CLAUDE.md to a shared file.
+    let shared = env.path().join(".agents").join("AGENTS.md");
+    std::fs::create_dir_all(shared.parent().unwrap()).expect("agents dir");
+    std::fs::write(&shared, "dotfiles copy\n").expect("shared file");
+    let claude_md = env.path().join(".claude").join("CLAUDE.md");
+    std::fs::create_dir_all(claude_md.parent().unwrap()).expect("claude dir");
+    std::os::unix::fs::symlink("../.agents/AGENTS.md", &claude_md).expect("symlink");
+
+    let (out, envelope) = all_json(&env, &["sync", "--yes"]);
+
+    assert!(out.status.success(), "sync must exit 0: {}", envelope.raw);
+    let meta = std::fs::symlink_metadata(&claude_md).expect("CLAUDE.md exists");
+    assert!(
+        meta.file_type().is_file(),
+        "CLAUDE.md must now be a regular file, not a symlink"
+    );
+    let written = std::fs::read_to_string(&claude_md).expect("read CLAUDE.md");
+    assert!(
+        written.contains("@AGENTS.md"),
+        "CLAUDE.md must import the shared rules:\n{written}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&shared).expect("read shared"),
+        "dotfiles copy\n",
+        "the symlink target must not be modified"
+    );
+    let warning = envelope
+        .diagnostics()
+        .as_array()
+        .expect("diagnostics")
+        .iter()
+        .find(|d| d["code"] == "symlink_replaced")
+        .unwrap_or_else(|| {
+            panic!(
+                "a symlink_replaced diagnostic is expected:\n{}",
+                envelope.raw
+            )
+        });
+    assert_eq!(warning["severity"], "warning");
+    assert!(
+        warning["path"]
+            .as_str()
+            .is_some_and(|p| p.ends_with(".claude/CLAUDE.md")),
+        "the warning names the replaced path: {warning}"
+    );
+    assert!(
+        warning["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("../.agents/AGENTS.md")),
+        "the warning names the old link target: {warning}"
+    );
+}
