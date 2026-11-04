@@ -23,6 +23,9 @@ use crate::errors::MusterError;
 use crate::manifest::{self, Manifest, SkillRemote};
 use crate::output::{Diagnostic, Severity};
 use crate::registry::{CommandSpec, ParamKind, ParamSpec, Params};
+use crate::skills::lifecycle::{
+    evaluate_update_action, read_upstream, Sources, UpdateAction, UpstreamSkill,
+};
 use crate::skills::lock::{self, LockEntry, SkillsLock};
 use crate::skills::upstream::{
     classify, relative, CachedStatus, Checkout, GitFetcher, SkillStatus, StatusCache, Upstream,
@@ -586,42 +589,6 @@ fn diff_summary(old: &BTreeMap<String, String>, new: &BTreeMap<String, String>) 
         .map(|(k, _)| k)
         .collect();
     json!({ "added": added, "changed": changed, "removed": removed })
-}
-
-/// One skill as fetched from its upstream source.
-struct UpstreamSkill {
-    files: BTreeMap<String, String>,
-    hash: String,
-    version: Option<String>,
-    deprecated: Option<String>,
-}
-
-impl UpstreamSkill {
-    fn upstream(&self) -> Upstream {
-        Upstream::Present {
-            content_hash: self.hash.clone(),
-            deprecated: self.deprecated.clone(),
-        }
-    }
-}
-
-fn read_upstream(
-    checkout: &Checkout,
-    remote: &SkillRemote,
-    name: &str,
-) -> Result<Option<UpstreamSkill>, MusterError> {
-    let dir = checkout.contained_skills_root(remote)?.join(name);
-    let Ok(skill_md) = std::fs::read_to_string(dir.join("SKILL.md")) else {
-        return Ok(None);
-    };
-    let meta = parse_frontmatter(&skill_md).unwrap_or_default();
-    let files = read_skill_files(&dir)?;
-    Ok(Some(UpstreamSkill {
-        hash: content_hash(&files),
-        files,
-        version: meta.version,
-        deprecated: meta.deprecated,
-    }))
 }
 
 fn diag_for(ctx: &mut Context, name: &str, status: SkillStatus, reason: Option<&str>) {
@@ -1814,41 +1781,6 @@ fn add_remote(
 // check
 // ---------------------------------------------------------------------------
 
-/// Fetch each source at most once.
-struct Sources<'a> {
-    remotes: Vec<SkillRemote>,
-    fetcher: &'a dyn UpstreamFetcher,
-    fetched: BTreeMap<String, Result<Checkout, String>>,
-}
-
-impl<'a> Sources<'a> {
-    fn new(manifest: &Manifest, fetcher: &'a dyn UpstreamFetcher) -> Self {
-        Self {
-            remotes: remotes(manifest),
-            fetcher,
-            fetched: BTreeMap::new(),
-        }
-    }
-
-    fn remote(&self, origin: &str) -> Option<&SkillRemote> {
-        self.remotes.iter().find(|r| r.name == origin)
-    }
-
-    /// The checkout of `origin`, or why it is unavailable.
-    fn checkout(&mut self, origin: &str) -> Result<(SkillRemote, Checkout), String> {
-        let remote = self
-            .remote(origin)
-            .cloned()
-            .ok_or_else(|| format!("source '{origin}' is no longer declared in muster.toml"))?;
-        let fetcher = self.fetcher;
-        let fetched = self
-            .fetched
-            .entry(origin.to_string())
-            .or_insert_with(|| fetcher.fetch(&remote).map_err(|e| e.to_string()));
-        fetched.clone().map(|c| (remote, c))
-    }
-}
-
 fn check(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let fetcher = GitFetcher::from_env()?;
     check_with(ctx, params, &fetcher)
@@ -2045,52 +1977,67 @@ fn update_inner(
                 continue;
             }
         };
-        let Some(skill) = read_upstream(&checkout, &remote, &entry.name)? else {
-            refuse(
-                ctx,
-                "skill_upstream_removed",
-                format!(
-                    "skill '{}' was removed from source '{}'; nothing to update to. Keep it with \
-                     `muster skill rm {} --detach --yes` or delete it with `muster skill rm {} --yes`",
-                    entry.name, entry.origin, entry.name, entry.name
-                ),
-            )?;
-            skipped.push(json!({ "name": entry.name, "reason": "upstream_removed" }));
-            continue;
+        let upstream = read_upstream(&checkout, &remote, &entry.name)?;
+        let disk = if upstream.is_some() {
+            Some(read_skill_files(&skill_dir)?)
+        } else {
+            None
         };
-        let disk = read_skill_files(&skill_dir)?;
-        let modified = content_hash(&disk) != entry.content_hash;
-        if skill.hash == content_hash(&disk)
-            && skill.hash == entry.content_hash
-            && entry.commit.as_deref() == Some(&checkout.commit)
-        {
-            continue;
+        let disk_hash = disk.as_ref().map(content_hash).unwrap_or_default();
+        let upstream_hash = upstream
+            .as_ref()
+            .map(|s| s.hash.as_str())
+            .unwrap_or_default();
+        let action = evaluate_update_action(
+            &entry.content_hash,
+            &disk_hash,
+            upstream_hash,
+            force,
+            upstream.is_none(),
+        );
+
+        match action {
+            UpdateAction::SkipUpstreamRemoved => {
+                refuse(
+                    ctx,
+                    "skill_upstream_removed",
+                    format!(
+                        "skill '{}' was removed from source '{}'; nothing to update to. Keep it with \
+                         `muster skill rm {} --detach --yes` or delete it with `muster skill rm {} --yes`",
+                        entry.name, entry.origin, entry.name, entry.name
+                    ),
+                )?;
+                skipped.push(json!({ "name": entry.name, "reason": "upstream_removed" }));
+                continue;
+            }
+            UpdateAction::UpToDate => continue,
+            UpdateAction::SkipModified => {
+                refuse(
+                    ctx,
+                    "skill_modified",
+                    format!(
+                        "skill '{}' has local modifications that the update would overwrite; \
+                         re-run with --force to discard them",
+                        entry.name
+                    ),
+                )?;
+                skipped.push(json!({ "name": entry.name, "reason": "modified" }));
+                continue;
+            }
+            UpdateAction::ApplyUpdate => {
+                let skill = upstream.expect("apply update requires upstream skill");
+                let disk = disk.expect("apply update requires disk files");
+                let modified = disk_hash != entry.content_hash;
+                planned.push(Planned {
+                    files: diff_summary(&disk, &skill.files),
+                    name: entry.name.clone(),
+                    origin: entry.origin.clone(),
+                    commit: checkout.commit.clone(),
+                    skill,
+                    forced: modified && force,
+                });
+            }
         }
-        if skill.hash == entry.content_hash && !modified {
-            // Same content at a newer commit: nothing to apply, nothing to bump.
-            continue;
-        }
-        if modified && skill.hash != content_hash(&disk) && !force {
-            refuse(
-                ctx,
-                "skill_modified",
-                format!(
-                    "skill '{}' has local modifications that the update would overwrite; \
-                     re-run with --force to discard them",
-                    entry.name
-                ),
-            )?;
-            skipped.push(json!({ "name": entry.name, "reason": "modified" }));
-            continue;
-        }
-        planned.push(Planned {
-            files: diff_summary(&disk, &skill.files),
-            name: entry.name.clone(),
-            origin: entry.origin.clone(),
-            commit: checkout.commit.clone(),
-            skill,
-            forced: modified && force,
-        });
     }
 
     let updated: Vec<Value> = planned
