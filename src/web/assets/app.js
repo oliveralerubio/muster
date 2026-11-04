@@ -407,8 +407,13 @@ function syncScrollRegions() {
 if (typeof addEventListener === "function") addEventListener("resize", syncScrollRegions);
 
 // Last sync as clean tabular text (the coloured pill is reserved for the Status column).
-function lastSyncCell(value) {
-  if (!value) return el("span", { class: "muted data" }, "Never");
+function lastSyncCell(value, status) {
+  if (!value) {
+    if (status === "enrolled") {
+      return el("span", { class: "muted data" }, "Never");
+    }
+    return el("span", { class: "muted data" }, "—");
+  }
   const d = new Date(value);
   const text = Number.isNaN(d.getTime()) ? String(value)
     : d.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
@@ -543,7 +548,7 @@ const views = {
           machineIdentity(m, m.is_current),
           el("code", { class: "data" }, m.version || "—"),
           machineState(m.status),
-          lastSyncCell(m.last_sync)]))
+          lastSyncCell(m.last_sync, m.status)]))
       : el("div", { class: "empty-state" },
         el("p", {}, "No machines in fleet. Run ", el("code", {}, "muster machine add"), " to enroll one, or open the Machines tab."),
         button("Open Machines", () => show("machines")));
@@ -711,7 +716,7 @@ const views = {
           hasProfile ? (m.profile || el("span", { class: "muted" }, "—")) : null,
           tags(m.agents),
           statusCell(m),
-          lastSyncCell(m.last_sync),
+          lastSyncCell(m.last_sync, m.status),
           hasActions ? (m.is_current ? "" : button("Remove", () => act(`Remove machine ${m.name}?`, "machine/rm", { name: m.name }), "danger")) : null].filter((c) => c !== null)),
         emptyCard("No machines enrolled yet", "Run ", el("code", {}, "muster init"), " on this machine, then ", el("code", {}, "muster machine add"), " to enroll more."),
         "machines-table" + (!hasRole && !hasProfile ? " machines-basic" : "") + (hasActions ? " actions-end" : "")),

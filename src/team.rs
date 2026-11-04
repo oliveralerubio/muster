@@ -530,6 +530,11 @@ pub fn record_applied(ctx: &Context, result: &Value) -> Result<(), MusterError> 
         return Ok(());
     }
     entry.applied_profile = Some(digest);
+    entry.last_sync = Some(
+        time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap_or_default(),
+    );
     manifest.save(&ctx.config_dir)?;
     git::commit_if_configured(
         &ctx.config_dir,

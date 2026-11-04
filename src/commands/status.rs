@@ -3,6 +3,7 @@
 use serde_json::{json, Value};
 
 use crate::context::Context;
+use crate::engine::layer;
 use crate::errors::MusterError;
 use crate::identity::Identity;
 use crate::machine;
@@ -38,10 +39,15 @@ fn run(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
             .or_else(|| is_current.then(|| local_sync.clone()).flatten());
         let status = if is_current {
             "current"
-        } else if last_sync.is_some() {
-            "active"
-        } else {
+        } else if m.applied_profile.is_none() {
             "enrolled"
+        } else {
+            let target_digest = layer::digest(&ctx.config_dir, &manifest, name);
+            if m.applied_profile.as_deref() == Some(target_digest.as_str()) {
+                "active"
+            } else {
+                "drifted"
+            }
         };
         machines.push(json!({
             "name": name,

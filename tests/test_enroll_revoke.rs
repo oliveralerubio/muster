@@ -65,7 +65,17 @@ fn enroll_approve_and_sync_between_two_machines() {
 
     assert_cli_success(&alice, &["--format", "json", "init", "--yes"]);
     assert_cli_success(&alice, &["--format", "json", "sync", "--remote", remote]);
-    assert_cli_success(&bob, &["--format", "json", "init", "--yes"]);
+    assert_cli_success(
+        &bob,
+        &[
+            "--format",
+            "json",
+            "init",
+            "--yes",
+            "--machine",
+            "bob-first",
+        ],
+    );
     assert_cli_success(&bob, &["--format", "json", "sync", "--remote", remote]);
     assert_cli_success(&bob, &["--format", "json", "enroll", "--name", "bob"]);
     assert!(bob.config_dir().join("enroll/bob.toml").exists());
@@ -134,7 +144,17 @@ fn reject_removes_the_request_without_revoking_and_allows_reenrollment() {
     ]);
     add.write_stdin(b"reject-vault-sentinel");
     assert!(add.output().expect("secret add").status.success());
-    assert_cli_success(&bob, &["--format", "json", "init", "--yes"]);
+    assert_cli_success(
+        &bob,
+        &[
+            "--format",
+            "json",
+            "init",
+            "--yes",
+            "--machine",
+            "bob-first",
+        ],
+    );
     assert_cli_success(&bob, &["--format", "json", "sync", "--remote", remote]);
     assert_cli_success(&bob, &["--format", "json", "enroll", "--name", "bob"]);
     assert_cli_success(&alice, &["--format", "json", "sync", "--pull"]);
@@ -186,7 +206,17 @@ fn reject_dry_run_changes_nothing_and_errors_match_approve() {
         ],
     );
     assert_cli_success(&alice, &["--format", "json", "sync", "--remote", remote]);
-    assert_cli_success(&bob, &["--format", "json", "init", "--yes"]);
+    assert_cli_success(
+        &bob,
+        &[
+            "--format",
+            "json",
+            "init",
+            "--yes",
+            "--machine",
+            "bob-first",
+        ],
+    );
     assert_cli_success(&bob, &["--format", "json", "sync", "--remote", remote]);
     assert_cli_success(&bob, &["--format", "json", "enroll", "--name", "bob"]);
     assert_cli_success(&alice, &["--format", "json", "sync", "--pull"]);
@@ -425,9 +455,16 @@ fn rotated_secret_reaches_authorized_machine_on_next_sync_only() {
     let alice = support::MusterEnv::new();
     let bob = support::MusterEnv::new();
     let outsider = support::MusterEnv::new();
-    for machine in [&alice, &bob, &outsider] {
+    for (machine, name) in [
+        (&alice, "alice-first"),
+        (&bob, "bob-first"),
+        (&outsider, "out-first"),
+    ] {
         machine.link_system_exe("git");
-        assert_cli_success(machine, &["--format", "json", "init", "--yes"]);
+        assert_cli_success(
+            machine,
+            &["--format", "json", "init", "--yes", "--machine", name],
+        );
         assert_cli_success(machine, &["--format", "json", "sync", "--remote", remote]);
     }
     assert_cli_success(&bob, &["--format", "json", "enroll", "--name", "bob"]);
