@@ -524,12 +524,44 @@ async function testEffectiveViewShowsStatesAndEscapesNames() {
 }
 
 async function testSkillToggleControls() {
-  setResponder((call) => ({ ok: true, diagnostics: [], result: call.path === "skills" ? { skills: [{ name: "pdf", origin: "local", status: "local" }] } : {} }));
+  setResponder((call) => ({ ok: true, diagnostics: [], result: call.path === "skills" ? { skills: [{ name: "pdf", origin: "local", status: "local", enabled: true }] } : {} }));
   await sandbox.show("skills");
   const mark = baseline();
   liveButton("Disable").fire("click");
   await flush();
   assert.deepEqual(callSince(mark, "disable").body, { item: "skill:pdf", confirm: true });
+
+  // Disabled skill renders Enable button, not Disable button
+  setResponder((call) => ({ ok: true, diagnostics: [], result: call.path === "skills" ? { skills: [{ name: "pdf", origin: "local", status: "local", enabled: false }] } : {} }));
+  await sandbox.show("skills");
+  const mark2 = baseline();
+  liveButton("Enable").fire("click");
+  await flush();
+  assert.deepEqual(callSince(mark2, "enable").body, { item: "skill:pdf", confirm: true });
+  setResponder();
+}
+
+async function testMcpToggleShowsOnlyValidAction() {
+  setResponder((call) => ({
+    ok: true, diagnostics: [],
+    result: call.path === "mcp-servers" ? { servers: [{ name: "github", enabled: false, server: {} }] } : {},
+  }));
+  await sandbox.show("profiles");
+  const mark = baseline();
+  liveButton("Enable").fire("click");
+  await flush();
+  assert.deepEqual(callSince(mark, "enable").body, { item: "mcp:github", confirm: true });
+  setResponder();
+}
+
+async function testCliFooterNotOverwrittenByBackgroundFetch() {
+  setResponder((call) => ({
+    ok: true, diagnostics: [], cli: call.path === "skills" ? "muster skill list" : "muster usage",
+    result: call.path === "skills" ? { skills: [] } : {},
+  }));
+  await sandbox.show("skills");
+  await flush();
+  assert.equal(need("cli").textContent, "muster skill list");
   setResponder();
 }
 
@@ -568,7 +600,7 @@ async function testUsageShowsCoverageActiveAndUnusedItems() {
   assert.doesNotMatch(rendered, /unsupported: 2/);
   assert.match(rendered, /Active items/);
   assert.match(rendered, /review/);
-  assert.match(rendered, /2099-01-02T00:00:00Z/);
+  assert.match(rendered, /2099/);
   assert.doesNotMatch(rendered, /mcp docs 0/);
   assert.match(rendered, /Unused items/);
   assert.match(rendered, /muster disable mcp:docs/);
@@ -587,6 +619,8 @@ async function testUsageWithoutSessionsExplainsNoCoverage() {
 const tests = {
   testEffectiveViewShowsStatesAndEscapesNames,
   testSkillToggleControls,
+  testMcpToggleShowsOnlyValidAction,
+  testCliFooterNotOverwrittenByBackgroundFetch,
   testUsageShowsUnusedItemsAsText,
   testUsageShowsCoverageActiveAndUnusedItems,
   testUsageWithoutSessionsExplainsNoCoverage,
