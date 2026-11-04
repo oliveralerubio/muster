@@ -636,6 +636,64 @@ fn team_status_reports_member_and_machine_profile_drift() {
 }
 
 #[test]
+fn machine_status_tracks_convergence_and_apply_records_last_sync() {
+    let owner = MusterEnv::new();
+    let alice = MusterEnv::new();
+    init(&owner);
+    let config = owner.config_dir();
+    add_member(&owner, "alice", "member");
+    join(&owner, &alice, "alice-laptop", "alice");
+
+    let alice_row = |env: &MusterEnv| -> Value {
+        let listed = ok(env, &config, &["machine", "list"]);
+        listed["machines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["name"] == "alice-laptop")
+            .cloned()
+            .expect("alice-laptop is listed")
+    };
+    let status_row = |env: &MusterEnv| -> Value {
+        let status = ok(env, &config, &["status"]);
+        status["machines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["name"] == "alice-laptop")
+            .cloned()
+            .expect("alice-laptop is in status")
+    };
+
+    // Enrolled but never applied.
+    let row = alice_row(&owner);
+    assert_eq!(row["status"], "enrolled", "{row}");
+    assert!(row["last_sync"].is_null(), "{row}");
+    assert_eq!(status_row(&owner)["status"], "enrolled");
+
+    // Applying records both the profile digest and the sync time.
+    ok(&alice, &config, &["agents", "apply", "--yes"]);
+    let row = alice_row(&owner);
+    assert_eq!(row["status"], "active", "{row}");
+    assert!(row["applied_profile"].is_string(), "{row}");
+    let stamp = row["last_sync"].as_str().expect("last_sync is recorded");
+    assert!(stamp.contains('T'), "RFC 3339 timestamp expected: {stamp}");
+    let on_disk = std::fs::read_to_string(config.join("muster.toml")).unwrap();
+    assert!(on_disk.contains("last_sync"), "{on_disk}");
+    assert_eq!(status_row(&owner)["status"], "active");
+
+    // The team profile changes: the machine is behind until it applies again.
+    let mut manifest = std::fs::read_to_string(config.join("muster.toml")).unwrap();
+    manifest.push_str("\n[agents.models]\nclaude = \"new-team-model\"\n");
+    std::fs::write(config.join("muster.toml"), manifest).unwrap();
+    assert_eq!(alice_row(&owner)["status"], "drifted");
+    assert_eq!(status_row(&owner)["status"], "drifted");
+
+    ok(&alice, &config, &["agents", "apply", "--yes"]);
+    assert_eq!(alice_row(&owner)["status"], "active");
+}
+
+#[test]
 fn team_quorum_requires_multiple_admin_approvals() {
     let owner = MusterEnv::new();
     let second_admin = MusterEnv::new();
@@ -695,7 +753,7 @@ fn team_quorum_requires_multiple_admin_approvals() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|m| m["name"] == "quorum-machine" && m["status"] == "active"),
+            .any(|m| m["name"] == "quorum-machine" && m["status"] == "enrolled"),
         "{machines}"
     );
 }
@@ -721,7 +779,7 @@ fn team_quorum_defaults_to_single_approval_when_omitted() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|m| m["name"] == "default-quorum-machine" && m["status"] == "active"),
+            .any(|m| m["name"] == "default-quorum-machine" && m["status"] == "enrolled"),
         "{machines}"
     );
 }
