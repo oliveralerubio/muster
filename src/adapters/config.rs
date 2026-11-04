@@ -107,7 +107,13 @@ pub(crate) fn is_valid_item_name(name: &str) -> bool {
 #[serde(deny_unknown_fields)]
 pub struct SkillsConfig {
     /// Path of the skills directory, relative to the config repository.
+    /// Empty when a layer only declares `customize` entries.
+    #[serde(default)]
     pub source: String,
+    /// Per-skill customizations stitched on top at render time
+    /// (`[agents.skills.customize.<name>]`). Merged by skill name across layers.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub customize: BTreeMap<String, SkillCustomization>,
     /// External git repositories whose skills are vendored into `source`
     /// (`muster skill add --url`). Provenance is pinned in `skills.lock`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -116,6 +122,16 @@ pub struct SkillsConfig {
     /// unattended. Locally modified skills are never overwritten.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub auto_update: bool,
+}
+
+/// `[agents.skills.customize.<name>]`: an overlay applied on top of a skill
+/// when it is rendered; the vendored files and their lock pin stay untouched.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SkillCustomization {
+    /// Markdown appended to `SKILL.md` after a divider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub append: Option<String>,
 }
 
 /// `[[agents.skills.remote]]`: one subscribed upstream skills repository.

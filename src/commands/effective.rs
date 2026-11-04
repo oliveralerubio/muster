@@ -481,6 +481,8 @@ fn scope(
             for item in items {
                 let name = item["name"].as_str().unwrap_or_default();
                 let files = crate::skills::read_skill_files(&dir.join(name));
+                let customized =
+                    crate::skills::is_customized(name, &merged.overlay_roots, &merged.customize);
                 let mut view = item.clone();
                 let (verification, description_tokens, body_tokens, data) = match files {
                     Err(_) => ("unreadable", 0, 0, BTreeMap::new()),
@@ -501,12 +503,19 @@ fn scope(
                         } else {
                             "unreviewed"
                         };
-                        (
-                            verification,
-                            meta.and_then(|m| m.description).map_or(0, |s| s.len() / 4),
-                            md.map_or(0, |s| s.len() / 4),
-                            files,
-                        )
+                        let description_tokens =
+                            meta.and_then(|m| m.description).map_or(0, |s| s.len() / 4);
+                        // Render what apply writes: overlays go on after the
+                        // pin check, so drift compares against the stitched files.
+                        let mut files = files;
+                        crate::skills::apply_overlays(
+                            name,
+                            &mut files,
+                            &merged.overlay_roots,
+                            &merged.customize,
+                        )?;
+                        let body_tokens = files.get("SKILL.md").map_or(0, |s| s.len() / 4);
+                        (verification, description_tokens, body_tokens, files)
                     }
                 };
                 let mut adapter_views = BTreeMap::new();
@@ -559,6 +568,7 @@ fn scope(
                     }
                     adapter_views.insert(adapter.id, json!({"path": path, "state": state}));
                 }
+                view["customized"] = json!(customized);
                 view["verification"] = json!(verification);
                 view["description_tokens"] = json!(description_tokens);
                 view["body_tokens"] = json!(body_tokens);

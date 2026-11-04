@@ -1003,6 +1003,7 @@ const views = {
           ? button("Disable", () => act(`Disable skill ${s.name}?`, "disable", { item: `skill:${s.name}` }))
           : button("Enable", () => act(`Enable skill ${s.name}?`, "enable", { item: `skill:${s.name}` })),
         button("Edit", () => openSkillEdit(s.name)),
+        button(s.customized ? "Clear customization" : "Customize", () => customizeSkill(s)),
       ];
       if (s.origin === "local" && (!s.locked || s.modified)) {
         actions.push(button("Pin", () => act(`Approve the current contents of ${s.name} (pin in skills.lock)?`, "skills/pin", { name: s.name })));
@@ -1014,8 +1015,11 @@ const views = {
         if (s.origin !== "local") actions.push(button("Update", () => updateSkill(s)));
         actions.push(button("Remove", () => act(`Delete skill ${s.name} and its files?`, "skills/rm", { name: s.name }), "danger"));
       }
+      const nameCell = s.customized
+        ? el("span", {}, s.name, " ", el("span", { class: "badge info", title: "Has a local overlay on top of the base skill" }, "customized"))
+        : s.name;
       return [
-        s.name,
+        nameCell,
         el("span", { class: "badge" + (s.origin === "local" ? "" : " info") }, s.origin === "local" ? "own" : s.origin),
         s.version || "",
         timeCell(s.updated_at),
@@ -1827,6 +1831,16 @@ function skillEditsDiscardable() {
   return skillFileLoaded === null
     || $("#skill-text").value === skillFileSaved
     || confirm(`Discard unsaved changes to ${skillFileLoaded}?`);
+}
+
+async function customizeSkill(s) {
+  if (s.customized) {
+    await act(`Remove the customization of ${s.name}?`, "skills/customize", { name: s.name, clear: true });
+    return;
+  }
+  const text = prompt(`Markdown to append to ${s.name}'s SKILL.md:`);
+  if (!text) return;
+  await act(`Append this to ${s.name}?\n\n${text}`, "skills/customize", { name: s.name, append: text });
 }
 
 async function openSkillEdit(name) {

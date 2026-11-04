@@ -96,6 +96,11 @@ pub struct Merged {
     /// Directory the subagents source resolves against (the layer that
     /// declared `[agents.subagents]`, else the first layer).
     pub subagents_dir: PathBuf,
+    /// `[agents.skills.customize.*]` merged by skill name across layers.
+    pub customize: BTreeMap<String, crate::adapters::config::SkillCustomization>,
+    /// Layer directories (deduplicated, lowest precedence first) whose
+    /// `skill-overlays/<name>/` folders overlay skills.
+    pub overlay_roots: Vec<PathBuf>,
 }
 
 /// Layers rendered into `machine`'s user-scope files, lowest precedence
@@ -222,6 +227,9 @@ pub fn merge(layers: &[Layer]) -> Merged {
     let mut instructions_dir = layers.first().map(|l| l.dir.clone()).unwrap_or_default();
     let mut skills_dir = instructions_dir.clone();
     let mut subagents_dir = instructions_dir.clone();
+    let mut customize: BTreeMap<String, crate::adapters::config::SkillCustomization> =
+        BTreeMap::new();
+    let mut overlay_roots = Vec::new();
     for layer in layers {
         let over = &layer.agents;
         if over.enabled.is_some() {
@@ -234,9 +242,21 @@ pub fn merge(layers: &[Layer]) -> Merged {
             agents.instructions = over.instructions.clone();
             instructions_dir = layer.dir.clone();
         }
-        if over.skills.is_some() {
-            agents.skills = over.skills.clone();
-            skills_dir = layer.dir.clone();
+        if let Some(skills) = &over.skills {
+            for (name, custom) in &skills.customize {
+                let entry = customize.entry(name.clone()).or_default();
+                if custom.append.is_some() {
+                    entry.append = custom.append.clone();
+                }
+            }
+            // A layer with only `customize` entries has no source of its own.
+            if !skills.source.is_empty() {
+                agents.skills = over.skills.clone();
+                skills_dir = layer.dir.clone();
+            }
+        }
+        if !overlay_roots.contains(&layer.dir) {
+            overlay_roots.push(layer.dir.clone());
         }
         if over.subagents.is_some() {
             agents.subagents = over.subagents.clone();
@@ -269,6 +289,8 @@ pub fn merge(layers: &[Layer]) -> Merged {
         instructions_dir,
         skills_dir,
         subagents_dir,
+        customize,
+        overlay_roots,
     }
 }
 
