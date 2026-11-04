@@ -1442,3 +1442,114 @@ fn ui_second_invocation_hands_off_fresh_login_to_running_server() {
     let (status, _, _) = ui.request("GET", &format!("/?token={handed_token}"), None, None);
     assert_eq!(status, 401);
 }
+
+#[test]
+fn web_skill_file_edit_and_pin_enforce_confirmation_and_confinement() {
+    let env = support::MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    env.run(&[
+        "--yes",
+        "skill",
+        "add",
+        "demo",
+        "--description",
+        "A demo skill",
+    ])
+    .assert()
+    .success();
+
+    let mut ui = Ui::start(&env);
+    let cookie = ui_session_cookie(&mut ui);
+
+    // List files
+    let (status, _, body) = ui.request("GET", "/api/skills/files?name=demo", Some(&cookie), None);
+    assert_eq!(status, 200);
+    let json: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(json["result"]["name"], "demo");
+    assert_eq!(json["result"]["files"][0]["path"], "SKILL.md");
+
+    // Read SKILL.md
+    let (status, _, body) = ui.request(
+        "GET",
+        "/api/skills/file?name=demo&path=SKILL.md",
+        Some(&cookie),
+        None,
+    );
+    assert_eq!(status, 200);
+    let json: Value = serde_json::from_str(&body).unwrap();
+    assert!(json["result"]["content"]
+        .as_str()
+        .unwrap()
+        .contains("name: demo"));
+
+    // Traversal is blocked with 403
+    let (status, _, _) = ui.request(
+        "GET",
+        "/api/skills/file?name=demo&path=../../muster.toml",
+        Some(&cookie),
+        None,
+    );
+    assert_eq!(status, 403);
+
+    // Write without confirm is refused with 400
+    let (status, refused) = ui_post(
+        &mut ui,
+        &cookie,
+        "/api/skills/file",
+        &serde_json::json!({
+            "name": "demo",
+            "path": "SKILL.md",
+            "content": "---\nname: demo\ndescription: Modified\n---\nbody\n",
+        }),
+    );
+    assert_eq!(status, 400);
+    assert_eq!(refused["ok"], false);
+
+    // Write with confirm: true succeeds
+    let (status, written) = ui_post(
+        &mut ui,
+        &cookie,
+        "/api/skills/file",
+        &serde_json::json!({
+            "name": "demo",
+            "path": "SKILL.md",
+            "content": "---\nname: demo\ndescription: Modified\n---\nbody\n",
+            "confirm": true,
+        }),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(written["ok"], true);
+
+    // Skills list now shows modified: true
+    let (status, _, body) = ui.request("GET", "/api/skills", Some(&cookie), None);
+    assert_eq!(status, 200);
+    let json: Value = serde_json::from_str(&body).unwrap();
+    let skill = json["result"]["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "demo")
+        .unwrap();
+    assert_eq!(skill["modified"], true);
+
+    // Pinning re-hashes and clears modified state
+    let (status, pinned) = ui_post(
+        &mut ui,
+        &cookie,
+        "/api/skills/pin",
+        &serde_json::json!({ "name": "demo", "confirm": true }),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(pinned["ok"], true);
+
+    let (status, _, body) = ui.request("GET", "/api/skills", Some(&cookie), None);
+    assert_eq!(status, 200);
+    let json: Value = serde_json::from_str(&body).unwrap();
+    let skill = json["result"]["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["name"] == "demo")
+        .unwrap();
+    assert_eq!(skill["modified"], false);
+}

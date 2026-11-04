@@ -273,6 +273,7 @@ fn file_set(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
             "content exceeds maximum allowed size of {MAX_SKILL_FILE_BYTES} bytes"
         )));
     }
+    ctx.confirm(&format!("Save {rel} in skill '{name}'?"))?;
     let (dir, _) = skills_dir(ctx, &manifest)?;
     let target = contained_skill_file(&dir, &name, rel)?;
     if target.exists() {
