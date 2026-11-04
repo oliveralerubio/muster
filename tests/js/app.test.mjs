@@ -223,6 +223,32 @@ const liveButton = (label) => allElements
   .filter((el) => el.tagName === "BUTTON" && el.children[0] === label).at(-1);
 
 // --- tests --------------------------------------------------------------------
+async function testDashboardSyncOperationsRedesign() {
+  setResponder((call) => {
+    if (call.path === "schedule") {
+      return { ok: true, diagnostics: [], result: { enabled: false, backend: "systemd", files: [], pull: true, interval_minutes: null } };
+    }
+    if (call.path === "status") {
+      return { ok: true, diagnostics: [], result: { machines: [], sync: null } };
+    }
+    return { ok: true, diagnostics: [], result: {} };
+  });
+  await sandbox.show("dashboard");
+  await flush();
+  const text = (node) => (typeof node === "string" ? node : (node.children || []).map(text).join(" "));
+  const rendered = text(view);
+  assert.match(rendered, /Automatic sync/, "Dashboard heading must say 'Automatic sync'");
+  assert.match(rendered, /This machine only syncs when you click Sync now\./, "Off state copy must explain manual sync");
+  assert.doesNotMatch(rendered, /Sync operations/, "Must not contain 'Sync operations'");
+  assert.doesNotMatch(rendered, /systemd/, "Must not display 'systemd' in visible text");
+
+  const turnOnBtn = liveButton("Turn on");
+  assert.ok(turnOnBtn, "Must show a 'Turn on' button when schedule is disabled");
+  const syncNowBtn = liveButton("Sync now");
+  assert.ok(syncNowBtn, "Must show a 'Sync now' button");
+  setResponder();
+}
+
 
 async function testProfileSaveIsGatedOnPreview() {
   // Open the new-profile dialog the way the panel does (initially disabled),
@@ -618,6 +644,7 @@ async function testUsageWithoutSessionsExplainsNoCoverage() {
 
 const tests = {
   testEffectiveViewShowsStatesAndEscapesNames,
+  testDashboardSyncOperationsRedesign,
   testSkillToggleControls,
   testMcpToggleShowsOnlyValidAction,
   testCliFooterNotOverwrittenByBackgroundFetch,
