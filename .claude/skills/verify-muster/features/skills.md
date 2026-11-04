@@ -10,11 +10,13 @@ skills, see whether upstream moved, pull updates, detach or remove. Provenance i
 - Check upstream (`skill check`, `POST /api/skills/check`) writes `$XDG_CACHE_HOME/muster/skills-status.json`.
 - Update (`skill update --all|NAME [--force]`), never removes.
 - Remove or detach (`skill rm NAME [--detach]`).
-- Import a skill installed directly in an agent folder (`skill import NAME [--adapter ID]`, `POST /api/skills/import`); `skill list` / `GET /api/skills` report candidates under `unmanaged`.
+- Import skills installed directly in an agent folder (`skill import NAME [--adapter ID]` or `--all`, `POST /api/skills/import`); `skill list` / `GET /api/skills` report candidates under `unmanaged`. When `~/.agents/.skill-lock.json` names the upstream repository, import subscribes (adds or extends a `[[agents.skills.remote]]`, vendors the upstream files, reports `replaced_local_copy`); otherwise it imports an own skill.
+- Auto-update (`skill auto-update on|off`, `POST /api/skills/auto-update`, `auto_update` in `skill list`): `muster sync` (no `--yes`, no TTY) updates subscribed skills between pull and push, reports `skills_updated`, skips locally modified skills, warns on unreachable sources.
+- Editing an own skill (`skill file set`, `POST /api/skills/file`) re-pins it in `skills.lock`; subscribed skills are not re-pinned.
 
 ## How to get to it (user POV)
 
-Panel tab "Skills" (red dot = needs attention), "Check repositories" button, per-skill update/remove actions;
+Panel tab "Skills" (red dot = needs attention), "Check repositories", "Update all" and "Auto-update" buttons, a Source column and "Subscribe"/"Import as own"/"Import all" in the unmanaged section, per-skill update/remove actions;
 CLI `muster skill ...`.
 
 ## Driving it with muster-harness

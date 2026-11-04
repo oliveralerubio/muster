@@ -749,3 +749,406 @@ fn matching_upstream_refreshes_stale_pin_without_deleting_junk() {
     );
     assert!(dir.join("note.bak-yolo").exists());
 }
+
+// ---------------------------------------------------------------------------
+// Provenance-aware import and unattended auto-update
+// ---------------------------------------------------------------------------
+
+fn foo_md(version: &str) -> String {
+    format!("---\nname: foo\ndescription: Foo skill\nversion: {version}\n---\nFoo {version}.\n")
+}
+
+fn bar_md(version: &str) -> String {
+    format!("---\nname: bar\ndescription: Bar skill\nversion: {version}\n---\nBar {version}.\n")
+}
+
+/// Upstream with `skills/engineering/{foo,bar}` and `skills/misc/baz`.
+fn engineering_upstream() -> Upstream {
+    let up = Upstream::new();
+    up.write("skills/engineering/foo/SKILL.md", &foo_md("1.0.0"));
+    up.write("skills/engineering/bar/SKILL.md", &bar_md("1.0.0"));
+    up.commit("engineering skills");
+    up
+}
+
+/// Install `name` as an unmanaged skill in `~/.agents/skills`.
+fn install_on_disk(env: &MusterEnv, name: &str, skill_md: &str) {
+    let dir = env.path().join(".agents/skills").join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("SKILL.md"), skill_md).unwrap();
+}
+
+/// Write `~/.agents/.skill-lock.json` the way `npx skills` does.
+fn write_agents_lock(env: &MusterEnv, url: &str, skills: &[(&str, &str)]) {
+    let mut entries = serde_json::Map::new();
+    for (name, skill_path) in skills {
+        entries.insert(
+            (*name).into(),
+            serde_json::json!({
+                "source": "acme/skills",
+                "sourceType": "github",
+                "sourceUrl": url,
+                "skillPath": skill_path,
+                "skillFolderHash": "abc",
+                "installedAt": "2026-01-01T00:00:00Z",
+                "updatedAt": "2026-01-01T00:00:00Z",
+                "someFutureField": 1,
+            }),
+        );
+    }
+    let text = serde_json::json!({ "version": 3, "skills": entries }).to_string();
+    let path = env.path().join(".agents/.skill-lock.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, text).unwrap();
+}
+
+fn manifest_remotes(env: &MusterEnv) -> Vec<toml::Value> {
+    let manifest: toml::Table =
+        toml::from_str(&read(&env.config_dir().join("muster.toml"))).unwrap();
+    manifest["agents"]["skills"]
+        .get("remote")
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn commit_count(env: &MusterEnv) -> usize {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(env.config_dir())
+        .args(["rev-list", "--count", "HEAD"])
+        .output()
+        .expect("git rev-list");
+    if !out.status.success() {
+        return 0;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0)
+}
+
+/// A bare remote for the config repo, so `sync` pushes.
+fn config_remote(env: &MusterEnv) -> tempfile::TempDir {
+    let dir = tempfile::TempDir::new().unwrap();
+    let branch = git(&env.config_dir(), &["branch", "--show-current"]);
+    git(dir.path(), &["init", "--bare", "--quiet", "-b", &branch]);
+    ok(
+        env,
+        &["--yes", "sync", "--remote", dir.path().to_str().unwrap()],
+    );
+    dir
+}
+
+/// Env with `foo` installed from `up`, imported (subscribed) and auto-update on.
+fn subscribed_foo(up: &Upstream, auto_update: bool) -> MusterEnv {
+    let env = initialized();
+    install_on_disk(&env, "foo", &foo_md("1.0.0"));
+    write_agents_lock(
+        &env,
+        &up.url(),
+        &[("foo", "skills/engineering/foo/SKILL.md")],
+    );
+    ok(&env, &["skill", "import", "foo", "--yes"]);
+    if auto_update {
+        ok(&env, &["skill", "auto-update", "on", "--yes"]);
+    }
+    env
+}
+
+#[test]
+fn import_with_provenance_subscribes_instead_of_copying() {
+    let up = engineering_upstream();
+    let env = initialized();
+    // The on-disk copy differs from upstream HEAD.
+    install_on_disk(&env, "foo", &foo_md("0.9.0"));
+    write_agents_lock(
+        &env,
+        &up.url(),
+        &[("foo", "skills/engineering/foo/SKILL.md")],
+    );
+
+    let listed = ok(&env, &["skill", "list"]);
+    let unmanaged = listed["unmanaged"].as_array().unwrap();
+    let entry = unmanaged.iter().find(|u| u["name"] == "foo").unwrap();
+    assert_eq!(entry["source"]["name"], "acme/skills");
+    assert_eq!(entry["source"]["path"], "skills/engineering");
+
+    let result = ok(&env, &["skill", "import", "foo", "--yes"]);
+    assert_eq!(result["replaced_local_copy"], true, "{result}");
+    assert_ne!(result["origin"], "local");
+    assert_eq!(result["commit"], up.head());
+
+    let remotes = manifest_remotes(&env);
+    assert_eq!(remotes.len(), 1, "{remotes:?}");
+    assert_eq!(remotes[0]["path"].as_str(), Some("skills/engineering"));
+    assert_eq!(
+        remotes[0]["include"].as_array().unwrap()[0].as_str(),
+        Some("foo")
+    );
+    assert_eq!(remotes[0]["name"].as_str(), Some("acme-skills-engineering"));
+    assert_eq!(
+        read(&skills_dir(&env).join("foo/SKILL.md")),
+        foo_md("1.0.0")
+    );
+    let locked = lock_entry(&env, "foo").unwrap();
+    assert_eq!(locked["origin"].as_str(), Some("acme-skills-engineering"));
+    assert_eq!(locked["commit"].as_str(), Some(up.head().as_str()));
+    // Upstream files, not the on-disk copy, are what ships.
+    assert_eq!(
+        read(&env.path().join(".agents/skills/foo/SKILL.md")),
+        foo_md("0.9.0"),
+        "the original on-disk copy is untouched by import"
+    );
+}
+
+#[test]
+fn second_skill_from_same_url_and_path_merges_into_the_remote() {
+    let up = engineering_upstream();
+    let env = initialized();
+    install_on_disk(&env, "foo", &foo_md("1.0.0"));
+    install_on_disk(&env, "bar", &bar_md("1.0.0"));
+    write_agents_lock(
+        &env,
+        &up.url(),
+        &[
+            ("foo", "skills/engineering/foo/SKILL.md"),
+            ("bar", "skills/engineering/bar/SKILL.md"),
+        ],
+    );
+    ok(&env, &["skill", "import", "foo", "--yes"]);
+    ok(&env, &["skill", "import", "bar", "--yes"]);
+    let remotes = manifest_remotes(&env);
+    assert_eq!(remotes.len(), 1, "{remotes:?}");
+    let include: Vec<&str> = remotes[0]["include"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(include, ["foo", "bar"]);
+    assert_eq!(
+        lock_entry(&env, "bar").unwrap()["origin"].as_str(),
+        remotes[0]["name"].as_str()
+    );
+}
+
+#[test]
+fn import_fails_without_falling_back_when_upstream_is_unreachable() {
+    let env = initialized();
+    install_on_disk(&env, "foo", &foo_md("1.0.0"));
+    write_agents_lock(
+        &env,
+        "file:///nonexistent/upstream-repo",
+        &[("foo", "skills/engineering/foo/SKILL.md")],
+    );
+    let (_, envelope) = fails(&env, &["skill", "import", "foo", "--yes"]);
+    assert!(
+        envelope.raw.to_string().contains("cannot fetch upstream"),
+        "{}",
+        envelope.raw
+    );
+    let lock_path = env.config_dir().join("skills.lock");
+    assert!(!lock_path.exists() || lock_entry(&env, "foo").is_none());
+    assert!(!skills_dir(&env).join("foo").exists());
+}
+
+#[test]
+fn import_all_mixes_subscribed_and_own_skills_in_one_commit() {
+    let up = engineering_upstream();
+    let env = initialized();
+    install_on_disk(&env, "foo", &foo_md("1.0.0"));
+    install_on_disk(&env, "bar", &bar_md("1.0.0"));
+    install_on_disk(
+        &env,
+        "mine",
+        "---\nname: mine\ndescription: Mine\n---\nOwn.\n",
+    );
+    install_on_disk(&env, "broken", "no frontmatter\n");
+    write_agents_lock(
+        &env,
+        &up.url(),
+        &[
+            ("foo", "skills/engineering/foo/SKILL.md"),
+            ("bar", "skills/engineering/bar/SKILL.md"),
+        ],
+    );
+    let before = commit_count(&env);
+    let result = ok(&env, &["skill", "import", "--all", "--yes"]);
+    assert_eq!(commit_count(&env), before + 1, "one commit for the batch");
+    let imported = result["imported"].as_array().unwrap();
+    assert_eq!(imported.len(), 3, "{result}");
+    assert_eq!(result["skipped"].as_array().unwrap().len(), 1, "{result}");
+    assert_eq!(result["skipped"][0]["name"], "broken");
+    assert_eq!(
+        lock_entry(&env, "mine").unwrap()["origin"].as_str(),
+        Some("local")
+    );
+    assert_ne!(
+        lock_entry(&env, "foo").unwrap()["origin"].as_str(),
+        Some("local")
+    );
+    // Both skills share one source: one remote, fetched once.
+    let remotes = manifest_remotes(&env);
+    assert_eq!(remotes.len(), 1, "{remotes:?}");
+    assert_eq!(remotes[0]["include"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn sync_auto_updates_subscribed_skills_unattended_and_pushes() {
+    let up = engineering_upstream();
+    let env = subscribed_foo(&up, true);
+    let remote = config_remote(&env);
+    assert_eq!(
+        ok(&env, &["skill", "list"])["auto_update"],
+        true,
+        "list reports the setting"
+    );
+
+    up.write("skills/engineering/foo/SKILL.md", &foo_md("1.1.0"));
+    let new_head = up.commit("foo 1.1.0");
+
+    // No --yes, stdin is not a terminal.
+    let (out, envelope) = json(&env, &["sync"]);
+    assert!(out.status.success(), "{}", envelope.raw);
+    assert_eq!(
+        envelope.result()["skills_updated"],
+        serde_json::json!(["foo"]),
+        "{}",
+        envelope.raw
+    );
+    assert_eq!(
+        read(&skills_dir(&env).join("foo/SKILL.md")),
+        foo_md("1.1.0")
+    );
+    assert_eq!(
+        lock_entry(&env, "foo").unwrap()["commit"].as_str(),
+        Some(new_head.as_str())
+    );
+    let applied = env.path().join(".claude/skills/foo/SKILL.md");
+    assert_eq!(read(&applied), foo_md("1.1.0"), "applied in the same run");
+    assert_eq!(
+        git(remote.path(), &["rev-parse", "HEAD"]),
+        git(&env.config_dir(), &["rev-parse", "HEAD"]),
+        "the update was pushed in the same run"
+    );
+}
+
+#[test]
+fn sync_leaves_skills_alone_when_auto_update_is_off() {
+    let up = engineering_upstream();
+    let env = subscribed_foo(&up, false);
+    let _remote = config_remote(&env);
+    up.write("skills/engineering/foo/SKILL.md", &foo_md("1.1.0"));
+    up.commit("foo 1.1.0");
+    let (out, envelope) = json(&env, &["sync"]);
+    assert!(out.status.success(), "{}", envelope.raw);
+    assert_eq!(envelope.result()["skills_updated"], serde_json::json!([]));
+    assert_eq!(
+        read(&skills_dir(&env).join("foo/SKILL.md")),
+        foo_md("1.0.0")
+    );
+
+    // Turning it off again removes the manifest key.
+    ok(&env, &["skill", "auto-update", "on", "--yes"]);
+    ok(&env, &["skill", "auto-update", "off"]);
+    assert!(!read(&env.config_dir().join("muster.toml")).contains("auto_update"));
+}
+
+#[test]
+fn sync_auto_update_never_overwrites_locally_modified_skills() {
+    let up = engineering_upstream();
+    let env = subscribed_foo(&up, true);
+    let _remote = config_remote(&env);
+    let edited = format!("{}local tweak\n", foo_md("1.0.0"));
+    std::fs::write(skills_dir(&env).join("foo/SKILL.md"), &edited).unwrap();
+    up.write("skills/engineering/foo/SKILL.md", &foo_md("1.1.0"));
+    up.commit("foo 1.1.0");
+    let (out, envelope) = json(&env, &["sync"]);
+    assert!(out.status.success(), "{}", envelope.raw);
+    assert_eq!(read(&skills_dir(&env).join("foo/SKILL.md")), edited);
+    assert!(
+        has_diag(envelope.diagnostics(), "skill_modified"),
+        "{}",
+        envelope.raw
+    );
+    assert_eq!(envelope.result()["skills_updated"], serde_json::json!([]));
+}
+
+#[test]
+fn sync_auto_update_warns_but_succeeds_when_upstream_is_unreachable() {
+    let up = engineering_upstream();
+    let env = subscribed_foo(&up, true);
+    let _remote = config_remote(&env);
+    std::fs::remove_dir_all(up.path()).unwrap();
+    let (out, envelope) = json(&env, &["sync"]);
+    assert!(out.status.success(), "{}", envelope.raw);
+    assert!(
+        has_diag(envelope.diagnostics(), "skill_source_unreachable"),
+        "{}",
+        envelope.raw
+    );
+    assert_eq!(
+        read(&skills_dir(&env).join("foo/SKILL.md")),
+        foo_md("1.0.0")
+    );
+}
+
+#[test]
+fn editing_an_own_skill_repins_it_but_subscribed_skills_are_not_pinned() {
+    let up = engineering_upstream();
+    let env = subscribed_foo(&up, false);
+    ok(&env, &["skill", "add", "mine", "--description", "Mine"]);
+    let before = lock_entry(&env, "mine").unwrap()["content_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    ok(
+        &env,
+        &[
+            "skill",
+            "file",
+            "set",
+            "mine",
+            "--path",
+            "SKILL.md",
+            "--content=---\nname: mine\ndescription: Mine edited\n---\nNew body.\n",
+            "--yes",
+        ],
+    );
+    let dir = skills_dir(&env).join("mine");
+    let hash = muster::skills::content_hash(&muster::skills::read_skill_files(&dir).unwrap());
+    let after = lock_entry(&env, "mine").unwrap()["content_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(before, after);
+    assert_eq!(after, hash, "lock follows the edit");
+    assert_eq!(git(&env.config_dir(), &["status", "--porcelain"]), "");
+    // The edited own skill reaches the agent folders without a manual pin.
+    ok(&env, &["sync", "--yes"]);
+    assert!(read(&env.path().join(".claude/skills/mine/SKILL.md")).contains("Mine edited"));
+
+    // Edits to a subscribed skill are not pinned.
+    let pinned = lock_entry(&env, "foo").unwrap()["content_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    ok(
+        &env,
+        &[
+            "skill",
+            "file",
+            "set",
+            "foo",
+            "--path",
+            "SKILL.md",
+            &format!("--content={}tweak\n", foo_md("1.0.0")),
+            "--yes",
+        ],
+    );
+    assert_eq!(
+        lock_entry(&env, "foo").unwrap()["content_hash"].as_str(),
+        Some(pinned.as_str())
+    );
+}

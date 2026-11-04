@@ -117,14 +117,21 @@ pub const ADD: CommandSpec = CommandSpec {
 
 pub const IMPORT: CommandSpec = CommandSpec {
     name: "skill.import",
-    about: "Import a skill found in an agent's skills folder as an own skill",
+    about: "Import skills found in an agent's skills folder (subscribes when the upstream repository is known, else as own skills)",
     params: &[
         param(
             "name",
-            "Name of the skill folder to import",
+            "Name of the skill folder to import (omit with --all)",
             ParamKind::String,
+            false,
             true,
-            true,
+        ),
+        param(
+            "all",
+            "Import every importable unmanaged skill in one run",
+            ParamKind::Bool,
+            false,
+            false,
         ),
         param(
             "adapter",
@@ -136,6 +143,29 @@ pub const IMPORT: CommandSpec = CommandSpec {
     ],
     mutating: true,
     handler: import,
+};
+
+pub const AUTO_UPDATE: CommandSpec = CommandSpec {
+    name: "skill.auto-update",
+    about: "Turn unattended updates of subscribed skills during `muster sync` on or off",
+    params: &[
+        param(
+            "state",
+            "on or off (true/false also accepted)",
+            ParamKind::String,
+            false,
+            true,
+        ),
+        param(
+            "enabled",
+            "Enable or disable auto-update (true or false)",
+            ParamKind::String,
+            false,
+            false,
+        ),
+    ],
+    mutating: true,
+    handler: auto_update_cmd,
 };
 
 pub const PIN: CommandSpec = CommandSpec {
@@ -317,6 +347,21 @@ fn file_set(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         }
         crate::manifest::write_atomic(&target, content.as_bytes())
             .map_err(|e| io_error(&target, e))?;
+        // Own skills follow their edits: re-pin so the next sync applies them.
+        // Subscribed skills are left alone; an update would overwrite them.
+        let mut lock = SkillsLock::load(&ctx.config_dir)?;
+        if lock.get(&name).is_some_and(LockEntry::is_local) {
+            let files = read_skill_files(&contained(&dir, &name, None)?)?;
+            if let Some(entry) = lock.skills.iter_mut().find(|e| e.name == name) {
+                entry.content_hash = content_hash(&files);
+                entry.version = files
+                    .get("SKILL.md")
+                    .and_then(|text| parse_frontmatter(text))
+                    .and_then(|m| m.version);
+                entry.updated_at = now();
+            }
+            lock.save(&ctx.config_dir)?;
+        }
         commit(
             ctx,
             actor.as_ref(),
@@ -801,8 +846,11 @@ fn list(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
         .map(|r| json!({ "name": r.name, "url": r.url, "ref": r.git_ref, "path": r.path, "include": r.include }))
         .collect();
     let managed: BTreeSet<&str> = names.iter().map(|n| n.as_str()).collect();
-    let unmanaged = unmanaged_skills(ctx, &merged.agents, &managed);
+    let provenance = read_provenance(ctx);
+    let unmanaged = unmanaged_skills(ctx, &merged.agents, &managed, &provenance);
+    let auto_update = merged.agents.skills.as_ref().is_some_and(|s| s.auto_update);
     Ok(json!({
+        "auto_update": auto_update,
         "source": source,
         "skills": skills,
         "unmanaged": unmanaged,
@@ -1006,6 +1054,7 @@ fn unmanaged_skills(
     ctx: &Context,
     agents: &crate::manifest::AgentsConfig,
     managed: &BTreeSet<&str>,
+    provenance: &BTreeMap<String, Provenance>,
 ) -> Vec<Value> {
     let Ok(found) = find_on_disk(&ctx.config_dir, agents, managed) else {
         return Vec::new();
@@ -1041,35 +1090,225 @@ fn unmanaged_skills(
                 "valid": best.is_some_and(|c| c.1.is_none()),
                 "problem": best.and_then(|c| c.1.clone()),
                 "description": best.and_then(|c| c.2.clone()),
+                "source": provenance.get(&name).map(Provenance::view),
             })
         })
         .collect()
 }
 
-fn import(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
-    let manifest = Manifest::load(&ctx.config_dir)?;
-    let actor = admin(ctx, &manifest)?;
-    let name = required_name(params)?;
-    let (dir, source) = skills_dir(ctx, &manifest)?;
-    let mut lock = SkillsLock::load(&ctx.config_dir)?;
-    if dir.join(&name).exists() || lock.get(&name).is_some() {
+// ---------------------------------------------------------------------------
+// provenance: `npx skills` lock (`~/.agents/.skill-lock.json`)
+// ---------------------------------------------------------------------------
+
+/// Where an on-disk skill was installed from, according to the `npx skills`
+/// CLI's lock file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Provenance {
+    /// Human label, e.g. `mattpocock/skills`.
+    label: String,
+    url: String,
+    /// Directory of the repository that holds one directory per skill.
+    path: Option<String>,
+}
+
+impl Provenance {
+    fn view(&self) -> Value {
+        json!({ "name": self.label, "url": self.url, "path": self.path })
+    }
+}
+
+fn provenance_from_entry(name: &str, entry: &Value) -> Option<Provenance> {
+    let text = |key: &str| {
+        entry
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
+    let url = text("sourceUrl")?;
+    let skill_path = text("skillPath")?.trim_matches('/');
+    let skill_dir = skill_path
+        .strip_suffix("SKILL.md")
+        .map_or(skill_path, |d| d.trim_end_matches('/'));
+    let (parent, last) = match skill_dir.rsplit_once('/') {
+        Some((parent, last)) => (Some(parent), last),
+        None => (None, skill_dir),
+    };
+    if last != name {
+        return None;
+    }
+    if let Some(parent) = parent {
+        relative(parent, "path").ok()?;
+    }
+    let label = text("source")
+        .map(str::to_owned)
+        .unwrap_or_else(|| source_name_from_url(url));
+    Some(Provenance {
+        label,
+        url: url.to_string(),
+        path: parent.map(str::to_owned),
+    })
+}
+
+/// Provenance by skill name from `~/.agents/.skill-lock.json`. A missing file
+/// means no provenance; an unreadable one is reported and ignored.
+fn read_provenance(ctx: &mut Context) -> BTreeMap<String, Provenance> {
+    let Ok(roots) = crate::engine::Roots::from_env() else {
+        return BTreeMap::new();
+    };
+    let path = roots
+        .base(crate::adapters::Base::Home)
+        .join(".agents/.skill-lock.json");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return BTreeMap::new(),
+        Err(e) => {
+            ctx.diag(Diagnostic::new(
+                Severity::Warning,
+                "skill_lock_unreadable",
+                format!(
+                    "cannot read {}: {e}; skills are treated as own",
+                    path.display()
+                ),
+            ));
+            return BTreeMap::new();
+        }
+    };
+    let parsed: Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.diag(Diagnostic::new(
+                Severity::Warning,
+                "skill_lock_unreadable",
+                format!(
+                    "cannot parse {}: {e}; skills are treated as own",
+                    path.display()
+                ),
+            ));
+            return BTreeMap::new();
+        }
+    };
+    parsed
+        .get("skills")
+        .and_then(Value::as_object)
+        .map(|skills| {
+            skills
+                .iter()
+                .filter_map(|(name, entry)| {
+                    provenance_from_entry(name, entry).map(|p| (name.clone(), p))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn slugify(text: &str) -> String {
+    let mut out = String::new();
+    for c in text.chars() {
+        let c = if c.is_ascii_alphanumeric() {
+            c.to_ascii_lowercase()
+        } else {
+            '-'
+        };
+        if c != '-' || !out.ends_with('-') {
+            out.push(c);
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
+/// Deterministic id for a new source: `<owner>-<repo>[-<last path segment>]`,
+/// numbered when already taken.
+fn remote_name_for(prov: &Provenance, taken: &BTreeSet<String>) -> String {
+    let mut base = slugify(&prov.label);
+    if base.is_empty() {
+        base = source_name_from_url(&prov.url);
+    }
+    if let Some(last) = prov.path.as_deref().and_then(|p| p.rsplit('/').next()) {
+        let last = slugify(last);
+        if !last.is_empty() {
+            base = format!("{base}-{last}");
+        }
+    }
+    if base == lock::LOCAL {
+        base = "local-source".into();
+    }
+    let mut name = base.clone();
+    let mut n = 2;
+    while taken.contains(&name) {
+        name = format!("{base}-{n}");
+        n += 1;
+    }
+    name
+}
+
+fn same_url(a: &str, b: &str) -> bool {
+    let norm = |u: &str| {
+        let u = u.trim().trim_end_matches('/');
+        u.strip_suffix(".git").unwrap_or(u).to_string()
+    };
+    norm(a) == norm(b)
+}
+
+fn same_path(a: Option<&str>, b: Option<&str>) -> bool {
+    let norm = |p: Option<&str>| {
+        p.map(|p| p.trim_matches('/').to_string())
+            .filter(|p| !p.is_empty())
+    };
+    norm(a) == norm(b)
+}
+
+/// Add `names` to the `include` of remote `remote`. A remote without
+/// `include` already covers every skill under its path.
+fn extend_remote_include(skills: &mut Table, remote: &str, names: &[String]) {
+    let Some(list) = skills
+        .get_mut("remote")
+        .and_then(Item::as_array_of_tables_mut)
+    else {
+        return;
+    };
+    let Some(table) = list
+        .iter_mut()
+        .find(|t| t.get("name").and_then(Item::as_str) == Some(remote))
+    else {
+        return;
+    };
+    if let Some(include) = table.get_mut("include").and_then(Item::as_array_mut) {
+        for name in names {
+            if !include.iter().any(|v| v.as_str() == Some(name)) {
+                include.push(name.clone());
+            }
+        }
+        include.fmt();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// import
+// ---------------------------------------------------------------------------
+
+/// A validated on-disk skill ready to import.
+struct Prepared {
+    adapter: &'static str,
+    files: BTreeMap<String, String>,
+}
+
+fn prepare_import(
+    name: &str,
+    mut places: Vec<OnDisk>,
+    adapter: Option<&str>,
+    dir: &Path,
+    lock: &SkillsLock,
+) -> Result<Prepared, MusterError> {
+    if dir.join(name).exists() || lock.get(name).is_some() {
         return Err(MusterError::Usage(format!("skill '{name}' already exists")));
     }
-    if crate::skills::builtin::is_builtin(&name) {
+    if crate::skills::builtin::is_builtin(name) {
         return Err(MusterError::Usage(format!(
             "'{name}' is a built-in skill and cannot be imported"
         )));
     }
-    let layers = crate::engine::layer::global_layers(
-        &ctx.config_dir,
-        &manifest,
-        crate::machine::load_name(&ctx.state_dir).as_deref(),
-    );
-    let merged = crate::engine::layer::merge(&layers);
-    let mut places = find_on_disk(&ctx.config_dir, &merged.agents, &BTreeSet::new())?
-        .remove(&name)
-        .unwrap_or_default();
-    if let Some(wanted) = params.get_string("adapter") {
+    if let Some(wanted) = adapter {
         places.retain(|p| p.adapter == wanted);
         if places.is_empty() {
             return Err(MusterError::Usage(format!(
@@ -1094,43 +1333,312 @@ fn import(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
             "skill '{name}' differs between agents ({adapter}, {other}); pass --adapter to choose one"
         )));
     }
-    if let Some(problem) = import_problem(&name, &files) {
+    if let Some(problem) = import_problem(name, &files) {
         return Err(MusterError::Usage(format!(
             "cannot import '{name}': {problem}"
         )));
     }
-    let version = files
-        .get("SKILL.md")
-        .and_then(|text| parse_frontmatter(text))
-        .and_then(|m| m.version);
-    let entry = LockEntry {
-        name: name.clone(),
-        origin: lock::LOCAL.into(),
-        commit: None,
-        content_hash: content_hash(&files),
-        version,
-        updated_at: now(),
+    Ok(Prepared { adapter, files })
+}
+
+/// One source the import subscribes to: an existing `[[remote]]` or a new one.
+struct RemotePlan {
+    remote: SkillRemote,
+    is_new: bool,
+    /// Skills of this run to add to an existing remote's `include`.
+    names: Vec<String>,
+}
+
+fn import(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
+    let manifest = Manifest::load(&ctx.config_dir)?;
+    let actor = admin(ctx, &manifest)?;
+    let all = params.get_bool("all");
+    let single = match (params.get_string("name"), all) {
+        (Some(_), true) => {
+            return Err(MusterError::Usage(
+                "pass a skill name or --all (not both)".into(),
+            ))
+        }
+        (None, false) => {
+            return Err(MusterError::Usage("pass a skill name or --all".into()));
+        }
+        (Some(_), false) => Some(required_name(params)?),
+        (None, true) => None,
     };
-    let result = json!({
-        "name": name,
-        "origin": lock::LOCAL,
-        "adapter": adapter,
-        "path": format!("{source}/{name}/SKILL.md"),
-        "files": files.len(),
-    });
-    if ctx.dry_run {
-        return Ok(result);
+    let (dir, source) = skills_dir(ctx, &manifest)?;
+    let lock = SkillsLock::load(&ctx.config_dir)?;
+    let layers = crate::engine::layer::global_layers(
+        &ctx.config_dir,
+        &manifest,
+        crate::machine::load_name(&ctx.state_dir).as_deref(),
+    );
+    let merged = crate::engine::layer::merge(&layers);
+    let managed: BTreeSet<String> = if all {
+        disk_skills(&dir)?
+            .into_keys()
+            .chain(lock.skills.iter().map(|e| e.name.clone()))
+            .collect()
+    } else {
+        BTreeSet::new()
+    };
+    let managed_refs: BTreeSet<&str> = managed.iter().map(String::as_str).collect();
+    let mut found = find_on_disk(&ctx.config_dir, &merged.agents, &managed_refs)?;
+    let wanted: Vec<String> = match &single {
+        Some(name) => vec![name.clone()],
+        None => found.keys().cloned().collect(),
+    };
+    let provenance = read_provenance(ctx);
+
+    let mut prepared: Vec<(String, Prepared)> = Vec::new();
+    let mut skipped: Vec<Value> = Vec::new();
+    for name in wanted {
+        let places = found.remove(&name).unwrap_or_default();
+        match prepare_import(&name, places, params.get_string("adapter"), &dir, &lock) {
+            Ok(p) => prepared.push((name, p)),
+            Err(e) if all => {
+                ctx.diag(Diagnostic::new(
+                    Severity::Warning,
+                    "skill_import_skipped",
+                    format!("skipped '{name}': {e}"),
+                ));
+                skipped.push(json!({ "name": name, "reason": e.to_string() }));
+            }
+            Err(e) => return Err(e),
+        }
     }
-    write_skill(&dir, &name, &files)?;
-    lock.upsert(entry);
+
+    // Resolve a source for every skill with provenance, one fetch per source.
+    let mut plans: Vec<RemotePlan> = Vec::new();
+    let mut taken: BTreeSet<String> = remotes(&manifest).iter().map(|r| r.name.clone()).collect();
+    let mut existing = remotes(&manifest);
+    let mut subscribed: Vec<(usize, String, Prepared, Provenance)> = Vec::new();
+    let mut own: Vec<(String, Prepared)> = Vec::new();
+    for (name, prep) in prepared {
+        let Some(prov) = provenance.get(&name).cloned() else {
+            own.push((name, prep));
+            continue;
+        };
+        let index = match plans.iter().position(|p| {
+            same_url(&p.remote.url, &prov.url)
+                && same_path(p.remote.path.as_deref(), prov.path.as_deref())
+                && p.remote.git_ref.is_none()
+        }) {
+            Some(i) => i,
+            None => {
+                let (remote, is_new) = match existing.iter().position(|r| {
+                    same_url(&r.url, &prov.url)
+                        && same_path(r.path.as_deref(), prov.path.as_deref())
+                        && r.git_ref.is_none()
+                }) {
+                    Some(i) => (existing.remove(i), false),
+                    None => {
+                        let remote_name = remote_name_for(&prov, &taken);
+                        taken.insert(remote_name.clone());
+                        (
+                            SkillRemote {
+                                name: remote_name,
+                                url: prov.url.clone(),
+                                git_ref: None,
+                                path: prov.path.clone(),
+                                include: Vec::new(),
+                            },
+                            true,
+                        )
+                    }
+                };
+                plans.push(RemotePlan {
+                    remote,
+                    is_new,
+                    names: Vec::new(),
+                });
+                plans.len() - 1
+            }
+        };
+        let plan = &mut plans[index];
+        plan.names.push(name.clone());
+        if plan.is_new {
+            plan.remote.include.push(name.clone());
+        }
+        subscribed.push((index, name, prep, prov));
+    }
+
+    // Fetch every source once; nothing is written when one fails.
+    let mut checkouts: Vec<Checkout> = Vec::new();
+    if !plans.is_empty() {
+        let fetcher = GitFetcher::from_env()?;
+        for plan in &plans {
+            let checkout = fetcher.fetch(&plan.remote).map_err(|e| {
+                MusterError::Operational(format!(
+                    "cannot fetch upstream {} for skill(s) {}: {e}; nothing was imported \
+                     (the on-disk copy is not used as a fallback)",
+                    plan.remote.url,
+                    plan.names.join(", ")
+                ))
+            })?;
+            checkouts.push(checkout);
+        }
+    }
+
+    struct Vendored {
+        name: String,
+        adapter: &'static str,
+        plan: usize,
+        skill: UpstreamSkill,
+        replaced: bool,
+        prov: Provenance,
+    }
+    let mut vendored: Vec<Vendored> = Vec::new();
+    for (plan, name, prep, prov) in subscribed {
+        match read_upstream(&checkouts[plan], &plans[plan].remote, &name)? {
+            Some(skill) => {
+                let replaced = skill.hash != content_hash(&prep.files);
+                vendored.push(Vendored {
+                    name,
+                    adapter: prep.adapter,
+                    plan,
+                    skill,
+                    replaced,
+                    prov,
+                });
+            }
+            None => {
+                let message = format!(
+                    "skill '{name}' was not found upstream at {} ({})",
+                    plans[plan].remote.url,
+                    plans[plan]
+                        .remote
+                        .path
+                        .as_deref()
+                        .unwrap_or("repository root")
+                );
+                if !all {
+                    return Err(MusterError::Usage(message));
+                }
+                ctx.diag(Diagnostic::new(
+                    Severity::Warning,
+                    "skill_import_skipped",
+                    format!("skipped '{name}': {message}"),
+                ));
+                skipped.push(json!({ "name": name, "reason": message }));
+            }
+        }
+    }
+
+    let mut imported: Vec<Value> = Vec::new();
+    for v in &vendored {
+        imported.push(json!({
+            "name": v.name,
+            "origin": plans[v.plan].remote.name,
+            "adapter": v.adapter,
+            "path": format!("{source}/{}/SKILL.md", v.name),
+            "files": v.skill.files.len(),
+            "source": v.prov.view(),
+            "commit": checkouts[v.plan].commit,
+            "version": v.skill.version,
+            "replaced_local_copy": v.replaced,
+            "new_remote": plans[v.plan].is_new,
+        }));
+    }
+    for (name, prep) in &own {
+        imported.push(json!({
+            "name": name,
+            "origin": lock::LOCAL,
+            "adapter": prep.adapter,
+            "path": format!("{source}/{name}/SKILL.md"),
+            "files": prep.files.len(),
+            "source": Value::Null,
+        }));
+    }
+    imported.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    let result_for = |imported: Vec<Value>, skipped: Vec<Value>, dry_run: bool| match &single {
+        Some(_) => imported.into_iter().next().unwrap_or(Value::Null),
+        None => json!({ "imported": imported, "skipped": skipped, "dry_run": dry_run }),
+    };
+    if ctx.dry_run || (vendored.is_empty() && own.is_empty()) {
+        return Ok(result_for(imported, skipped, ctx.dry_run));
+    }
+
+    let mut lock = lock;
+    let updated_at = now();
+    let mut cache = StatusCache::load(&ctx.state_dir);
+    for v in &vendored {
+        write_skill(&dir, &v.name, &v.skill.files)?;
+        lock.upsert(LockEntry {
+            name: v.name.clone(),
+            origin: plans[v.plan].remote.name.clone(),
+            commit: Some(checkouts[v.plan].commit.clone()),
+            content_hash: v.skill.hash.clone(),
+            version: v.skill.version.clone(),
+            updated_at: updated_at.clone(),
+        });
+        let status = classify(false, &v.skill.hash, &v.skill.upstream());
+        cache.skills.insert(
+            v.name.clone(),
+            CachedStatus {
+                status,
+                reason: v.skill.deprecated.clone(),
+                upstream_commit: Some(checkouts[v.plan].commit.clone()),
+                checked_at: updated_at.clone(),
+            },
+        );
+        diag_for(ctx, &v.name, status, v.skill.deprecated.as_deref());
+    }
+    for (name, prep) in &own {
+        write_skill(&dir, name, &prep.files)?;
+        lock.upsert(LockEntry {
+            name: name.clone(),
+            origin: lock::LOCAL.into(),
+            commit: None,
+            content_hash: content_hash(&prep.files),
+            version: prep
+                .files
+                .get("SKILL.md")
+                .and_then(|text| parse_frontmatter(text))
+                .and_then(|m| m.version),
+            updated_at: updated_at.clone(),
+        });
+    }
     lock.save(&ctx.config_dir)?;
-    edit_manifest(ctx, |_| Ok(()))?;
-    commit(
-        ctx,
-        actor.as_ref(),
-        &format!("feat(skills): import skill {name}"),
-    )?;
-    Ok(result)
+    // Only remotes that gained a skill are touched.
+    let used: BTreeSet<usize> = vendored.iter().map(|v| v.plan).collect();
+    edit_manifest(ctx, |skills| {
+        for (i, plan) in plans.iter().enumerate().filter(|(i, _)| used.contains(i)) {
+            if plan.is_new {
+                let mut remote = plan.remote.clone();
+                remote
+                    .include
+                    .retain(|n| vendored.iter().any(|v| &v.name == n && v.plan == i));
+                add_remote_entry(skills, &remote)?;
+            } else {
+                extend_remote_include(skills, &plan.remote.name, &plan.names);
+            }
+        }
+        Ok(())
+    })?;
+    if !vendored.is_empty() {
+        if let Err(e) = cache.save(&ctx.state_dir) {
+            ctx.diag(Diagnostic::new(
+                Severity::Warning,
+                "skill_status_cache",
+                format!("cannot record skill status: {e}"),
+            ));
+        }
+    }
+    let names: Vec<&str> = vendored
+        .iter()
+        .map(|v| v.name.as_str())
+        .chain(own.iter().map(|(n, _)| n.as_str()))
+        .collect();
+    let summary = if single.is_some() && vendored.len() == 1 {
+        format!(
+            "feat(skills): subscribe to {} ({})",
+            plans[vendored[0].plan].remote.name, vendored[0].name
+        )
+    } else {
+        format!("feat(skills): import skill(s) {}", names.join(", "))
+    };
+    commit(ctx, actor.as_ref(), &summary)?;
+    Ok(result_for(imported, skipped, false))
 }
 
 /// Default source id: the last URL segment without `.git`, as a valid name.
@@ -1465,6 +1973,17 @@ fn update_with(
     params: &Params,
     fetcher: &dyn UpstreamFetcher,
 ) -> Result<Value, MusterError> {
+    update_inner(ctx, params, fetcher, false)
+}
+
+/// `unattended`: the caller (sync) already decided to apply, so no
+/// confirmation is asked. This is NOT the global `--yes`.
+fn update_inner(
+    ctx: &mut Context,
+    params: &Params,
+    fetcher: &dyn UpstreamFetcher,
+    unattended: bool,
+) -> Result<Value, MusterError> {
     let manifest = Manifest::load(&ctx.config_dir)?;
     let actor = admin(ctx, &manifest)?;
     let all = params.get_bool("all");
@@ -1605,7 +2124,9 @@ fn update_with(
             )
         })
         .collect();
-    ctx.confirm(&format!("Update skill(s) {}?", summary.join(", ")))?;
+    if !unattended {
+        ctx.confirm(&format!("Update skill(s) {}?", summary.join(", ")))?;
+    }
 
     let updated_at = now();
     let mut cache = StatusCache::load(&ctx.state_dir);
@@ -1648,6 +2169,121 @@ fn update_with(
         &format!("feat(skills): update {}", names.join(", ")),
     )?;
     Ok(result)
+}
+
+// ---------------------------------------------------------------------------
+// auto-update
+// ---------------------------------------------------------------------------
+
+fn auto_update_cmd(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
+    let raw = params
+        .get_string("enabled")
+        .or_else(|| params.get_string("state"))
+        .ok_or_else(|| {
+            MusterError::Usage("state must be `on` or `off` (or --enabled true|false)".into())
+        })?;
+    let enabled = match raw.to_ascii_lowercase().as_str() {
+        "on" | "true" | "yes" | "1" | "enable" | "enabled" => true,
+        "off" | "false" | "no" | "0" | "disable" | "disabled" => false,
+        _ => return Err(MusterError::Usage("state must be `on` or `off`".into())),
+    };
+    let manifest = Manifest::load(&ctx.config_dir)?;
+    let actor = admin(ctx, &manifest)?;
+    let result = json!({ "auto_update": enabled, "dry_run": ctx.dry_run });
+    if ctx.dry_run {
+        return Ok(result);
+    }
+    if enabled {
+        ctx.confirm(
+            "Apply upstream updates of subscribed skills automatically during `muster sync`?",
+        )?;
+    }
+    edit_manifest(ctx, |skills| {
+        if enabled {
+            skills.insert("auto_update", toml_edit::value(true));
+        } else {
+            skills.remove("auto_update");
+        }
+        Ok(())
+    })?;
+    commit(
+        ctx,
+        actor.as_ref(),
+        &format!(
+            "feat(skills): turn skill auto-update {}",
+            if enabled { "on" } else { "off" }
+        ),
+    )?;
+    Ok(result)
+}
+
+/// Unattended skill updates for `muster sync`: when `auto_update` is on, check
+/// and update every subscribed skill without confirmation. Locally modified
+/// skills are skipped (never forced), a non-admin team member does nothing,
+/// and any failure (network, git) is a warning: sync carries on. Returns the
+/// names of the skills that were updated.
+pub fn auto_update_in_sync(ctx: &mut Context) -> Vec<Value> {
+    let fetcher = match GitFetcher::from_env() {
+        Ok(fetcher) => fetcher,
+        Err(e) => {
+            auto_update_warning(ctx, &e.to_string());
+            return Vec::new();
+        }
+    };
+    match auto_update_with(ctx, &fetcher) {
+        Ok(updated) => updated,
+        Err(e) => {
+            auto_update_warning(ctx, &e.to_string());
+            Vec::new()
+        }
+    }
+}
+
+fn auto_update_warning(ctx: &mut Context, why: &str) {
+    ctx.diag(Diagnostic::new(
+        Severity::Warning,
+        "skill_auto_update_failed",
+        format!("skill auto-update did not complete: {why}"),
+    ));
+}
+
+fn auto_update_with(
+    ctx: &mut Context,
+    fetcher: &dyn UpstreamFetcher,
+) -> Result<Vec<Value>, MusterError> {
+    let manifest = Manifest::load(&ctx.config_dir)?;
+    let layers = crate::engine::layer::global_layers(
+        &ctx.config_dir,
+        &manifest,
+        crate::machine::load_name(&ctx.state_dir).as_deref(),
+    );
+    let merged = crate::engine::layer::merge(&layers);
+    if !merged.agents.skills.as_ref().is_some_and(|s| s.auto_update) {
+        return Ok(Vec::new());
+    }
+    if !SkillsLock::load(&ctx.config_dir)?
+        .skills
+        .iter()
+        .any(|e| !e.is_local())
+    {
+        return Ok(Vec::new());
+    }
+    if let Err(e) = admin(ctx, &manifest) {
+        ctx.diag(Diagnostic::new(
+            Severity::Warning,
+            "skill_auto_update_skipped",
+            format!("skill auto-update skipped: {e}"),
+        ));
+        return Ok(Vec::new());
+    }
+    check_with(ctx, &Params::default(), fetcher)?;
+    let mut params = Params::default();
+    params.set("all", Value::Bool(true));
+    let result = update_inner(ctx, &params, fetcher, true)?;
+    Ok(result["updated"]
+        .as_array()
+        .map(|items| items.iter().map(|u| u["name"].clone()).collect())
+        .unwrap_or_default())
 }
 
 // ---------------------------------------------------------------------------

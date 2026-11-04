@@ -1027,12 +1027,16 @@ const views = {
       ];
     });
     const unmanagedRows = (r.unmanaged || []).map((u) => {
-      const btn = button("Import", () => act(`Import skill ${u.name} into Muster?`, "skills/import", { name: u.name, adapter: u.adapter }));
+      const src = u.source || null;
+      const btn = src
+        ? button("Subscribe", () => act(`Subscribe to ${src.name} for skill ${u.name}? Muster will follow the upstream repository and replace the on-disk copy.`, "skills/import", { name: u.name, adapter: u.adapter }))
+        : button("Import as own", () => act(`Import skill ${u.name} into Muster as an own skill?`, "skills/import", { name: u.name, adapter: u.adapter }));
       if (!u.valid) {
         btn.disabled = true;
       }
       return [
         u.name,
+        src ? src.name : "own",
         (u.adapters || []).join(", "),
         u.valid ? (u.description || "") : el("span", { class: "badge warning" }, u.problem || "missing SKILL.md frontmatter"),
         btn,
@@ -1050,12 +1054,18 @@ const views = {
         await show("skills");
       }, "primary"),
       button("Update all", () => updateAll()),
+      button(r.auto_update ? "Auto-update: on" : "Auto-update: off", () => act(
+        r.auto_update
+          ? "Turn off automatic skill updates during sync?"
+          : "Apply upstream updates of subscribed skills automatically during sync? Locally edited skills are never overwritten.",
+        "skills/auto-update", { state: r.auto_update ? "off" : "on" })),
     ],
       el("p", {}, r.checked_at ? `Last upstream check: ${formatTime(r.checked_at)}.` : "Upstream sources not checked yet on this machine."),
       table(["Name", "Origin", "Version", "Updated", "State", "Status", "", ""], rows, "No skills yet. Add one below."),
       el("h2", {}, "On disk, not managed by Muster"),
-      el("p", {}, "Skills installed directly in an agent's skills folder. Importing copies one into your config repo as an own skill; the original stays untouched."),
-      table(["Name", "Found in", "Description", ""], unmanagedRows, "No unmanaged skills found on disk."),
+      el("p", {}, "Skills installed directly in an agent's skills folder. Skills installed from a known repository are subscribed, so they keep receiving updates; the rest are copied into your config repo as own skills. The original files stay untouched."),
+      (r.unmanaged || []).some((u) => u.valid) ? el("p", {}, button("Import all", () => importAll())) : null,
+      table(["Name", "Source", "Found in", "Description", ""], unmanagedRows, "No unmanaged skills found on disk."),
       el("h2", {}, "Usage"),
       (() => {
         const u = usage.result || {};
@@ -1267,6 +1277,22 @@ async function confirmUpdate(body) {
 async function updateSkill(skill) {
   if (skill.modified && !(await askConfirm(`${skill.name} was edited locally. Overwrite the local changes?`))) return;
   return confirmUpdate(skill.modified ? { name: skill.name, force: true } : { name: skill.name });
+}
+
+// Preview with a dry run, then import every importable unmanaged skill at once.
+async function importAll() {
+  const preview = await api("skills/import", { all: true, dry_run: true });
+  if (!preview.ok) {
+    toast(failMessage(preview));
+    return;
+  }
+  const items = (preview.result && preview.result.imported) || [];
+  if (!items.length) {
+    toast("Nothing to import.", "info");
+    return;
+  }
+  const lines = items.map((i) => `${i.name}: ${i.source ? "subscribe to " + i.source.name : "own skill"}`);
+  await act("Import these skills?\n\n" + lines.join("\n"), "skills/import", { all: true });
 }
 
 function updateAll() {

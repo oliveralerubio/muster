@@ -378,3 +378,102 @@ fn preexisting_skill_not_truncated_on_unmanage() {
     assert_eq!(md, original_md, "SKILL.md must retain original content");
     assert_eq!(sh, original_sh, "run.sh must retain original content");
 }
+
+#[test]
+fn import_requires_a_name_or_all_but_not_both() {
+    let env = MusterEnv::new();
+    seed_manifest(&env.config_dir(), &["claude"]);
+    let neither = env.run(&["--yes", "skill", "import"]).output().unwrap();
+    assert!(!neither.status.success());
+    assert!(String::from_utf8_lossy(&neither.stderr).contains("--all"));
+    let both = env
+        .run(&["--yes", "skill", "import", "x", "--all"])
+        .output()
+        .unwrap();
+    assert!(!both.status.success());
+    assert!(String::from_utf8_lossy(&both.stderr).contains("not both"));
+}
+
+#[test]
+fn import_all_imports_every_valid_skill_and_skips_the_rest() {
+    let env = MusterEnv::new();
+    seed_manifest(&env.config_dir(), &["claude"]);
+    let claude_skills = user_skills_dir(&env, "claude");
+    for name in ["one", "two"] {
+        let dir = claude_skills.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: Skill {name}\n---\nBody.\n"),
+        )
+        .unwrap();
+    }
+    let bad = claude_skills.join("bad");
+    std::fs::create_dir_all(&bad).unwrap();
+    std::fs::write(bad.join("SKILL.md"), "no frontmatter\n").unwrap();
+
+    let (_, preview) = env.run_json(&["--format", "json", "--dry-run", "skill", "import", "--all"]);
+    assert!(preview.ok());
+    assert_eq!(preview.result()["imported"].as_array().unwrap().len(), 2);
+    assert!(!env.config_dir().join("skills/one").exists());
+
+    let (_, res) = env.run_json(&["--format", "json", "--yes", "skill", "import", "--all"]);
+    assert!(res.ok(), "{:?}", res.diagnostics());
+    let imported = res.result()["imported"].as_array().unwrap();
+    assert_eq!(imported.len(), 2);
+    assert!(imported.iter().all(|i| i["origin"] == "local"));
+    assert_eq!(res.result()["skipped"][0]["name"], "bad");
+    assert!(env.config_dir().join("skills/one/SKILL.md").exists());
+    assert!(env.config_dir().join("skills/two/SKILL.md").exists());
+    assert!(!env.config_dir().join("skills/bad").exists());
+}
+
+#[test]
+fn unreadable_agents_skill_lock_is_a_warning_and_means_no_provenance() {
+    let env = MusterEnv::new();
+    seed_manifest(&env.config_dir(), &["claude"]);
+    let dir = user_skills_dir(&env, "claude").join("custom");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("SKILL.md"),
+        "---\nname: custom\ndescription: Custom\n---\nBody.\n",
+    )
+    .unwrap();
+    let lock = env.path().join(".agents/.skill-lock.json");
+    std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    std::fs::write(&lock, "{ not json").unwrap();
+
+    let (_, res) = env.run_json(&["--format", "json", "--yes", "skill", "import", "custom"]);
+    assert!(res.ok(), "{:?}", res.diagnostics());
+    assert_eq!(res.result()["origin"], "local");
+    assert!(res
+        .diagnostics()
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|d| d["code"] == "skill_lock_unreadable"));
+}
+
+#[test]
+fn skill_auto_update_command_toggles_the_manifest_and_validates_input() {
+    let env = MusterEnv::new();
+    seed_manifest(&env.config_dir(), &["claude"]);
+    let manifest = || std::fs::read_to_string(env.config_dir().join("muster.toml")).unwrap();
+
+    env.run(&["--yes", "skill", "auto-update", "on"])
+        .assert()
+        .success();
+    assert!(manifest().contains("auto_update = true"), "{}", manifest());
+    let (_, list) = env.run_json(&["--format", "json", "skill", "list"]);
+    assert_eq!(list.result()["auto_update"], true);
+
+    // Enabling needs approval; there is no terminal here.
+    env.run(&["skill", "auto-update", "--enabled", "false"])
+        .assert()
+        .success();
+    assert!(!manifest().contains("auto_update"));
+    env.run(&["skill", "auto-update", "on"]).assert().failure();
+    env.run(&["--yes", "skill", "auto-update", "maybe"])
+        .assert()
+        .failure();
+}

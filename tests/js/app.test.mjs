@@ -550,7 +550,7 @@ async function testEffectiveViewShowsStatesAndEscapesNames() {
   await sandbox.show("effective");
   const nodes = [];
   const walk = (node) => { if (node instanceof FakeElement) { nodes.push(node); node.children.forEach(walk); } };
-  walk(view);
+  walk(view); walk(actions);
   const text = nodes.flatMap((node) => [node.textContent, ...node.children.filter((c) => typeof c === "string")]).join(" ");
   // Both instruction sources render with their supplying layer.
   for (const expected of ["AGENTS.md", "team", "demo/AGENTS.md", "project",
@@ -665,6 +665,7 @@ async function testSkillsViewRendersUnmanagedSectionAndEscapesNames() {
     diagnostics: [],
     result: call.path === "skills" ? {
       skills: [],
+      auto_update: false,
       unmanaged: [
         {
           name: "<script>alert('xss')</script>",
@@ -672,6 +673,15 @@ async function testSkillsViewRendersUnmanagedSectionAndEscapesNames() {
           adapter: "claude",
           valid: true,
           description: "A dangerous skill",
+          source: null,
+        },
+        {
+          name: "ask-matt",
+          adapters: ["codex"],
+          adapter: "codex",
+          valid: true,
+          description: "From upstream",
+          source: { name: "mattpocock/skills", url: "https://github.com/mattpocock/skills.git", path: "skills/engineering" },
         },
         {
           name: "broken",
@@ -686,7 +696,7 @@ async function testSkillsViewRendersUnmanagedSectionAndEscapesNames() {
   await sandbox.show("skills");
   const nodes = [];
   const walk = (node) => { if (node instanceof FakeElement) { nodes.push(node); node.children.forEach(walk); } };
-  walk(view);
+  walk(view); walk(actions);
   const text = nodes.flatMap((node) => [node.textContent, ...node.children.filter((c) => typeof c === "string")]).join(" ");
   assert.ok(text.includes("On disk, not managed by Muster"), "renders unmanaged section");
   assert.ok(text.includes("<script>alert('xss')</script>"), "escapes name safely");
@@ -695,10 +705,16 @@ async function testSkillsViewRendersUnmanagedSectionAndEscapesNames() {
   assert.ok(text.includes("broken"), "lists invalid skill name");
   assert.ok(text.includes("missing SKILL.md frontmatter"), "shows invalid problem");
   assert.ok(!nodes.some((node) => node.tagName === "SCRIPT"), "no script tags injected");
-  const buttons = nodes.filter((node) => node.tagName === "BUTTON" && node.children.includes("Import"));
-  assert.equal(buttons.length, 2, "renders import buttons");
+  assert.ok(text.includes("mattpocock/skills"), "shows the upstream source");
+  assert.ok(text.includes("own"), "shows own for skills without a source");
+  const buttons = nodes.filter((node) => node.tagName === "BUTTON" && node.children.includes("Import as own"));
+  assert.equal(buttons.length, 2, "renders import-as-own buttons");
   assert.equal(buttons[0].disabled, false, "valid skill has enabled button");
   assert.equal(buttons[1].disabled, true, "invalid skill has disabled button");
+  const subscribe = nodes.filter((node) => node.tagName === "BUTTON" && node.children.includes("Subscribe"));
+  assert.ok(subscribe.some((b) => !b.disabled), "a skill with a source gets a Subscribe button");
+  assert.ok(nodes.some((node) => node.tagName === "BUTTON" && node.children.includes("Import all")), "renders Import all");
+  assert.ok(nodes.some((node) => node.tagName === "BUTTON" && node.children.includes("Auto-update: off")), "renders the auto-update toggle");
   setResponder();
 }
 

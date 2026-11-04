@@ -1523,7 +1523,7 @@ fn web_skill_file_edit_and_pin_enforce_confirmation_and_confinement() {
     assert_eq!(status, 200);
     assert_eq!(written["ok"], true);
 
-    // Skills list now shows modified: true
+    // Editing an own skill re-pins it, so it is not flagged modified
     let (status, _, body) = ui.request("GET", "/api/skills", Some(&cookie), None);
     assert_eq!(status, 200);
     let json: Value = serde_json::from_str(&body).unwrap();
@@ -1533,7 +1533,7 @@ fn web_skill_file_edit_and_pin_enforce_confirmation_and_confinement() {
         .iter()
         .find(|s| s["name"] == "demo")
         .unwrap();
-    assert_eq!(skill["modified"], true);
+    assert_eq!(skill["modified"], false);
 
     // Pinning re-hashes and clears modified state
     let (status, pinned) = ui_post(
@@ -1660,4 +1660,70 @@ Hello.
     );
 
     assert!(env.config_dir().join("skills/local-tool/SKILL.md").exists());
+}
+
+#[test]
+fn web_skill_import_all_and_auto_update_routes_match_cli() {
+    let env = support::MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    let dir = env.home.path().join(".claude/skills/local-tool");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("SKILL.md"),
+        "---\nname: local-tool\ndescription: Test tool\n---\nHello.\n",
+    )
+    .unwrap();
+
+    let mut ui = Ui::start(&env);
+    let cookie = ui_session_cookie(&mut ui);
+
+    let (status, reply) = ui_post(
+        &mut ui,
+        &cookie,
+        "/api/skills/import",
+        &serde_json::json!({"all": true, "dry_run": true}),
+    );
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["result"]["imported"][0]["name"], "local-tool");
+    assert!(!env.config_dir().join("skills/local-tool").exists());
+
+    let (status, reply) = ui_post(
+        &mut ui,
+        &cookie,
+        "/api/skills/import",
+        &serde_json::json!({"all": true, "confirm": true}),
+    );
+    assert_eq!(status, 200, "{reply}");
+    assert!(
+        reply["cli"]
+            .as_str()
+            .is_some_and(|cli| cli.contains("muster skill import --all")),
+        "{reply}"
+    );
+    assert!(env.config_dir().join("skills/local-tool/SKILL.md").exists());
+
+    let (status, reply) = ui_post(
+        &mut ui,
+        &cookie,
+        "/api/skills/auto-update",
+        &serde_json::json!({"state": "on", "confirm": true}),
+    );
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(reply["result"]["auto_update"], true);
+    assert!(
+        reply["cli"]
+            .as_str()
+            .is_some_and(|cli| cli.contains("muster skill auto-update on")),
+        "{reply}"
+    );
+    let manifest = std::fs::read_to_string(env.config_dir().join("muster.toml")).unwrap();
+    assert!(manifest.contains("auto_update = true"), "{manifest}");
+
+    let (status, reply) = ui_post(
+        &mut ui,
+        &cookie,
+        "/api/skills/auto-update",
+        &serde_json::json!({"state": "off", "path": "/etc", "confirm": true}),
+    );
+    assert_eq!(status, 400, "{reply}");
 }
