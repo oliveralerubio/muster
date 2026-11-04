@@ -18,26 +18,42 @@
     <div id="side-body" class="side-body">
       <nav aria-label="Views">
         <ul id="nav" role="tablist" aria-orientation="vertical">
+          <li class="nav-group" role="presentation" aria-hidden="true">Workspace</li>
           <li role="presentation"><button type="button" role="tab" id="tab-dashboard" aria-controls="view" data-view="dashboard" aria-selected="true">Dashboard</button></li>
           <li role="presentation"><button type="button" role="tab" id="tab-machines" aria-controls="view" data-view="machines" aria-selected="false" tabindex="-1">Machines</button></li>
           <li role="presentation"><button type="button" role="tab" id="tab-team" aria-controls="view" data-view="team" aria-selected="false" tabindex="-1">Members &amp; groups</button></li>
           <li role="presentation"><button type="button" role="tab" id="tab-providers" aria-controls="view" data-view="providers" aria-selected="false" tabindex="-1">AI providers</button></li>
           <li role="presentation"><button type="button" role="tab" id="tab-secrets" aria-controls="view" data-view="secrets" aria-selected="false" tabindex="-1">Secrets &amp; approvals</button></li>
           <li role="presentation"><button type="button" role="tab" id="tab-skills" aria-controls="view" data-view="skills" aria-selected="false" tabindex="-1">Skills <span id="skills-dot" class="dot" role="img" aria-label="Needs attention" hidden title="Needs attention"></span></button></li>
+          <li class="nav-group" role="presentation" aria-hidden="true">System</li>
           <li role="presentation"><button type="button" role="tab" id="tab-effective" aria-controls="view" data-view="effective" aria-selected="false" tabindex="-1">Effective</button></li>
           <li role="presentation"><button type="button" role="tab" id="tab-profiles" aria-controls="view" data-view="profiles" aria-selected="false" tabindex="-1">Profiles &amp; diff</button></li>
           <li role="presentation"><button type="button" role="tab" id="tab-history" aria-controls="view" data-view="history" aria-selected="false" tabindex="-1">History</button></li>
           <li role="presentation"><button type="button" role="tab" id="tab-doctor" aria-controls="view" data-view="doctor" aria-selected="false" tabindex="-1">Doctor</button></li>
         </ul>
       </nav>
-      <button type="button" id="theme" class="btn" aria-label="Toggle light or dark theme">Theme</button>
+      <div class="side-foot">
+        <div id="theme" class="theme-switch" role="group" aria-label="Color theme">
+          <button type="button" data-theme-choice="light" aria-pressed="false" title="Light theme"><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="2.8"/><path d="M8 1.5v1.6M8 12.9v1.6M1.5 8h1.6M12.9 8h1.6M3.4 3.4l1.1 1.1M11.5 11.5l1.1 1.1M3.4 12.6l1.1-1.1M11.5 4.5l1.1-1.1"/></svg><span>Light</span></button>
+          <button type="button" data-theme-choice="system" aria-pressed="true" title="Follow system theme"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="1.8" y="2.5" width="12.4" height="8.4" rx="1.4"/><path d="M5.5 13.6h5M8 10.9v2.7"/></svg><span>Auto</span></button>
+          <button type="button" data-theme-choice="dark" aria-pressed="false" title="Dark theme"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13.2 9.6A5.6 5.6 0 0 1 6.4 2.8a5.6 5.6 0 1 0 6.8 6.8z"/></svg><span>Dark</span></button>
+        </div>
+      </div>
     </div>
   </header>
 
   <div class="page">
     <main id="main" tabindex="-1">
-      <h1 id="title">Dashboard</h1>
-      <div id="actions" class="actions"></div>
+      <div class="page-header">
+        <div class="page-header-text">
+          <div class="page-title-row">
+            <h1 id="title">Dashboard</h1>
+            <span id="page-count" class="count-chip" hidden></span>
+          </div>
+          <p id="page-desc" class="page-desc">Overview of fleet status, periodic sync, and health.</p>
+        </div>
+        <div id="actions" class="actions"></div>
+      </div>
       <div id="view" role="tabpanel" aria-labelledby="tab-dashboard" aria-live="polite"></div>
     </main>
 

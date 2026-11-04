@@ -98,12 +98,12 @@ function diagnostics(data) {
   return list.length ? diagnosticsTable(list) : null;
 }
 
-function table(headers, rows, empty) {
-  if (!rows.length) return el("p", { class: "empty" }, empty || "Nothing to show.");
+function table(headers, rows, empty, cls) {
+  if (!rows.length) return empty instanceof Node ? empty : el("p", { class: "empty" }, empty || "Nothing to show.");
   const isActions = (cell) => cell instanceof Node
     && (cell.tagName === "BUTTON" || (cell.getAttribute("class") || "").includes("actions"));
   const label = headers.filter(Boolean).join(", ");
-  return el("div", { class: "table-wrap", role: "region", tabindex: "0", "aria-label": label },
+  return el("div", { class: "table-wrap" + (cls ? " " + cls : ""), role: "region", tabindex: "0", "aria-label": label },
     el("table", {},
       el("thead", {}, el("tr", {}, headers.map((h) =>
         el("th", { scope: "col" }, h || el("span", { class: "sr-only" }, "Actions"))))),
@@ -139,16 +139,104 @@ async function act(question, path, body) {
   await show(current);
 }
 
+// One-line description under each page title.
+const descriptions = {
+  "Dashboard": "Fleet health, periodic sync and anything that needs a decision.",
+  "Machines": "Devices enrolled in this fleet and requests waiting for approval.",
+  "Members & groups": "People who can read the vault, and the groups that scope access.",
+  "AI providers": "Endpoints and keys that agents on this fleet receive.",
+  "Secrets": "Vault entries by reference. Values stay encrypted until you reveal them.",
+  "Skills": "Skills installed for your agents, their sources and update status.",
+  "Effective": "The configuration each agent actually receives on this machine.",
+  "Profiles & diff preview": "Agent profiles and MCP servers declared in muster.toml.",
+  "History & generations": "Applied generations you can roll back to, and the audit trail.",
+  "Doctor": "Health checks for this machine and the fleet.",
+};
+
+// The small count chip next to the title ("1 machine"); empty hides it.
+function setCount(text) {
+  const chip = $("#page-count");
+  if (!chip) return;
+  chip.textContent = text || "";
+  chip.hidden = !text;
+}
+
 function render(title, actions, ...blocks) {
   $("#title").textContent = title;
+  const desc = $("#page-desc");
+  if (desc) desc.textContent = descriptions[title] || "";
+  setCount("");
   actionsEl.replaceChildren(...actions.flat(Infinity).filter(Boolean));
   viewEl.replaceChildren(...blocks.flat(Infinity).filter(Boolean));
+}
+
+// Last sync as clean tabular text (the coloured pill is reserved for the Status column).
+function lastSyncCell(value) {
+  if (!value) return el("span", { class: "muted data" }, "Never");
+  const d = new Date(value);
+  const text = Number.isNaN(d.getTime()) ? String(value)
+    : d.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+  return el("time", { class: "data sync-time", datetime: String(value), title: String(value) }, text);
+}
+
+// Raw drift reasons from the backend, shown as state (not action) labels.
+// Unknown future reasons fall back to a humanized form of the code.
+const DRIFT_REASON_LABELS = {
+  machines_drifted: "Machines out of sync",
+  profile_not_applied: "Profile not applied",
+  profile_outdated: "Profile outdated",
+  sync_pending: "Sync pending",
+  approval_pending: "Awaiting approval",
+  skills_missing: "Skills missing",
+  subagents_missing: "Subagents missing",
+  instructions_missing: "Instructions missing",
+  identity_missing: "Identity missing",
+  hash_mismatch: "Content mismatch",
+  git_missing: "Git not installed",
+};
+function driftReasonLabel(reason) {
+  if (DRIFT_REASON_LABELS[reason]) return DRIFT_REASON_LABELS[reason];
+  const text = String(reason || "").replace(/_/g, " ");
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
+// Friendly empty state: a title and a helper line (strings or nodes).
+function emptyCard(title, ...help) {
+  return el("div", { class: "empty-card" }, el("strong", {}, title), el("p", {}, ...help));
+}
+
+// Machine identity shared by Dashboard and Machines: name over platform, plus an optional status pill.
+const MACHINE_STATUS_KIND = { current: "live", active: "live", enrolled: "idle", pending: "wait", drifted: "wait", revoked: "alert" };
+function machineState(status) {
+  return el("span", { class: "state state-" + (MACHINE_STATUS_KIND[status] || "idle") },
+    el("span", { class: "state-dot", "aria-hidden": "true" }), sentenceCase(status));
+}
+
+// Display-only: capitalise the first letter of a status label; data values stay as sent.
+function sentenceCase(text) {
+  const s = String(text);
+  return s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
+}
+
+// Section header shared by Dashboard and Machines: h2, optional count pill, same rhythm everywhere.
+function sectionHead(title, id, badge) {
+  return el("div", { class: "section-head" }, el("h2", id ? { id } : {}, title), badge || null);
+}
+
+function machineIdentity(m, current) {
+  return el("div", { class: "name-cell" },
+    el("div", { class: "name-line" },
+      el("span", { class: "board-name" }, m.name),
+      current ? el("span", { class: "badge info" }, "this machine") : null),
+    el("code", { class: "data muted" }, m.platform || "unknown platform"));
 }
 
 const views = {
   async dashboard(token) {
     const [data, schedule] = await Promise.all([api("status"), api("schedule")]);
     if (token !== undefined && token !== navToken) return;
+    // Both fetches race to set the footer hint; the dashboard's own command wins.
+    showCli("muster status");
     const r = data.result || {};
     const machines = r.machines || [];
     const pending = (r.pending && r.pending.members) || [];
@@ -160,14 +248,14 @@ const views = {
     const s = schedule.result || {};
     const defaultInterval = s.interval_minutes || 60;
     const interval = el("input", { type: "number", min: "1", value: String(defaultInterval), "aria-label": "Minutes between syncs" });
-    const state = (kind, label) => el("span", { class: "state state-" + kind }, label);
+    const state = (kind, label) => el("span", { class: "state state-" + kind },
+      el("span", { class: "state-dot", "aria-hidden": "true" }), sentenceCase(label));
     const resultKind = (text) => (/^(ok|success|synced|applied|current)/i.test(text) ? "live"
       : /fail|error|drift|denied|revoked/i.test(text) ? "alert"
         : /pending|waiting/i.test(text) ? "wait" : "idle");
-    const statusKind = { current: "live", enrolled: "idle", pending: "wait", drifted: "alert", revoked: "alert" };
-    const plate = (label, figure, sub, signal) => el("div", { class: "plate" + (signal ? " plate-signal" : "") },
+    const plate = (label, figure, sub, attention, fallback) => el("div", { class: "plate" + (attention ? " plate-attention" : "") },
       el("dt", { class: "plate-label" }, label),
-      el("dd", { class: "plate-figure num" }, figure),
+      el("dd", { class: "plate-figure num" + (fallback ? " is-fallback" : "") }, figure),
       el("dd", { class: "plate-sub" }, sub));
 
     // Last sync: the local time of r.sync.ts as the figure, the date and result as its state.
@@ -187,66 +275,74 @@ const views = {
       : "None enrolled";
     const attentionSub = attentionCount
       ? [pending.length ? `${pending.length} pending` : null,
-        driftCount ? `${driftCount} drifted` : null,
+        driftCount ? "Drift detected" : null,
         flagged ? `${flagged} ${flagged === 1 ? "diagnostic" : "diagnostics"}` : null].filter(Boolean).join(", ")
-      : "Nothing to review";
+      : "Fleet converged";
 
     const fleet = machines.length
-      ? table(["Machine", "Platform", "Version", "Last sync", "Status"],
+      ? table(["Machine", "Version", "Status", "Last sync"],
         machines.map((m) => [
-          el("span", { class: "board-name" }, m.name), m.platform || "", m.version || "",
-          m.last_sync || "never",
-          state(statusKind[m.status] || "idle", m.status)]))
+          machineIdentity(m, m.is_current),
+          el("code", { class: "data" }, m.version || "—"),
+          machineState(m.status),
+          lastSyncCell(m.last_sync)]))
       : el("div", { class: "empty-state" },
         el("p", {}, "No machines in fleet. Run ", el("code", {}, "muster machine add"), " to enroll one, or open the Machines tab."),
         button("Open Machines", () => show("machines")));
-    if (machines.length) fleet.setAttribute("class", "table-wrap board");
+    if (machines.length) fleet.setAttribute("class", "table-wrap board fleet-table");
 
-    const periodic = s.enabled
+    const periodicText = s.enabled
       ? (s.interval_minutes ? `Every ${s.interval_minutes} min` : "Enabled") + (s.backend ? ` via ${s.backend}` : "")
       : "Off";
 
     const driftRows = [
-      ...(drift.members || []).map((d) => ["member", el("code", {}, d.name), d.reason]),
-      ...(drift.machines || []).map((d) => ["machine", el("code", {}, d.name), d.reason]),
+      ...(drift.members || []).map((d) => [sentenceCase("member"), el("code", {}, d.name), state("wait", driftReasonLabel(d.reason))]),
+      ...(drift.machines || []).map((d) => [sentenceCase("machine"), el("code", {}, d.name), state("wait", driftReasonLabel(d.reason))]),
     ];
     const attentionBlocks = [
       pending.length
         ? [el("h3", {}, `Pending approvals (${pending.length})`),
-          table(["Name"], pending.map((p) => [el("code", {}, typeof p === "string" ? p : p.name)]))]
+          table(["Name"], pending.map((p) => [el("code", {}, typeof p === "string" ? p : p.name)]), null, "narrow")]
         : null,
       driftCount
-        ? [el("h3", {}, `Drift (${driftCount})`), table(["Kind", "Name", "Reason"], driftRows)]
+        ? table(["Kind", "Name", "Reason"], driftRows, null, "narrow drift-table")
         : null,
       diags.length
         ? [el("h3", {}, `Diagnostics (${diags.length})`), diagnosticsTable(diags)]
         : null,
     ].filter(Boolean);
 
-    render("Dashboard", [],
+    render("Dashboard", [button("Sync now", () => act("Pull, plan and apply now?", "sync"), "primary")],
       el("dl", { class: "plates", "aria-label": "Fleet status" },
         plate("Machines", String(machines.length), fleetSub),
         plate("Needs attention", String(attentionCount), attentionSub, attentionCount > 0),
-        plate("Last sync", syncFigure, syncSub)),
-      el("h2", {}, `Fleet (${machines.length})`),
+        plate("Last sync", syncFigure, syncSub, false, !r.sync)),
+      sectionHead("Fleet"),
       fleet,
-      el("h2", { id: "ops-title" }, "Sync operations"),
+      sectionHead("Sync operations", "ops-title"),
       el("section", { class: "ops", "aria-labelledby": "ops-title" },
-        el("div", { class: "ops-primary" },
-          button("Sync now", () => act("Pull, plan and apply now?", "sync"), "primary")),
         el("div", { class: "ops-periodic" },
-          el("div", { class: "ops-state" },
-            el("span", { class: "ops-label" }, "Periodic sync"),
-            el("span", { class: "ops-value" }, periodic)),
-          el("label", { class: "ops-interval" }, interval, el("span", { class: "muted" }, "min")),
+         el("div", { class: "ops-info" },
+          el("div", { class: "ops-heading" },
+            el("span", { class: "ops-title" }, "Periodic sync"),
+            state(s.enabled ? "live" : "idle", periodicText)),
+          el("span", { class: "ops-desc" }, "Run periodic background sync on this machine")),
+         el("div", { class: "ops-form" },
+          el("label", { class: "ops-interval" },
+            interval, el("span", { class: "muted" }, "min")),
           el("div", { class: "ops-controls" },
-            button(s.enabled ? "Update" : "Enable", () => act(`Enable periodic sync every ${interval.value} minute(s)?`, "schedule/enable", { interval: Number(interval.value) || undefined })),
-            s.enabled ? button("Disable", () => act("Disable periodic sync?", "schedule/disable")) : ""))),
+            button(s.enabled ? "Update" : "Enable", () => {
+              return act(`Enable periodic sync every ${interval.value} minute(s)?`, "schedule/enable", { interval: Number(interval.value) || undefined });
+            }),
+            s.enabled ? button("Disable", () => act("Disable periodic sync?", "schedule/disable")) : "")))),
       el("section", { class: "attention", "aria-labelledby": "attention-title" },
-        el("h2", { id: "attention-title" }, "Needs attention"),
+        sectionHead("Needs attention", "attention-title",
+          attentionCount ? el("span", { class: "badge warning count", "aria-label": `${attentionCount} items` }, String(attentionCount)) : null),
+        el("p", { class: "section-desc" }, attentionBlocks.length ? "Drift, pending approvals and diagnostics that need a decision." : "Pending approvals, drift and diagnostics appear here."),
         attentionBlocks.length
           ? attentionBlocks
           : el("p", { class: "quiet", role: "status" }, "Nothing needs attention: no pending approvals, no drift and no diagnostics.")));
+    setCount(`${machines.length} ${machines.length === 1 ? "machine" : "machines"}`);
   },
 
   async providers(token) {
@@ -297,22 +393,49 @@ const views = {
       return `${approvals.length}/${p.approvals_required}`
         + (approvals.length ? ` (${approvals.join(", ")})` : "");
     };
-    render("Machines", [],
-      el("h2", {}, "Enrolled"),
-      table(["Name", "Platform", "Role", "Profile", "Agents", "Last sync", ""],
-        machines.map((m) => [m.name, m.platform || "", m.role || "", m.profile || "",
-          (m.agents || []).join(", "), m.last_sync || "never",
-          m.is_current ? "this machine" : button("Remove", () => act(`Remove machine ${m.name}?`, "machine/rm", { name: m.name }))]),
-        "No machines enrolled yet."),
-      el("h2", {}, "Pending enrollment requests"),
-      table(["Name", "Platform", "Version", "Agents", "Approvals", ""],
-        pending.map((p) => [p.name, p.platform || "", p.version || "",
-          (p.agents || []).join(", "), quorum(p),
+    const tags = (list) => ((list || []).length
+      ? el("div", { class: "tags" }, list.map((a) => el("span", { class: "tag" }, a)))
+      : el("span", { class: "muted" }, "—"));
+    const hasRole = machines.some((m) => m.role);
+    const hasProfile = machines.some((m) => m.profile);
+    const hasActions = machines.some((m) => !m.is_current);
+    const nameCell = (m, current) => machineIdentity(m, current);
+    const statusCell = (m) => (m.status ? machineState(m.status) : el("span", { class: "muted" }, "—"));
+    const enrollCommand = "muster machine add <host>";
+    const enroll = button("Enroll machine", async () => {
+      let copied = false;
+      try {
+        await navigator.clipboard.writeText(enrollCommand);
+        copied = true;
+      } catch (err) { /* clipboard unavailable: the command is still shown in the toast */ }
+      toast((copied ? "Copied: " : "Run on the new machine: ") + enrollCommand, "info");
+    }, "primary");
+    enroll.title = "Copies " + enrollCommand;
+    render("Machines", [enroll],
+      sectionHead("Enrolled"),
+      table(["Machine", "Version", hasRole ? "Role" : null, hasProfile ? "Profile" : null, "Agents", "Status", "Last sync", hasActions ? "Actions" : null].filter((h) => h !== null),
+        machines.map((m) => [nameCell(m, m.is_current),
+          el("code", { class: "data" }, m.version || "—"),
+          hasRole ? (m.role || el("span", { class: "muted" }, "—")) : null,
+          hasProfile ? (m.profile || el("span", { class: "muted" }, "—")) : null,
+          tags(m.agents),
+          statusCell(m),
+          lastSyncCell(m.last_sync),
+          hasActions ? (m.is_current ? "" : button("Remove", () => act(`Remove machine ${m.name}?`, "machine/rm", { name: m.name }), "danger")) : null].filter((c) => c !== null)),
+        emptyCard("No machines enrolled yet", "Run ", el("code", {}, "muster init"), " on this machine, then ", el("code", {}, "muster machine add"), " to enroll more."),
+        "machines-table" + (!hasRole && !hasProfile ? " machines-basic" : "") + (hasActions ? " actions-end" : "")),
+      sectionHead("Pending enrollment requests"),
+      el("p", { class: "section-desc" }, "Machines waiting for approval before they can join."),
+      table(["Machine", "Version", "Agents", "Approvals", ""],
+        pending.map((p) => [nameCell(p, false), el("code", { class: "data" }, p.version || "—"),
+          tags(p.agents), quorum(p),
           el("span", { class: "actions" },
             button("Approve", () => act(`Approve enrollment of machine ${p.name}?`, "approve", { name: p.name })),
             button("Reject", () => act(`Reject the enrollment request of machine ${p.name}? Its recorded approvals are discarded.`, "reject", { name: p.name }), "danger"))]),
-        "No pending enrollment requests."),
+        emptyCard("No pending requests", "New machines run ", el("code", {}, "muster init"), " to request enrollment.")),
       diagnostics(data));
+    setCount(`${machines.length} ${machines.length === 1 ? "machine" : "machines"}`
+      + (pending.length ? `, ${pending.length} pending` : ""));
   },
 
   async team(token) {
@@ -711,16 +834,24 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
-// Theme: system → light → dark, remembered locally.
+// Theme: Light / Auto (system) / Dark segmented control, remembered locally.
+const themeEl = $("#theme");
 function applyTheme(theme) {
   if (theme === "light" || theme === "dark") document.documentElement.dataset.theme = theme;
   else delete document.documentElement.dataset.theme;
-  $("#theme").textContent = "Theme: " + (theme || "system");
+  if (themeEl && typeof themeEl.querySelectorAll === "function") {
+    for (const b of themeEl.querySelectorAll("button")) {
+      b.setAttribute("aria-pressed", String((b.dataset.themeChoice || "system") === (theme || "system")));
+    }
+  }
 }
 applyTheme(localStorage.getItem("muster-theme"));
-$("#theme").addEventListener("click", () => {
-  const order = [null, "light", "dark"];
-  const next = order[(order.indexOf(localStorage.getItem("muster-theme")) + 1) % order.length];
+themeEl.addEventListener("click", (event) => {
+  const target = event.target && typeof event.target.closest === "function"
+    ? event.target.closest("[data-theme-choice]") : null;
+  if (!target) return;
+  const choice = target.dataset.themeChoice;
+  const next = choice === "light" || choice === "dark" ? choice : null;
   if (next) localStorage.setItem("muster-theme", next);
   else localStorage.removeItem("muster-theme");
   applyTheme(next);
@@ -903,7 +1034,7 @@ $("#profile-form").addEventListener("submit", async (event) => {
 
 // MCP server form: list fields hold JSON arrays, what the API itself accepts
 // as KEY=VALUE lists. JSON keeps every value verbatim: " padded ", "" and
-// commas survive the edit → preview → save round trip unchanged. Values that
+// commas survive the edit -> preview -> save round trip unchanged. Values that
 // look like secret material must be references (e.g. native://group/name);
 // they are stored verbatim and resolved only at apply time.
 function jsonList(text, label) {
