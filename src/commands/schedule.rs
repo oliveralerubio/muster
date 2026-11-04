@@ -258,12 +258,42 @@ fn status(_ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
             .map(|s| s.contains("--pull"))
             .unwrap_or(false)
     });
+    let interval_minutes = installed.iter().find_map(|(b, path)| {
+        let text = std::fs::read_to_string(path).ok()?;
+        installed_interval(*b, path, &text)
+    });
     Ok(json!({
         "enabled": !installed.is_empty(),
         "backend": backend,
         "files": files,
         "pull": pull,
+        "interval_minutes": interval_minutes,
     }))
+}
+
+/// The interval an installed unit file runs at, in minutes.
+fn installed_interval(backend: Backend, path: &Path, text: &str) -> Option<i64> {
+    match backend {
+        Backend::Systemd => {
+            if path.file_name()? != TIMER {
+                return None;
+            }
+            if text.contains("OnCalendar=hourly") {
+                return Some(DEFAULT_INTERVAL_MINUTES);
+            }
+            let value = text
+                .lines()
+                .find_map(|l| l.strip_prefix("OnUnitActiveSec="))?;
+            value.trim().strip_suffix("min")?.parse().ok()
+        }
+        Backend::Launchd => {
+            let (_, rest) = text.split_once("<key>StartInterval</key>")?;
+            let rest = rest.split_once("<integer>")?.1;
+            let seconds: i64 = rest.split_once("</integer>")?.0.trim().parse().ok()?;
+            Some(seconds / 60)
+        }
+        Backend::Manual => None,
+    }
 }
 
 /// Stop and delete every Muster scheduler unit (all backends). Honours

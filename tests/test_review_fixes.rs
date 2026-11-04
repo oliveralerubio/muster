@@ -463,6 +463,7 @@ fn schedule_enable_writes_a_systemd_user_timer_and_disable_removes_it() {
     let status = ok(&env, &["schedule", "status"]);
     assert_eq!(status["enabled"], true, "{status}");
     assert_eq!(status["backend"], "systemd", "{status}");
+    assert_eq!(status["interval_minutes"], 30, "{status}");
 
     let disabled = ok(&env, &["schedule", "disable", "--yes"]);
     assert_eq!(disabled["enabled"], false, "{disabled}");
@@ -502,6 +503,8 @@ fn schedule_enable_writes_a_launchd_agent_plist() {
     assert!(plist.contains("<key>StartInterval</key>"), "{plist}");
     assert!(plist.contains("<integer>900</integer>"), "{plist}");
     assert!(plist.contains("<string>sync</string>"), "{plist}");
+    let status = ok(&env, &["schedule", "status"]);
+    assert_eq!(status["interval_minutes"], 15, "{status}");
 }
 
 #[test]

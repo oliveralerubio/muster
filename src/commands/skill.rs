@@ -243,9 +243,15 @@ fn file_get(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         .ok_or_else(|| MusterError::Usage("path is required".into()))?;
     let (dir, _) = skills_dir(ctx, &manifest)?;
     let target = contained_skill_file(&dir, &name, rel)?;
-    let metadata = std::fs::symlink_metadata(&target).map_err(|e| io_error(&target, e))?;
+    let metadata = std::fs::symlink_metadata(&target).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            MusterError::Usage(format!("{rel:?} does not exist in skill '{name}'"))
+        } else {
+            io_error(&target, e)
+        }
+    })?;
     if metadata.file_type().is_symlink() {
-        return Err(MusterError::Security(
+        return Err(MusterError::Usage(
             "symlinks inside skills are forbidden".into(),
         ));
     }
@@ -276,10 +282,10 @@ fn file_set(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     ctx.confirm(&format!("Save {rel} in skill '{name}'?"))?;
     let (dir, _) = skills_dir(ctx, &manifest)?;
     let target = contained_skill_file(&dir, &name, rel)?;
-    if target.exists() {
-        let meta = std::fs::symlink_metadata(&target).map_err(|e| io_error(&target, e))?;
+    // `symlink_metadata` also sees dangling symlinks, which `exists()` misses.
+    if let Ok(meta) = std::fs::symlink_metadata(&target) {
         if meta.file_type().is_symlink() {
-            return Err(MusterError::Security("cannot overwrite symlinks".into()));
+            return Err(MusterError::Usage("cannot overwrite symlinks".into()));
         }
     }
     if !ctx.dry_run {
@@ -320,20 +326,40 @@ pub fn contained_skill_file(
     name: &str,
     rel: &str,
 ) -> Result<PathBuf, MusterError> {
-    let skill_dir = contained(skills_dir, name, None)?;
-    let target = contained(skills_dir, name, Some(rel))?;
-    // Canonicalize skill_dir to detect symlink breakouts
-    if skill_dir.exists() {
-        let canonical_dir = skill_dir
-            .canonicalize()
-            .map_err(|e| io_error(&skill_dir, e))?;
-        if target.exists() {
-            let canonical_target = target.canonicalize().map_err(|e| io_error(&target, e))?;
-            if !canonical_target.starts_with(&canonical_dir) {
-                return Err(MusterError::Security(format!(
-                    "{rel:?} escapes skill directory via symlink"
-                )));
+    let escape = || MusterError::Usage("path escapes the skill directory".into());
+    let skill_dir = contained(skills_dir, name, None).map_err(|_| escape())?;
+    let target = contained(skills_dir, name, Some(rel)).map_err(|_| escape())?;
+
+    let canonical_root = match skills_dir.canonicalize() {
+        Ok(p) => p,
+        // Nothing exists yet, so nothing can be redirected.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(target),
+        Err(e) => return Err(io_error(skills_dir, e)),
+    };
+    // The skill directory itself must be a real directory inside the skills root.
+    match std::fs::symlink_metadata(&skill_dir) {
+        Ok(meta) if meta.file_type().is_symlink() => return Err(escape()),
+        Ok(_) => {
+            let canonical_dir = skill_dir
+                .canonicalize()
+                .map_err(|e| io_error(&skill_dir, e))?;
+            if !canonical_dir.starts_with(canonical_root.join(name)) {
+                return Err(escape());
             }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(target),
+        Err(e) => return Err(io_error(&skill_dir, e)),
+    }
+    // Walk every component below the skill directory: none may be a symlink.
+    let mut current = skill_dir;
+    for component in Path::new(rel).components() {
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => return Err(escape()),
+            Ok(_) => {}
+            // The rest does not exist yet, so it cannot be a symlink.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(_) => return Err(escape()),
         }
     }
     Ok(target)
@@ -1524,6 +1550,32 @@ mod tests {
         }
     }
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn contained_skill_file_rejects_symlinked_skill_dirs_and_dangling_links() {
+        let root = tempfile::TempDir::new().unwrap();
+        let skills = root.path().join("skills");
+        let skill = skills.join("my-skill");
+        std::fs::create_dir_all(&skill).unwrap();
+        // A skill directory that is a symlink to `/` must not make everything pass.
+        std::os::unix::fs::symlink("/", skills.join("esc")).unwrap();
+        for rel in ["etc/passwd", "nonexistent-file"] {
+            let err = contained_skill_file(&skills, "esc", rel).unwrap_err();
+            assert!(matches!(err, MusterError::Usage(_)), "{rel}: {err:?}");
+        }
+        // A dangling leaf symlink is refused too.
+        std::os::unix::fs::symlink("/nonexistent", skill.join("dangling")).unwrap();
+        let err = contained_skill_file(&skills, "my-skill", "dangling").unwrap_err();
+        assert!(matches!(err, MusterError::Usage(_)), "{err:?}");
+        // An intermediate directory symlink is refused.
+        std::os::unix::fs::symlink("/", skill.join("dir")).unwrap();
+        let err = contained_skill_file(&skills, "my-skill", "dir/etc/passwd").unwrap_err();
+        assert!(matches!(err, MusterError::Usage(_)), "{err:?}");
+        // Traversal to a nonexistent target is a usage error, not an I/O error.
+        let err = contained_skill_file(&skills, "my-skill", "../../nope").unwrap_err();
+        assert!(matches!(err, MusterError::Usage(_)), "{err:?}");
+    }
 
     #[test]
     fn write_skill_refuses_paths_outside_the_skills_dir() {

@@ -1482,14 +1482,17 @@ fn web_skill_file_edit_and_pin_enforce_confirmation_and_confinement() {
         .unwrap()
         .contains("name: demo"));
 
-    // Traversal is blocked with 403
-    let (status, _, _) = ui.request(
-        "GET",
-        "/api/skills/file?name=demo&path=../../muster.toml",
-        Some(&cookie),
-        None,
-    );
-    assert_eq!(status, 403);
+    // Traversal is blocked with 400, whether or not the target exists
+    for path in ["../../muster.toml", "../../nonexistent-file"] {
+        let (status, _, body) = ui.request(
+            "GET",
+            &format!("/api/skills/file?name=demo&path={path}"),
+            Some(&cookie),
+            None,
+        );
+        assert_eq!(status, 400, "{path}: {body}");
+        assert!(body.contains("path escapes the skill directory"), "{body}");
+    }
 
     // Write without confirm is refused with 400
     let (status, refused) = ui_post(
@@ -1552,4 +1555,48 @@ fn web_skill_file_edit_and_pin_enforce_confirmation_and_confinement() {
         .find(|s| s["name"] == "demo")
         .unwrap();
     assert_eq!(skill["modified"], false);
+}
+
+#[cfg(unix)]
+#[test]
+fn web_skill_files_reject_symlink_escapes_with_400() {
+    let env = support::MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    env.run(&["--yes", "skill", "add", "my-skill", "--description", "d"])
+        .assert()
+        .success();
+    let skills = env.config_dir().join("skills");
+    std::os::unix::fs::symlink("/", skills.join("esc")).unwrap();
+    std::os::unix::fs::symlink("/nonexistent", skills.join("my-skill/dangling")).unwrap();
+
+    let mut ui = Ui::start(&env);
+    let cookie = ui_session_cookie(&mut ui);
+
+    // A skill directory symlinked to `/` is refused on read and write.
+    let (status, _, body) = ui.request(
+        "GET",
+        "/api/skills/file?name=esc&path=etc/passwd",
+        Some(&cookie),
+        None,
+    );
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("path escapes the skill directory"), "{body}");
+    let (status, refused) = ui_post(
+        &mut ui,
+        &cookie,
+        "/api/skills/file",
+        &serde_json::json!({"name": "esc", "path": "tmp-muster-probe", "content": "x", "confirm": true}),
+    );
+    assert_eq!(status, 400, "{refused}");
+    assert!(!std::path::Path::new("/tmp-muster-probe").exists());
+
+    // A dangling symlink inside a skill is never written through.
+    let (status, refused) = ui_post(
+        &mut ui,
+        &cookie,
+        "/api/skills/file",
+        &serde_json::json!({"name": "my-skill", "path": "dangling", "content": "x", "confirm": true}),
+    );
+    assert_eq!(status, 400, "{refused}");
+    assert!(!std::path::Path::new("/nonexistent").exists());
 }
