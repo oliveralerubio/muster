@@ -87,6 +87,13 @@ async function api(path, body, quiet) {
     startReconnect();
     return { ok: false, error: attempt.failure, diagnostics: [] };
   }
+  // Any answer means the server is back: drop a pending probe and its banner
+  // (e.g. the user pressed Retry before the backoff timer fired).
+  if (reconnectTimer !== null) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+    setConnBanner("");
+  }
   const data = await response.json().catch(() => ({ ok: false, diagnostics: [] }));
   if (response.status === 401 || response.status === 403) {
     attempt.failure = "Session expired. Reopen the panel with `muster ui`.";
@@ -1522,6 +1529,7 @@ function openMcpEdit(server) {
 const skillDialog = $("#skill-edit");
 let skillEditing = null;
 let skillFileLoaded = null;
+let skillFileSaved = "";
 
 async function loadSkillFile(path) {
   $("#skill-error").textContent = "";
@@ -1533,7 +1541,15 @@ async function loadSkillFile(path) {
     return;
   }
   skillFileLoaded = path;
-  $("#skill-text").value = (data.result && data.result.content) || "";
+  skillFileSaved = (data.result && data.result.content) || "";
+  $("#skill-text").value = skillFileSaved;
+}
+
+// Unsaved edits are lost on file switch or close; ask first.
+function skillEditsDiscardable() {
+  return skillFileLoaded === null
+    || $("#skill-text").value === skillFileSaved
+    || confirm(`Discard unsaved changes to ${skillFileLoaded}?`);
 }
 
 async function openSkillEdit(name) {
@@ -1558,9 +1574,18 @@ async function openSkillEdit(name) {
 }
 
 const skillFileEl = $("#skill-file");
-if (skillFileEl) skillFileEl.addEventListener("change", () => loadSkillFile(skillFileEl.value));
+if (skillFileEl) skillFileEl.addEventListener("change", () => {
+  if (!skillEditsDiscardable()) { skillFileEl.value = skillFileLoaded; return; }
+  loadSkillFile(skillFileEl.value);
+});
 const skillCloseEl = $("#skill-close");
-if (skillCloseEl) skillCloseEl.addEventListener("click", () => skillDialog && skillDialog.close());
+if (skillCloseEl) skillCloseEl.addEventListener("click", () => {
+  if (skillDialog && skillEditsDiscardable()) skillDialog.close();
+});
+// Escape closes a <dialog> via "cancel"; guard it the same way.
+if (skillDialog) skillDialog.addEventListener("cancel", (event) => {
+  if (!skillEditsDiscardable()) event.preventDefault();
+});
 if (skillDialog) skillDialog.addEventListener("close", () => { if (current === "skills") show("skills"); });
 const skillFormEl = $("#skill-form");
 if (skillFormEl) skillFormEl.addEventListener("submit", async (event) => {
@@ -1574,6 +1599,7 @@ if (skillFormEl) skillFormEl.addEventListener("submit", async (event) => {
     });
     if (data.ok) {
       $("#skill-error").textContent = "";
+      skillFileSaved = $("#skill-text").value;
       toast(`Saved ${skillFileLoaded}.`, "info");
       await show("skills");
     } else {
