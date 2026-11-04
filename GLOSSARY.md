@@ -91,8 +91,12 @@ An Agent Skills folder (`SKILL.md` with `name`/`description` frontmatter plus an
 _Avoid_: plugin, extension
 
 **Unmanaged skill**:
-A skill folder found in an enabled agent's own skills folder (for example `~/.claude/skills/<name>`) that is neither in the config repository nor built in. `muster skill list` reports it under `unmanaged`; `muster skill import` copies it into the config repository as an own skill and pins it, leaving the original untouched.
+A skill folder found in an enabled agent's own skills folder (for example `~/.claude/skills/<name>`) that is neither in the config repository nor built in. `muster skill list` reports it under `unmanaged`, with its `source` when the `npx skills` lock (`~/.agents/.skill-lock.json`) says which repository it came from. `muster skill import` subscribes to that repository when the source is known (so it keeps receiving updates) and otherwise copies it in as an own skill; `--all` does every importable one in a single commit. The original files stay untouched.
 _Avoid_: orphan skill, foreign skill
+
+**Auto-update**:
+The opt-in `[agents.skills] auto_update` setting: `muster sync` updates subscribed skills unattended, between pull and push. Locally modified skills are skipped, never forced, and it is separate from the global `--yes`.
+_Avoid_: auto-upgrade
 
 **Vendored skill**:
 A skill copied from an external Git repository into the config repository's skills folder, so the engine and adapters treat it exactly like an own skill and every machine receives it through the normal sync.

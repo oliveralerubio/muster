@@ -69,19 +69,22 @@ include = ["pdf"]                          # optional: only these skills
 | `muster skill list` | List every skill with origin, version, last update and status. Offline. |
 | `muster skill add <name> [--description <text>]` | Scaffold an own skill at `skills/<name>/SKILL.md`. |
 | `muster skill add --url <git-url> [--ref <ref>] [--path <dir>] [--include <skill>]` | Subscribe to a Git repository of skills and vendor them. |
-| `muster skill import <name> [--adapter <id>]` | Copy a skill installed directly in an agent's skills folder (not managed by Muster) into the config repo as an own skill and pin it. The original folder is left untouched; `skill list` shows these under `unmanaged`. |
+| `muster skill import <name> [--adapter <id>]` / `--all` | Bring skills installed directly in an agent's skills folder (not managed by Muster) under Muster. When `~/.agents/.skill-lock.json` (written by `npx skills`) says which repository a skill came from, it is subscribed to that repository so it keeps receiving updates (the result reports `replaced_local_copy` when your copy differed from upstream); otherwise it is copied in as an own skill. `--all` imports every importable one in a single commit. The original folder is left untouched; `skill list` shows these under `unmanaged`, with their `source`. |
+| `muster skill auto-update on\|off` | Let `muster sync` (including a scheduled one) apply upstream updates of subscribed skills unattended. See below. |
 | `muster skill pin <name>` | Record the reviewed files of an own skill in `skills.lock` after editing. |
 | `muster skill check [name]` | Query upstream repositories for updates, deprecations and removals. |
 | `muster skill update [name] [--all] [--force]` | Apply upstream changes, showing files added, changed or removed (`--force` overwrites local edits). |
 | `muster skill rm <name> [--detach]` | Delete a skill, or with `--detach` keep a subscribed skill as your own. |
 
-After editing an own skill, review it, run `muster skill pin <name>`, and commit both its files and `skills.lock`. `skill add` records the initial pin; subscribed skills continue to use `skill update`. Without the pin step, edits do not spread on sync.
+Editing an own skill through Muster (`skill file set`, or the panel) re-pins it in `skills.lock` in the same commit, so the edit spreads on the next sync. Edits made by hand outside Muster still need `muster skill pin <name>`. Subscribed skills use `skill update` and are never re-pinned.
+
+**Auto-update.** With `[agents.skills] auto_update = true` (`muster skill auto-update on`), `muster sync` checks the subscribed sources after pulling and before pushing, updates the skills, pushes the commit and applies the new files in the same run, and lists them as `skills_updated`. It needs no `--yes`, so a scheduled sync (`muster schedule enable`) keeps skills current; `--yes` is not used because it would also approve new hooks and MCP servers. Locally modified skills are skipped with a warning, never overwritten; an unreachable source is a warning, not a failure; in a team only admins update skills. It is off by default; see [ADR 0004](docs/adr/0004-skill-auto-update.md).
 
 Every command accepts `--format json`, `--dry-run` and `--yes`.
 
 Statuses: `local`, `up_to_date`, `update_available`, `deprecated` (upstream `SKILL.md` has `deprecated: true` or `deprecated: "<reason>"`), `upstream_removed`, `unknown` (not checked yet, or the source could not be reached). Nothing is applied or deleted on its own: updates need `muster skill update`, and a skill removed upstream stays until you run `muster skill rm` (with or without `--detach`). A skill edited by hand shows `modified` and `update` refuses to overwrite it without `--force`. In a team, only admins add, update or remove skills; members can list and check.
 
-The web admin panel (`muster ui`) includes a **Skills** tab showing installed skills, upstream status, and an attention indicator when updates are available, with buttons to check sources and update a skill. A section "On disk, not managed by Muster" lists skills found in the agents' skills folders and imports them with one click.
+The web admin panel (`muster ui`) includes a **Skills** tab showing installed skills, upstream status, and an attention indicator when updates are available, with buttons to check sources, update skills and toggle auto-update. A section "On disk, not managed by Muster" lists skills found in the agents' skills folders with their source (or "own"), and subscribes to the source or imports them as own skills, one at a time or all at once.
 
 ## Subagents
 

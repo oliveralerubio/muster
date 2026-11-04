@@ -116,7 +116,7 @@ fn sync(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         && !ctx.config_dir.join(crate::manifest::FILE_NAME).exists();
     if joining {
         git::init_repo(&ctx.config_dir)?;
-        let joined = transport(ctx, params)?;
+        let (joined, _) = transport(ctx, params, false)?;
         if !ctx.config_dir.join(crate::manifest::FILE_NAME).exists() {
             return Err(MusterError::Operational(
                 "the remote has no Muster config yet; run `muster init` on the first machine and `muster sync --push`".into(),
@@ -126,10 +126,10 @@ fn sync(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     }
     Manifest::load(&ctx.config_dir)?;
     let target = target(params)?;
-    let transport = if ctx.dry_run {
-        Value::Null
+    let (transport, skills_updated) = if ctx.dry_run {
+        (Value::Null, Vec::new())
     } else {
-        transport(ctx, params)?
+        transport(ctx, params, true)?
     };
     let global = target == engine::Target::Global;
     let plan = engine::plan(
@@ -144,19 +144,32 @@ fn sync(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         crate::team::record_applied(ctx, &result)?;
     }
     result["transport"] = transport;
+    result["skills_updated"] = Value::Array(skills_updated);
     Ok(result)
 }
 
 /// Commit local config changes and exchange them with the remote. Skipped
-/// when the repo has no remote and no transport flag was given.
-fn transport(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
+/// when the repo has no remote and no transport flag was given. With
+/// `auto_update`, subscribed skills are updated unattended (when the manifest
+/// opts in) after pulling and before pushing, so the same run publishes and
+/// applies them. Returns the transport report and the updated skill names.
+fn transport(
+    ctx: &mut Context,
+    params: &Params,
+    auto_update: bool,
+) -> Result<(Value, Vec<Value>), MusterError> {
     let (only_pull, only_push) = (params.get_bool("pull"), params.get_bool("push"));
     let remote = params.get_string("remote");
     if let Some(url) = remote {
         git::set_remote(&ctx.config_dir, url)?;
     }
     if !(git::has_remote(&ctx.config_dir) || only_pull || only_push) {
-        return Ok(Value::Null);
+        let updated = if auto_update {
+            crate::commands::skill::auto_update_in_sync(ctx)
+        } else {
+            Vec::new()
+        };
+        return Ok((Value::Null, updated));
     }
     let (do_pull, do_push) = match (only_pull, only_push) {
         (false, false) => (true, true),
@@ -181,14 +194,22 @@ fn transport(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
             }
         };
     }
+    let skills_updated = if auto_update {
+        crate::commands::skill::auto_update_in_sync(ctx)
+    } else {
+        Vec::new()
+    };
     if do_push {
         ctx.progress("Pushing config repo…");
         git::push(&ctx.config_dir)?;
     }
-    Ok(json!({
-        "config_path": ctx.config_dir,
-        "committed": committed,
-        "pulled": pulled,
-        "pushed": do_push,
-    }))
+    Ok((
+        json!({
+            "config_path": ctx.config_dir,
+            "committed": committed,
+            "pulled": pulled,
+            "pushed": do_push,
+        }),
+        skills_updated,
+    ))
 }

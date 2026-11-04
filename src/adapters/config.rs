@@ -112,6 +112,10 @@ pub struct SkillsConfig {
     /// (`muster skill add --url`). Provenance is pinned in `skills.lock`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub remote: Vec<SkillRemote>,
+    /// Apply upstream updates of subscribed skills during `muster sync`,
+    /// unattended. Locally modified skills are never overwritten.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_update: bool,
 }
 
 /// `[[agents.skills.remote]]`: one subscribed upstream skills repository.

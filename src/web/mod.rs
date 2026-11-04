@@ -161,6 +161,7 @@ const ROUTES: &[Route] = &[
     post("skills/update", "skill.update"),
     post("skills/rm", "skill.rm"),
     post("skills/pin", "skill.pin"),
+    post("skills/auto-update", "skill.auto-update"),
     // The panel names an agent and a skill; the command resolves the folder
     // itself, so a request can never point it at an arbitrary directory.
     post("skills/import", "skill.import"),
@@ -792,6 +793,7 @@ fn parse_params(
         let bad = || MusterError::Usage(format!("parameter '{}' must be a {:?}", p.name, p.kind));
         let value = match (p.kind, value) {
             (ParamKind::String, Value::String(s)) => Value::String(s),
+            (ParamKind::String, Value::Bool(b)) => Value::String(b.to_string()),
             (ParamKind::Bool, v) => Value::Bool(as_bool(&v, p.name)?),
             (ParamKind::Int, Value::Number(n)) if n.is_i64() => Value::Number(n),
             (ParamKind::Int, Value::String(s)) => Value::from(s.parse::<i64>().map_err(|_| bad())?),
