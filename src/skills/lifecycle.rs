@@ -53,7 +53,7 @@ pub fn read_upstream(
 }
 
 /// The declared upstream sources of a manifest.
-fn declared_remotes(manifest: &Manifest) -> Vec<SkillRemote> {
+pub fn remotes(manifest: &Manifest) -> Vec<SkillRemote> {
     manifest
         .agents
         .as_ref()
@@ -72,7 +72,7 @@ pub struct Sources<'a> {
 impl<'a> Sources<'a> {
     pub fn new(manifest: &Manifest, fetcher: &'a dyn UpstreamFetcher) -> Self {
         Self {
-            remotes: declared_remotes(manifest),
+            remotes: remotes(manifest),
             fetcher,
             fetched: BTreeMap::new(),
         }
@@ -115,17 +115,16 @@ pub enum UpdateAction {
 ///
 /// - `locked_hash`: what `skills.lock` pins.
 /// - `disk_hash`: what is vendored on disk now.
-/// - `upstream_hash`: what the source offers now (ignored when removed).
+/// - `upstream_hash`: what the source offers now (`None` if removed upstream).
 pub fn evaluate_update_action(
     locked_hash: &str,
     disk_hash: &str,
-    upstream_hash: &str,
+    upstream_hash: Option<&str>,
     force: bool,
-    upstream_removed: bool,
 ) -> UpdateAction {
-    if upstream_removed {
+    let Some(upstream_hash) = upstream_hash else {
         return UpdateAction::SkipUpstreamRemoved;
-    }
+    };
     if upstream_hash == disk_hash && upstream_hash == locked_hash {
         return UpdateAction::UpToDate;
     }

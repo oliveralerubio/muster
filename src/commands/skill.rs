@@ -476,14 +476,7 @@ fn skills_dir(ctx: &Context, manifest: &Manifest) -> Result<(PathBuf, String), M
     Ok((ctx.config_dir.join(rel), source))
 }
 
-fn remotes(manifest: &Manifest) -> Vec<SkillRemote> {
-    manifest
-        .agents
-        .as_ref()
-        .and_then(|a| a.skills.as_ref())
-        .map(|s| s.remote.clone())
-        .unwrap_or_default()
-}
+use crate::skills::lifecycle::remotes;
 
 /// Team mode: skill changes are admin changes. Single-person mode: no actor.
 fn admin(ctx: &Context, manifest: &Manifest) -> Result<Option<team::Actor>, MusterError> {
@@ -1984,16 +1977,11 @@ fn update_inner(
             None
         };
         let disk_hash = disk.as_ref().map(content_hash).unwrap_or_default();
-        let upstream_hash = upstream
-            .as_ref()
-            .map(|s| s.hash.as_str())
-            .unwrap_or_default();
         let action = evaluate_update_action(
             &entry.content_hash,
             &disk_hash,
-            upstream_hash,
+            upstream.as_ref().map(|s| s.hash.as_str()),
             force,
-            upstream.is_none(),
         );
 
         match action {

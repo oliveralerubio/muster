@@ -1167,47 +1167,61 @@ fn evaluate_update_action_matrix() {
 
     // 1. Upstream removed always takes precedence over hashes
     assert_eq!(
-        evaluate_update_action(lock, disk, up, false, true),
+        evaluate_update_action(lock, disk, None, false),
         UpdateAction::SkipUpstreamRemoved
     );
     assert_eq!(
-        evaluate_update_action(lock, "sha256:diff", "sha256:diff2", true, true),
+        evaluate_update_action(lock, "sha256:diff", None, true),
         UpdateAction::SkipUpstreamRemoved
     );
 
     // 2. Everything in sync -> UpToDate
     assert_eq!(
-        evaluate_update_action(lock, disk, up, false, false),
+        evaluate_update_action(lock, disk, Some(up), false),
         UpdateAction::UpToDate
     );
     assert_eq!(
-        evaluate_update_action(lock, disk, up, true, false),
+        evaluate_update_action(lock, disk, Some(up), true),
         UpdateAction::UpToDate
     );
 
     // 3. Upstream changed, local disk clean -> ApplyUpdate
     let up_new = "sha256:2222";
     assert_eq!(
-        evaluate_update_action(lock, disk, up_new, false, false),
+        evaluate_update_action(lock, disk, Some(up_new), false),
+        UpdateAction::ApplyUpdate
+    );
+    assert_eq!(
+        evaluate_update_action(lock, disk, Some(up_new), true),
         UpdateAction::ApplyUpdate
     );
 
     // 4. Local modifications exist, force = false -> SkipModified
     let disk_modified = "sha256:3333";
     assert_eq!(
-        evaluate_update_action(lock, disk_modified, up_new, false, false),
+        evaluate_update_action(lock, disk_modified, Some(up_new), false),
         UpdateAction::SkipModified
     );
 
     // 5. Local modifications exist, force = true -> ApplyUpdate
     assert_eq!(
-        evaluate_update_action(lock, disk_modified, up_new, true, false),
+        evaluate_update_action(lock, disk_modified, Some(up_new), true),
         UpdateAction::ApplyUpdate
     );
 
     // 6. Disk already matches upstream (e.g. manually synced), lock stale -> ApplyUpdate
     assert_eq!(
-        evaluate_update_action(lock, up_new, up_new, false, false),
+        evaluate_update_action(lock, up_new, Some(up_new), false),
+        UpdateAction::ApplyUpdate
+    );
+
+    // 7. Disk edited, upstream unchanged since lock: edits are kept unless forced
+    assert_eq!(
+        evaluate_update_action(lock, disk_modified, Some(lock), false),
+        UpdateAction::SkipModified
+    );
+    assert_eq!(
+        evaluate_update_action(lock, disk_modified, Some(lock), true),
         UpdateAction::ApplyUpdate
     );
 }
@@ -1248,8 +1262,16 @@ fn upstream_skill_and_read_upstream() {
 
     assert_eq!(skill.version.as_deref(), Some("1.2.3"));
     assert_eq!(skill.deprecated.as_deref(), Some("use v2"));
-    assert!(skill.files.contains_key("SKILL.md"));
-    assert!(skill.files.contains_key("helper.py"));
+    assert_eq!(skill.files.len(), 2);
+    assert_eq!(
+        skill.files.get("SKILL.md").map(String::as_str),
+        Some(skill_md)
+    );
+    assert_eq!(
+        skill.files.get("helper.py").map(String::as_str),
+        Some("print('hello')\n")
+    );
+    assert_eq!(skill.hash, muster::skills::content_hash(&skill.files));
     assert!(skill.hash.starts_with("sha256:"));
 
     match skill.upstream() {
