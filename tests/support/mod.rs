@@ -34,7 +34,31 @@ impl MusterEnv {
 
     /// `muster <args>` with isolated HOME/XDG, temp bin dir first on PATH,
     /// no inherited `MUSTER_*` variables and an empty, non-TTY stdin.
+    ///
+    /// Stands in for an operator who checked the fleet signer out of band: when
+    /// this machine has no trust pin yet and the config repo is signed, the
+    /// signer is passed as `--expect-signer`. Use [`MusterEnv::run_strict`] to
+    /// exercise the first-use gate itself.
     pub fn run(&self, args: &[&str]) -> Command {
+        let config = args
+            .iter()
+            .position(|a| *a == "--config")
+            .and_then(|i| args.get(i + 1))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.config_dir());
+        let pinned = self.path().join(".local/state/muster/trust.json").exists();
+        let signed = config.join("fleet.state.json").exists();
+        if !pinned && signed && !args.contains(&"--expect-signer") {
+            let signer = fleet_signer(&config);
+            let mut full = vec!["--expect-signer", signer.as_str()];
+            full.extend_from_slice(args);
+            return self.run_strict(&full);
+        }
+        self.run_strict(args)
+    }
+
+    /// Like [`MusterEnv::run`] but never names a signer on its own.
+    pub fn run_strict(&self, args: &[&str]) -> Command {
         let mut cmd = Command::cargo_bin("muster").expect("muster binary");
         let path = format!(
             "{}:{}",
@@ -60,6 +84,10 @@ impl MusterEnv {
     /// Run and parse stdout as a JSON envelope.
     pub fn run_json(&self, args: &[&str]) -> (Output, Envelope) {
         json(self.run(args))
+    }
+
+    pub fn run_json_strict(&self, args: &[&str]) -> (Output, Envelope) {
+        json(self.run_strict(args))
     }
 }
 

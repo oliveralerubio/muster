@@ -943,3 +943,59 @@ fn first_sync_of_a_fresh_machine_needs_expect_signer_when_not_interactive() {
     );
     assert!(state_dir(&bob).join("trust.json").exists());
 }
+
+fn hand_clone(remote: &str, env: &MusterEnv) {
+    let status = Command::new("git")
+        .args(["clone", "--quiet", remote])
+        .arg(env.config_dir())
+        .status()
+        .expect("git clone");
+    assert!(status.success());
+}
+
+#[test]
+fn first_use_is_confirmed_by_every_command_not_only_sync() {
+    let strict_fail = |env: &MusterEnv, args: &[&str]| {
+        let mut full = vec!["--format", "json"];
+        full.extend_from_slice(args);
+        let (output, envelope) = env.run_json_strict(&full);
+        assert!(!envelope.ok(), "{args:?} should fail: {}", envelope.raw);
+        (output.status.code().unwrap_or(-1), envelope.raw)
+    };
+    let (_guard, remote) = bare_remote();
+    let remote = remote.to_str().unwrap();
+    let alice = MusterEnv::new();
+    ok(&alice, &["init", "--yes"]);
+    ok(&alice, &["sync", "--remote", remote]);
+    let signer = support::fleet_signer(&alice.config_dir());
+
+    // A hand-cloned repo on a machine with no pin: `status` must not pin silently.
+    let bob = MusterEnv::new();
+    hand_clone(remote, &bob);
+    for args in [&["status"][..], &["secret", "requests"][..]] {
+        let (code, raw) = strict_fail(&bob, args);
+        assert_eq!(code, 5, "{args:?}: {raw}");
+        assert!(raw.to_string().contains("--expect-signer"), "{raw}");
+        assert!(!state_dir(&bob).join("trust.json").exists(), "{args:?}");
+    }
+    // `trust show` never pins either.
+    let _ = bob.run_json_strict(&["--format", "json", "trust", "show"]);
+    assert!(!state_dir(&bob).join("trust.json").exists());
+
+    // A wrong signer is refused; the right one (global flag) pins.
+    let (code, _) = strict_fail(&bob, &["status", "--expect-signer", "musterpk1deadbeef"]);
+    assert_eq!(code, 5);
+    ok(&bob, &["status", "--expect-signer", &signer]);
+    assert!(state_dir(&bob).join("trust.json").exists());
+
+    // The environment variable is the same thing as the flag.
+    let carol = MusterEnv::new();
+    hand_clone(remote, &carol);
+    let out = carol
+        .run_strict(&["--format", "json", "status"])
+        .env("MUSTER_EXPECT_SIGNER", &signer)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+    assert!(state_dir(&carol).join("trust.json").exists());
+}

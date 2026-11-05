@@ -82,7 +82,18 @@ fn run_show(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
         None => Value::Null,
     };
 
-    let status = match fleet_state::verify(&ctx.config_dir, &ctx.state_dir, &manifest, None) {
+    // Inspection only: `trust show` never creates or advances a pin.
+    let inspected = fleet_state::verify_with(
+        &ctx.config_dir,
+        &ctx.state_dir,
+        &manifest,
+        &fleet_state::VerifyOptions {
+            expect_signer: None,
+            persist: false,
+            check_content: true,
+        },
+    );
+    let status = match inspected {
         Ok(Verification::Verified { .. }) => "verified",
         Ok(Verification::Legacy) => "legacy_uninitialized",
         Err(e) => {

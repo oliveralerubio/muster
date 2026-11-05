@@ -163,6 +163,11 @@ pub fn verify(
     manifest: &Manifest,
     persist: bool,
 ) -> Result<Verification, MusterError> {
+    // Whatever the entry point, creating a first pin from someone else's
+    // signature needs `--expect-signer` or a typed confirmation.
+    if persist {
+        confirm_first_use(ctx)?;
+    }
     let result = fleet_state::verify_with(
         &ctx.config_dir,
         &ctx.state_dir,
@@ -385,10 +390,7 @@ pub fn verify_pulled(
         }
     }
     let manifest = Manifest::load(&ctx.config_dir);
-    let result = manifest.and_then(|m| {
-        confirm_first_use(ctx)?;
-        verify(ctx, &m, true)
-    });
+    let result = manifest.and_then(|m| verify(ctx, &m, true));
     if let Err(e) = result {
         let restored = git::restore_after_pull(&ctx.config_dir, previous);
         let note = match restored {

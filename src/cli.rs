@@ -37,7 +37,14 @@ where
         return crate::mcp::serve(globals, pinned);
     }
     let (format, quiet) = (globals.format.unwrap_or(Format::Text), globals.quiet);
-    let (envelope, code) = execute(spec, globals, &params(spec, sub), true);
+    let mut p = params(spec, sub);
+    // `--expect-signer` / `MUSTER_EXPECT_SIGNER` apply to every command.
+    if p.get_string("expect-signer").is_none() {
+        if let Some(signer) = matches.get_one::<String>("expect-signer") {
+            p.set("expect-signer", Value::from(signer.as_str()));
+        }
+    }
+    let (envelope, code) = execute(spec, globals, &p, true);
     output::render(&envelope, format, quiet);
     code
 }
@@ -115,6 +122,17 @@ pub fn command() -> Command {
                 .value_parser(["text", "json"])
                 .default_value("text")
                 .help("Output format")
+                .global(true),
+        )
+        .arg(
+            Arg::new("expect-signer")
+                .long("expect-signer")
+                .value_name("KEY")
+                .env("MUSTER_EXPECT_SIGNER")
+                .help(
+                    "Full public key (musterpk1...) or full SHA256 fingerprint the fleet \
+                     signer must have when this machine pins a fleet for the first time",
+                )
                 .global(true),
         )
         .arg(flag(
