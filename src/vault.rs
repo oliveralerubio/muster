@@ -168,9 +168,11 @@ impl Vault {
             self.ensure_pair(group)?;
             let data = self.read_verified_readers(group, id)?;
             self.verify_recipients(group, &data.recipients)?;
+            self.verify_group_exact(group, &data.recipients)?;
             data
         } else {
             self.verify_recipients(group, recipients)?;
+            self.verify_group_membership(group, recipients)?;
             GroupData {
                 group: group.to_owned(),
                 recipients: recipients.to_vec(),
@@ -215,6 +217,7 @@ impl Vault {
     ) -> Result<(), MusterError> {
         let mut data = self.read_verified_readers(group, id)?;
         self.verify_recipients(group, &data.recipients)?;
+        self.verify_group_exact(group, &data.recipients)?;
         let entry = data
             .secrets
             .get_mut(name)
@@ -309,6 +312,29 @@ impl Vault {
                     "recipient '{r}' is not a reader of group '{group}' in muster.toml"
                 )));
             }
+        }
+        Ok(())
+    }
+
+    /// The recipients carried by a decrypted payload must be exactly what the
+    /// signed manifest assigns to `group` (plus the recovery key): a write
+    /// re-encrypts to that set, never to a set the payload brought along.
+    fn verify_group_exact(&self, group: &str, carried: &[String]) -> Result<(), MusterError> {
+        let config_dir = self.dir.parent().unwrap_or(&self.dir);
+        if !config_dir.join(crate::manifest::FILE_NAME).exists() {
+            return Ok(());
+        }
+        let manifest = Manifest::load(config_dir)?;
+        let expected: BTreeSet<String> = crate::team::group_recipients(&manifest, group)
+            .into_iter()
+            .collect();
+        let carried: BTreeSet<String> = carried.iter().cloned().collect();
+        if expected != carried {
+            return Err(MusterError::Security(format!(
+                "the recipients of secret group '{group}' differ from the readers muster.toml \
+                 assigns to it; nothing was written. Run `muster group rekey {group}` to \
+                 re-encrypt it for exactly the signed readers"
+            )));
         }
         Ok(())
     }
