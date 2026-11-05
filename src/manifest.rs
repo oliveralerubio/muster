@@ -270,8 +270,9 @@ pub struct SecretPolicy {
     /// Agents allowed to receive the secret: an adapter id (`claude`) grants
     /// it everywhere; `agent@project` only inside that project (the project
     /// directory's name). Empty = no agent (the human CLI always can).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub allow: Vec<String>,
+    /// `None` = no list declared; `Some([])` = explicit `allow = []` (deny all).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow: Option<Vec<String>>,
     #[serde(default)]
     pub approval: SecretApproval,
     pub approval_ttl: Option<String>,
@@ -286,13 +287,20 @@ pub enum SecretApproval {
 }
 
 impl SecretPolicy {
+    /// The declared allow entries (empty when absent or explicitly empty).
+    pub fn allow_list(&self) -> &[String] {
+        self.allow.as_deref().unwrap_or(&[])
+    }
+
     /// Whether `agent` may receive the secret when rendering for `project`
     /// (`None` = user scope).
     pub fn allows(&self, agent: &str, project: Option<&str>) -> bool {
-        self.allow.iter().any(|entry| match entry.split_once('@') {
-            None => entry == agent,
-            Some((a, p)) => a == agent && project == Some(p),
-        })
+        self.allow_list()
+            .iter()
+            .any(|entry| match entry.split_once('@') {
+                None => entry == agent,
+                Some((a, p)) => a == agent && project == Some(p),
+            })
     }
 }
 
@@ -548,7 +556,7 @@ impl Manifest {
             }
             crate::secrets::SecretRef::parse(reference)
                 .map_err(|e| invalid(format!("secrets: {e}")))?;
-            for entry in &policy.allow {
+            for entry in policy.allow_list() {
                 validate_allow_entry(entry)
                     .map_err(|e| invalid(format!("secrets.\"{reference}\".allow: {e}")))?;
             }

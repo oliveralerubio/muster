@@ -180,7 +180,7 @@ pub(crate) fn add_with_value(
         manifest.secrets.insert(
             format!("native://{group}/{name}"),
             SecretPolicy {
-                allow: allow.clone(),
+                allow: Some(allow.clone()),
                 ..Default::default()
             },
         );
@@ -207,7 +207,7 @@ fn list(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
             let allow = manifest
                 .as_ref()
                 .and_then(|m| m.secrets.get(&reference))
-                .map(|p| p.allow.clone())
+                .map(|p| p.allow_list().to_vec())
                 .unwrap_or_default();
             secrets.push(json!({
                 "group": group,
@@ -305,23 +305,6 @@ fn rm(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     Ok(json!({ "removed": format!("{group}/{name}") }))
 }
 
-/// Whether `muster.toml` spells `allow = []` for `reference`. The parsed policy
-/// cannot tell that apart from an absent `allow`, and only the explicit empty
-/// list means "deny everyone".
-fn has_explicit_empty_allow(ctx: &Context, reference: &SecretRef) -> bool {
-    std::fs::read_to_string(ctx.config_dir.join("muster.toml"))
-        .ok()
-        .and_then(|text| text.parse::<toml::Table>().ok())
-        .and_then(|t| {
-            t.get("secrets")?
-                .get(reference.as_str())?
-                .get("allow")?
-                .as_array()
-                .map(Vec::is_empty)
-        })
-        .unwrap_or(false)
-}
-
 fn get(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let reference = SecretRef::parse(required(params, "reference")?)?;
     let reveal = params.get_bool("reveal");
@@ -343,7 +326,7 @@ fn get(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         let policy = manifest
             .as_ref()
             .and_then(|m| m.secrets.get(reference.as_str()));
-        if policy.is_some_and(|p| p.allow.is_empty() && has_explicit_empty_allow(ctx, &reference)) {
+        if policy.is_some_and(|p| p.allow.as_ref().is_some_and(Vec::is_empty)) {
             ctx.diag(Diagnostic::error(
                 "secret_allow_list_empty",
                 format!("{reference} has `allow = []`: no one may reveal it"),
@@ -352,8 +335,8 @@ fn get(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
                 "secret has an empty allow list; access denied".into(),
             ));
         }
-        let restricted =
-            policy.is_some_and(|p| !p.allow.is_empty() || p.approval == SecretApproval::Each);
+        let restricted = policy
+            .is_some_and(|p| !p.allow_list().is_empty() || p.approval == SecretApproval::Each);
         if restricted {
             ctx.diag(Diagnostic::error(
                 "secret_policy_requires_agent",

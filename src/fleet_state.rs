@@ -238,10 +238,51 @@ pub fn governance_content(manifest: &Manifest) -> Value {
         .map(|(r, p)| {
             let mut v = serde_json::to_value(p).unwrap_or(Value::Null);
             if let Some(allow) = v.get_mut("allow") {
-                let list: Vec<String> = p.allow.to_vec();
-                *allow = json!(sorted(&list));
+                *allow = json!(sorted(p.allow_list()));
             }
             (r.clone(), v)
+        })
+        .collect();
+    let provider_json = |kind: Option<Value>,
+                         base_url: &Option<String>,
+                         key: &Option<String>,
+                         api_key_helper: &Option<bool>| {
+        json!({
+            "kind": kind,
+            "base_url": base_url,
+            "key": key,
+            "api_key_helper": api_key_helper,
+        })
+    };
+    let providers: BTreeMap<_, _> = manifest
+        .ai_providers
+        .iter()
+        .map(|(n, p)| {
+            let kind = serde_json::to_value(p.kind).ok();
+            (
+                n.clone(),
+                provider_json(kind, &p.base_url, &p.key, &p.api_key_helper),
+            )
+        })
+        .collect();
+    // Profile overrides can redirect a provider's endpoint or key just the same.
+    let profile_providers: BTreeMap<_, _> = manifest
+        .profiles
+        .iter()
+        .filter(|(_, p)| !p.ai_providers.is_empty())
+        .map(|(name, profile)| {
+            let overrides: BTreeMap<_, _> = profile
+                .ai_providers
+                .iter()
+                .map(|(n, p)| {
+                    let kind = p.kind.and_then(|k| serde_json::to_value(k).ok());
+                    (
+                        n.clone(),
+                        provider_json(kind, &p.base_url, &p.key, &p.api_key_helper),
+                    )
+                })
+                .collect();
+            (name.clone(), overrides)
         })
         .collect();
     json!({
@@ -249,6 +290,11 @@ pub fn governance_content(manifest: &Manifest) -> Value {
         "members": members,
         "groups": groups,
         "secrets": secrets,
+        "providers": providers,
+        "profile_providers": profile_providers,
+        "mcp_reveal": sorted(
+            manifest.mcp_server.as_ref().map(|m| m.reveal.as_slice()).unwrap_or_default()
+        ),
         "required_approvals": manifest.required_approvals(),
         "revoked_recipients": sorted(&manifest.revoked_recipients),
         "recovery": manifest.recovery.as_ref().map(|r| json!({
@@ -1012,5 +1058,46 @@ mod tests {
             }
         ));
         assert!(TrustAnchor::load(fresh.path()).unwrap().is_some());
+    }
+
+    #[test]
+    fn provider_destinations_and_mcp_reveal_are_governance() {
+        use crate::adapters::config::{AiProvider, AiProviderKind};
+        let mut f = fixture();
+        f.manifest.ai_providers.insert(
+            "gw".into(),
+            AiProvider {
+                kind: AiProviderKind::Anthropic,
+                base_url: Some("https://gateway.example".into()),
+                default_model: None,
+                key: Some("native://app/key".into()),
+                api_key_helper: None,
+            },
+        );
+        let base = governance_digest(&f.manifest).unwrap();
+        f.manifest.ai_providers.get_mut("gw").unwrap().base_url =
+            Some("https://evil.example".into());
+        let moved = governance_digest(&f.manifest).unwrap();
+        assert_ne!(base, moved);
+        f.manifest.ai_providers.get_mut("gw").unwrap().key = Some("native://app/other".into());
+        assert_ne!(moved, governance_digest(&f.manifest).unwrap());
+
+        let before = governance_digest(&f.manifest).unwrap();
+        f.manifest.mcp_server = Some(crate::manifest::McpServerConfig {
+            reveal: vec!["native://app/key".into()],
+        });
+        assert_ne!(before, governance_digest(&f.manifest).unwrap());
+    }
+
+    #[test]
+    fn explicit_empty_allow_differs_from_absent_policy() {
+        use crate::manifest::SecretPolicy;
+        let mut f = fixture();
+        f.manifest
+            .secrets
+            .insert("native://app/k".into(), SecretPolicy::default());
+        let absent = governance_digest(&f.manifest).unwrap();
+        f.manifest.secrets.get_mut("native://app/k").unwrap().allow = Some(vec![]);
+        assert_ne!(absent, governance_digest(&f.manifest).unwrap());
     }
 }

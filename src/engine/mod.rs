@@ -1031,6 +1031,41 @@ fn approvals(
             next.mcp.insert(name.clone(), value);
         }
     }
+    // A provider's endpoint and key reference decide where a credential is
+    // sent: a new or changed destination needs the user's consent.
+    if !selected.is_empty() {
+        let in_use: BTreeSet<&str> = merged
+            .agents
+            .ai_providers
+            .iter()
+            .filter(|(agent, _)| selected.iter().any(|a| a.id == agent.as_str()))
+            .map(|(_, id)| id.as_str())
+            .collect();
+        next.providers = BTreeMap::new();
+        for (id, provider) in &merged.ai_providers {
+            if !in_use.contains(id.as_str()) {
+                continue;
+            }
+            let value = json!({
+                "kind": provider.kind,
+                "base_url": provider.base_url,
+                "key": provider.key,
+                "api_key_helper": provider.api_key_helper,
+            });
+            if previous.providers.get(id) != Some(&value) {
+                approvals.push(Approval {
+                    kind: "ai_provider",
+                    name: id.clone(),
+                    detail: format!(
+                        "endpoint {}, key {}",
+                        provider.base_url.as_deref().unwrap_or("default"),
+                        provider.key.as_deref().unwrap_or("none")
+                    ),
+                });
+            }
+            next.providers.insert(id.clone(), value);
+        }
+    }
     // A project layer comes from the repository, which may not be trusted:
     // `[agents.permissions] allow = ["Bash"]` would let its agent run commands
     // without asking. Any newly allowed rule needs the user's consent.

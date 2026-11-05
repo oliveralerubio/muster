@@ -390,6 +390,7 @@ fn machine_profile_overrides_provider_by_id_and_keeps_other_providers() {
         .replace("[machines.laptop]", "[machines.laptop]\nprofile = 'work'");
     config.push_str("\n[agents]\nenabled = ['claude']\n[agents.providers]\nclaude = 'gateway'\n[providers.gateway]\nkind = 'anthropic'\ndefault_model = 'team-model'\n[providers.local]\nkind = 'ollama'\n[profiles.work.providers.gateway]\nkind = 'anthropic'\ndefault_model = 'machine-model'\n");
     std::fs::write(path, config).unwrap();
+    env.run(&["trust", "resign", "--yes"]).assert().success();
     env.run(&["agents", "apply", "--yes"]).assert().success();
     let file: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(env.path().join(".claude/settings.json")).unwrap(),
@@ -660,6 +661,7 @@ fn provider_profile_merges_fields_and_explains_each_source() {
         .replace("[machines.laptop]", "[machines.laptop]\nprofile = 'work'");
     config.push_str("\n[agents]\nenabled = ['claude']\n[agents.providers]\nclaude = 'gateway'\n[providers.gateway]\nkind = 'anthropic'\nbase_url = 'https://example.invalid'\ndefault_model = 'team'\n[profiles.work.providers.gateway]\ndefault_model = 'machine'\n");
     std::fs::write(path, config).unwrap();
+    env.run(&["trust", "resign", "--yes"]).assert().success();
     env.run(&["agents", "apply", "--yes"]).assert().success();
     let settings: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(env.path().join(".claude/settings.json")).unwrap(),
@@ -834,7 +836,7 @@ fn provider_add_value_stdin_vaults_without_echo_and_value_warns() {
 }
 
 #[test]
-fn unattended_sync_applies_provider_changes_without_approval() {
+fn unattended_sync_refuses_unapproved_provider_changes() {
     let env = MusterEnv::new();
     env.run(&["init", "--machine", "laptop", "--yes"])
         .assert()
@@ -843,6 +845,13 @@ fn unattended_sync_applies_provider_changes_without_approval() {
     let mut config = std::fs::read_to_string(&path).unwrap();
     config.push_str("\n[agents]\nenabled = ['claude']\n[agents.providers]\nclaude = 'gateway'\n[providers.gateway]\nkind = 'anthropic'\nbase_url = 'https://first.invalid'\ndefault_model = 'first'\n");
     std::fs::write(&path, &config).unwrap();
+    env.run(&["trust", "resign", "--yes"]).assert().success();
+    // A new provider destination needs consent: unattended sync exits 2.
+    env.run(&["sync", "--format", "json"]).assert().code(2);
+    env.run(&["sync", "--yes", "--format", "json"])
+        .assert()
+        .success();
+    // Approved destination: unattended runs keep converging.
     env.run(&["sync", "--format", "json"]).assert().success();
     std::fs::write(
         &path,
@@ -851,11 +860,19 @@ fn unattended_sync_applies_provider_changes_without_approval() {
             .replace("default_model = 'first'", "default_model = 'second'"),
     )
     .unwrap();
-    env.run(&["sync", "--format", "json"]).assert().success();
-    let settings: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(env.path().join(".claude/settings.json")).unwrap(),
-    )
-    .unwrap();
+    env.run(&["trust", "resign", "--yes"]).assert().success();
+    env.run(&["sync", "--format", "json"]).assert().code(2);
+    let read = || -> serde_json::Value {
+        serde_json::from_str(
+            &std::fs::read_to_string(env.path().join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap()
+    };
+    assert_eq!(read()["env"]["ANTHROPIC_BASE_URL"], "https://first.invalid");
+    env.run(&["sync", "--yes", "--format", "json"])
+        .assert()
+        .success();
+    let settings = read();
     assert_eq!(
         settings["env"]["ANTHROPIC_BASE_URL"],
         "https://second.invalid"
@@ -994,6 +1011,7 @@ fn provider_rm_refuses_to_orphan_an_inherited_profile_declaration() {
         .replace("[machines.laptop]", "[machines.laptop]\nprofile = 'work'");
     config.push_str("\n[providers.gateway]\nkind = 'anthropic'\n[profiles.work.providers.gateway]\ndefault_model = 'machine'\n");
     std::fs::write(&path, &config).unwrap();
+    env.run(&["trust", "resign", "--yes"]).assert().success();
     env.run(&["provider", "rm", "gateway", "--yes", "--format", "json"])
         .assert()
         .code(3);
