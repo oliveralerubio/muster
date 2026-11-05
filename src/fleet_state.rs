@@ -44,6 +44,12 @@ pub struct StatePayload {
     pub governance: String,
     /// `group -> sha256(<group>.age)`.
     pub vault: BTreeMap<String, String>,
+    /// `group -> sha256(<group>.meta.json)`: the plaintext sidecars (recipient
+    /// and secret-name lists) are signed too. Omitted from the canonical bytes
+    /// when empty, so states signed before sidecars were covered still verify
+    /// (and are re-signed with digests by the next change).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub vault_meta: BTreeMap<String, String>,
     pub signer: String,
 }
 
@@ -251,6 +257,19 @@ pub fn governance_digest(manifest: &Manifest) -> Result<String, MusterError> {
 
 /// `group -> sha256` of every `vault/*.age` file.
 pub fn vault_hashes(config_dir: &Path) -> Result<BTreeMap<String, String>, MusterError> {
+    hash_vault_files(config_dir, |name| name.strip_suffix(".age"))
+}
+
+/// `group -> sha256` of every `vault/*.meta.json` sidecar.
+pub fn vault_meta_hashes(config_dir: &Path) -> Result<BTreeMap<String, String>, MusterError> {
+    hash_vault_files(config_dir, |name| name.strip_suffix(".meta.json"))
+}
+
+/// Hashes the vault files whose name `group_of` maps to a group.
+fn hash_vault_files(
+    config_dir: &Path,
+    group_of: impl Fn(&str) -> Option<&str>,
+) -> Result<BTreeMap<String, String>, MusterError> {
     let dir = config_dir.join("vault");
     let mut map = BTreeMap::new();
     let entries = match fs::read_dir(&dir) {
@@ -262,12 +281,11 @@ pub fn vault_hashes(config_dir: &Path) -> Result<BTreeMap<String, String>, Muste
         let path = entry
             .map_err(|e| MusterError::Operational(format!("{}: {e}", dir.display())))?
             .path();
-        if path.extension().is_some_and(|e| e == "age") {
-            let group = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or_default()
-                .to_string();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        if let Some(group) = group_of(name).map(str::to_string) {
             let bytes = fs::read(&path)
                 .map_err(|e| MusterError::Operational(format!("{}: {e}", path.display())))?;
             map.insert(group, sha256_hex(&bytes));
@@ -388,7 +406,8 @@ pub fn is_current(
     state: &FleetState,
 ) -> Result<bool, MusterError> {
     Ok(state.payload.governance == governance_digest(manifest)?
-        && state.payload.vault == vault_hashes(config_dir)?)
+        && state.payload.vault == vault_hashes(config_dir)?
+        && state.payload.vault_meta == vault_meta_hashes(config_dir)?)
 }
 
 /// Refuses a repo whose signed state is older than the local pin. `action`
@@ -442,6 +461,7 @@ pub fn seal(
         prev,
         governance: governance_digest(manifest)?,
         vault: vault_hashes(config_dir)?,
+        vault_meta: vault_meta_hashes(config_dir)?,
         signer: signer.public(),
     };
     let state = FleetState::sign(payload, signer)?;
@@ -633,6 +653,37 @@ pub fn verify_with(
             "vault group '{group}' is not in the signed fleet state (unsigned ciphertext)"
         )));
     }
+    // A state signed before sidecars were covered has no digests: nothing to
+    // compare until the next change re-signs it.
+    if !(state.payload.vault_meta.is_empty() && !state.payload.vault.is_empty()) {
+        let actual_meta = vault_meta_hashes(config_dir)?;
+        for (group, signed) in &state.payload.vault_meta {
+            match actual_meta.get(group) {
+                Some(h) if h == signed => {}
+                Some(_) => {
+                    return Err(MusterError::Security(format!(
+                        "metadata sidecar '{group}.meta.json' does not match the signed fleet \
+                         state (tampered recipients or secret names)"
+                    )))
+                }
+                None => {
+                    return Err(MusterError::Security(format!(
+                        "metadata sidecar '{group}.meta.json' is missing but the signed fleet \
+                         state lists it"
+                    )))
+                }
+            }
+        }
+        if let Some(group) = actual_meta
+            .keys()
+            .find(|g| !state.payload.vault_meta.contains_key(*g))
+        {
+            return Err(MusterError::Security(format!(
+                "metadata sidecar '{group}.meta.json' is not in the signed fleet state \
+                 (unsigned metadata)"
+            )));
+        }
+    }
 
     if options.persist {
         TrustAnchor::for_state(&state, manifest)?.save(state_dir)?;
@@ -736,12 +787,25 @@ mod tests {
                 prev: None,
                 governance: "g".into(),
                 vault: BTreeMap::from([("app".into(), "h".into())]),
+                vault_meta: BTreeMap::from([("app".into(), "m".into())]),
                 signer: "musterpk1ab".into(),
             },
             signature: String::new(),
         };
         assert_eq!(
             String::from_utf8(state.payload_bytes().unwrap()).unwrap(),
+            r#"{"epoch":7,"governance":"g","prev":null,"signer":"musterpk1ab","vault":{"app":"h"},"vault_meta":{"app":"m"},"version":1}"#
+        );
+        // States signed before sidecar coverage keep their exact bytes.
+        let legacy = FleetState {
+            payload: StatePayload {
+                vault_meta: BTreeMap::new(),
+                ..state.payload
+            },
+            signature: String::new(),
+        };
+        assert_eq!(
+            String::from_utf8(legacy.payload_bytes().unwrap()).unwrap(),
             r#"{"epoch":7,"governance":"g","prev":null,"signer":"musterpk1ab","vault":{"app":"h"},"version":1}"#
         );
     }
@@ -816,6 +880,49 @@ mod tests {
         fs::write(&age, b"real").unwrap();
         fs::write(f.config.join("vault/extra.age"), b"x").unwrap();
         assert!(message(f.verify().unwrap_err()).contains("'extra'"));
+    }
+
+    #[test]
+    fn tampered_missing_and_extra_sidecars_are_refused() {
+        let f = fixture();
+        let meta = f.config.join("vault/prod.meta.json");
+        fs::write(f.config.join("vault/prod.age"), b"real").unwrap();
+        fs::write(&meta, br#"{"recipients":["age1a"]}"#).unwrap();
+        let state = f.seal();
+        assert!(state.payload.vault_meta.contains_key("prod"));
+        f.verify().unwrap();
+        fs::write(&meta, br#"{"recipients":["age1a","age1evil"]}"#).unwrap();
+        let msg = message(f.verify().unwrap_err());
+        assert!(
+            msg.contains("prod.meta.json") && msg.contains("does not match"),
+            "{msg}"
+        );
+        fs::remove_file(&meta).unwrap();
+        assert!(message(f.verify().unwrap_err()).contains("prod.meta.json"));
+        fs::write(&meta, br#"{"recipients":["age1a"]}"#).unwrap();
+        f.verify().unwrap();
+        fs::write(f.config.join("vault/ghost.meta.json"), b"{}").unwrap();
+        assert!(message(f.verify().unwrap_err()).contains("ghost.meta.json"));
+    }
+
+    #[test]
+    fn state_signed_before_sidecar_coverage_still_verifies() {
+        let f = fixture();
+        fs::write(f.config.join("vault/prod.age"), b"real").unwrap();
+        fs::write(f.config.join("vault/prod.meta.json"), b"{}").unwrap();
+        let mut payload = f.seal().payload;
+        payload.vault_meta.clear();
+        payload.epoch = 1;
+        let old = FleetState::sign(payload, &f.signer).unwrap();
+        old.save(&f.config).unwrap();
+        TrustAnchor::for_state(&old, &f.manifest)
+            .unwrap()
+            .save(&f.state)
+            .unwrap();
+        f.verify().unwrap();
+        // The next change re-signs with sidecar digests.
+        let next = f.seal();
+        assert!(next.payload.vault_meta.contains_key("prod"));
     }
 
     #[test]

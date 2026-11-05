@@ -120,12 +120,9 @@ fn run_resign(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> 
     };
 
     // Show governance diff if any
-    let current_gov = governance_digest(&manifest)?;
     let existing_state = FleetState::load(&ctx.config_dir)?;
     if let Some(existing) = &existing_state {
-        if existing.payload.governance == current_gov
-            && existing.payload.vault == fleet_state::vault_hashes(&ctx.config_dir)?
-        {
+        if fleet_state::is_current(&ctx.config_dir, &manifest, existing)? {
             return Ok(json!({
                 "resigned": false,
                 "message": "fleet state is already up to date with the current muster.toml and vault",

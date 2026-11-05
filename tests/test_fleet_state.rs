@@ -603,3 +603,36 @@ fn resign_after_a_local_rollback_is_refused() {
     let pin = ok(&alice, &["trust", "show"]);
     assert_eq!(pin["result"]["trust_pin"]["epoch"], 2);
 }
+
+#[test]
+fn tampered_sidecar_meta_json_is_refused_on_get_and_on_sync() {
+    let (_guard, remote) = bare_remote();
+    let remote = remote.to_str().unwrap();
+    let alice = MusterEnv::new();
+    ok(&alice, &["init", "--yes"]);
+    ok(&alice, &["sync", "--remote", remote]);
+    add_secret(&alice, "app/api", "SEED-real");
+    ok(&alice, &["sync", "--push"]);
+    let config = alice.config_dir();
+
+    // Attacker modifies app.meta.json to add a fake recipient or secret
+    let meta_path = config.join("vault/app.meta.json");
+    let mut meta: Value =
+        serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+    meta["recipients"]
+        .as_array_mut()
+        .unwrap()
+        .push(Value::String("age1evil".into()));
+    std::fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+
+    let (code, raw) = fail(
+        &alice,
+        &["secret", "get", "native://app/api", "--reveal", "--yes"],
+    );
+    assert_eq!(code, 5, "{raw}");
+    assert!(raw.to_string().contains("app.meta.json"), "{raw}");
+
+    let (code, raw) = fail(&alice, &["sync"]);
+    assert_eq!(code, 5, "{raw}");
+    assert!(raw.to_string().contains("app.meta.json"), "{raw}");
+}
