@@ -11,6 +11,7 @@ use crate::machine;
 use crate::manifest::Manifest;
 use crate::output::{Diagnostic, Severity};
 use crate::registry::{CommandSpec, ParamKind, ParamSpec, Params};
+use crate::signing::{self, Signer};
 
 pub const SPEC: CommandSpec = CommandSpec {
     name: "enroll",
@@ -81,6 +82,10 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         machine::save_name(&ctx.state_dir, &name)?;
     }
 
+    let signer = Signer::load_or_create(&ctx.state_dir)?;
+    let mut nonce = [0u8; 16];
+    getrandom::getrandom(&mut nonce)
+        .map_err(|e| MusterError::Operational(format!("no randomness available: {e}")))?;
     let now = time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .expect("RFC 3339 formatting of current UTC time cannot fail");
@@ -88,6 +93,8 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let req = EnrollmentRequest {
         name: name.clone(),
         recipient: identity.recipient(),
+        signing_key: Some(signer.public()),
+        nonce: signing::to_hex(&nonce),
         platform: machine::platform(),
         muster_version: env!("CARGO_PKG_VERSION").into(),
         agents,

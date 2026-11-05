@@ -14,6 +14,12 @@ const ENROLL_DIR: &str = "enroll";
 pub struct EnrollmentRequest {
     pub name: String,
     pub recipient: String,
+    /// Ed25519 public key (`musterpk1...`) of the requesting machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing_key: Option<String>,
+    /// Random per-request nonce; bound into signed approvals (see `fleet_state`).
+    #[serde(default)]
+    pub nonce: String,
     pub platform: String,
     pub muster_version: String,
     #[serde(default)]

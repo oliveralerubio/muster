@@ -99,6 +99,10 @@ fn default_required_approvals() -> u32 {
 pub struct Recovery {
     /// age x25519 recipient (`age1...`).
     pub recipient: String,
+    /// Ed25519 signing key (`musterpk1...`) derived from the recovery key, so
+    /// the break-glass path can sign fleet state and approvals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing_key: Option<String>,
 }
 
 /// A whole file Muster writes under `$HOME` (`muster sync`), with its
@@ -122,6 +126,10 @@ pub struct ManagedDotfile {
 pub struct Machine {
     /// age x25519 recipient (`age1...`) of the machine identity.
     pub recipient: String,
+    /// Ed25519 public key (`musterpk1...`) the machine signs fleet state and
+    /// approvals with. Absent in legacy manifests until the machine publishes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing_key: Option<String>,
     /// `<os>-<arch>`, e.g. `linux-x86_64`.
     pub platform: String,
     /// Muster version that last wrote this entry.
@@ -677,11 +685,13 @@ mod tests {
         let mut m = Manifest::new();
         m.recovery = Some(Recovery {
             recipient: "age1recovery".into(),
+            signing_key: None,
         });
         m.machines.insert(
             "laptop".into(),
             Machine {
                 recipient: "age1laptop".into(),
+                signing_key: None,
                 platform: "linux-x86_64".into(),
                 muster_version: "0.1.0".into(),
                 agents: vec!["claude".into()],

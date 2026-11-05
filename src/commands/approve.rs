@@ -154,6 +154,7 @@ pub(super) fn approve_with_identity(
         name.to_string(),
         Machine {
             recipient: req.recipient.clone(),
+            signing_key: req.signing_key.clone(),
             platform: req.platform.clone(),
             muster_version: req.muster_version.clone(),
             agents: req.agents.clone(),

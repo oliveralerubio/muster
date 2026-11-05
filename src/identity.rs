@@ -92,7 +92,7 @@ fn open_private(path: &Path) -> Result<fs::File, MusterError> {
 }
 
 #[cfg(unix)]
-fn restrict(path: &Path, mode: u32) -> Result<(), MusterError> {
+pub(crate) fn restrict(path: &Path, mode: u32) -> Result<(), MusterError> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|e| {
         MusterError::Security(format!("cannot set permissions on {}: {e}", path.display()))
@@ -100,10 +100,10 @@ fn restrict(path: &Path, mode: u32) -> Result<(), MusterError> {
 }
 
 #[cfg(not(unix))]
-fn restrict(_path: &Path, _mode: u32) -> Result<(), MusterError> {
+pub(crate) fn restrict(_path: &Path, _mode: u32) -> Result<(), MusterError> {
     Ok(())
 }
 
-fn io_err(path: &Path, e: std::io::Error) -> MusterError {
+pub(crate) fn io_err(path: &Path, e: std::io::Error) -> MusterError {
     MusterError::Operational(format!("{}: {e}", path.display()))
 }

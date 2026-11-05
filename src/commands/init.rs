@@ -14,6 +14,7 @@ use crate::machine;
 use crate::manifest::{self, Machine, Manifest, Recovery};
 use crate::output::{Diagnostic, Severity};
 use crate::registry::{CommandSpec, ParamKind, ParamSpec, Params};
+use crate::signing::Signer;
 
 pub const SPEC: CommandSpec = CommandSpec {
     name: "init",
@@ -86,13 +87,16 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     create_dir(&config_dir.join("vault"))?;
 
     let mut manifest = Manifest::new();
+    let signer = Signer::load_or_create(&state_dir)?;
     manifest.recovery = Some(Recovery {
         recipient: recovery.recipient(),
+        signing_key: Some(Signer::from_recovery(&recovery)?.public()),
     });
     manifest.machines.insert(
         name.clone(),
         Machine {
             recipient: identity.recipient(),
+            signing_key: Some(signer.public()),
             platform: machine::platform(),
             muster_version: env!("CARGO_PKG_VERSION").into(),
             agents: agents.clone(),

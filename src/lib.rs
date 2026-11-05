@@ -23,6 +23,7 @@ pub mod providers;
 pub mod registry;
 pub mod secret_leases;
 pub mod secrets;
+pub mod signing;
 pub mod skills;
 pub mod team;
 pub mod usage;
