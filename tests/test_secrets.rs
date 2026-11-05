@@ -885,3 +885,77 @@ fn bitwarden_json_output_yields_only_the_named_field() {
         "{text}"
     );
 }
+
+#[test]
+fn secret_get_reveal_refuses_when_allow_list_is_empty_or_manifest_is_corrupt() {
+    let env = initialized();
+    let path = env.config_dir().join("muster.toml");
+    let mut text = std::fs::read_to_string(&path).unwrap();
+    text.push_str(
+        "
+[secrets.'env://DENIED_KEY']
+allow = []
+",
+    );
+    std::fs::write(&path, text).unwrap();
+    env.run(&["trust", "resign", "--yes"]).assert().success();
+
+    // 1. allow = [] without --agent: must fail
+    let out = env
+        .run(&[
+            "--format",
+            "json",
+            "secret",
+            "get",
+            "env://DENIED_KEY",
+            "--reveal",
+            "--yes",
+        ])
+        .env("DENIED_KEY", "denied-secret-value")
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(5),
+        "reveal must fail: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("denied-secret-value"));
+
+    // 2. allow = [] with --agent: must fail
+    let out_agent = env
+        .run(&[
+            "--format",
+            "json",
+            "secret",
+            "get",
+            "env://DENIED_KEY",
+            "--agent",
+            "claude",
+            "--reveal",
+            "--yes",
+        ])
+        .env("DENIED_KEY", "denied-secret-value")
+        .output()
+        .unwrap();
+    assert_eq!(out_agent.status.code(), Some(5));
+    assert!(!String::from_utf8_lossy(&out_agent.stdout).contains("denied-secret-value"));
+
+    // 3. muster.toml has syntax error: must fail hard, not leak
+    std::fs::write(&path, "this is not valid toml = [[[").unwrap();
+    let out_corrupt = env
+        .run(&[
+            "--format",
+            "json",
+            "secret",
+            "get",
+            "env://DENIED_KEY",
+            "--reveal",
+            "--yes",
+        ])
+        .env("DENIED_KEY", "denied-secret-value")
+        .output()
+        .unwrap();
+    assert!(!out_corrupt.status.success());
+    assert!(!String::from_utf8_lossy(&out_corrupt.stdout).contains("denied-secret-value"));
+}

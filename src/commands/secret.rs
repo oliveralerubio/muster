@@ -305,6 +305,23 @@ fn rm(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     Ok(json!({ "removed": format!("{group}/{name}") }))
 }
 
+/// Whether `muster.toml` spells `allow = []` for `reference`. The parsed policy
+/// cannot tell that apart from an absent `allow`, and only the explicit empty
+/// list means "deny everyone".
+fn has_explicit_empty_allow(ctx: &Context, reference: &SecretRef) -> bool {
+    std::fs::read_to_string(ctx.config_dir.join("muster.toml"))
+        .ok()
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .and_then(|t| {
+            t.get("secrets")?
+                .get(reference.as_str())?
+                .get("allow")?
+                .as_array()
+                .map(Vec::is_empty)
+        })
+        .unwrap_or(false)
+}
+
 fn get(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let reference = SecretRef::parse(required(params, "reference")?)?;
     let reveal = params.get_bool("reveal");
@@ -315,11 +332,28 @@ fn get(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     // A secret with an allow list or per-use approval is never revealed to an
     // unnamed caller: `--yes` alone does not satisfy a policy.
     if reveal && actor.is_none() {
-        let restricted = Manifest::load(&ctx.config_dir).ok().is_some_and(|m| {
-            m.secrets
-                .get(reference.as_str())
-                .is_some_and(|p| !p.allow.is_empty() || p.approval == SecretApproval::Each)
-        });
+        // Fail closed: an unreadable manifest must never turn into "no policy".
+        let manifest = match Manifest::load(&ctx.config_dir) {
+            Ok(m) => Some(m),
+            Err(MusterError::Operational(_)) if !ctx.config_dir.join("muster.toml").exists() => {
+                None
+            }
+            Err(e) => return Err(e),
+        };
+        let policy = manifest
+            .as_ref()
+            .and_then(|m| m.secrets.get(reference.as_str()));
+        if policy.is_some_and(|p| p.allow.is_empty() && has_explicit_empty_allow(ctx, &reference)) {
+            ctx.diag(Diagnostic::error(
+                "secret_allow_list_empty",
+                format!("{reference} has `allow = []`: no one may reveal it"),
+            ));
+            return Err(MusterError::Security(
+                "secret has an empty allow list; access denied".into(),
+            ));
+        }
+        let restricted =
+            policy.is_some_and(|p| !p.allow.is_empty() || p.approval == SecretApproval::Each);
         if restricted {
             ctx.diag(Diagnostic::error(
                 "secret_policy_requires_agent",
