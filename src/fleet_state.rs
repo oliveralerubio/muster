@@ -956,33 +956,58 @@ fn check_transition(
             "fleet state history forked: its predecessor is not the accepted state".into(),
         ));
     }
-    if vault_only {
-        if prior.snapshot.is_some() {
-            let changed = changed_groups(
-                &prior.vault,
-                &prior.vault_meta,
-                &state.payload.vault,
-                &state.payload.vault_meta,
-            );
-            if !prior.admins.contains(signer) {
-                ensure_reads_groups(manifest, signer, &changed)?;
-            } else if ensure_reads_groups(manifest, signer, &changed).is_err() {
-                // An admin rewriting ciphertext it cannot read is not a
-                // routine write: with several admins required it needs their
-                // co-signatures, like a governance change.
-                if let Some((received, required)) = quorum_count(prior, state) {
-                    if received < required {
-                        return Ok(Transition::Pending { received, required });
-                    }
-                }
+    // The vault rule holds for every transition, whatever else it changes: a
+    // governance edit that is exempt from the quorum (an invitation, an
+    // approved enrollment) never carries ciphertext rewrites along with it.
+    let vault = vault_gate(prior, state, manifest)?;
+    if !vault_only {
+        if let Some(old) = &prior.snapshot {
+            let new = governance_content(manifest);
+            check_quorum(old, &new, state, &prior.hash)?;
+            return Ok(match transition_outcome(prior, state, &new) {
+                Transition::Accepted => vault.unwrap_or(Transition::Accepted),
+                pending => pending,
+            });
+        }
+    }
+    Ok(vault.unwrap_or(Transition::Accepted))
+}
+
+/// The vault part of a transition. A signer that is not an admin must read
+/// every group it changed (refused otherwise). An admin rewriting a group it
+/// cannot read is not a routine write: with several admins required it needs
+/// their co-signatures, like a governance change (`Some(Pending)`). `None`
+/// when the vault part is fine.
+fn vault_gate(
+    prior: &Prior,
+    state: &FleetState,
+    manifest: &Manifest,
+) -> Result<Option<Transition>, MusterError> {
+    if prior.snapshot.is_none() {
+        return Ok(None);
+    }
+    let signer = &state.payload.signer;
+    let changed = changed_groups(
+        &prior.vault,
+        &prior.vault_meta,
+        &state.payload.vault,
+        &state.payload.vault_meta,
+    );
+    if changed.is_empty() {
+        return Ok(None);
+    }
+    if !prior.admins.contains(signer) {
+        ensure_reads_groups(manifest, signer, &changed)?;
+        return Ok(None);
+    }
+    if ensure_reads_groups(manifest, signer, &changed).is_err() {
+        if let Some((received, required)) = quorum_count(prior, state) {
+            if received < required {
+                return Ok(Some(Transition::Pending { received, required }));
             }
         }
-    } else if let Some(old) = &prior.snapshot {
-        let new = governance_content(manifest);
-        check_quorum(old, &new, state, &prior.hash)?;
-        return Ok(transition_outcome(prior, state, &new));
     }
-    Ok(Transition::Accepted)
+    Ok(None)
 }
 
 /// How a transition fared against the k-of-n rule.
@@ -1223,19 +1248,22 @@ pub fn pending_quorum(
     if state.payload.epoch != pin.epoch + 1 {
         return Ok(None);
     }
-    if state.payload.governance == pin.governance {
-        // Vault-only: pending when an admin rewrote groups it does not read.
-        return Ok(match check_transition(&pin.as_prior(), state, manifest) {
-            Ok(Transition::Pending { received, required }) => Some((received, required)),
-            _ => None,
-        });
-    }
-    Ok(
-        match transition_outcome(&pin.as_prior(), state, &governance_content(manifest)) {
-            Transition::Pending { received, required } => Some((received, required)),
-            Transition::Accepted => None,
-        },
-    )
+    let prior = pin.as_prior();
+    let outcome = if state.payload.governance == pin.governance {
+        Transition::Accepted
+    } else {
+        transition_outcome(&prior, state, &governance_content(manifest))
+    };
+    // An admin rewriting groups it does not read is pending whatever else the
+    // transition changes (see `vault_gate`).
+    let outcome = match (outcome, vault_gate(&prior, state, manifest)) {
+        (Transition::Accepted, Ok(Some(pending))) => pending,
+        (outcome, _) => outcome,
+    };
+    Ok(match outcome {
+        Transition::Pending { received, required } => Some((received, required)),
+        Transition::Accepted => None,
+    })
 }
 
 /// Groups whose ciphertext or sidecar differs between two vault baselines.
@@ -2541,7 +2569,7 @@ mod tests {
 
     #[test]
     fn a_new_machine_with_its_own_quorum_joining_a_plain_member_is_accepted() {
-        let (mut f, k2, k3) = graft_fixture();
+        let (mut f, k2, _k3) = graft_fixture();
         let scratch = tempdir().unwrap();
         let (_d4, k4) = new_signer();
         f.manifest
@@ -2740,5 +2768,199 @@ mod tests {
         f.seal_as(&f.signer, scratch.path(), vec![ev]);
         let msg = message(f.verify().unwrap_err());
         assert!(msg.contains("without a quorum of 2"), "{msg}");
+    }
+
+    #[test]
+    fn dropped_invitation_bundling_unread_vault_rewrite_stays_pending() {
+        let (mut f, _k2, _k3) = quorum_fixture();
+        let scratch = tempdir().unwrap();
+
+        // Add a pending invitation to the fixture state
+        f.manifest.members.insert(
+            "pending_user".into(),
+            Member {
+                role: Role::Member,
+                status: MemberStatus::Pending,
+                invited_by: Some("alice".into()),
+                machines: vec![],
+                ..Member::default()
+            },
+        );
+        f.seal_as(&f.signer, &f.state, vec![]);
+        f.verify().unwrap();
+
+        // Alice drops the pending invitation AND tampers vault/dev.age (which alice does not read)
+        f.manifest.members.remove("pending_user");
+        fs::write(f.config.join("vault/dev.age"), b"forged_bundled_with_drop").unwrap();
+
+        f.seal_as(&f.signer, scratch.path(), vec![]);
+        match f.verify().unwrap() {
+            Verification::Pending {
+                received: 1,
+                required: 2,
+                ..
+            } => {}
+            other => panic!("bundled rewrite accepted with one signature: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enrollment_bundling_unread_vault_rewrite_stays_pending() {
+        let (mut f, k2, _k3) = graft_fixture();
+        let scratch = tempdir().unwrap();
+
+        let (_d4, k4) = new_signer();
+        f.manifest
+            .machines
+            .insert("node4".into(), machine_for(&k4, "age1node4"));
+        f.manifest
+            .members
+            .get_mut("carol")
+            .unwrap()
+            .machines
+            .push("node4".into());
+
+        let mut request = EnrollmentRequest {
+            name: "node4".into(),
+            recipient: "age1node4".into(),
+            signing_key: Some(k4.public()),
+            nonce: "n".into(),
+            platform: "linux".into(),
+            muster_version: "0.1.0".into(),
+            agents: vec![],
+            created_at: "now".into(),
+            approvals: vec![],
+            role: None,
+            profile: None,
+            member: Some("carol".into()),
+        };
+        let at = current_hash(&f.config).unwrap();
+        request
+            .sign_approval("alice", "node1", &f.signer, at.as_deref())
+            .unwrap();
+        request
+            .sign_approval("bob", "node2", &k2, at.as_deref())
+            .unwrap();
+
+        let signed = request
+            .approvals
+            .iter()
+            .filter_map(|a| match a {
+                crate::fleet::ApprovalEntry::Signed(s) => Some(s.clone()),
+                crate::fleet::ApprovalEntry::Legacy(_) => None,
+            })
+            .collect();
+        let ev = EnrollmentEvidence {
+            name: "node4".into(),
+            recipient: request.recipient.clone(),
+            signing_key: request.signing_key.clone(),
+            member: request.member.clone(),
+            role: None,
+            profile: None,
+            created_at: request.created_at.clone(),
+            nonce: request.nonce.clone(),
+            approvals: signed,
+        };
+
+        // Alice rewrites dev.age (unread by alice) while bundling the approved enrollment
+        fs::write(
+            f.config.join("vault/dev.age"),
+            b"forged_bundled_with_enrollment",
+        )
+        .unwrap();
+
+        f.seal_as(&f.signer, scratch.path(), vec![ev]);
+        match f.verify().unwrap() {
+            Verification::Pending {
+                received: 1,
+                required: 2,
+                ..
+            } => {}
+            other => panic!("bundled enrollment rewrite accepted with one signature: {other:?}"),
+        }
+    }
+
+    mod forged_ciphertext_property {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// k=2, admins alice (reads `ops`) and bob (reads `dev`), a plain
+        /// member carol and a never-active invitation `erin`, all accepted.
+        fn base() -> (Fixture, Signer, Signer) {
+            let (mut f, k2, k3) = quorum_fixture();
+            f.manifest.members.insert(
+                "carol".into(),
+                Member {
+                    role: Role::Member,
+                    status: MemberStatus::Active,
+                    ..Member::default()
+                },
+            );
+            f.manifest.members.insert(
+                "erin".into(),
+                Member {
+                    role: Role::Member,
+                    status: MemberStatus::Pending,
+                    invited_by: Some("alice".into()),
+                    ..Member::default()
+                },
+            );
+            f.seal_as(&f.signer, &f.state, vec![]);
+            f.verify().unwrap();
+            (f, k2, k3)
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(24))]
+
+            /// One admin that does not read `dev` signs any mix of exempt
+            /// governance edits plus a rewrite of `dev`: never accepted.
+            #[test]
+            fn one_admin_never_gets_forged_ciphertext_accepted(
+                add_invite in any::<bool>(),
+                drop_invite in any::<bool>(),
+                enroll in any::<bool>(),
+                rewrite_meta_only in any::<bool>(),
+                also_ops in any::<bool>(),
+            ) {
+                let (mut f, k2, k3) = base();
+                let scratch = tempdir().unwrap();
+                let mut evidence_list = vec![];
+                if add_invite {
+                    f.manifest.members.insert(
+                        "frank".into(),
+                        Member {
+                            role: Role::Member,
+                            status: MemberStatus::Pending,
+                            invited_by: Some("alice".into()),
+                            ..Member::default()
+                        },
+                    );
+                }
+                if drop_invite {
+                    f.manifest.members.remove("erin");
+                }
+                if enroll {
+                    f.manifest
+                        .machines
+                        .insert("node3".into(), machine_for(&k3, "age1node3"));
+                    f.manifest.members.get_mut("carol").unwrap().machines.push("node3".into());
+                    evidence_list.push(evidence_for(&f, &k2, &k3, &["alice", "bob"], "carol"));
+                }
+                if rewrite_meta_only {
+                    fs::write(f.config.join("vault/dev.meta.json"), b"{\"forged\":true}").unwrap();
+                } else {
+                    fs::write(f.config.join("vault/dev.age"), b"forged by one admin").unwrap();
+                }
+                if also_ops {
+                    fs::write(f.config.join("vault/ops.age"), b"alice also updates ops").unwrap();
+                }
+                f.seal_as(&f.signer, scratch.path(), evidence_list);
+                match f.verify() {
+                    Ok(Verification::Pending { required: 2, .. }) | Err(MusterError::Security(_)) => {}
+                    other => prop_assert!(false, "forged ciphertext accepted: {:?}", other),
+                }
+            }
+        }
     }
 }
