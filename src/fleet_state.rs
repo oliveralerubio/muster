@@ -305,6 +305,8 @@ pub fn governance_content(manifest: &Manifest) -> Value {
                     "status": m.status,
                     "machines": sorted(&m.machines),
                     "invited_by": m.invited_by,
+                    "invite_nonce": m.invite_nonce,
+                    "invited_at_state": m.invited_at_state,
                     "approved_by": m.approved_by,
                     "approvals": sorted(&m.approvals),
                 }),
@@ -986,6 +988,18 @@ fn check_transition(
             "fleet state history forked: its predecessor is not the accepted state".into(),
         ));
     }
+    // Sidecar digests, once signed, stay signed: only states from before
+    // sidecars were covered may omit them, never a later one.
+    if !prior.vault_meta.is_empty()
+        && state.payload.vault_meta.is_empty()
+        && !state.payload.vault.is_empty()
+    {
+        return Err(MusterError::Security(
+            "fleet state drops the signed metadata sidecar digests the accepted state carried \
+             (downgrade into the legacy window)"
+                .into(),
+        ));
+    }
     // The vault rule holds for every transition, whatever else it changes: a
     // governance edit that is exempt from the quorum (an invitation, an
     // approved enrollment) never carries ciphertext rewrites along with it.
@@ -1120,6 +1134,27 @@ fn revoked_machine_added(old: &Value, new: &Value) -> Option<String> {
     })
 }
 
+/// A machine of `member` whose recipient or signing key the old state revoked.
+fn revoked_member_machine(old: &Value, new: &Value, member: &Value) -> Option<String> {
+    let listed = |field: &str, value: &Value| {
+        value.is_string()
+            && old[field]
+                .as_array()
+                .is_some_and(|list| list.iter().any(|x| x == value))
+    };
+    member["machines"].as_array()?.iter().find_map(|m| {
+        let name = m.as_str()?;
+        let machine = if new["machines"][name].is_object() {
+            &new["machines"][name]
+        } else {
+            &old["machines"][name]
+        };
+        (listed("revoked_recipients", &machine["recipient"])
+            || listed("revoked_signing_keys", &machine["signing_key"]))
+        .then(|| name.to_string())
+    })
+}
+
 /// Whether the diff only enrolls brand-new machines whose own signed
 /// approvals (checked by [`check_quorum`]) already carry the quorum, and
 /// activates members that carry theirs. A machine is brand new when its name,
@@ -1234,6 +1269,8 @@ fn enrollment_only(old: &Value, new: &Value, state: &FleetState) -> bool {
             nm.is_object()
                 && om["role"] == nm["role"]
                 && om["invited_by"] == nm["invited_by"]
+                && om["invite_nonce"] == nm["invite_nonce"]
+                && om["invited_at_state"] == nm["invited_at_state"]
                 && (om["status"] == nm["status"] || activated)
                 && (om["approved_by"] == nm["approved_by"] || activated)
                 && subset(&om["machines"], &nm["machines"])
@@ -1353,18 +1390,30 @@ fn member_active_admin(old: &Value, member: &str, machine: &str, key: &str) -> b
         && old["machines"][machine]["signing_key"] == key
 }
 
-/// Message an admin signs to approve a pending member (bound to its role and
-/// inviter, so an approval of a plain member cannot promote to admin).
+/// The invitation an approval is given for: role and inviter (so an approval
+/// of a plain member cannot promote to admin), plus the invitation's random
+/// nonce and the state it was created in (so an approval is single-use and
+/// never verifies against a later re-invitation).
+#[derive(Clone, Copy)]
+pub struct Invitation<'a> {
+    pub role: &'a Value,
+    pub invited_by: &'a Value,
+    pub nonce: &'a Value,
+    pub state: &'a Value,
+}
+
+/// Message an admin signs to approve a pending member.
 pub fn member_approval_message(
     name: &str,
-    role: &Value,
-    invited_by: &Value,
+    invitation: Invitation<'_>,
 ) -> Result<Vec<u8>, MusterError> {
     canonical_bytes(&json!({
-        "domain": "muster member approval v1",
+        "domain": "muster member approval v2",
         "member": name,
-        "role": role,
-        "invited_by": invited_by,
+        "role": invitation.role,
+        "invited_by": invitation.invited_by,
+        "invite_nonce": invitation.nonce,
+        "invited_at_state": invitation.state,
     }))
 }
 
@@ -1374,11 +1423,10 @@ pub fn sign_member_approval(
     admin: &str,
     machine: &str,
     member: &str,
-    role: &Value,
-    invited_by: &Value,
+    invitation: Invitation<'_>,
     signer: &Signer,
 ) -> Result<String, MusterError> {
-    let message = member_approval_message(member, role, invited_by)?;
+    let message = member_approval_message(member, invitation)?;
     Ok(format!("{admin}:{machine}:{}", signer.sign(&message)))
 }
 
@@ -1387,11 +1435,10 @@ pub fn sign_member_approval(
 pub fn valid_member_approvals(
     snapshot: &Value,
     member: &str,
-    role: &Value,
-    invited_by: &Value,
+    invitation: Invitation<'_>,
     approvals: &[String],
 ) -> Vec<String> {
-    let Ok(message) = member_approval_message(member, role, invited_by) else {
+    let Ok(message) = member_approval_message(member, invitation) else {
         return Vec::new();
     };
     let mut valid: Vec<String> = Vec::new();
@@ -1545,6 +1592,21 @@ fn check_quorum(
         }
     }
     if let Some(members) = new["members"].as_object() {
+        // A brand-new invitation is minted against the accepted state, with a
+        // fresh nonce: copying an earlier invitation's fields cannot revive
+        // its approvals.
+        for (name, member) in members {
+            if old["members"][name].is_object() || member["status"] == "active" {
+                continue;
+            }
+            if member["invited_at_state"].as_str() != Some(prior_hash)
+                || !member["invite_nonce"].as_str().is_some_and(|n| !n.is_empty())
+            {
+                return Err(MusterError::Security(format!(
+                    "invites member '{name}' without a fresh nonce bound to the accepted state"
+                )));
+            }
+        }
         for (name, member) in members {
             let was_active = old["members"][name]["status"] == "active";
             if member["status"] != "active" || was_active {
@@ -1558,11 +1620,43 @@ fn check_quorum(
                         .collect()
                 })
                 .unwrap_or_default();
+            let is_text = |v: &Value| v.as_str().is_some_and(|s| !s.is_empty());
+            if !is_text(&member["invite_nonce"]) || !is_text(&member["invited_at_state"]) {
+                return Err(MusterError::Security(format!(
+                    "activates member '{name}' whose invitation carries no nonce and creation \
+                     state; re-invite the member"
+                )));
+            }
+            // The approvals must belong to the invitation the prior state
+            // holds, not to an earlier one that was dropped and re-created.
+            let old_member = &old["members"][name];
+            let same_invitation = if old_member.is_object() {
+                old_member["invite_nonce"] == member["invite_nonce"]
+                    && old_member["invited_at_state"] == member["invited_at_state"]
+            } else {
+                member["invited_at_state"].as_str() == Some(prior_hash)
+            };
+            if !same_invitation {
+                return Err(MusterError::Security(format!(
+                    "activates member '{name}' with an invitation that is not the one the \
+                     accepted state holds; approvals of an earlier invitation do not carry over"
+                )));
+            }
+            if let Some(machine) = revoked_member_machine(old, new, member) {
+                return Err(MusterError::Security(format!(
+                    "activates member '{name}' who owns machine '{machine}' whose age \
+                     recipient or signing key was revoked; revocation is permanent"
+                )));
+            }
             let found = valid_member_approvals(
                 old,
                 name,
-                &member["role"],
-                &member["invited_by"],
+                Invitation {
+                    role: &member["role"],
+                    invited_by: &member["invited_by"],
+                    nonce: &member["invite_nonce"],
+                    state: &member["invited_at_state"],
+                },
                 &approvals,
             )
             .len();
@@ -2068,6 +2162,29 @@ mod tests {
     }
 
     #[test]
+    fn a_pinned_sidecar_digest_set_cannot_be_dropped_later() {
+        let f = fixture();
+        fs::write(f.config.join("vault/prod.age"), b"real").unwrap();
+        fs::write(f.config.join("vault/prod.meta.json"), b"{}").unwrap();
+        let first = f.seal();
+        assert!(!first.payload.vault_meta.is_empty());
+        f.verify().unwrap();
+        // The next epoch is validly signed but omits every sidecar digest, so
+        // the sidecars would go unchecked ("legacy" window).
+        let mut payload = first.payload.clone();
+        payload.epoch = 2;
+        payload.prev = Some(first.payload_hash().unwrap());
+        payload.vault_meta.clear();
+        FleetState::sign(payload, &f.signer)
+            .unwrap()
+            .save(&f.config)
+            .unwrap();
+        fs::write(f.config.join("vault/prod.meta.json"), b"{\"forged\":1}").unwrap();
+        let err = message(f.verify().unwrap_err());
+        assert!(err.contains("drops the signed metadata sidecar"), "{err}");
+    }
+
+    #[test]
     fn governance_edit_is_refused_but_other_fields_are_free() {
         let mut f = fixture();
         f.seal();
@@ -2478,48 +2595,136 @@ mod tests {
         f.verify().unwrap();
     }
 
+    /// carol invited by alice with the given nonce, created in the accepted state.
+    fn invited(f: &Fixture, nonce: &str, status: MemberStatus, approvals: Vec<String>) -> Member {
+        Member {
+            role: Role::Member,
+            status,
+            invited_by: Some("alice".into()),
+            invite_nonce: Some(nonce.into()),
+            invited_at_state: current_hash(&f.config).unwrap(),
+            approvals,
+            ..Member::default()
+        }
+    }
+
+    fn approve_as(admin: &str, machine: &str, m: &Member, signer: &Signer) -> String {
+        let (role, by) = (json!(m.role), json!(m.invited_by));
+        let (nonce, at) = (json!(m.invite_nonce), json!(m.invited_at_state));
+        let inv = Invitation {
+            role: &role,
+            invited_by: &by,
+            nonce: &nonce,
+            state: &at,
+        };
+        sign_member_approval(admin, machine, "carol", inv, signer).unwrap()
+    }
+
     #[test]
     fn bare_member_approvals_never_count_but_signed_ones_do() {
         let (mut f, _k2, _k3) = quorum_fixture();
         let scratch = tempdir().unwrap();
-        f.manifest.members.insert(
-            "carol".into(),
-            Member {
-                role: Role::Member,
-                status: MemberStatus::Active,
-                invited_by: Some("alice".into()),
-                approvals: vec!["alice".into(), "bob".into()],
-                ..Member::default()
-            },
+        let carol = invited(
+            &f,
+            "n1",
+            MemberStatus::Active,
+            vec!["alice".into(), "bob".into()],
         );
+        f.manifest.members.insert("carol".into(), carol);
         f.seal_as(&f.signer, scratch.path(), vec![]);
         assert!(message(f.verify().unwrap_err()).contains("activates member 'carol'"));
 
         git_in(&f.config, &["reset", "-q", "--hard", "HEAD~1"]);
         let scratch2 = tempdir().unwrap();
-        let role = serde_json::to_value(Role::Member).unwrap();
-        let invited = json!("alice");
-        let (_d, k2) = (0, {
-            // bob's signer is the one fixture() created for node2
-            let machines = &f.manifest.machines;
-            machines["node2"].signing_key.clone().unwrap()
-        });
-        let _ = k2;
         // Sign as alice (node1) only -> still short of 2.
-        let a =
-            sign_member_approval("alice", "node1", "carol", &role, &invited, &f.signer).unwrap();
-        f.manifest.members.insert(
-            "carol".into(),
-            Member {
-                role: Role::Member,
-                status: MemberStatus::Active,
-                invited_by: Some("alice".into()),
-                approvals: vec![a],
-                ..Member::default()
-            },
-        );
+        let mut carol = invited(&f, "n1", MemberStatus::Active, vec![]);
+        carol.approvals = vec![approve_as("alice", "node1", &carol, &f.signer)];
+        f.manifest.members.insert("carol".into(), carol);
         f.seal_as(&f.signer, scratch2.path(), vec![]);
         assert!(message(f.verify().unwrap_err()).contains("found 1"));
+    }
+
+    #[test]
+    fn stale_member_approvals_do_not_survive_a_re_invitation() {
+        let (mut f, k2, _k3) = quorum_fixture();
+        // First invitation (nonce n1): both admins approve it, but it is dropped.
+        let first = invited(&f, "n1", MemberStatus::Pending, vec![]);
+        let stale = vec![
+            approve_as("alice", "node1", &first, &f.signer),
+            approve_as("bob", "node2", &first, &k2),
+        ];
+        f.manifest.members.insert("carol".into(), first);
+        f.seal_as(&f.signer, tempdir().unwrap().path(), vec![]);
+        f.verify().unwrap();
+        f.manifest.members.remove("carol");
+        f.seal_as(&f.signer, tempdir().unwrap().path(), vec![]);
+        f.verify().unwrap();
+
+        // Re-inviting with the old nonce is refused outright.
+        f.manifest
+            .members
+            .insert("carol".into(), invited(&f, "n1", MemberStatus::Pending, vec![]));
+        f.manifest.members.get_mut("carol").unwrap().invited_at_state = Some("00".into());
+        f.seal_as(&f.signer, tempdir().unwrap().path(), vec![]);
+        assert!(message(f.verify().unwrap_err()).contains("fresh nonce"));
+        git_in(&f.config, &["reset", "-q", "--hard", "HEAD~1"]);
+
+        // A genuine re-invitation (new nonce), then the old approvals pasted in.
+        let second = invited(&f, "n2", MemberStatus::Pending, vec![]);
+        f.manifest.members.insert("carol".into(), second);
+        f.seal_as(&f.signer, tempdir().unwrap().path(), vec![]);
+        f.verify().unwrap();
+        let mut replay = f.manifest.members["carol"].clone();
+        replay.status = MemberStatus::Active;
+        replay.approvals = stale;
+        f.manifest.members.insert("carol".into(), replay);
+        f.seal_as(&f.signer, tempdir().unwrap().path(), vec![]);
+        assert!(message(f.verify().unwrap_err()).contains("found 0"));
+        git_in(&f.config, &["reset", "-q", "--hard", "HEAD~1"]);
+
+        // The honest flow: both admins approve the current invitation.
+        let mut honest = f.manifest.members["carol"].clone();
+        honest.status = MemberStatus::Pending;
+        honest.approvals = vec![];
+        honest.approvals = vec![
+            approve_as("alice", "node1", &honest, &f.signer),
+            approve_as("bob", "node2", &honest, &k2),
+        ];
+        honest.status = MemberStatus::Active;
+        f.manifest.members.insert("carol".into(), honest);
+        f.seal_as(&f.signer, tempdir().unwrap().path(), vec![]);
+        assert!(matches!(f.verify().unwrap(), Verification::Verified { .. }));
+    }
+
+    #[test]
+    fn activating_a_member_with_a_revoked_machine_is_refused() {
+        let (mut f, k2, k3) = quorum_fixture();
+        // Accepted (bob co-signs): carol is invited and owns node3, whose key
+        // is on the revocation list.
+        f.manifest
+            .machines
+            .insert("node3".into(), machine_for(&k3, "age1node3"));
+        f.manifest.revoked_signing_keys.push(k3.public());
+        let mut carol = invited(&f, "n1", MemberStatus::Pending, vec![]);
+        carol.machines = vec!["node3".into()];
+        f.manifest.members.insert("carol".into(), carol.clone());
+        let ev = evidence_for(&f, &k2, &k3, &["alice", "bob"], "carol");
+        f.seal_as(&f.signer, tempdir().unwrap().path(), vec![ev]);
+        let mut state = FleetState::load(&f.config).unwrap().unwrap();
+        state.add_cosignature(&k2).unwrap();
+        state.save(&f.config).unwrap();
+        f.verify().unwrap();
+
+        let mut active = carol.clone();
+        active.approvals = vec![
+            approve_as("alice", "node1", &carol, &f.signer),
+            approve_as("bob", "node2", &carol, &k2),
+        ];
+        active.status = MemberStatus::Active;
+        f.manifest.members.insert("carol".into(), active);
+        f.seal_as(&f.signer, tempdir().unwrap().path(), vec![]);
+        let err = message(f.verify().unwrap_err());
+        assert!(err.contains("revoked"), "{err}");
     }
 
     /// alice and bob are admins at k=2; carol is a plain member who owns node3.

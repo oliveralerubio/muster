@@ -193,6 +193,15 @@ pub struct Member {
     /// Member who invited this member.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invited_by: Option<String>,
+    /// Random nonce minted when the member was invited. Signed approvals are
+    /// bound to it, so approvals of an earlier invitation never verify against
+    /// a re-invitation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invite_nonce: Option<String>,
+    /// Payload hash of the signed fleet state the invitation was created in;
+    /// also bound into every approval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invited_at_state: Option<String>,
     /// Admin who approved the invitation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approved_by: Option<String>,

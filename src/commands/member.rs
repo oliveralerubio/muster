@@ -135,12 +135,18 @@ fn add(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
             "member '{name}' already exists"
         )));
     }
+    let mut nonce = [0u8; 16];
+    getrandom::getrandom(&mut nonce)
+        .map_err(|e| MusterError::Operational(format!("no randomness available: {e}")))?;
+    let nonce = crate::signing::to_hex(&nonce);
     manifest.members.insert(
         name.clone(),
         Member {
             role,
             status: MemberStatus::Pending,
             invited_by: Some(actor.member.clone()),
+            invite_nonce: Some(nonce),
+            invited_at_state: crate::fleet_state::current_hash(&ctx.config_dir)?,
             ..Member::default()
         },
     );
@@ -172,7 +178,7 @@ fn approve(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let recovery = team::recovery_identity(ctx, params, &before)?;
     let by_recovery = recovery.is_some();
     let mut manifest = before.clone();
-    let (mut approvals, member_role, member_invited) = {
+    let (mut approvals, member_role, member_invited, member_nonce, member_state) = {
         let member = existing(&mut manifest, &name)?;
         if member.status != MemberStatus::Pending {
             return Err(MusterError::Usage(format!(
@@ -181,9 +187,17 @@ fn approve(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         }
         let role = member.role;
         let invited = member.invited_by.clone();
+        let nonce = member.invite_nonce.clone();
+        let at_state = member.invited_at_state.clone();
         member.status = MemberStatus::Active;
         member.approved_by = Some(actor.member.clone());
-        (std::mem::take(&mut member.approvals), role, invited)
+        (
+            std::mem::take(&mut member.approvals),
+            role,
+            invited,
+            nonce,
+            at_state,
+        )
     };
     team::check_self_grant(ctx, &before, &manifest, &actor)?;
     ctx.confirm(&format!("Approve member '{name}'?"))?;
@@ -199,11 +213,18 @@ fn approve(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         let snapshot = crate::fleet_state::governance_content(&before);
         let role_val = serde_json::to_value(member_role).unwrap_or(Value::Null);
         let invited_val = serde_json::to_value(&member_invited).unwrap_or(Value::Null);
+        let nonce_val = serde_json::to_value(&member_nonce).unwrap_or(Value::Null);
+        let state_val = serde_json::to_value(&member_state).unwrap_or(Value::Null);
+        let invitation = crate::fleet_state::Invitation {
+            role: &role_val,
+            invited_by: &invited_val,
+            nonce: &nonce_val,
+            state: &state_val,
+        };
         let already = crate::fleet_state::valid_member_approvals(
             &snapshot,
             &name,
-            &role_val,
-            &invited_val,
+            invitation,
             &approvals,
         );
         if already.contains(&actor.member) {
@@ -225,16 +246,14 @@ fn approve(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
             &actor.member,
             &actor.machine,
             &name,
-            &role_val,
-            &invited_val,
+            invitation,
             &signer,
         )?;
         approvals.push(entry);
         let received = crate::fleet_state::valid_member_approvals(
             &snapshot,
             &name,
-            &role_val,
-            &invited_val,
+            invitation,
             &approvals,
         )
         .len();
