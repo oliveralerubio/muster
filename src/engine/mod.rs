@@ -1157,12 +1157,15 @@ impl Plan {
                 .unwrap_or_default()
         };
         let action = entry.action();
-        let diff = diff::unified(
+        let mut diff = diff::unified(
             &redact(&entry.before),
             &redact(&entry.after),
             &entry.path.display().to_string(),
             entry.private,
         );
+        if entry.private {
+            diff = mask_secret_lines(&diff, &self.secrets);
+        }
         json!({
             "path": entry.path,
             "action": action,
@@ -1557,22 +1560,119 @@ fn adapter_failure(id: &str, name: &str, message: &str) -> Diagnostic {
     .with_path(id)
 }
 
+/// Every textual form a secret can take once an adapter serializes it: the
+/// raw value plus its JSON, TOML basic-string and YAML (double- and
+/// single-quoted) escapes. Longest first so overlapping forms redact cleanly.
+fn secret_forms(value: &str) -> Vec<String> {
+    if value.is_empty() {
+        return Vec::new();
+    }
+    let json = serde_json::to_string(value).expect("a string serializes");
+    let json = json[1..json.len() - 1].to_owned();
+    let mut json_ascii = String::new();
+    for c in json.chars() {
+        if c.is_ascii() {
+            json_ascii.push(c);
+        } else {
+            let mut units = [0u16; 2];
+            for unit in c.encode_utf16(&mut units) {
+                json_ascii.push_str(&format!("\\u{unit:04x}"));
+            }
+        }
+    }
+    let (mut toml, mut yaml) = (String::new(), String::new());
+    for c in value.chars() {
+        match c {
+            '\\' => {
+                toml.push_str("\\\\");
+                yaml.push_str("\\\\");
+            }
+            '"' => {
+                toml.push_str("\\\"");
+                yaml.push_str("\\\"");
+            }
+            '\n' => {
+                toml.push_str("\\n");
+                yaml.push_str("\\n");
+            }
+            '\t' => {
+                toml.push_str("\\t");
+                yaml.push_str("\\t");
+            }
+            '\r' => {
+                toml.push_str("\\r");
+                yaml.push_str("\\r");
+            }
+            '\u{8}' => {
+                toml.push_str("\\b");
+                yaml.push_str("\\b");
+            }
+            '\u{c}' => {
+                toml.push_str("\\f");
+                yaml.push_str("\\f");
+            }
+            c if c.is_control() => {
+                toml.push_str(&format!("\\u{:04X}", c as u32));
+                yaml.push_str(&format!("\\x{:02X}", c as u32 & 0xff));
+            }
+            c => {
+                toml.push(c);
+                yaml.push(c);
+            }
+        }
+    }
+    let mut forms = vec![
+        value.to_owned(),
+        json,
+        json_ascii,
+        toml,
+        yaml,
+        value.replace('\'', "''"),
+    ];
+    forms.sort_by_key(|f| std::cmp::Reverse(f.len()));
+    forms.dedup();
+    forms.retain(|f| !f.is_empty());
+    forms
+}
+
 fn holds_secret(text: Option<&str>, secrets: &BTreeMap<String, SecretValue>) -> bool {
     text.is_some_and(|t| {
-        secrets
-            .values()
-            .any(|s| !s.expose().is_empty() && t.contains(s.expose()))
+        secrets.values().any(|s| {
+            secret_forms(s.expose())
+                .iter()
+                .any(|f| t.contains(f.as_str()))
+        })
     })
 }
 
 fn redact(text: &str, secrets: &BTreeMap<String, SecretValue>) -> String {
     let mut out = text.to_string();
     for (reference, secret) in secrets {
-        if !secret.expose().is_empty() {
-            out = out.replace(secret.expose(), &format!("<redacted:{reference}>"));
+        for form in secret_forms(secret.expose()) {
+            out = out.replace(&form, &format!("<redacted:{reference}>"));
         }
     }
     out
+}
+
+/// Last line of defence for secret-bearing files: any diff line that still
+/// carries a secret form is hidden entirely.
+fn mask_secret_lines(diff: &str, secrets: &BTreeMap<String, SecretValue>) -> String {
+    let forms: Vec<String> = secrets
+        .values()
+        .flat_map(|s| secret_forms(s.expose()))
+        .collect();
+    diff.lines()
+        .map(|line| {
+            if forms.iter().any(|f| line.contains(f.as_str())) {
+                "<line hidden: file contains secrets>".to_owned()
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + if diff.ends_with('\n') { "\n" } else { "" }
 }
 
 /// Resolve every secret reference in MCP `env`/`headers` through the provider

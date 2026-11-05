@@ -683,3 +683,74 @@ fn approved_dotfile_applies_and_does_not_reprompt_until_content_changes() {
         "echo one\n"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 7. Escaped serializations of a secret never reach plans or diffs
+// ---------------------------------------------------------------------------
+
+#[test]
+fn plan_and_sync_hide_json_and_toml_escaped_secret_forms() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = MusterEnv::new();
+    env.run(&["--format", "json", "--yes", "init"])
+        .assert()
+        .code(0);
+    std::fs::write(env.config_dir().join("AGENTS.md"), "# Rules\n").unwrap();
+    std::fs::write(
+        env.config_dir().join("muster.toml"),
+        r#"
+version = 1
+
+[agents]
+enabled = ["claude", "codex"]
+
+[agents.instructions]
+source = "AGENTS.md"
+
+[secrets."env://TRICKY"]
+allow = ["claude", "codex"]
+
+[mcp.tricky]
+command = "tricky-mcp"
+env = { KEY = "env://TRICKY" }
+"#,
+    )
+    .unwrap();
+
+    let secret = "pa\"ss\\w\nor\td-\u{e9}\u{20ac}-tail";
+    let forms = [
+        secret.to_owned(),
+        serde_json::to_string(secret)
+            .unwrap()
+            .trim_matches('"')
+            .to_owned(),
+        secret
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\t', "\\t"),
+    ];
+    for (verb, args) in [("plan", vec!["plan"]), ("sync", vec!["sync", "--yes"])] {
+        let mut full = vec!["--format", "json"];
+        full.extend(args);
+        let out = env.run(&full).env("TRICKY", secret).output().unwrap();
+        assert!(out.status.success(), "{verb}: {}", stdout_of(&out));
+        let text = format!("{}{}", stdout_of(&out), stderr_of(&out));
+        for form in &forms {
+            assert!(
+                !text.contains(form.as_str()),
+                "{verb} leaked {form:?}:\n{text}"
+            );
+        }
+        // Distinctive fragments survive any one escaping scheme.
+        assert!(
+            !text.contains("d-\u{e9}\u{20ac}-tail"),
+            "{verb} leaked tail"
+        );
+    }
+    for file in [".claude.json", ".codex/config.toml"] {
+        let path = env.path().join(file);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{file} must stay private");
+    }
+}
