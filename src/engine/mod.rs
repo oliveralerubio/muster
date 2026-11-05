@@ -656,7 +656,10 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
         .and_then(|(_, s)| s.approved.get(&key))
         .cloned()
         .unwrap_or_default();
-    let (mut approvals, approved) = approvals(&selected, &merged, previous, &options.target);
+    let (mut approvals, mut approved) = approvals(&selected, &merged, previous, &options.target);
+    if options.target == Target::Global && options.agent.is_none() {
+        dotfiles::approvals(&entries, &mut approved, &mut approvals);
+    }
     let bin_dir = installer::bin_dir()?;
     let installs = agent_installs(ctx, options.agent, &bin_dir)?;
     for (agent, pin) in &installs {

