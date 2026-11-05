@@ -215,3 +215,91 @@ fn forged_secret_key_not_matching_entry_name_is_rejected() {
     forge(d.path(), "g.age", &payload, &id);
     assert!(is_security(v.get("g", "n", &id)));
 }
+
+#[test]
+fn groups_enumerates_union_and_incomplete_pair_fails_closed() {
+    let d = tempdir().unwrap();
+    let id = Identity::generate();
+    let mut v = Vault::open(d.path()).unwrap();
+    let rec = [id.recipient()];
+    v.add("full", "s", SecretValue::new("1".into()), &rec, &id)
+        .unwrap();
+    v.add("orphan_age", "s", SecretValue::new("2".into()), &rec, &id)
+        .unwrap();
+    v.add("orphan_meta", "s", SecretValue::new("3".into()), &rec, &id)
+        .unwrap();
+    fs::remove_file(d.path().join("vault/orphan_age.meta.json")).unwrap();
+    fs::remove_file(d.path().join("vault/orphan_meta.age")).unwrap();
+
+    let all = v.groups().unwrap();
+    assert!(all.contains(&"full".into()));
+    assert!(all.contains(&"orphan_age".into()));
+    assert!(all.contains(&"orphan_meta".into()));
+
+    assert!(is_security(v.ensure_pair("orphan_age")));
+    assert!(is_security(v.ensure_pair("orphan_meta")));
+
+    assert!(is_security(v.rotate(
+        "orphan_age",
+        "s",
+        SecretValue::new("x".into()),
+        &id
+    )));
+    assert!(is_security(v.rotate(
+        "orphan_meta",
+        "s",
+        SecretValue::new("x".into()),
+        &id
+    )));
+    assert!(is_security(v.add(
+        "orphan_age",
+        "new_sec",
+        SecretValue::new("x".into()),
+        &rec,
+        &id
+    )));
+    assert!(is_security(v.add(
+        "orphan_meta",
+        "new_sec",
+        SecretValue::new("x".into()),
+        &rec,
+        &id
+    )));
+    assert!(is_security(v.remove("orphan_age", "s", &id)));
+    assert!(is_security(v.remove("orphan_meta", "s", &id)));
+    assert!(is_security(v.reencrypt("orphan_age", &rec, &id)));
+}
+
+#[test]
+fn mutating_ops_fail_if_sidecar_readers_differ_from_ciphertext() {
+    let d = tempdir().unwrap();
+    let id = Identity::generate();
+    let other = Identity::generate();
+    let mut v = Vault::open(d.path()).unwrap();
+    let rec = [id.recipient()];
+    v.add("g", "s", SecretValue::new("1".into()), &rec, &id)
+        .unwrap();
+
+    // Tamper with meta sidecar to inject `other` as a reader
+    let meta_path = d.path().join("vault/g.meta.json");
+    let mut meta: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+    meta["recipients"] = serde_json::json!([id.recipient(), other.recipient()]);
+    fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+
+    assert!(is_security(v.rotate(
+        "g",
+        "s",
+        SecretValue::new("2".into()),
+        &id
+    )));
+    assert!(is_security(v.add(
+        "g",
+        "s2",
+        SecretValue::new("2".into()),
+        &rec,
+        &id
+    )));
+    assert!(is_security(v.remove("g", "s", &id)));
+    assert!(is_security(v.reencrypt("g", &rec, &id)));
+}

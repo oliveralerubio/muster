@@ -118,8 +118,9 @@ impl Vault {
     ) -> Result<(), MusterError> {
         validate_segment("group", group)?;
         validate_segment("secret name", name)?;
-        let mut data = if self.age_path(group).exists() {
-            self.read(group, id)?
+        let mut data = if self.age_path(group).exists() || self.meta_path(group).exists() {
+            self.ensure_pair(group)?;
+            self.read_verified_readers(group, id)?
         } else {
             GroupData {
                 group: group.to_owned(),
@@ -163,7 +164,7 @@ impl Vault {
         value: SecretValue,
         id: &Identity,
     ) -> Result<(), MusterError> {
-        let mut data = self.read(group, id)?;
+        let mut data = self.read_verified_readers(group, id)?;
         let entry = data
             .secrets
             .get_mut(name)
@@ -176,11 +177,32 @@ impl Vault {
     }
 
     pub fn remove(&mut self, group: &str, name: &str, id: &Identity) -> Result<(), MusterError> {
-        let mut data = self.read(group, id)?;
+        let mut data = self.read_verified_readers(group, id)?;
         data.secrets
             .remove(name)
             .ok_or_else(|| not_found(group, name))?;
         self.write(group, &data)
+    }
+
+    /// Verifies that both `<group>.age` and `<group>.meta.json` exist. Fails
+    /// closed with a Security error if either is missing, or an Operational
+    /// error if neither exists.
+    pub fn ensure_pair(&self, group: &str) -> Result<(), MusterError> {
+        validate_segment("group", group)?;
+        let age = self.age_path(group);
+        let meta = self.meta_path(group);
+        match (age.exists(), meta.exists()) {
+            (true, true) => Ok(()),
+            (false, false) => Err(MusterError::Operational(format!(
+                "secret group '{group}' does not exist"
+            ))),
+            (true, false) => Err(MusterError::Security(format!(
+                "vault group '{group}' is incomplete: missing metadata sidecar '{group}.meta.json'"
+            ))),
+            (false, true) => Err(MusterError::Security(format!(
+                "vault group '{group}' is incomplete: missing ciphertext '{group}.age'"
+            ))),
+        }
     }
 
     /// Metadata for every secret in `group`, sorted by name. Needs no identity.
@@ -202,19 +224,27 @@ impl Vault {
         Ok(list)
     }
 
-    /// Names of every group in the vault, sorted. Needs no identity.
+    /// Names of every group in the vault, sorted. Enumerates the union of
+    /// `<group>.age` and `<group>.meta.json` so incomplete pairs are visible.
     pub fn groups(&self) -> Result<Vec<String>, MusterError> {
-        let entries = fs::read_dir(&self.dir).map_err(|e| io_err(&self.dir, e))?;
-        let mut groups = Vec::new();
+        let entries = match fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(io_err(&self.dir, e)),
+        };
+        let mut groups = BTreeSet::new();
         for entry in entries {
             let entry = entry.map_err(|e| io_err(&self.dir, e))?;
             let file = entry.file_name();
-            if let Some(group) = file.to_str().and_then(|f| f.strip_suffix(".meta.json")) {
-                groups.push(group.to_owned());
+            let file = file.to_string_lossy();
+            if let Some(group) = file
+                .strip_suffix(".meta.json")
+                .or_else(|| file.strip_suffix(".age"))
+            {
+                groups.insert(group.to_owned());
             }
         }
-        groups.sort();
-        Ok(groups)
+        Ok(groups.into_iter().collect())
     }
 
     /// Current recipients (readers) of `group`, from metadata. Needs no identity.
@@ -235,6 +265,7 @@ impl Vault {
     }
 
     fn read_verified_readers(&self, group: &str, id: &Identity) -> Result<GroupData, MusterError> {
+        self.ensure_pair(group)?;
         let data = self.read(group, id)?;
         let meta = self.read_meta(group)?;
         if meta.group != group
