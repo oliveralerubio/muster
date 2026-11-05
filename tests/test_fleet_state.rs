@@ -1067,3 +1067,39 @@ fn legacy_migration_needs_confirmation_when_history_had_other_machines() {
     assert!(raw.to_string().contains("without confirmation"), "{raw}");
     assert!(!config.join("fleet.state.json").exists());
 }
+
+#[test]
+fn resign_without_a_pin_is_refused_when_other_machines_are_enrolled() {
+    let env = MusterEnv::new();
+    ok(&env, &["init", "--yes", "--machine", "alpha"]);
+    let attacker = "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq";
+    let mut text = manifest_text(&env);
+    text.push_str(&format!(
+        "\n[machines.evil]\nrecipient = \"{attacker}\"\nplatform = \"linux-x86_64\"\nmuster_version = \"0.1.0\"\n"
+    ));
+    std::fs::write(env.config_dir().join("muster.toml"), text).unwrap();
+    std::fs::remove_file(state_dir(&env).join("trust.json")).unwrap();
+
+    let (code, raw) = fail(&env, &["trust", "resign", "--yes"]);
+    assert_eq!(code, 5, "{raw}");
+    assert!(raw.to_string().contains("no trust pin"), "{raw}");
+    let state = std::fs::read_to_string(env.config_dir().join("fleet.state.json")).unwrap();
+    assert!(!state.contains("\"epoch\": 2"), "nothing was signed");
+}
+
+#[test]
+fn resign_without_a_pin_on_a_single_machine_fleet_shows_the_full_diff() {
+    let env = MusterEnv::new();
+    ok(&env, &["init", "--yes", "--machine", "alpha"]);
+    let mut text = manifest_text(&env);
+    text.push_str("\n[secrets.\"native://app/key\"]\nallow = [\"pi\"]\n");
+    std::fs::write(env.config_dir().join("muster.toml"), text).unwrap();
+    std::fs::remove_file(state_dir(&env).join("trust.json")).unwrap();
+
+    let resigned = ok(&env, &["trust", "resign", "--yes"]);
+    let diff = resigned["result"]["governance_diff"].as_str().unwrap();
+    assert!(diff.contains("native://app/key"), "{diff}");
+    // Only the edit shows up: the diff is against the last signed manifest,
+    // so the unchanged machine entry is not listed as added.
+    assert!(!diff.contains("+    \"alpha\""), "{diff}");
+}

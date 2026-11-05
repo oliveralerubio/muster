@@ -146,20 +146,33 @@ fn run_resign(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> 
         )));
     }
 
-    // Governance diff against what this machine last accepted.
-    let governance_diff = pin
-        .as_ref()
-        .and_then(|p| p.snapshot.as_ref())
-        .map(|old| {
-            let render = |v: &Value| serde_json::to_string_pretty(v).unwrap_or_default();
-            crate::engine::diff::unified(
-                &render(old),
-                &render(&governance_content(&manifest)),
-                "governance",
-                false,
-            )
-        })
-        .unwrap_or_default();
+    // With no pin there is nothing to hold the manifest against, so the
+    // manifest being signed could be exactly what an attacker wrote. Only a
+    // machine that is the whole fleet (a fresh `init`) may re-sign then.
+    if pin.is_none() && !only_enrolled_machine(ctx, &manifest) {
+        return Err(MusterError::Security(
+            "cannot re-sign: this machine has no trust pin and is not the only machine of \
+             the fleet, so there is no accepted state to compare muster.toml with. Pin the \
+             fleet with `muster sync --pull --expect-signer <fingerprint>` or restore the \
+             repo from a trusted copy"
+                .into(),
+        ));
+    }
+
+    // Governance diff against what this machine last accepted; with no pin,
+    // against the last signed state committed to the repo (everything counts
+    // as added when there is none).
+    let base = match pin.as_ref().and_then(|p| p.snapshot.clone()) {
+        Some(snapshot) => Some(snapshot),
+        None => last_signed_governance(&ctx.config_dir),
+    };
+    let render = |v: &Value| serde_json::to_string_pretty(v).unwrap_or_default();
+    let governance_diff = crate::engine::diff::unified(
+        &base.as_ref().map(render).unwrap_or_default(),
+        &render(&governance_content(&manifest)),
+        "governance",
+        false,
+    );
     let existing_state = FleetState::load(&ctx.config_dir)?;
     if let Some(existing) = &existing_state {
         if fleet_state::is_current(&ctx.config_dir, &manifest, existing)? {
@@ -174,12 +187,11 @@ fn run_resign(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> 
     if params.get_bool("yes") {
         ctx.yes = true;
     }
-    if !ctx.yes {
-        if governance_diff.is_empty() {
-            eprintln!("Governance fields are unchanged; only vault hashes will be re-signed.");
-        } else {
-            eprintln!("Governance changes to be signed:\n{governance_diff}");
-        }
+    // Always shown, `--yes` or not: the operator and the logs see what is signed.
+    if governance_diff.is_empty() {
+        eprintln!("Governance fields are unchanged; only vault hashes will be re-signed.");
+    } else {
+        eprintln!("Governance changes to be signed:\n{governance_diff}");
     }
     ctx.confirm("Re-sign fleet state with the current muster.toml security fields?")?;
 
@@ -200,4 +212,32 @@ fn run_resign(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> 
         "governance_content": governance_content(&manifest),
         "governance_diff": governance_diff,
     }))
+}
+
+/// Whether `manifest` lists exactly one machine and it is this one.
+fn only_enrolled_machine(ctx: &Context, manifest: &Manifest) -> bool {
+    let Ok(identity) = crate::identity::Identity::load(&ctx.state_dir) else {
+        return false;
+    };
+    manifest.machines.len() == 1
+        && manifest
+            .machines
+            .values()
+            .all(|m| m.recipient == identity.recipient())
+}
+
+/// Governance content of the newest committed `muster.toml` that matches the
+/// digest of the `fleet.state.json` committed with it: what was last signed.
+fn last_signed_governance(config_dir: &std::path::Path) -> Option<Value> {
+    for commit in git::commits_touching(config_dir, fleet_state::STATE_FILE, 20) {
+        let state: FleetState =
+            serde_json::from_str(&git::file_at(config_dir, &commit, fleet_state::STATE_FILE)?)
+                .ok()?;
+        let text = git::file_at(config_dir, &commit, crate::manifest::FILE_NAME)?;
+        let past = Manifest::parse(&text, crate::manifest::FILE_NAME).ok()?;
+        if governance_digest(&past).ok()? == state.payload.governance {
+            return Some(governance_content(&past));
+        }
+    }
+    None
 }
