@@ -209,6 +209,36 @@ fn local_machine(ctx: &Context, manifest: &Manifest) -> Option<String> {
         .max_by_key(|name| Some(name) == local.as_ref())
 }
 
+/// Whether the repo looks like one this machine alone created: no remote, only
+/// this machine in the manifest, and no committed version of `muster.toml`
+/// that ever listed another machine.
+fn created_by_this_machine(ctx: &Context, manifest: &Manifest) -> bool {
+    let Ok(identity) = Identity::load(&ctx.state_dir) else {
+        return false;
+    };
+    let recipient = identity.recipient();
+    let only_self = |m: &Manifest| m.machines.values().all(|e| e.recipient == recipient);
+    if manifest.machines.len() != 1 || !only_self(manifest) {
+        return false;
+    }
+    if !git::is_repo(&ctx.config_dir) {
+        return true;
+    }
+    if git::has_remote(&ctx.config_dir) {
+        return false;
+    }
+    let Ok(commits) =
+        git::commits_touching_oldest_first(&ctx.config_dir, crate::manifest::FILE_NAME)
+    else {
+        return false;
+    };
+    commits.iter().all(|commit| {
+        git::file_at(&ctx.config_dir, commit, crate::manifest::FILE_NAME)
+            .and_then(|text| Manifest::parse(&text, crate::manifest::FILE_NAME).ok())
+            .is_some_and(|past| only_self(&past))
+    })
+}
+
 /// A repo from before signed state: the first mutating command on an
 /// enrolled machine signs epoch 1 (no user step), publishing this machine's
 /// signing key. In team mode only an admin's machine may be the root.
@@ -221,9 +251,11 @@ fn migrate_legacy(ctx: &mut Context, mut manifest: Manifest) -> Result<(), Muste
     }
     let signer = Signer::load_or_create(&ctx.state_dir)?;
     // Signing epoch 1 makes this machine the root of trust. That is automatic
-    // only when it is the whole fleet (it ran `init`); otherwise someone must
-    // confirm that this machine should be the root.
-    if manifest.machines.len() > 1 {
+    // only for a repo this machine created and has never shared: someone must
+    // otherwise confirm that this machine should be the root. A manifest
+    // pruned down to one machine is not proof of that, so the history and the
+    // remote decide, not the current machine count.
+    if !created_by_this_machine(ctx, &manifest) {
         let fingerprint = signing::fingerprint(&signer.public());
         confirm_typed(
             ctx,
@@ -231,8 +263,9 @@ fn migrate_legacy(ctx: &mut Context, mut manifest: Manifest) -> Result<(), Muste
              root of trust, with signing key:",
             &fingerprint,
             &format!(
-                "this repo has no signed fleet state and has other machines; refusing to sign \
-                 it from this machine ({fingerprint}) without confirmation. Run the command \
+                "this repo has no signed fleet state and was not created by this machine alone \
+                 (remote, other machines or a history with them); refusing to sign it from \
+                 this machine ({fingerprint}) without confirmation. Run the command \
                  interactively, or on the machine that ran `muster init`"
             ),
         )?;

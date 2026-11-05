@@ -999,3 +999,71 @@ fn first_use_is_confirmed_by_every_command_not_only_sync() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
     assert!(state_dir(&carol).join("trust.json").exists());
 }
+
+fn try_add_secret(env: &MusterEnv, reference: &str, value: &str) -> (i32, Value) {
+    let mut cmd = env.run(&[
+        "--format",
+        "json",
+        "secret",
+        "add",
+        reference,
+        "--value-stdin",
+    ]);
+    cmd.write_stdin(value.as_bytes());
+    let (output, envelope) = support::json(cmd);
+    (output.status.code().unwrap_or(-1), envelope.raw)
+}
+
+/// A repo from before signed state, as `legacy_repo_migrates_...` builds it.
+fn rewind_to_legacy(env: &MusterEnv) {
+    let config = env.config_dir();
+    std::fs::remove_file(config.join("fleet.state.json")).unwrap();
+    std::fs::remove_file(state_dir(env).join("trust.json")).unwrap();
+    let text = manifest_text(env)
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("signing_key"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(config.join("muster.toml"), text).unwrap();
+}
+
+#[test]
+fn legacy_migration_needs_confirmation_when_the_repo_has_a_remote() {
+    let (_guard, remote) = bare_remote();
+    let env = MusterEnv::new();
+    ok(&env, &["init", "--yes", "--machine", "this-box"]);
+    rewind_to_legacy(&env);
+    git(
+        &env.config_dir(),
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    let (code, raw) = try_add_secret(&env, "app/token", "v");
+    assert_eq!(code, 5, "{raw}");
+    assert!(raw.to_string().contains("without confirmation"), "{raw}");
+    assert!(!env.config_dir().join("fleet.state.json").exists());
+}
+
+#[test]
+fn legacy_migration_needs_confirmation_when_history_had_other_machines() {
+    let env = MusterEnv::new();
+    ok(&env, &["init", "--yes", "--machine", "this-box"]);
+    let config = env.config_dir();
+    // History: a second machine existed, then the manifest was pruned to this one.
+    let original = manifest_text(&env);
+    let attacker = "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq";
+    std::fs::write(
+        config.join("muster.toml"),
+        format!(
+            "{original}\n[machines.other]\nrecipient = \"{attacker}\"\nplatform = \"linux\"\nmuster_version = \"0.1.0\"\nagents = []\n"
+        ),
+    )
+    .unwrap();
+    git(&config, &["commit", "-qam", "add other"]);
+    std::fs::write(config.join("muster.toml"), &original).unwrap();
+    git(&config, &["commit", "-qam", "prune"]);
+    rewind_to_legacy(&env);
+    let (code, raw) = try_add_secret(&env, "app/token", "v");
+    assert_eq!(code, 5, "{raw}");
+    assert!(raw.to_string().contains("without confirmation"), "{raw}");
+    assert!(!config.join("fleet.state.json").exists());
+}
