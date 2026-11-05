@@ -236,6 +236,55 @@ fn validate_journal(journal: &Journal) -> Result<(), MusterError> {
         .try_for_each(|rel| validate_rel_path(rel))
 }
 
+/// The pin a journal wants to install must be the one its own staged state
+/// implies, and that state must be signed by someone the *current* pin
+/// authorizes. Otherwise a journal written by anything else could set the pin
+/// to a low epoch naming attacker-controlled signers.
+fn verify_journal_pin(
+    shadow: &Path,
+    state_dir: &Path,
+    journal: &Journal,
+) -> Result<(), MusterError> {
+    let refuse = |why: &str| {
+        MusterError::Security(format!(
+            "revocation journal does not match its staged fleet state ({why}); discarded"
+        ))
+    };
+    let state = fleet_state::FleetState::load(shadow)?
+        .ok_or_else(|| refuse("the staged fleet state is missing"))?;
+    state.verify_signature()?;
+    let manifest = Manifest::load(shadow)?;
+    let expected = TrustAnchor::for_state(&state, &manifest, false)?;
+    if expected != journal.pin {
+        return Err(refuse("its pin is not the one the staged state implies"));
+    }
+    let current = TrustAnchor::load(state_dir)?
+        .ok_or_else(|| refuse("this machine has no pin to apply it against"))?;
+    let signer = &state.payload.signer;
+    if state.payload.epoch == current.epoch {
+        // Re-applying a transaction that already advanced the pin.
+        return if state.payload_hash()? == current.payload_hash {
+            Ok(())
+        } else {
+            Err(refuse("a different state at the pinned epoch"))
+        };
+    }
+    if state.payload.epoch != current.epoch + 1 {
+        return Err(refuse("not the epoch after the pinned one"));
+    }
+    let allowed = if state.payload.governance == current.governance {
+        &current.writers
+    } else {
+        &current.admins
+    };
+    if !allowed.contains(signer)
+        || state.payload.prev.as_deref() != Some(current.payload_hash.as_str())
+    {
+        return Err(refuse("its signer or predecessor is not authorized by the pin"));
+    }
+    Ok(())
+}
+
 /// Idempotent: every step can be repeated after a crash.
 fn apply(
     config_dir: &Path,
@@ -243,8 +292,12 @@ fn apply(
     root: &Path,
     journal: &Journal,
 ) -> Result<(), MusterError> {
-    validate_journal(journal)?;
     let shadow = root.join(SHADOW);
+    let checked = validate_journal(journal).and_then(|()| verify_journal_pin(&shadow, state_dir, journal));
+    if let Err(e) = checked {
+        let _ = fs::remove_dir_all(root);
+        return Err(e);
+    }
     for (i, rel) in journal.write.iter().enumerate() {
         let bytes = fs::read(shadow.join(rel)).map_err(|e| io(&shadow.join(rel), e))?;
         let dest = config_dir.join(rel);
@@ -342,5 +395,85 @@ mod tests {
         let err = recover(&config, &state).unwrap_err();
         assert!(matches!(err, MusterError::Security(_)), "{err:?}");
         assert!(!config.join("muster.toml").exists());
+    }
+
+    fn machine(recipient: &str, key: &str) -> crate::manifest::Machine {
+        crate::manifest::Machine {
+            recipient: recipient.into(),
+            signing_key: Some(key.into()),
+            platform: "linux".into(),
+            muster_version: "0.1.0".into(),
+            agents: Vec::new(),
+            last_sync: None,
+            role: None,
+            profile: None,
+            applied_profile: None,
+        }
+    }
+
+    /// A fleet of one machine sealed by `signer` in `config`, pinned in `state`.
+    fn sealed_fleet(config: &Path, state: &Path, signer: &crate::signing::Signer) -> Manifest {
+        fs::create_dir_all(config.join("vault")).unwrap();
+        let mut manifest = Manifest::new();
+        manifest.machines.insert(
+            "m".into(),
+            machine(
+                "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+                &signer.public(),
+            ),
+        );
+        manifest.save(config).unwrap();
+        fleet_state::seal(config, state, &manifest, signer, true).unwrap();
+        manifest
+    }
+
+    fn stage_journal(state: &Path, shadow_src: &Path, pin: TrustAnchor) {
+        let shadow = root(state).join(SHADOW);
+        fs::create_dir_all(&shadow).unwrap();
+        for file in TRACKED_FILES {
+            fs::copy(shadow_src.join(file), shadow.join(file)).unwrap();
+        }
+        let journal = Journal {
+            write: vec![],
+            delete: vec![],
+            message: "x".into(),
+            pin,
+        };
+        fs::write(
+            root(state).join(JOURNAL),
+            serde_json::to_vec(&journal).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn journal_cannot_install_a_pin_its_staged_state_does_not_imply() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (config, state) = (tmp.path().join("config"), tmp.path().join("state"));
+        let (evil_config, evil_state) = (tmp.path().join("evil"), tmp.path().join("evil-state"));
+        let honest = crate::signing::Signer::load_or_create(&state).unwrap();
+        let evil = crate::signing::Signer::load_or_create(&evil_state).unwrap();
+        sealed_fleet(&config, &state, &honest);
+        let real_pin = TrustAnchor::load(&state).unwrap().unwrap();
+
+        // A fleet sealed by an unauthorized key, with a pin that matches it.
+        let evil_manifest = sealed_fleet(&evil_config, &evil_state, &evil);
+        let evil_state_file = fleet_state::FleetState::load(&evil_config).unwrap().unwrap();
+        let evil_pin = TrustAnchor::for_state(&evil_state_file, &evil_manifest, false).unwrap();
+        stage_journal(&state, &evil_config, evil_pin);
+        let err = recover(&config, &state).unwrap_err();
+        assert!(matches!(err, MusterError::Security(_)), "{err:?}");
+        assert_eq!(TrustAnchor::load(&state).unwrap().unwrap(), real_pin);
+        assert!(!root(&state).exists(), "the staged transaction is discarded");
+
+        // A journal whose pin does not match the staged state (low epoch, own admins).
+        let mut lowered = real_pin.clone();
+        lowered.epoch = 0;
+        lowered.admins = vec![evil.public()];
+        stage_journal(&state, &config, lowered);
+        let err = recover(&config, &state).unwrap_err();
+        assert!(matches!(err, MusterError::Security(_)), "{err:?}");
+        assert_eq!(TrustAnchor::load(&state).unwrap().unwrap(), real_pin);
+        assert!(!root(&state).exists());
     }
 }
