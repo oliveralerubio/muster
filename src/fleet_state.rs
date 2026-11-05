@@ -755,36 +755,7 @@ fn verify_chain(
             state.payload.epoch
         )));
     }
-    let mut by_epoch: BTreeMap<u64, (FleetState, Manifest)> = BTreeMap::new();
-    for commit in crate::git::commits_touching_oldest_first(config_dir, STATE_FILE)? {
-        let Some(text) = crate::git::file_at(config_dir, &commit, STATE_FILE) else {
-            continue;
-        };
-        let Ok(past) = serde_json::from_str::<FleetState>(&text) else {
-            continue;
-        };
-        let epoch = past.payload.epoch;
-        if epoch <= pin.epoch || epoch > state.payload.epoch {
-            continue;
-        }
-        // Later versions of the same payload carry more co-signatures; a
-        // different payload at that epoch is a fork and the first one wins.
-        if by_epoch
-            .get(&epoch)
-            .is_some_and(|(seen, _)| seen.payload_hash().ok() != past.payload_hash().ok())
-        {
-            continue;
-        }
-        let Some(manifest_text) =
-            crate::git::file_at(config_dir, &commit, crate::manifest::FILE_NAME)
-        else {
-            continue;
-        };
-        let Ok(past_manifest) = Manifest::parse(&manifest_text, crate::manifest::FILE_NAME) else {
-            continue;
-        };
-        by_epoch.insert(epoch, (past, past_manifest));
-    }
+    let by_epoch = history_states(config_dir, pin.epoch + 1, state.payload.epoch)?;
     let mut prior = pin.as_prior();
     let mut outcome = Transition::Accepted;
     for epoch in pin.epoch + 1..=state.payload.epoch {
@@ -827,6 +798,106 @@ fn verify_chain(
         prior = Prior::from_state(step, step_manifest)?;
     }
     Ok(outcome)
+}
+
+/// Every signed state recorded in git history with an epoch in `min..=max`,
+/// with the `muster.toml` committed alongside it.
+fn history_states(
+    config_dir: &Path,
+    min: u64,
+    max: u64,
+) -> Result<BTreeMap<u64, (FleetState, Manifest)>, MusterError> {
+    let mut by_epoch: BTreeMap<u64, (FleetState, Manifest)> = BTreeMap::new();
+    for commit in crate::git::commits_touching_oldest_first(config_dir, STATE_FILE)? {
+        let Some(text) = crate::git::file_at(config_dir, &commit, STATE_FILE) else {
+            continue;
+        };
+        let Ok(past) = serde_json::from_str::<FleetState>(&text) else {
+            continue;
+        };
+        let epoch = past.payload.epoch;
+        if epoch < min || epoch > max {
+            continue;
+        }
+        // Later versions of the same payload carry more co-signatures; a
+        // different payload at that epoch is a fork and the first one wins.
+        if by_epoch
+            .get(&epoch)
+            .is_some_and(|(seen, _)| seen.payload_hash().ok() != past.payload_hash().ok())
+        {
+            continue;
+        }
+        let Some(manifest_text) =
+            crate::git::file_at(config_dir, &commit, crate::manifest::FILE_NAME)
+        else {
+            continue;
+        };
+        let Ok(past_manifest) = Manifest::parse(&manifest_text, crate::manifest::FILE_NAME) else {
+            continue;
+        };
+        by_epoch.insert(epoch, (past, past_manifest));
+    }
+    Ok(by_epoch)
+}
+
+/// A machine with no pin must not adopt a governance change that lacks its
+/// admin co-signatures. Evaluates `state` against its predecessor in git
+/// history; when it is short of quorum, walks back to the newest state whose
+/// own transition was quorate (the one to pin). `None` means `state` itself is
+/// quorate (or is the genesis state).
+fn bootstrap_hold(
+    config_dir: &Path,
+    state: &FleetState,
+    manifest: &Manifest,
+) -> Result<Option<(Transition, FleetState, Manifest)>, MusterError> {
+    let epoch = state.payload.epoch;
+    if epoch <= 1 {
+        return Ok(None);
+    }
+    let refuse = |why: String| {
+        MusterError::Security(format!(
+            "cannot pin this fleet: {why}; ask an admin to confirm the state out of band"
+        ))
+    };
+    if !crate::git::is_repo(config_dir) {
+        return Err(refuse(format!(
+            "its state is at epoch {epoch} but there is no git history to check the admin signatures \
+             of its last change"
+        )));
+    }
+    let history = history_states(config_dir, 1, epoch)?;
+    let transition_of = |e: u64| -> Result<Transition, MusterError> {
+        let (pred, pred_manifest) = history.get(&(e - 1)).ok_or_else(|| {
+            refuse(format!(
+                "epoch {} is missing from the repository history",
+                e - 1
+            ))
+        })?;
+        let prior = Prior::from_state(pred, pred_manifest)?;
+        let (step, step_manifest) = if e == epoch {
+            (state, manifest)
+        } else {
+            let (s, m) = history.get(&e).ok_or_else(|| {
+                refuse(format!("epoch {e} is missing from the repository history"))
+            })?;
+            (s, m)
+        };
+        check_transition(&prior, step, step_manifest)
+    };
+    let head = transition_of(epoch)?;
+    if head == Transition::Accepted {
+        return Ok(None);
+    }
+    for e in (1..epoch).rev() {
+        let (step, step_manifest) = history
+            .get(&e)
+            .ok_or_else(|| refuse(format!("epoch {e} is missing from the repository history")))?;
+        step.verify_signature()?;
+        if e == 1 || transition_of(e)? == Transition::Accepted {
+            return Ok(Some((head, step.clone(), step_manifest.clone())));
+        }
+    }
+    Err(refuse("no quorate state found in its history".into()))
 }
 
 /// One transition `prior` -> `state`: signer authorization (admin for
@@ -1348,6 +1419,9 @@ pub fn verify_with(
     let signer = state.payload.signer.clone();
     let hash = state.payload_hash()?;
     let mut outcome = Transition::Accepted;
+    // No pin and the latest governance change is short of its co-signatures:
+    // the newest quorate state in the history, to pin instead of this one.
+    let mut bootstrap: Option<(FleetState, Manifest)> = None;
 
     match &anchor {
         Some(pin) => {
@@ -1385,18 +1459,30 @@ pub fn verify_with(
                         .into(),
                 ));
             }
+            if let Some((held, step, step_manifest)) = bootstrap_hold(config_dir, &state, manifest)?
+            {
+                outcome = held;
+                bootstrap = Some((step, step_manifest));
+            }
         }
     }
 
-    let pending = |outcome: Transition| match (outcome, &anchor) {
-        (Transition::Pending { received, required }, Some(pin)) => Some(Verification::Pending {
-            epoch: state.payload.epoch,
-            signer: state.payload.signer.clone(),
-            received,
-            required,
-            diff: governance_diff(pin.snapshot.as_ref(), &governance_content(manifest)),
-        }),
-        _ => None,
+    let pending = |outcome: Transition| match outcome {
+        Transition::Pending { received, required } => {
+            let base = match (&anchor, &bootstrap) {
+                (Some(pin), _) => pin.snapshot.clone(),
+                (None, Some((_, m))) => Some(governance_content(m)),
+                _ => None,
+            };
+            Some(Verification::Pending {
+                epoch: state.payload.epoch,
+                signer: state.payload.signer.clone(),
+                received,
+                required,
+                diff: governance_diff(base.as_ref(), &governance_content(manifest)),
+            })
+        }
+        Transition::Accepted => None,
     };
     if !options.check_content {
         if let Some(held) = pending(outcome) {
@@ -1473,8 +1559,13 @@ pub fn verify_with(
         }
     }
 
-    // Pending: content was checked above, but the pin stays where it is.
+    // Pending: content was checked above, but the pin stays where it is (a
+    // machine with no pin gets the last quorate state, never the pending one).
     if let Some(held) = pending(outcome) {
+        if let (true, None, Some((step, step_manifest))) = (options.persist, &anchor, &bootstrap) {
+            let confirmed = expect_signer.is_some_and(|e| signing::signer_matches(e, &signer));
+            TrustAnchor::for_state(step, step_manifest, !confirmed)?.save(state_dir)?;
+        }
         return Ok(held);
     }
     if options.persist {
