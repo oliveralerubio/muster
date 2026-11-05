@@ -73,6 +73,12 @@ pub struct StatePayload {
     /// the canonical bytes when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub enrollments: Vec<EnrollmentEvidence>,
+    /// A bootstrap origin (`muster trust checkpoint`): this state changes
+    /// nothing, and a fresh machine that names the signer out of band may start
+    /// its forward chain here instead of at genesis. Omitted from the canonical
+    /// bytes when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub checkpoint: bool,
     pub signer: String,
 }
 
@@ -730,7 +736,31 @@ pub fn seal_with(
         force,
         enrollments,
         true,
+        false,
     )
+}
+
+/// Signs a checkpoint: the current content, unchanged, marked as a bootstrap
+/// origin. The signer must be the recovery key or an admin; with several
+/// admins required the checkpoint is pending until enough co-sign it, like any
+/// governance change.
+pub fn seal_checkpoint(
+    config_dir: &Path,
+    state_dir: &Path,
+    manifest: &Manifest,
+    signer: &Signer,
+) -> Result<FleetState, MusterError> {
+    seal_inner(
+        config_dir,
+        state_dir,
+        manifest,
+        signer,
+        true,
+        Vec::new(),
+        true,
+        true,
+    )?
+    .ok_or_else(|| MusterError::Operational("sealing failed".into()))
 }
 
 /// Like [`seal_with`] but leaves the local pin alone: the caller publishes the
@@ -750,9 +780,11 @@ pub fn seal_unpinned(
         false,
         enrollments,
         false,
+        false,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn seal_inner(
     config_dir: &Path,
     state_dir: &Path,
@@ -761,6 +793,7 @@ fn seal_inner(
     force: bool,
     enrollments: Vec<EnrollmentEvidence>,
     save_pin: bool,
+    checkpoint: bool,
 ) -> Result<Option<FleetState>, MusterError> {
     // A seal must advance or preserve the pinned epoch, never launder an older state.
     ensure_not_behind_pin(config_dir, state_dir, "re-sign")?;
@@ -792,6 +825,7 @@ fn seal_inner(
         vault: vault_hashes(config_dir)?,
         vault_meta: vault_meta_hashes(config_dir)?,
         enrollments,
+        checkpoint,
         signer: signer.public(),
     };
     let state = FleetState::sign(payload, signer)?;
@@ -1008,6 +1042,7 @@ fn bootstrap_hold(
     config_dir: &Path,
     state: &FleetState,
     manifest: &Manifest,
+    allow_checkpoint: bool,
 ) -> Result<Option<(Transition, FleetState, Manifest)>, MusterError> {
     let epoch = state.payload.epoch;
     let refuse = |why: String| {
@@ -1028,7 +1063,15 @@ fn bootstrap_hold(
         )));
     }
     let chain = history_chain(config_dir, 1, state, manifest)?;
-    for e in 1..=epoch {
+    // With the signer named out of band, the forward chain may start at the
+    // newest valid checkpoint instead of genesis.
+    let origin = if allow_checkpoint {
+        newest_checkpoint(&chain, epoch)
+    } else {
+        None
+    };
+    let first = origin.unwrap_or(1);
+    for e in first..=epoch {
         if !chain.contains_key(&e) {
             return Err(refuse(format!(
                 "epoch {e} is missing from the repository history (or does not chain to the \
@@ -1036,19 +1079,21 @@ fn bootstrap_hold(
             )));
         }
     }
-    let (genesis, genesis_manifest) = &chain[&1];
-    if genesis.payload.prev.is_some() {
-        return Err(refuse("its first state names a predecessor".into()));
-    }
-    let (admins, writers) = signer_sets(genesis_manifest);
-    if !admins.contains(&genesis.payload.signer) && !writers.contains(&genesis.payload.signer) {
-        return Err(refuse(
-            "its first state is signed by a key its own governance does not authorize".into(),
-        ));
+    let (genesis, genesis_manifest) = &chain[&first];
+    if origin.is_none() {
+        if genesis.payload.prev.is_some() {
+            return Err(refuse("its first state names a predecessor".into()));
+        }
+        let (admins, writers) = signer_sets(genesis_manifest);
+        if !admins.contains(&genesis.payload.signer) && !writers.contains(&genesis.payload.signer) {
+            return Err(refuse(
+                "its first state is signed by a key its own governance does not authorize".into(),
+            ));
+        }
     }
     let mut prior = Prior::from_state(genesis, genesis_manifest)?;
     let mut accepted = (genesis.clone(), genesis_manifest.clone());
-    for e in 2..=epoch {
+    for e in first + 1..=epoch {
         let (step, step_manifest) = &chain[&e];
         let outcome = check_transition(&prior, step, step_manifest).map_err(|err| match err {
             MusterError::Security(m) if e < epoch => refuse(format!("epoch {e}: {m}")),
@@ -1063,6 +1108,52 @@ fn bootstrap_hold(
     Ok(None)
 }
 
+/// Epoch of the newest valid checkpoint in `chain` (contiguous down from the
+/// head), `None` without one.
+fn newest_checkpoint(chain: &BTreeMap<u64, (FleetState, Manifest)>, head: u64) -> Option<u64> {
+    for epoch in (1..=head).rev() {
+        let (state, manifest) = chain.get(&epoch)?;
+        if state.payload.checkpoint && checkpoint_valid(state, manifest) {
+            // A checkpoint never alters content: if its predecessor is recorded,
+            // its digests must equal the predecessor's.
+            if let Some(prev_hash) = &state.payload.prev {
+                if let Some((prev_state, _)) = chain.get(&(epoch - 1)) {
+                    if prev_state.payload_hash().ok().as_ref() != Some(prev_hash)
+                        || state.payload.governance != prev_state.payload.governance
+                        || state.payload.vault != prev_state.payload.vault
+                        || state.payload.vault_meta != prev_state.payload.vault_meta
+                        || !state.payload.enrollments.is_empty()
+                    {
+                        continue;
+                    }
+                }
+            }
+            return Some(epoch);
+        }
+    }
+    None
+}
+
+/// A checkpoint vouches for everything before it, so it must come from the
+/// recovery key of its own governance or from as many distinct admins of that
+/// governance as it requires (its signer plus verified co-signers).
+fn checkpoint_valid(state: &FleetState, manifest: &Manifest) -> bool {
+    let signer = &state.payload.signer;
+    if manifest
+        .recovery
+        .as_ref()
+        .and_then(|r| r.signing_key.as_deref())
+        == Some(signer.as_str())
+    {
+        return true;
+    }
+    let Ok(prior) = Prior::from_state(state, manifest) else {
+        return false;
+    };
+    prior.admins.contains(signer)
+        && quorum_count(&prior, state).is_none_or(|(received, required)| received >= required)
+}
+
 /// One transition `prior` -> `state`: signer authorization (admin for
 /// governance changes, a reader of every touched group for vault-only ones),
 /// the predecessor link, and the signed quorum for added machines/members.
@@ -1072,7 +1163,20 @@ fn check_transition(
     manifest: &Manifest,
 ) -> Result<Transition, MusterError> {
     let signer = &state.payload.signer;
-    let vault_only = state.payload.governance == prior.governance;
+    let checkpoint = state.payload.checkpoint;
+    let vault_only = state.payload.governance == prior.governance && !checkpoint;
+    if checkpoint
+        && (state.payload.governance != prior.governance
+            || state.payload.vault != prior.vault
+            || state.payload.vault_meta != prior.vault_meta
+            || !state.payload.enrollments.is_empty())
+    {
+        return Err(MusterError::Security(
+            "a checkpoint state changes nothing; this one alters governance, the vault or \
+             enrollments"
+                .into(),
+        ));
+    }
     let allowed = if vault_only {
         &prior.writers
     } else {
@@ -1085,6 +1189,8 @@ fn check_transition(
             signing::fingerprint(signer),
             if vault_only {
                 "to update the vault"
+            } else if checkpoint {
+                "to sign a checkpoint"
             } else {
                 "to change governance"
             }
@@ -1398,6 +1504,14 @@ fn transition_outcome(prior: &Prior, state: &FleetState, new: &Value) -> Transit
     else {
         return Transition::Accepted;
     };
+    // A checkpoint is not an enrollment: it needs its quorum like any change.
+    if state.payload.checkpoint {
+        return if received >= required {
+            Transition::Accepted
+        } else {
+            Transition::Pending { received, required }
+        };
+    }
     if received >= required || enrollment_only(old, new, state) {
         Transition::Accepted
     } else {
@@ -1449,7 +1563,7 @@ pub fn pending_quorum(
         return Ok(None);
     }
     let prior = pin.as_prior();
-    let outcome = if state.payload.governance == pin.governance {
+    let outcome = if state.payload.governance == pin.governance && !state.payload.checkpoint {
         Transition::Accepted
     } else {
         transition_outcome(&prior, state, &governance_content(manifest))
@@ -2049,7 +2163,8 @@ pub fn verify_with(
                         .into(),
                 ));
             }
-            if let Some((held, step, step_manifest)) = bootstrap_hold(config_dir, &state, manifest)?
+            if let Some((held, step, step_manifest)) =
+                bootstrap_hold(config_dir, &state, manifest, expect_signer.is_some())?
             {
                 outcome = held;
                 bootstrap = Some((step, step_manifest));
@@ -2273,6 +2388,7 @@ mod tests {
                 vault: BTreeMap::from([("app".into(), "h".into())]),
                 vault_meta: BTreeMap::from([("app".into(), "m".into())]),
                 enrollments: vec![],
+                checkpoint: false,
                 signer: "musterpk1ab".into(),
             },
             signature: String::new(),
@@ -3612,6 +3728,149 @@ mod tests {
         assert_eq!(TrustAnchor::load(&f.state).unwrap().unwrap(), pinned);
         // Peers refuse the very same state.
         assert!(message(f.verify().unwrap_err()).contains("quorum"));
+    }
+
+    // ---- bootstrap checkpoint ------------------------------------------------
+
+    /// A k=2 fleet whose history holds a transition today's rules refuse (carol
+    /// activated without signed approvals, as fleets did before approvals were
+    /// bound to the invitation): the accepted pin of every existing machine is
+    /// fine, but a fresh machine cannot walk the history from genesis.
+    fn legacy_history() -> (Fixture, Signer) {
+        let (mut f, k2, _k3) = quorum_fixture();
+        f.manifest.members.insert(
+            "carol".into(),
+            Member {
+                role: Role::Member,
+                status: MemberStatus::Active,
+                ..Member::default()
+            },
+        );
+        f.seal_adopted(vec![]);
+        f.verify().unwrap();
+        (f, k2)
+    }
+
+    fn bootstrap(f: &Fixture, signer: Option<&str>) -> Result<Verification, MusterError> {
+        let fresh = tempdir().unwrap();
+        verify_with(
+            &f.config,
+            fresh.path(),
+            &f.manifest,
+            &VerifyOptions {
+                expect_signer: signer,
+                persist: true,
+                check_content: true,
+            },
+        )
+    }
+
+    /// Seals a checkpoint as `signer`, then lets `cosigners` co-sign it.
+    fn checkpoint_as(f: &Fixture, signer: &Signer, cosigners: &[&Signer]) {
+        let mut state =
+            seal_checkpoint(&f.config, tempdir().unwrap().path(), &f.manifest, signer).unwrap();
+        for c in cosigners {
+            state.add_cosignature(c).unwrap();
+        }
+        state.save(&f.config).unwrap();
+        f.commit();
+    }
+
+    #[test]
+    fn legacy_history_blocks_a_fresh_machine_without_a_checkpoint() {
+        let (f, _k2) = legacy_history();
+        let signer = f.signer.public();
+        for expect in [None, Some(signer.as_str())] {
+            let msg = message(bootstrap(&f, expect).unwrap_err());
+            assert!(
+                msg.contains("cannot pin this fleet") || msg.contains("activates member 'carol'"),
+                "{msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cosigned_checkpoint_lets_a_fresh_machine_bootstrap_past_legacy_history() {
+        let (f, k2) = legacy_history();
+        checkpoint_as(&f, &f.signer, &[&k2]);
+        let signer = f.signer.public();
+        // Only with the signer named out of band.
+        assert!(bootstrap(&f, None).is_err());
+        match bootstrap(&f, Some(&signer)).unwrap() {
+            Verification::Verified {
+                first_use: true, ..
+            } => {}
+            other => panic!("checkpoint must bootstrap: {other:?}"),
+        }
+        // A change after the checkpoint is still held by the normal rules.
+        let mut f = f;
+        f.manifest.revoked_recipients.push("age1gone".into());
+        f.seal_as(&f.signer, tempdir().unwrap().path(), vec![]);
+        match bootstrap(&f, Some(&signer)).unwrap() {
+            Verification::Pending {
+                received: 1,
+                required: 2,
+                ..
+            } => {}
+            other => panic!("the forward chain stays verified: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_checkpoint_short_of_its_admins_does_not_shorten_the_walk() {
+        let (f, _k2) = legacy_history();
+        checkpoint_as(&f, &f.signer, &[]);
+        let signer = f.signer.public();
+        let msg = message(bootstrap(&f, Some(&signer)).unwrap_err());
+        assert!(msg.contains("cannot pin this fleet"), "{msg}");
+    }
+
+    #[test]
+    fn a_recovery_signed_checkpoint_needs_no_cosigner() {
+        let (mut f, _k2) = legacy_history();
+        let recovery = crate::identity::Identity::generate();
+        let recovery_signer = Signer::from_recovery(&recovery).unwrap();
+        f.manifest.recovery = Some(crate::manifest::Recovery {
+            recipient: recovery.recipient(),
+            signing_key: Some(recovery_signer.public()),
+        });
+        f.seal_adopted(vec![]);
+        checkpoint_as(&f, &recovery_signer, &[]);
+        let signer = f.signer.public();
+        // The recovery-signed checkpoint is the head; the signer named out of
+        // band is the one that signed it.
+        let head_signer = recovery_signer.public();
+        assert!(bootstrap(&f, Some(&signer)).is_err());
+        match bootstrap(&f, Some(&head_signer)).unwrap() {
+            Verification::Verified {
+                first_use: true, ..
+            } => {}
+            other => panic!("recovery checkpoint must bootstrap: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_checkpoint_that_changes_content_is_refused() {
+        let (mut f, k2) = legacy_history();
+        let head = FleetState::load(&f.config).unwrap().unwrap();
+        // A "checkpoint" that also slips a governance change in, fully co-signed.
+        f.manifest.revoked_recipients.push("age1gone".into());
+        f.manifest.save(&f.config).unwrap();
+        let mut payload = head.payload.clone();
+        payload.epoch += 1;
+        payload.prev = Some(head.payload_hash().unwrap());
+        payload.governance = governance_digest(&f.manifest).unwrap();
+        payload.checkpoint = true;
+        let mut forged = FleetState::sign(payload, &f.signer).unwrap();
+        forged.add_cosignature(&k2).unwrap();
+        forged.save(&f.config).unwrap();
+        f.commit();
+        let signer = f.signer.public();
+        let msg = message(bootstrap(&f, Some(&signer)).unwrap_err());
+        assert!(
+            msg.contains("cannot pin this fleet") || msg.contains("checkpoint"),
+            "{msg}"
+        );
     }
 
     mod forged_ciphertext_property {

@@ -1645,3 +1645,57 @@ fn a_lone_admin_cannot_reject_its_own_removal() {
     let cosigned = ok(&carol, &["trust", "cosign", "--yes"]);
     assert_eq!(cosigned["result"]["accepted"], true, "{cosigned}");
 }
+
+/// R12 Opus F2 / Sol F5: a checkpoint co-signed by k admins is a bootstrap
+/// origin, and a fresh machine that names the signer starts from it.
+#[test]
+fn cosigned_checkpoint_is_a_bootstrap_origin_for_a_fresh_machine() {
+    let (_guard, remote) = bare_remote();
+    let remote = remote.to_str().unwrap();
+    let (alice, bob, carol) = (MusterEnv::new(), MusterEnv::new(), MusterEnv::new());
+    let signer_a = quorum_fleet(remote, &alice, &bob, &carol);
+
+    // Alice proposes the checkpoint: pending until a second admin co-signs.
+    let proposed = ok(&alice, &["trust", "checkpoint", "--yes"]);
+    assert_eq!(proposed["result"]["checkpoint"], true, "{proposed}");
+    assert_eq!(proposed["result"]["accepted"], false, "{proposed}");
+    ok(&alice, &["sync", "--push"]);
+    ok(&bob, &["sync", "--pull"]);
+    let cosigned = ok(&bob, &["trust", "cosign", "--yes"]);
+    assert_eq!(cosigned["result"]["accepted"], true, "{cosigned}");
+    ok(&bob, &["sync", "--push"]);
+
+    let dave = MusterEnv::new();
+    let joined = ok(
+        &dave,
+        &[
+            "sync",
+            "--remote",
+            remote,
+            "--pull",
+            "--expect-signer",
+            &signer_a,
+        ],
+    );
+    assert_eq!(joined["result"]["joined"], true, "{joined}");
+    assert_eq!(pinned_epoch(&dave), pinned_epoch(&bob));
+}
+
+/// A lone, unco-signed checkpoint proposal is just a pending change.
+#[test]
+fn a_lone_checkpoint_proposal_stays_pending_for_peers() {
+    let (_guard, remote) = bare_remote();
+    let remote = remote.to_str().unwrap();
+    let (alice, bob, carol) = (MusterEnv::new(), MusterEnv::new(), MusterEnv::new());
+    quorum_fleet(remote, &alice, &bob, &carol);
+    ok(&alice, &["trust", "checkpoint", "--yes"]);
+    ok(&alice, &["sync", "--push"]);
+    let pulled = ok(&bob, &["sync", "--pull"]);
+    assert_eq!(pulled["result"]["applied"], false, "{pulled}");
+    assert!(
+        pulled["diagnostics"]
+            .to_string()
+            .contains("governance_pending"),
+        "{pulled}"
+    );
+}

@@ -66,6 +66,24 @@ pub const RESIGN: CommandSpec = CommandSpec {
     handler: run_resign,
 };
 
+pub const CHECKPOINT: CommandSpec = CommandSpec {
+    name: "trust.checkpoint",
+    about: "Mark the current accepted state as a bootstrap origin (recovery key or k admins)",
+    params: &[
+        team::RECOVERY_KEY_PARAM,
+        team::RECOVERY_KEY_STDIN_PARAM,
+        ParamSpec {
+            name: "yes",
+            about: "Confirm the checkpoint without an interactive prompt",
+            kind: ParamKind::Bool,
+            required: false,
+            positional: false,
+        },
+    ],
+    mutating: true,
+    handler: run_checkpoint,
+};
+
 fn run_show(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
     let manifest = Manifest::load(&ctx.config_dir)?;
     let state = FleetState::load(&ctx.config_dir)?;
@@ -521,5 +539,53 @@ fn run_reject(
         "rejections_received": received,
         "rejections_required": required,
         "pushed": pushed,
+    }))
+}
+
+fn run_checkpoint(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
+    let manifest = Manifest::load(&ctx.config_dir)?;
+    fleet_state::ensure_not_behind_pin(&ctx.config_dir, &ctx.state_dir, "checkpoint")?;
+    let pin = TrustAnchor::load(&ctx.state_dir)?
+        .ok_or_else(|| MusterError::Security("no local trust pin; cannot checkpoint".into()))?;
+    let recovery = team::recovery_identity(ctx, params, &manifest)?;
+    let signer = match recovery {
+        Some(rec_id) => Signer::from_recovery(&rec_id)?,
+        None => {
+            let s = Signer::load_or_create(&ctx.state_dir)?;
+            if !manifest.members.is_empty() {
+                let _ = team::admin(&manifest, &ctx.state_dir)?;
+            }
+            s
+        }
+    };
+    let public = signer.public();
+    if !pin.admins.contains(&public) {
+        return Err(MusterError::Security(format!(
+            "cannot checkpoint: signer {} is not an admin of this fleet",
+            signing::fingerprint(&public)
+        )));
+    }
+    if params.get_bool("yes") {
+        ctx.yes = true;
+    }
+    ctx.confirm("Mark the current accepted fleet state as a bootstrap checkpoint?")?;
+
+    let state = fleet_state::seal_checkpoint(&ctx.config_dir, &ctx.state_dir, &manifest, &signer)?;
+    git::commit_if_configured(
+        &ctx.config_dir,
+        "feat(security): mark fleet state checkpoint",
+    )?;
+    let pushed = publish(ctx, "checkpoint");
+
+    let pending = fleet_state::pending_quorum(&ctx.state_dir, &state, &manifest)?;
+    Ok(json!({
+        "checkpoint": true,
+        "accepted": pending.is_none(),
+        "approvals_received": pending.map(|(received, _)| received),
+        "approvals_required": pending.map(|(_, required)| required),
+        "pushed": pushed,
+        "epoch": state.payload.epoch,
+        "signer": state.payload.signer,
+        "fingerprint": signing::fingerprint(&state.payload.signer),
     }))
 }

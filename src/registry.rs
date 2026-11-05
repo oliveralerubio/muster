@@ -168,6 +168,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     crate::commands::trust::SHOW,
     crate::commands::trust::RESIGN,
     crate::commands::trust::COSIGN,
+    crate::commands::trust::CHECKPOINT,
 ];
 
 pub fn find(name: &str) -> Option<&'static CommandSpec> {
