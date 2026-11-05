@@ -10,6 +10,7 @@ pub mod doctor;
 pub mod engine;
 pub mod errors;
 pub mod fleet;
+pub mod fleet_state;
 pub mod git;
 pub mod hash;
 pub mod identity;
