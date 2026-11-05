@@ -441,6 +441,9 @@ pub fn rekey(
     identity: &Identity,
 ) -> Result<Vec<String>, MusterError> {
     check_can_rekey(vault, changes, identity)?;
+    // The manifest was saved after the vault was opened: authorize its
+    // current recipients (e.g. the machine being approved).
+    vault.reload_policy()?;
     for (group, recipients) in changes {
         vault.reencrypt(group, recipients, identity)?;
     }

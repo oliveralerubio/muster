@@ -133,6 +133,19 @@ impl Vault {
         self
     }
 
+    /// Re-reads the recipient policy from the saved `muster.toml`, keeping any
+    /// revocations added with [`Vault::with_revoked`]. Call it after the
+    /// manifest changed on disk (a newly approved machine becomes authorized).
+    pub fn reload_policy(&mut self) -> Result<(), MusterError> {
+        let config_dir = self.dir.parent().unwrap_or(&self.dir).to_path_buf();
+        let extra = self.policy.take().map(|p| p.revoked).unwrap_or_default();
+        self.policy = Manifest::vault_policy(&config_dir)?;
+        if let Some(policy) = &mut self.policy {
+            policy.revoked.extend(extra);
+        }
+        Ok(())
+    }
+
     /// Records `actor` (a machine name) as author of later adds and rotations.
     pub fn with_actor(mut self, actor: Option<String>) -> Self {
         self.actor = actor;
