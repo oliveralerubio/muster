@@ -186,7 +186,7 @@ mod tests {
         std::fs::write(&path, "").unwrap();
         let mut child = std::process::Command::new("sh")
             .arg("-c")
-            .arg("exec 9>>\"$1\"; flock -n 9 || exit 3; echo ready; sleep 30")
+            .arg("exec 9>>\"$1\"; flock -n 9 || exit 3; echo ready; exec sleep 30")
             .arg("sh")
             .arg(&path)
             .stdout(std::process::Stdio::piped())
