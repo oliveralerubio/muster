@@ -314,12 +314,40 @@ fn run_cosign(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> 
             "epoch": state.payload.epoch,
         }));
     }
-    // Show the operator the exact governance diff vs their pinned baseline.
+    // The signature covers the payload's digests, so the working tree must be
+    // exactly what they describe before anything is shown or signed.
+    fleet_state::verify_with(
+        &ctx.config_dir,
+        &ctx.state_dir,
+        &manifest,
+        &fleet_state::VerifyOptions {
+            expect_signer: None,
+            persist: false,
+            check_content: true,
+        },
+    )
+    .map_err(|e| match e {
+        MusterError::Security(m) => MusterError::Security(format!(
+            "refusing to co-sign: the working tree does not match the proposed fleet state \
+             ({m})"
+        )),
+        other => other,
+    })?;
+    // Show the operator the exact governance diff vs their pinned baseline,
+    // and which vault groups changed (names only, never values).
     let diff = fleet_state::governance_diff(pin.snapshot.as_ref(), &governance_content(&manifest));
-    eprintln!(
-        "Governance changes to co-sign:
-{diff}"
+    let groups = fleet_state::changed_groups(
+        &pin.vault,
+        &pin.vault_meta,
+        &state.payload.vault,
+        &state.payload.vault_meta,
     );
+    eprintln!("Governance changes to co-sign:\n{diff}");
+    if groups.is_empty() {
+        eprintln!("Vault groups changed: none");
+    } else {
+        eprintln!("Vault groups changed: {}", groups.join(", "));
+    }
     if params.get_bool("yes") {
         ctx.yes = true;
     }
@@ -352,5 +380,6 @@ fn run_cosign(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> 
         "signer": public,
         "fingerprint": signing::fingerprint(&public),
         "cosigners": state.valid_cosigners(),
+        "vault_groups_changed": groups,
     }))
 }

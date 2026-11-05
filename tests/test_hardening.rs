@@ -295,3 +295,102 @@ fn read_only_command_preserves_live_revocation_stage_owned_by_another_command() 
     // The live staging directory MUST NOT be deleted by the read-only command!
     assert!(tx_dir.join("staged_marker.txt").exists());
 }
+
+#[test]
+fn cosign_refuses_when_working_tree_does_not_match_payload_digests() {
+    let (_guard, remote) = bare_remote();
+    let remote = remote.to_str().unwrap();
+    let (alice, bob, carol) = (MusterEnv::new(), MusterEnv::new(), MusterEnv::new());
+    quorum_fleet(remote, &alice, &bob, &carol);
+
+    // Alice proposes a governance change
+    ok(&alice, &["member", "rm", "carol", "--yes"]);
+    ok(&alice, &["sync", "--push"]);
+
+    // Bob pulls the pending proposal
+    ok(&bob, &["sync", "--pull"]);
+
+    // Tamper with Bob's working tree muster.toml before cosigning
+    let bob_manifest_path = bob.config_dir().join("muster.toml");
+    let original = std::fs::read_to_string(&bob_manifest_path).unwrap();
+    let tampered = original.replace("required_approvals = 2", "required_approvals = 1");
+    std::fs::write(&bob_manifest_path, tampered).unwrap();
+
+    // Bob tries to cosign: MUST refuse with Security BEFORE signing
+    let (code, raw) = fail(&bob, &["trust", "cosign", "--yes"]);
+    assert_eq!(code, 5, "{raw}");
+    assert!(
+        raw.to_string().contains("working tree does not match"),
+        "{raw}"
+    );
+
+    // fleet.state.json on disk must not have been signed by Bob
+    let state_file = std::fs::read_to_string(bob.config_dir().join("fleet.state.json")).unwrap();
+    let state: Value = serde_json::from_str(&state_file).unwrap();
+    assert_eq!(state["cosignatures"].as_array().map_or(0, |a| a.len()), 0);
+}
+
+fn bare_remote() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::TempDir::new().expect("remote tempdir");
+    let path = dir.path().join("central.git");
+    let status = std::process::Command::new("git")
+        .args(["init", "--bare", path.to_str().unwrap()])
+        .status()
+        .expect("git init --bare");
+    assert!(status.success());
+    (dir, path)
+}
+
+fn quorum_fleet(remote: &str, alice: &MusterEnv, bob: &MusterEnv, carol: &MusterEnv) -> String {
+    ok(alice, &["init", "--yes", "--machine", "alice-box"]);
+    ok(alice, &["sync", "--remote", remote]);
+    let signer_a = support::fleet_signer(&alice.config_dir());
+
+    ok(alice, &["member", "add", "bob", "--role", "admin"]);
+    ok(alice, &["member", "approve", "bob", "--yes"]);
+    ok(alice, &["member", "add", "carol", "--role", "admin"]);
+    ok(alice, &["member", "approve", "carol", "--yes"]);
+
+    ok(
+        bob,
+        &[
+            "sync",
+            "--remote",
+            remote,
+            "--pull",
+            "--expect-signer",
+            &signer_a,
+        ],
+    );
+    ok(bob, &["enroll", "--name", "bob-box"]);
+    ok(alice, &["sync", "--pull"]);
+    ok(alice, &["approve", "bob-box", "--member", "bob", "--yes"]);
+
+    ok(
+        carol,
+        &[
+            "sync",
+            "--remote",
+            remote,
+            "--pull",
+            "--expect-signer",
+            &signer_a,
+        ],
+    );
+    ok(carol, &["enroll", "--name", "carol-box"]);
+    ok(alice, &["sync", "--pull"]);
+    ok(
+        alice,
+        &["approve", "carol-box", "--member", "carol", "--yes"],
+    );
+
+    let mut manifest = manifest_text(alice);
+    manifest.push_str("\n[team]\nrequired_approvals = 2\n");
+    std::fs::write(alice.config_dir().join("muster.toml"), manifest).unwrap();
+    ok(alice, &["trust", "resign", "--yes"]);
+    ok(alice, &["sync", "--push"]);
+
+    ok(bob, &["sync", "--pull"]);
+    ok(carol, &["sync", "--pull"]);
+    signer_a
+}

@@ -943,14 +943,25 @@ fn check_transition(
         ));
     }
     if vault_only {
-        if prior.snapshot.is_some() && !prior.admins.contains(signer) {
+        if prior.snapshot.is_some() {
             let changed = changed_groups(
                 &prior.vault,
                 &prior.vault_meta,
                 &state.payload.vault,
                 &state.payload.vault_meta,
             );
-            ensure_reads_groups(manifest, signer, &changed)?;
+            if !prior.admins.contains(signer) {
+                ensure_reads_groups(manifest, signer, &changed)?;
+            } else if ensure_reads_groups(manifest, signer, &changed).is_err() {
+                // An admin rewriting ciphertext it cannot read is not a
+                // routine write: with several admins required it needs their
+                // co-signatures, like a governance change.
+                if let Some((received, required)) = quorum_count(prior, state) {
+                    if received < required {
+                        return Ok(Transition::Pending { received, required });
+                    }
+                }
+            }
         }
     } else if let Some(old) = &prior.snapshot {
         let new = governance_content(manifest);
@@ -1173,8 +1184,15 @@ pub fn pending_quorum(
     let Some(pin) = TrustAnchor::load(state_dir)? else {
         return Ok(None);
     };
-    if state.payload.governance == pin.governance || state.payload.epoch != pin.epoch + 1 {
+    if state.payload.epoch != pin.epoch + 1 {
         return Ok(None);
+    }
+    if state.payload.governance == pin.governance {
+        // Vault-only: pending when an admin rewrote groups it does not read.
+        return Ok(match check_transition(&pin.as_prior(), state, manifest) {
+            Ok(Transition::Pending { received, required }) => Some((received, required)),
+            _ => None,
+        });
     }
     Ok(
         match transition_outcome(&pin.as_prior(), state, &governance_content(manifest)) {
@@ -2505,6 +2523,37 @@ mod tests {
             approvals: signed,
         };
         f.seal_as(&f.signer, scratch.path(), vec![ev]);
+        assert!(matches!(f.verify().unwrap(), Verification::Verified { .. }));
+    }
+
+    #[test]
+    fn admin_rewriting_a_group_it_does_not_read_needs_the_quorum() {
+        let (f, k2, _k3) = quorum_fixture();
+        let scratch = tempdir().unwrap();
+        // alice reads `ops` but not `dev`, which only bob reads.
+        fs::write(f.config.join("vault/dev.age"), b"forged by one admin").unwrap();
+        f.seal_as(&f.signer, scratch.path(), vec![]);
+        match f.verify().unwrap() {
+            Verification::Pending {
+                received: 1,
+                required: 2,
+                ..
+            } => {}
+            other => panic!("vault rewrite accepted with one signature: {other:?}"),
+        }
+        // Bob co-signs: now it is accepted.
+        let mut state = FleetState::load(&f.config).unwrap().unwrap();
+        state.add_cosignature(&k2).unwrap();
+        state.save(&f.config).unwrap();
+        assert!(matches!(f.verify().unwrap(), Verification::Verified { .. }));
+    }
+
+    #[test]
+    fn admin_rewriting_a_group_it_reads_stays_a_single_signature_change() {
+        let (f, _k2, _k3) = quorum_fixture();
+        let scratch = tempdir().unwrap();
+        fs::write(f.config.join("vault/ops.age"), b"alice updates ops").unwrap();
+        f.seal_as(&f.signer, scratch.path(), vec![]);
         assert!(matches!(f.verify().unwrap(), Verification::Verified { .. }));
     }
 }
