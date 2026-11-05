@@ -62,7 +62,7 @@ pub fn guard(ctx: &mut Context, command: &str, mutating: bool) -> Result<(), Mus
     // before anything reads the repo: no user action needed.
     // Recovery shares the mutation lock: while another command runs, its
     // staged transaction is live, not debris, and is left alone.
-    if !ctx.dry_run {
+    if !ctx.dry_run && crate::revocation_tx::pending(&ctx.state_dir) {
         if let Some(_lock) = crate::lock::try_acquire(&ctx.state_dir)? {
             if crate::revocation_tx::recover(&ctx.config_dir, &ctx.state_dir)? {
                 ctx.diag(Diagnostic::new(

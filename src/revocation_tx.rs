@@ -330,6 +330,11 @@ fn apply(
     fs::remove_dir_all(root).map_err(|e| io(root, e))
 }
 
+/// Whether a staged or journaled transaction exists under `state_dir`.
+pub fn pending(state_dir: &Path) -> bool {
+    root(state_dir).exists()
+}
+
 /// Finishes a journaled transaction, or discards an unjournaled one. Returns
 /// whether a journaled transaction was completed.
 pub fn recover(config_dir: &Path, state_dir: &Path) -> Result<bool, MusterError> {
