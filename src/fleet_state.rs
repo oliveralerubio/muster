@@ -3632,12 +3632,12 @@ mod tests {
             );
             f.manifest.members.insert(
                 "erin".into(),
-                Member {
-                    role: Role::Member,
-                    status: MemberStatus::Pending,
-                    invited_by: Some("alice".into()),
-                    ..Member::default()
-                },
+                invited(
+                    &f,
+                    "nonce_erin_0123456789abcdef",
+                    MemberStatus::Pending,
+                    vec![],
+                ),
             );
             f.seal_adopted(vec![]);
             f.verify().unwrap();
@@ -3645,7 +3645,7 @@ mod tests {
         }
 
         proptest! {
-            #![proptest_config(ProptestConfig::with_cases(24))]
+            #![proptest_config(ProptestConfig::with_cases(32))]
 
             /// One admin that does not read `dev` signs any mix of exempt
             /// governance edits plus a rewrite of `dev`: never accepted.
@@ -3663,12 +3663,7 @@ mod tests {
                 if add_invite {
                     f.manifest.members.insert(
                         "frank".into(),
-                        Member {
-                            role: Role::Member,
-                            status: MemberStatus::Pending,
-                            invited_by: Some("alice".into()),
-                            ..Member::default()
-                        },
+                        invited(&f, "nonce_frank_0123456789abcdef", MemberStatus::Pending, vec![]),
                     );
                 }
                 if drop_invite {
@@ -3691,8 +3686,16 @@ mod tests {
                 }
                 f.seal_as(&f.signer, scratch.path(), evidence_list);
                 match f.verify() {
-                    Ok(Verification::Pending { required: 2, .. }) | Err(MusterError::Security(_)) => {}
-                    other => prop_assert!(false, "forged ciphertext accepted: {:?}", other),
+                    Ok(Verification::Pending {
+                        received: 1,
+                        required: 2,
+                        ..
+                    }) => {}
+                    other => prop_assert!(
+                        false,
+                        "expected Pending {{ received: 1, required: 2 }}, got {:?}",
+                        other
+                    ),
                 }
             }
         }
