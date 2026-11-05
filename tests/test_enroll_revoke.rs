@@ -78,7 +78,19 @@ fn enroll_approve_and_sync_between_two_machines() {
             "bob-first",
         ],
     );
-    assert_cli_success(&bob, &["--format", "json", "sync", "--remote", remote]);
+    let signer = support::fleet_signer(&alice.config_dir());
+    assert_cli_success(
+        &bob,
+        &[
+            "--format",
+            "json",
+            "sync",
+            "--remote",
+            remote,
+            "--expect-signer",
+            &signer,
+        ],
+    );
     assert_cli_success(&bob, &["--format", "json", "enroll", "--name", "bob"]);
     assert!(bob.config_dir().join("enroll/bob.toml").exists());
     assert_cli_success(&alice, &["--format", "json", "sync", "--pull"]);
@@ -157,7 +169,19 @@ fn reject_removes_the_request_without_revoking_and_allows_reenrollment() {
             "bob-first",
         ],
     );
-    assert_cli_success(&bob, &["--format", "json", "sync", "--remote", remote]);
+    let signer = support::fleet_signer(&alice.config_dir());
+    assert_cli_success(
+        &bob,
+        &[
+            "--format",
+            "json",
+            "sync",
+            "--remote",
+            remote,
+            "--expect-signer",
+            &signer,
+        ],
+    );
     assert_cli_success(&bob, &["--format", "json", "enroll", "--name", "bob"]);
     assert_cli_success(&alice, &["--format", "json", "sync", "--pull"]);
 
@@ -219,7 +243,19 @@ fn reject_dry_run_changes_nothing_and_errors_match_approve() {
             "bob-first",
         ],
     );
-    assert_cli_success(&bob, &["--format", "json", "sync", "--remote", remote]);
+    let signer = support::fleet_signer(&alice.config_dir());
+    assert_cli_success(
+        &bob,
+        &[
+            "--format",
+            "json",
+            "sync",
+            "--remote",
+            remote,
+            "--expect-signer",
+            &signer,
+        ],
+    );
     assert_cli_success(&bob, &["--format", "json", "enroll", "--name", "bob"]);
     assert_cli_success(&alice, &["--format", "json", "sync", "--pull"]);
     let request = alice.config_dir().join("enroll/bob.toml");
@@ -467,7 +503,14 @@ fn rotated_secret_reaches_authorized_machine_on_next_sync_only() {
             machine,
             &["--format", "json", "init", "--yes", "--machine", name],
         );
-        assert_cli_success(machine, &["--format", "json", "sync", "--remote", remote]);
+        let mut args = vec!["--format", "json", "sync", "--remote", remote];
+        // Everyone after the first joins alice's fleet and names her signer.
+        let signer;
+        if !std::ptr::eq(machine, &alice) {
+            signer = support::fleet_signer(&alice.config_dir());
+            args.extend(["--expect-signer", &signer]);
+        }
+        assert_cli_success(machine, &args);
     }
     assert_cli_success(&bob, &["--format", "json", "enroll", "--name", "bob"]);
     assert_cli_success(&alice, &["--format", "json", "sync", "--pull"]);

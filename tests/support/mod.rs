@@ -133,3 +133,14 @@ impl MusterEnv {
         std::os::unix::fs::symlink(target, link).expect("symlink system exe");
     }
 }
+
+/// The public key that signed the fleet state in `config_dir`: what a new
+/// machine passes as `--expect-signer` on first use.
+pub fn fleet_signer(config_dir: &std::path::Path) -> String {
+    let text = std::fs::read_to_string(config_dir.join("fleet.state.json")).expect("fleet state");
+    let state: Value = serde_json::from_str(&text).expect("fleet state json");
+    state["payload"]["signer"]
+        .as_str()
+        .expect("signer")
+        .to_string()
+}

@@ -84,7 +84,18 @@ fn enroll_request_carries_signing_key_and_nonce() {
     let bob = MusterEnv::new();
     ok(&alice, &["init", "--yes"]);
     ok(&alice, &["sync", "--remote", remote]);
-    ok(&bob, &["sync", "--remote", remote, "--pull"]);
+    let signer = support::fleet_signer(&alice.config_dir());
+    ok(
+        &bob,
+        &[
+            "sync",
+            "--remote",
+            remote,
+            "--pull",
+            "--expect-signer",
+            &signer,
+        ],
+    );
     ok(&bob, &["enroll", "--name", "bob"]);
     let text = std::fs::read_to_string(bob.config_dir().join("enroll/bob.toml")).unwrap();
     let req: toml::Table = text.parse().unwrap();
@@ -800,9 +811,26 @@ fn doctor_flags_unconfirmed_tofu_pin_until_confirmed_with_expect_signer() {
         .unwrap()
         .to_string();
 
-    // Bob syncs without --expect-signer (auto-TOFU)
+    // Bob holds a pin that was confirmed interactively on a terminal (TOFU,
+    // not named with --expect-signer): simulate it by marking his pin unconfirmed.
     let bob = MusterEnv::new();
-    ok(&bob, &["sync", "--remote", remote, "--pull"]);
+    let signer = support::fleet_signer(&alice.config_dir());
+    ok(
+        &bob,
+        &[
+            "sync",
+            "--remote",
+            remote,
+            "--pull",
+            "--expect-signer",
+            &signer,
+        ],
+    );
+    let pin_path = state_dir(&bob).join("trust.json");
+    let mut pin: Value =
+        serde_json::from_str(&std::fs::read_to_string(&pin_path).unwrap()).unwrap();
+    pin["tofu"] = Value::Bool(true);
+    std::fs::write(&pin_path, serde_json::to_string(&pin).unwrap()).unwrap();
 
     // Bob runs doctor: must flag unconfirmed pin with info diagnostic
     let (_, envelope) = bob.run_json(&["--format", "json", "doctor"]);
@@ -880,4 +908,38 @@ fn resign_reports_the_governance_diff() {
     let resigned = ok(&env, &["trust", "resign", "--yes"]);
     let diff = resigned["result"]["governance_diff"].as_str().unwrap();
     assert!(diff.contains("+") && diff.contains("evil"), "{diff}");
+}
+
+#[test]
+fn first_sync_of_a_fresh_machine_needs_expect_signer_when_not_interactive() {
+    let (_guard, remote) = bare_remote();
+    let remote = remote.to_str().unwrap();
+    let alice = MusterEnv::new();
+    ok(&alice, &["init", "--yes"]);
+    ok(&alice, &["sync", "--remote", remote]);
+    let signer = support::fleet_signer(&alice.config_dir());
+
+    let bob = MusterEnv::new();
+    let (code, raw) = fail(&bob, &["sync", "--remote", remote, "--pull", "--yes"]);
+    assert_eq!(code, 5, "{raw}");
+    assert!(raw.to_string().contains("--expect-signer"), "{raw}");
+    assert!(raw.to_string().contains("muster trust show"), "{raw}");
+    assert!(!state_dir(&bob).join("trust.json").exists());
+    assert!(
+        !bob.config_dir().join("muster.toml").exists(),
+        "refused pull is discarded"
+    );
+
+    ok(
+        &bob,
+        &[
+            "sync",
+            "--remote",
+            remote,
+            "--pull",
+            "--expect-signer",
+            &signer,
+        ],
+    );
+    assert!(state_dir(&bob).join("trust.json").exists());
 }

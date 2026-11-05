@@ -2,6 +2,7 @@
 //! command consumes security state, and re-sign as part of every commit that
 //! changes it. See `docs/adr/0005-signed-fleet-state.md`.
 
+use std::io::BufRead;
 use std::path::Path;
 
 use crate::context::Context;
@@ -98,6 +99,64 @@ pub fn guard(ctx: &mut Context, command: &str, mutating: bool) -> Result<(), Mus
     Ok(())
 }
 
+/// Asks the user on a terminal to type `expected` back. Never satisfied by
+/// `--yes`; without a terminal the `refusal` is returned as a Security error.
+fn confirm_typed(
+    ctx: &Context,
+    intro: &str,
+    expected: &str,
+    refusal: &str,
+) -> Result<(), MusterError> {
+    if !ctx.is_tty {
+        return Err(MusterError::Security(refusal.to_string()));
+    }
+    eprintln!("{intro}");
+    eprintln!("  {expected}");
+    eprint!("Type the fingerprint above to trust it: ");
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+    let mut answer = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut answer)
+        .map_err(|e| MusterError::Operational(format!("cannot read answer: {e}")))?;
+    if answer.trim().eq_ignore_ascii_case(expected) {
+        Ok(())
+    } else {
+        Err(MusterError::Security(
+            "the fingerprint typed does not match; nothing was pinned".into(),
+        ))
+    }
+}
+
+/// First use on this machine: there is no pin, the repo carries a signed
+/// state, and nothing named its signer. The signer must come from
+/// `--expect-signer`, a typed confirmation on a terminal, or be this
+/// machine's own key.
+fn confirm_first_use(ctx: &Context) -> Result<(), MusterError> {
+    if ctx.expect_signer.is_some() || TrustAnchor::load(&ctx.state_dir)?.is_some() {
+        return Ok(());
+    }
+    let Some(state) = FleetState::load(&ctx.config_dir)? else {
+        return Ok(());
+    };
+    let signer = &state.payload.signer;
+    if Signer::load(&ctx.state_dir)?.is_some_and(|own| &own.public() == signer) {
+        return Ok(());
+    }
+    let fingerprint = signing::fingerprint(signer);
+    confirm_typed(
+        ctx,
+        "This machine has not pinned a fleet yet. The repository's state is signed by:",
+        &fingerprint,
+        &format!(
+            "first use: this machine has not pinned a fleet and the repo is signed by \
+             {fingerprint}. Compare that with `muster trust show` on a machine you already \
+             trust, then re-run with --expect-signer <fingerprint> (or run interactively to \
+             confirm it)"
+        ),
+    )
+}
+
 /// Verifies the repo against the pin, reporting a first-use pin as an info diagnostic.
 pub fn verify(
     ctx: &mut Context,
@@ -156,6 +215,23 @@ fn migrate_legacy(ctx: &mut Context, mut manifest: Manifest) -> Result<(), Muste
         return Ok(());
     }
     let signer = Signer::load_or_create(&ctx.state_dir)?;
+    // Signing epoch 1 makes this machine the root of trust. That is automatic
+    // only when it is the whole fleet (it ran `init`); otherwise someone must
+    // confirm that this machine should be the root.
+    if manifest.machines.len() > 1 {
+        let fingerprint = signing::fingerprint(&signer.public());
+        confirm_typed(
+            ctx,
+            "This repo has no signed fleet state. This machine would sign it and become the \
+             root of trust, with signing key:",
+            &fingerprint,
+            &format!(
+                "this repo has no signed fleet state and has other machines; refusing to sign \
+                 it from this machine ({fingerprint}) without confirmation. Run the command \
+                 interactively, or on the machine that ran `muster init`"
+            ),
+        )?;
+    }
     let entry = manifest
         .machines
         .get_mut(&name)
@@ -309,7 +385,10 @@ pub fn verify_pulled(
         }
     }
     let manifest = Manifest::load(&ctx.config_dir);
-    let result = manifest.and_then(|m| verify(ctx, &m, true));
+    let result = manifest.and_then(|m| {
+        confirm_first_use(ctx)?;
+        verify(ctx, &m, true)
+    });
     if let Err(e) = result {
         let restored = git::restore_after_pull(&ctx.config_dir, previous);
         let note = match restored {
