@@ -187,7 +187,7 @@ fn recovery_key_via_env_var_is_accepted_without_a_diagnostic() {
 }
 
 #[test]
-fn recovery_key_via_argv_emits_a_warning_diagnostic() {
+fn recovery_key_via_argv_is_rejected_with_usage_error() {
     let machine = MusterEnv::new();
     let recovery_key = init(&machine);
     ok(&machine, &["enroll", "--name", "bob"]);
@@ -201,9 +201,17 @@ fn recovery_key_via_argv_emits_a_warning_diagnostic() {
         &recovery_key,
         "--yes",
     ]);
-    assert!(out.status.success(), "{}", envelope.raw);
-    assert!(envelope.ok());
-    assert!(codes(&envelope.raw).contains(&"insecure_recovery_key_argument".to_string()));
+    assert_eq!(out.status.code(), Some(2));
+    assert!(!envelope.ok());
+    let raw_text = envelope.raw.to_string();
+    assert!(
+        !raw_text.contains(&recovery_key),
+        "error must not echo the recovery key: {raw_text}"
+    );
+    assert!(
+        raw_text.contains("--recovery-key-stdin") || raw_text.contains("MUSTER_RECOVERY_KEY"),
+        "error must point to safe alternatives: {raw_text}"
+    );
 }
 
 // --- profile ----------------------------------------------------------------

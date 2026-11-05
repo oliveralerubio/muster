@@ -351,29 +351,21 @@ fn revoking_member_revokes_all_associated_machines_and_lists_secrets_to_rotate()
     let get = ["secret", "get", "native://engineering/api-key"];
     ok(&desktop, &config, &get);
 
-    let (out, envelope) = on(
-        &owner,
-        &config,
-        &[
-            "member",
-            "rm",
-            "alice",
-            "--recovery-key",
-            &recovery_key,
-            "--yes",
-        ],
-    );
-    assert!(out.status.success());
+    let mut cmd = owner.run(&[
+        "--format",
+        "json",
+        "--config",
+        config.to_str().unwrap(),
+        "member",
+        "rm",
+        "alice",
+        "--recovery-key-stdin",
+        "--yes",
+    ]);
+    cmd.write_stdin(recovery_key.as_bytes());
+    let (out, envelope) = support::json(cmd);
+    assert!(out.status.success(), "{}", envelope.raw);
     assert!(envelope.ok());
-    assert!(
-        envelope.raw["diagnostics"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|d| d["code"] == "insecure_recovery_key_argument"),
-        "argv recovery key must warn: {}",
-        envelope.raw
-    );
     let revoked = envelope.result().clone();
     let mut machines: Vec<_> = revoked["revoked_machines"]
         .as_array()

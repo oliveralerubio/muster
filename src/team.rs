@@ -31,10 +31,10 @@ pub const IMPLICIT_MEMBER: &str = "owner";
 
 pub const RECOVERY_KEY_ENV: &str = "MUSTER_RECOVERY_KEY";
 
-/// `--recovery-key`, for re-encrypting groups the caller cannot read (deprecated: use stdin or env).
+/// `--recovery-key`: always rejected (argv leaks into history and `ps`); kept so the error can explain the safe options.
 pub const RECOVERY_KEY_PARAM: ParamSpec = ParamSpec {
     name: "recovery-key",
-    about: "Offline recovery key (deprecated: prefer --recovery-key-stdin or MUSTER_RECOVERY_KEY)",
+    about: "Rejected: use --recovery-key-stdin or MUSTER_RECOVERY_KEY instead",
     kind: ParamKind::String,
     required: false,
     positional: false,
@@ -272,29 +272,21 @@ pub fn check_self_grant(
     )))
 }
 
-/// The offline recovery key, if one was supplied: `--recovery-key-stdin`, the
-/// deprecated `--recovery-key` argument (warns: it lands in shell history and
-/// `ps`), or [`RECOVERY_KEY_ENV`]. Call once per command: stdin is consumed.
+/// The offline recovery key, if one was supplied: `--recovery-key-stdin` or
+/// [`RECOVERY_KEY_ENV`]. The `--recovery-key` argument is a Usage error. Call once per command: stdin is consumed.
 pub fn recovery_key(
     ctx: &mut Context,
     params: &Params,
 ) -> Result<Option<SecretValue>, MusterError> {
+    if params.get_string(RECOVERY_KEY_PARAM.name).is_some() {
+        return Err(MusterError::Usage(format!(
+            "passing the recovery key via --{} is insecure and forbidden (it appears in process listings and shell history); pipe it via --{} or set {RECOVERY_KEY_ENV}",
+            RECOVERY_KEY_PARAM.name,
+            RECOVERY_KEY_STDIN_PARAM.name,
+        )));
+    }
     if params.get_bool(RECOVERY_KEY_STDIN_PARAM.name) {
         return ctx.read_secret_stdin().map(Some);
-    }
-    if let Some(raw) = params.get_string(RECOVERY_KEY_PARAM.name) {
-        ctx.diag(
-            Diagnostic::new(
-                Severity::Warning,
-                "insecure_recovery_key_argument",
-                "the recovery key was passed as a command-line argument, where shell history and \
-                 process listings can record it",
-            )
-            .with_suggestion(format!(
-                "pipe it with --recovery-key-stdin or set {RECOVERY_KEY_ENV}"
-            )),
-        );
-        return Ok(Some(SecretValue::new(raw.to_string())));
     }
     Ok(std::env::var(RECOVERY_KEY_ENV)
         .ok()

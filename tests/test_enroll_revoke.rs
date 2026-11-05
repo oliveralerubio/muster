@@ -407,18 +407,17 @@ fn revoke_reencrypts_lists_exposed_secrets_and_machine_list_shows_roles() {
         .expect("init exposes recovery key once");
     assert_cli_success(&machine, &["--format", "json", "enroll", "--name", "bob"]);
     // Single simulated machine: self-approval is forbidden, so use the recovery key.
-    assert_cli_success(
-        &machine,
-        &[
-            "--format",
-            "json",
-            "approve",
-            "bob",
-            "--recovery-key",
-            recovery_key,
-            "--yes",
-        ],
-    );
+    let mut cmd = machine.run(&[
+        "--format",
+        "json",
+        "approve",
+        "bob",
+        "--recovery-key-stdin",
+        "--yes",
+    ]);
+    cmd.write_stdin(recovery_key.as_bytes());
+    let (output, envelope) = support::json(cmd);
+    assert!(output.status.success(), "{}", envelope.raw);
 
     let machines = assert_cli_success(&machine, &["--format", "json", "machine", "list"]);
     assert!(machines.to_string().contains("bob"), "{machines}");
