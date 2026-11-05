@@ -78,12 +78,35 @@ pub fn guard(ctx: &mut Context, command: &str, mutating: bool) -> Result<(), Mus
     if !consuming {
         return Ok(());
     }
-    let Ok(manifest) = Manifest::load(&ctx.config_dir) else {
-        return Ok(());
+    let manifest = match Manifest::load(&ctx.config_dir) {
+        Ok(m) => m,
+        Err(e) => {
+            let pinned = TrustAnchor::load(&ctx.state_dir)?.is_some()
+                || ctx.config_dir.join(fleet_state::STATE_FILE).exists();
+            if !pinned {
+                return Ok(());
+            }
+            // A signed fleet without its governance is never "no policy".
+            let message = format!(
+                "muster.toml is missing or unreadable but this fleet has a trust pin or signed \
+                 state ({e}); restore it from a trusted copy"
+            );
+            if command == "doctor" {
+                ctx.fleet_state_invalid = true;
+                ctx.diag(Diagnostic::new(
+                    Severity::Error,
+                    "fleet_state_invalid",
+                    message,
+                ));
+                return Ok(());
+            }
+            return Err(MusterError::Security(message));
+        }
     };
     let verification = match verify(ctx, &manifest, !ctx.dry_run) {
         // `doctor` reports a failed verification next to its other findings.
         Err(MusterError::Security(message)) if command == "doctor" => {
+            ctx.fleet_state_invalid = true;
             ctx.diag(Diagnostic::new(
                 Severity::Error,
                 "fleet_state_invalid",

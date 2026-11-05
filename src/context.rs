@@ -48,6 +48,8 @@ pub struct Context {
     /// co-signatures: this machine keeps using the last accepted state and
     /// commands that would consume the new one refuse (see `trust::guard`).
     pub governance_pending: bool,
+    /// Fleet state is invalid (bad signature, forged vault, tampered governance).
+    pub fleet_state_invalid: bool,
     diagnostics: Vec<Diagnostic>,
     failed: bool,
 }
@@ -74,6 +76,7 @@ impl Context {
             expect_signer: None,
             enrollments: Vec::new(),
             governance_pending: false,
+            fleet_state_invalid: false,
             diagnostics: Vec::new(),
             failed: false,
         })
@@ -81,6 +84,10 @@ impl Context {
 
     pub fn diag(&mut self, diagnostic: Diagnostic) {
         self.diagnostics.push(diagnostic);
+    }
+
+    pub fn diagnostics(&self) -> &[Diagnostic] {
+        &self.diagnostics
     }
 
     pub fn take_diagnostics(&mut self) -> Vec<Diagnostic> {
@@ -216,6 +223,7 @@ mod tests {
             expect_signer: None,
             enrollments: Vec::new(),
             governance_pending: false,
+            fleet_state_invalid: false,
             diagnostics: Vec::new(),
             failed: false,
         }

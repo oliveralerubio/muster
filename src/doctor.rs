@@ -58,13 +58,14 @@ pub fn run(
     check_keys: bool,
     offline: bool,
 ) -> Result<Value, MusterError> {
-    // Governance waiting for admin co-signatures is not accepted: doctor only
-    // reports, and never plans, renders or resolves secrets from it.
-    if fix && ctx.governance_pending {
+    // Governance waiting for admin co-signatures, or a signed state that failed
+    // verification, is not accepted: doctor only reports, and never plans,
+    // renders, decrypts or resolves secrets from it.
+    if fix && (ctx.governance_pending || ctx.fleet_state_invalid) {
         return Err(MusterError::Security(
-            "`muster doctor --fix` refused: the repo holds a governance change that has not \
-             gathered enough admin signatures. Doctor only reports until an admin completes \
-             it with `muster trust cosign`"
+            "`muster doctor --fix` refused: the repo's signed fleet state is invalid or holds a \
+             governance change that has not gathered enough admin signatures. Doctor only \
+             reports until an admin completes it (`muster trust cosign`) or the repo is restored"
                 .into(),
         ));
     }
@@ -94,14 +95,21 @@ pub fn run(
 
     // Run the optional network check once, even when repairs re-examine local state.
     checkup.checks.push(api_keys::check(check_keys, offline));
-    checkup.checks.push(if ctx.governance_pending {
-        Check::skipped("provider_api_keys")
-    } else {
-        api_keys::check_declared(ctx, check_keys, offline)
-    });
+    checkup
+        .checks
+        .push(if ctx.governance_pending || ctx.fleet_state_invalid {
+            Check::skipped("provider_api_keys")
+        } else {
+            api_keys::check_declared(ctx, check_keys, offline)
+        });
+    let pre_errors = ctx
+        .diagnostics()
+        .iter()
+        .filter(|d| d.severity == Severity::Error)
+        .count();
     let diagnostics = checkup.diagnostics();
     let count = |s: Severity| diagnostics.iter().filter(|d| d.severity == s).count();
-    let errors = count(Severity::Error);
+    let errors = count(Severity::Error) + pre_errors;
     let result = json!({
         "healthy": errors == 0,
         "summary": {
@@ -218,6 +226,7 @@ impl Checkup {
 }
 
 fn examine(ctx: &mut Context) -> Checkup {
+    let held = ctx.governance_pending || ctx.fleet_state_invalid;
     let mut repairs = Vec::new();
     let git_ok = git::version().is_some();
     let initialized = ctx.config_dir.join(manifest::FILE_NAME).is_file();
@@ -243,7 +252,6 @@ fn examine(ctx: &mut Context) -> Checkup {
         Check::skipped("vault")
     });
     let mut plan = None;
-    let held = ctx.governance_pending;
     checks.push(match &manifest {
         _ if held => Check::skipped("adapters"),
         Some(_) => {
@@ -679,7 +687,11 @@ fn check_vault(ctx: &Context) -> Check {
     if !dir.is_dir() {
         return Check::new("vault", Vec::new());
     }
-    let identity = Identity::load(&ctx.state_dir).ok();
+    let identity = if ctx.fleet_state_invalid {
+        None
+    } else {
+        Identity::load(&ctx.state_dir).ok()
+    };
     let problems = Vault::open(&ctx.config_dir).and_then(|v| v.verify(identity.as_ref()));
     let diags = match problems {
         Ok(problems) => problems
