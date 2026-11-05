@@ -1,5 +1,6 @@
 mod support;
 
+use muster::manifest::{Group, Manifest, Readers};
 use serde_json::Value;
 use std::{fs, process::Command};
 use tempfile::TempDir;
@@ -545,4 +546,203 @@ fn rotated_secret_reaches_authorized_machine_on_next_sync_only() {
         let text = String::from_utf8_lossy(stream);
         assert!(!text.contains(old) && !text.contains(new), "secret leaked");
     }
+}
+
+/// Alice (admin, recovery key in `.1`) and an approved machine "bob".
+fn alice_and_bob() -> (support::MusterEnv, support::MusterEnv, String) {
+    let alice = support::MusterEnv::new();
+    let bob = support::MusterEnv::new();
+    for env in [&alice, &bob] {
+        env.link_system_exe("git");
+    }
+    let init = assert_cli_success(
+        &alice,
+        &["--format", "json", "init", "--yes", "--machine", "alice"],
+    );
+    let key = init["recovery_key"].as_str().unwrap().to_owned();
+    on(&bob, &alice.config_dir(), &["enroll", "--name", "bob"]);
+    let mut approve = alice.run_isolated(&[
+        "--format",
+        "json",
+        "approve",
+        "bob",
+        "--recovery-key-stdin",
+        "--yes",
+    ]);
+    approve.write_stdin(key.clone());
+    let (out, env) = support::json(approve);
+    assert!(out.status.success(), "{}", env.raw);
+    (alice, bob, key)
+}
+
+fn add_secret(env: &support::MusterEnv, path: &str, value: &str) {
+    let out = env
+        .run_isolated(&["--format", "json", "secret", "add", path, "--value-stdin"])
+        .write_stdin(value.to_owned())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+fn bob_reads(bob: &support::MusterEnv, alice: &support::MusterEnv, path: &str) -> bool {
+    bob.run_isolated(&[
+        "--format",
+        "json",
+        "--config",
+        alice.config_dir().to_str().unwrap(),
+        "--yes",
+        "secret",
+        "get",
+        path,
+        "--reveal",
+    ])
+    .output()
+    .unwrap()
+    .status
+    .success()
+}
+
+fn revoke(alice: &support::MusterEnv, name: &str) -> (std::process::Output, support::Envelope) {
+    alice.run_json(&["--format", "json", "revoke", name, "--yes"])
+}
+
+#[test]
+fn sidecar_edited_to_drop_target_before_revoke_still_rekeys() {
+    let (alice, bob, _key) = alice_and_bob();
+    add_secret(&alice, "grp/s", "secval");
+    assert!(bob_reads(&bob, &alice, "native://grp/s"));
+
+    // Tamper with the plaintext sidecar: drop bob (the first non-alice reader).
+    let meta_path = alice.config_dir().join("vault/grp.meta.json");
+    let mut meta: Value = serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+    let bob_rec = Manifest::load(&alice.config_dir()).unwrap().machines["bob"]
+        .recipient
+        .clone();
+    meta["recipients"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|r| r.as_str() != Some(bob_rec.as_str()));
+    fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+
+    let (out, env) = revoke(&alice, "bob");
+    // Either revoke repairs the group or it fails closed; bob must lose access.
+    let _ = (out, env);
+    assert!(!bob_reads(&bob, &alice, "native://grp/s"));
+}
+
+#[test]
+fn failed_preflight_leaves_manifest_unchanged_and_rerun_completes() {
+    let (alice, bob, _key) = alice_and_bob();
+    add_secret(&alice, "g1/s", "sec1");
+    add_secret(&alice, "g2/s", "sec2");
+    let digest = vault_digest(&alice.config_dir());
+    let g2_age = alice.config_dir().join("vault/g2.age");
+    let good = fs::read(&g2_age).unwrap();
+    fs::write(&g2_age, b"corrupt").unwrap();
+
+    let before = fs::read_to_string(alice.config_dir().join("muster.toml")).unwrap();
+    let (out, _env) = revoke(&alice, "bob");
+    assert!(!out.status.success());
+    assert_eq!(
+        fs::read_to_string(alice.config_dir().join("muster.toml")).unwrap(),
+        before,
+        "manifest must not change when the rekey cannot proceed"
+    );
+    // The healthy group was not touched either (preflight precedes mutation).
+    fs::write(&g2_age, &good).unwrap();
+    assert_eq!(vault_digest(&alice.config_dir()), digest);
+    assert!(bob_reads(&bob, &alice, "native://g1/s"));
+
+    let (out, env) = revoke(&alice, "bob");
+    assert!(out.status.success(), "{}", env.raw);
+    assert!(!bob_reads(&bob, &alice, "native://g1/s"));
+    assert!(!bob_reads(&bob, &alice, "native://g2/s"));
+}
+
+#[test]
+fn rerun_finishes_rekeying_when_machine_is_already_out_of_the_manifest() {
+    let (alice, bob, _key) = alice_and_bob();
+    add_secret(&alice, "grp/s", "secval");
+    // Simulate a partial revoke: manifest entry was removed and recorded in revoked_recipients,
+    // but vault groups were not yet re-encrypted.
+    let bob_rec = Manifest::load(&alice.config_dir()).unwrap().machines["bob"].recipient.clone();
+    let mut manifest = Manifest::load(&alice.config_dir()).unwrap();
+    manifest.machines.remove("bob");
+    manifest.revoked_recipients.push(bob_rec);
+    manifest.save(&alice.config_dir()).unwrap();
+    assert!(bob_reads(&bob, &alice, "native://grp/s"));
+
+    let (out, env) = revoke(&alice, "bob");
+    assert!(out.status.success(), "{}", env.raw);
+    assert!(!bob_reads(&bob, &alice, "native://grp/s"));
+}
+
+#[test]
+fn stale_group_reader_recipient_cannot_regrant_and_revoked_cannot_reenroll() {
+    let (alice, bob, _key) = alice_and_bob();
+    let bob_rec = Manifest::load(&alice.config_dir()).unwrap().machines["bob"]
+        .recipient
+        .clone();
+    let mut manifest = Manifest::load(&alice.config_dir()).unwrap();
+    manifest.groups.insert(
+        "special".into(),
+        Group {
+            readers: Readers {
+                recipients: vec![bob_rec.clone()],
+                ..Default::default()
+            },
+            profile: None,
+        },
+    );
+    manifest.save(&alice.config_dir()).unwrap();
+
+    let (out, env) = revoke(&alice, "bob");
+    assert!(out.status.success(), "{}", env.raw);
+    let after = Manifest::load(&alice.config_dir()).unwrap();
+    assert!(!after.groups["special"]
+        .readers
+        .recipients
+        .contains(&bob_rec));
+    assert!(after.revoked_recipients.contains(&bob_rec));
+
+    // The same key cannot come back, nor be added by hand to a new group.
+    let (out, _env) = bob.run_json(&[
+        "--format",
+        "json",
+        "--config",
+        alice.config_dir().to_str().unwrap(),
+        "enroll",
+        "--name",
+        "bob-again",
+    ]);
+    assert!(!out.status.success(), "revoked key must not re-enroll");
+    let mut manifest = Manifest::load(&alice.config_dir()).unwrap();
+    manifest
+        .groups
+        .get_mut("special")
+        .unwrap()
+        .readers
+        .recipients
+        .push(bob_rec);
+    manifest.save(&alice.config_dir()).unwrap();
+    let out = alice
+        .run_isolated(&[
+            "--format",
+            "json",
+            "secret",
+            "add",
+            "special/x",
+            "--value-stdin",
+        ])
+        .write_stdin("v".to_owned())
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "vault must refuse a revoked recipient"
+    );
 }

@@ -598,11 +598,18 @@ pub fn drift(config_dir: &Path, manifest: &Manifest) -> Value {
 
 /// Remove `machine` from every member and group reader list.
 pub fn forget_machine(manifest: &mut Manifest, machine: &str) {
+    let machine_recipient = manifest.machines.get(machine).map(|m| m.recipient.clone());
     for member in manifest.members.values_mut() {
         member.machines.retain(|m| m != machine);
     }
     for group in manifest.groups.values_mut() {
         group.readers.machines.retain(|m| m != machine);
+        if let Some(r) = &machine_recipient {
+            group.readers.recipients.retain(|rec| rec != r);
+        }
+        for r in &manifest.revoked_recipients {
+            group.readers.recipients.retain(|rec| rec != r);
+        }
     }
 }
 

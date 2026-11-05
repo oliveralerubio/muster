@@ -27,6 +27,10 @@ const EXTENSION_PREFIX: &str = "x-";
 pub struct Manifest {
     /// Manifest format version.
     pub version: u32,
+    /// age recipients removed by `muster revoke`. Vault encryption and
+    /// enrollment refuse them, so a stale reader list cannot re-grant access.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub revoked_recipients: Vec<String>,
     /// Offline recovery key: its public recipient is added to every secret group.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery: Option<Recovery>,
@@ -314,10 +318,20 @@ pub struct McpServerConfig {
     pub reveal: Vec<String>,
 }
 
+/// Which age recipients the vault may encrypt to / expect on existing groups.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VaultPolicy {
+    /// Recipients revoked by `muster revoke`: never encrypted to.
+    pub revoked: std::collections::BTreeSet<String>,
+    /// Enrolled machines, group `readers.recipients` and the recovery key.
+    pub authorized: std::collections::BTreeSet<String>,
+}
+
 impl Manifest {
     pub fn new() -> Self {
         Self {
             version: 1,
+            revoked_recipients: Vec::new(),
             recovery: None,
             machines: BTreeMap::new(),
             members: BTreeMap::new(),
@@ -349,6 +363,62 @@ impl Manifest {
             Err(e) => return Err(MusterError::Operational(format!("{}: {e}", path.display()))),
         };
         Self::parse(&text, &path.display().to_string())
+    }
+
+    /// The recipient policy of `<config_dir>/muster.toml` for the vault, read
+    /// leniently so a manifest that is broken elsewhere does not hide the
+    /// vault. `None` when there is no manifest; an unparsable one fails closed.
+    pub fn vault_policy(config_dir: &Path) -> Result<Option<VaultPolicy>, MusterError> {
+        let path = config_dir.join(FILE_NAME);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(MusterError::Operational(format!("{}: {e}", path.display()))),
+        };
+        let table: toml::Table = text.parse().map_err(|e| MusterError::InvalidConfig {
+            message: format!("cannot read recipient policy: {e}"),
+            path: Some(path.display().to_string()),
+        })?;
+        let strings = |value: Option<&toml::Value>| -> Vec<String> {
+            value
+                .and_then(toml::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        };
+        let mut policy = VaultPolicy::default();
+        policy
+            .revoked
+            .extend(strings(table.get("revoked_recipients")));
+        let recipient = |value: &toml::Value| {
+            value
+                .get("recipient")
+                .and_then(toml::Value::as_str)
+                .map(str::to_owned)
+        };
+        policy
+            .authorized
+            .extend(table.get("recovery").and_then(recipient));
+        for machine in table
+            .get("machines")
+            .and_then(toml::Value::as_table)
+            .into_iter()
+            .flat_map(|t| t.values())
+        {
+            policy.authorized.extend(recipient(machine));
+        }
+        for group in table
+            .get("groups")
+            .and_then(toml::Value::as_table)
+            .into_iter()
+            .flat_map(|t| t.values())
+        {
+            policy.authorized.extend(strings(
+                group.get("readers").and_then(|r| r.get("recipients")),
+            ));
+        }
+        Ok(Some(policy))
     }
 
     /// Write `<config_dir>/muster.toml`.

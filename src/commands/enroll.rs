@@ -67,6 +67,12 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         }
     };
     // A machine that is not yet a fleet member takes the requested name locally.
+    if manifest.revoked_recipients.contains(&identity.recipient()) {
+        return Err(MusterError::Security(format!(
+            "recipient '{}' has been revoked and cannot be enrolled",
+            identity.recipient()
+        )));
+    }
     let is_member = manifest
         .machines
         .values()

@@ -133,6 +133,12 @@ pub(super) fn approve_with_identity(
     };
 
     // Team mode: only admins approve machines, and nobody for themselves.
+    if manifest.revoked_recipients.contains(&req.recipient) {
+        return Err(MusterError::Security(format!(
+            "recipient '{}' has been revoked and cannot be approved",
+            req.recipient
+        )));
+    }
     let before = manifest;
     let role = proposal(params, "role", &mut req.role)?;
     let profile = proposal(params, "profile", &mut req.profile)?;

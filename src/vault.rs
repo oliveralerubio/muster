@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::errors::MusterError;
 use crate::identity::Identity;
+use crate::manifest::{Manifest, VaultPolicy};
 use crate::secrets::SecretValue;
 
 const VAULT_DIR: &str = "vault";
@@ -90,6 +91,23 @@ pub struct Problem {
 pub struct Vault {
     dir: PathBuf,
     actor: Option<String>,
+    policy: Option<VaultPolicy>,
+}
+
+/// What `muster revoke` needs to know about a group, from its decrypted
+/// payload only (the plaintext sidecar is untrusted).
+pub struct GroupView {
+    /// Recipients the ciphertext is really encrypted for.
+    pub readers: Vec<String>,
+    /// Secret names held in the group.
+    pub secrets: Vec<String>,
+}
+
+const NOT_A_RECIPIENT: &str = "this machine is not a recipient of the secret group";
+
+/// Whether `err` means the identity is simply not a reader of the group.
+pub fn is_not_a_recipient(err: &MusterError) -> bool {
+    matches!(err, MusterError::Security(m) if m == NOT_A_RECIPIENT)
 }
 
 impl Vault {
@@ -97,7 +115,22 @@ impl Vault {
     pub fn open(config_dir: &Path) -> Result<Self, MusterError> {
         let dir = config_dir.join(VAULT_DIR);
         fs::create_dir_all(&dir).map_err(|e| io_err(&dir, e))?;
-        Ok(Self { dir, actor: None })
+        let policy = Manifest::vault_policy(config_dir)?;
+        Ok(Self {
+            dir,
+            actor: None,
+            policy,
+        })
+    }
+
+    /// Also refuse to encrypt to `recipients` (revoked in this operation but
+    /// not yet persisted in the manifest).
+    pub fn with_revoked(mut self, recipients: impl IntoIterator<Item = String>) -> Self {
+        self.policy
+            .get_or_insert_with(VaultPolicy::default)
+            .revoked
+            .extend(recipients);
+        self
     }
 
     /// Records `actor` (a machine name) as author of later adds and rotations.
@@ -120,8 +153,11 @@ impl Vault {
         validate_segment("secret name", name)?;
         let mut data = if self.age_path(group).exists() || self.meta_path(group).exists() {
             self.ensure_pair(group)?;
-            self.read_verified_readers(group, id)?
+            let data = self.read_verified_readers(group, id)?;
+            self.verify_recipients(group, &data.recipients)?;
+            data
         } else {
+            self.verify_recipients(group, recipients)?;
             GroupData {
                 group: group.to_owned(),
                 recipients: recipients.to_vec(),
@@ -165,6 +201,7 @@ impl Vault {
         id: &Identity,
     ) -> Result<(), MusterError> {
         let mut data = self.read_verified_readers(group, id)?;
+        self.verify_recipients(group, &data.recipients)?;
         let entry = data
             .secrets
             .get_mut(name)
@@ -203,6 +240,40 @@ impl Vault {
                 "vault group '{group}' is incomplete: missing ciphertext '{group}.age'"
             ))),
         }
+    }
+
+    /// Authentic readers and secret names of `group` decrypted with `id`.
+    /// The plaintext sidecar is verified to exist but not trusted for readers.
+    pub fn group_view(&self, group: &str, id: &Identity) -> Result<GroupView, MusterError> {
+        self.ensure_pair(group)?;
+        let data = self.read(group, id)?;
+        let mut secrets: Vec<String> = data.secrets.keys().cloned().collect();
+        secrets.sort();
+        Ok(GroupView {
+            readers: data.recipients,
+            secrets,
+        })
+    }
+
+    /// Verifies that `recipients` contains no revoked key, and, when the
+    /// manifest defines fleet recipients, only known authorized keys.
+    fn verify_recipients(&self, group: &str, recipients: &[String]) -> Result<(), MusterError> {
+        let Some(policy) = &self.policy else {
+            return Ok(());
+        };
+        for r in recipients {
+            if policy.revoked.contains(r) {
+                return Err(MusterError::Security(format!(
+                    "recipient '{r}' has been revoked"
+                )));
+            }
+            if !policy.authorized.is_empty() && !policy.authorized.contains(r) {
+                return Err(MusterError::Security(format!(
+                    "recipient '{r}' is not authorized for group '{group}'"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Metadata for every secret in `group`, sorted by name. Needs no identity.
@@ -259,7 +330,12 @@ impl Vault {
         new_recipients: &[String],
         id: &Identity,
     ) -> Result<(), MusterError> {
-        let mut data = self.read_verified_readers(group, id)?;
+        self.ensure_pair(group)?;
+        let mut data = match self.read_verified_readers(group, id) {
+            Ok(data) => data,
+            Err(MusterError::Security(_)) => self.read(group, id)?,
+            Err(e) => return Err(e),
+        };
         data.recipients = new_recipients.to_vec();
         self.write(group, &data)
     }
@@ -432,6 +508,15 @@ impl Vault {
                 data.group
             )));
         }
+        if let Some(policy) = &self.policy {
+            for r in &data.recipients {
+                if policy.revoked.contains(r) {
+                    return Err(MusterError::Security(format!(
+                        "refusing to encrypt group '{group}' to revoked recipient '{r}'"
+                    )));
+                }
+            }
+        }
         let plaintext = Zeroizing::new(
             serde_json::to_vec(data)
                 .map_err(|e| MusterError::Operational(format!("cannot serialize group: {e}")))?,
@@ -496,9 +581,7 @@ fn decrypt(armored: &[u8], id: &Identity) -> Result<Zeroizing<Vec<u8>>, MusterEr
     let mut reader = decryptor
         .decrypt(std::iter::once(id.as_age() as &dyn age::Identity))
         .map_err(|e| match e {
-            age::DecryptError::NoMatchingKeys => {
-                MusterError::Security("this machine is not a recipient of the secret group".into())
-            }
+            age::DecryptError::NoMatchingKeys => MusterError::Security(NOT_A_RECIPIENT.into()),
             other => crypto_err(other),
         })?;
     let mut plaintext = Zeroizing::new(Vec::new());
