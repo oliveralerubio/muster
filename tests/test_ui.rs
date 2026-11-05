@@ -1734,3 +1734,42 @@ fn web_skill_import_all_and_auto_update_routes_match_cli() {
     );
     assert_eq!(status, 400, "{reply}");
 }
+
+#[test]
+fn ui_sync_on_first_use_surfaces_the_security_error_and_accepts_expect_signer() {
+    let remote_dir = tempfile::TempDir::new().unwrap();
+    let remote = remote_dir.path().join("central.git");
+    let git_ok = |args: &[&str]| {
+        assert!(Command::new("git").args(args).status().unwrap().success());
+    };
+    git_ok(&["init", "--bare", "--quiet", remote.to_str().unwrap()]);
+    let alice = support::MusterEnv::new();
+    alice.run(&["--yes", "init"]).assert().success();
+    alice
+        .run(&["sync", "--remote", remote.to_str().unwrap()])
+        .assert()
+        .success();
+    let signer = support::fleet_signer(&alice.config_dir());
+
+    // A machine that cloned the repo by hand and has never pinned a fleet.
+    let bob = support::MusterEnv::new();
+    git_ok(&[
+        "clone",
+        "--quiet",
+        remote.to_str().unwrap(),
+        bob.config_dir().to_str().unwrap(),
+    ]);
+    let mut ui = Ui::start(&bob);
+    let cookie = ui.session();
+
+    let (status, _, body) = ui.request("POST", "/api/sync", Some(&cookie), Some("{}"));
+    assert_eq!(status, 403, "{body}");
+    assert!(body.contains("--expect-signer"), "{body}");
+    assert!(body.contains("SHA256:"), "the fingerprint is surfaced: {body}");
+    assert!(!bob.path().join(".local/state/muster/trust.json").exists());
+
+    let request = format!("{{\"expect_signer\": \"{signer}\"}}");
+    let (status, _, body) = ui.request("POST", "/api/sync", Some(&cookie), Some(&request));
+    assert_eq!(status, 200, "{body}");
+    assert!(bob.path().join(".local/state/muster/trust.json").exists());
+}
