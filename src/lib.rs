@@ -16,6 +16,7 @@ pub mod hash;
 pub mod identity;
 pub mod importers;
 pub mod installer;
+pub mod lock;
 pub mod machine;
 pub mod manifest;
 pub mod mcp;

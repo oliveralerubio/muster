@@ -76,8 +76,32 @@ pub(crate) fn execute_with(
         Ok(mut ctx) => {
             ctx.is_tty &= interactive;
             ctx.expect_signer = expect_signer;
-            let result = crate::trust::guard(&mut ctx, spec.name, spec.mutating)
-                .and_then(|()| handler(&mut ctx));
+            // One mutation at a time per machine, so a concurrent command can
+            // never clobber a live revocation stage or a half-written commit.
+            let lock = if spec.mutating && !ctx.dry_run {
+                let wait = if spec.name == "sync" {
+                    std::time::Duration::ZERO
+                } else {
+                    crate::lock::wait_budget()
+                };
+                crate::lock::acquire_for(&ctx.state_dir, wait).map(Some)
+            } else {
+                Ok(None)
+            };
+            let result = match lock {
+                // A scheduled sync yields to a running command instead of failing.
+                Err(MusterError::Operational(_)) if spec.name == "sync" => {
+                    ctx.diag(crate::output::Diagnostic::new(
+                        crate::output::Severity::Info,
+                        "sync_skipped_locked",
+                        "another muster command is running",
+                    ));
+                    Ok(serde_json::json!({"skipped": "locked", "applied": false}))
+                }
+                Err(e) => Err(e),
+                Ok(_held) => crate::trust::guard(&mut ctx, spec.name, spec.mutating)
+                    .and_then(|()| handler(&mut ctx)),
+            };
             (result, ctx.take_diagnostics(), ctx.failed())
         }
         Err(err) => (Err(err), Vec::new(), false),

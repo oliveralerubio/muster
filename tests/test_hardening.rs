@@ -208,3 +208,90 @@ machines = [\"alpha\"]
     let current_age = std::fs::read_to_string(&age_path).unwrap();
     assert!(!current_age.contains("new_secret_value"));
 }
+
+#[test]
+fn concurrent_mutating_command_fails_with_another_command_is_running() {
+    let env = MusterEnv::new();
+    ok(&env, &["init", "--yes", "--machine", "alpha"]);
+
+    let state = env.path().join(".local/state/muster");
+    // Acquire the mutation lock as another process (using parent process PID)
+    let parent = std::os::unix::process::parent_id();
+    let lock_file = state.join("mutation.lock");
+    std::fs::write(&lock_file, format!("{parent} 0\n")).unwrap();
+
+    // A mutating command (secret add) must wait briefly and fail with Operational:
+    // "another muster command is running"
+    let out = env
+        .run(&[
+            "--format",
+            "json",
+            "secret",
+            "add",
+            "app/key",
+            "--value-stdin",
+        ])
+        .env("MUSTER_LOCK_WAIT_MS", "100")
+        .write_stdin(b"secret_val")
+        .output()
+        .unwrap();
+
+    assert_ne!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("another muster command is running"),
+        "{stdout}"
+    );
+
+    // Stale lock detection: if the lock has a dead PID, it is broken and command succeeds
+    let mut dead = std::process::Command::new("true").spawn().unwrap();
+    let dead_pid = dead.id();
+    dead.wait().unwrap();
+    std::fs::write(&lock_file, format!("{dead_pid} 1\n")).unwrap();
+
+    let out2 = env
+        .run(&[
+            "--format",
+            "json",
+            "secret",
+            "add",
+            "app/key",
+            "--value-stdin",
+        ])
+        .env("MUSTER_LOCK_WAIT_MS", "100")
+        .write_stdin(b"secret_val")
+        .output()
+        .unwrap();
+    assert!(
+        out2.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
+}
+
+#[test]
+fn read_only_command_preserves_live_revocation_stage_owned_by_another_command() {
+    let env = MusterEnv::new();
+    ok(&env, &["init", "--yes", "--machine", "alpha"]);
+
+    let state = env.path().join(".local/state/muster");
+    let tx_dir = state.join("revocation-tx");
+    std::fs::create_dir_all(&tx_dir).unwrap();
+    std::fs::write(tx_dir.join("staged_marker.txt"), b"live transaction stage").unwrap();
+
+    // The mutation lock is held by another live process
+    let parent = std::os::unix::process::parent_id();
+    let lock_file = state.join("mutation.lock");
+    std::fs::write(&lock_file, format!("{parent} 0\n")).unwrap();
+
+    // A read-only command runs
+    let out = env.run(&["--format", "json", "status"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The live staging directory MUST NOT be deleted by the read-only command!
+    assert!(tx_dir.join("staged_marker.txt").exists());
+}
