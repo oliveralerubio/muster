@@ -875,6 +875,8 @@ allow = ["claude"]
         "secret",
         "get",
         "env://MUSTER_RUNTIME_KEY",
+        "--agent",
+        "claude",
         "--reveal",
         "--yes",
         "--format",
