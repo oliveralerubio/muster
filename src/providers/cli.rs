@@ -57,17 +57,37 @@ pub static BWS: CliSpec = CliSpec {
 /// `bws secret get -o json` prints the whole secret object; pick the field
 /// (`value` unless the reference names `key` or `note`). Non-JSON output is
 /// taken as the value itself.
-fn bws_field(reference: &SecretRef, stdout: String) -> Result<String, ProviderError> {
+fn bws_field(reference: &SecretRef, mut stdout: String) -> Result<String, ProviderError> {
     let field = reference.segments().get(1).map_or("value", String::as_str);
     match serde_json::from_str::<serde_json::Value>(&stdout) {
-        Ok(serde_json::Value::Object(object)) => match object.get(field) {
-            Some(serde_json::Value::String(value)) => Ok(value.clone()),
-            _ => Err(ProviderError::new(
-                ProviderErrorKind::NotFound,
-                format!("Bitwarden secret {reference} has no `{field}` field"),
-            )),
-        },
+        Ok(serde_json::Value::Object(mut object)) => {
+            // The parsed copy is moved, never cloned; every other string and
+            // the raw CLI output are wiped.
+            stdout.zeroize();
+            let found = object.remove(field);
+            object.into_iter().for_each(|(_, v)| wipe(v));
+            match found {
+                Some(serde_json::Value::String(value)) => Ok(value),
+                other => {
+                    other.into_iter().for_each(wipe);
+                    Err(ProviderError::new(
+                        ProviderErrorKind::NotFound,
+                        format!("Bitwarden secret {reference} has no `{field}` field"),
+                    ))
+                }
+            }
+        }
         _ => Ok(stdout),
+    }
+}
+
+/// Zeroize every string inside a parsed JSON value before it is dropped.
+fn wipe(value: serde_json::Value) {
+    match value {
+        serde_json::Value::String(mut s) => s.zeroize(),
+        serde_json::Value::Array(items) => items.into_iter().for_each(wipe),
+        serde_json::Value::Object(map) => map.into_iter().for_each(|(_, v)| wipe(v)),
+        _ => {}
     }
 }
 

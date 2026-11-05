@@ -851,3 +851,29 @@ fn secret_get_reveal_without_agent_enforces_policy_and_refuses_yes_alone() {
     );
     assert!(!String::from_utf8_lossy(&out2.stdout).contains("super-secret-value-must-not-leak"));
 }
+
+#[test]
+fn bitwarden_json_output_yields_only_the_named_field() {
+    let env = initialized();
+    env.fake_exe(
+        "bws",
+        r#"echo '{"key":"K-NAME","value":"V-SECRET-1","note":"N-NOTE-2","other":"O-3"}'"#,
+    );
+    let get = |reference: &str| {
+        env.run_json(&[
+            "--format", "json", "secret", "get", reference, "--reveal", "--yes",
+        ])
+    };
+    let (out, envelope) = get("bws://item/value");
+    assert!(out.status.success(), "{}", envelope.raw);
+    assert_eq!(envelope.result().as_str(), Some("V-SECRET-1"));
+    let (_, envelope) = get("bws://item/note");
+    assert_eq!(envelope.result().as_str(), Some("N-NOTE-2"));
+    let (out, envelope) = get("bws://item/missing");
+    assert!(!out.status.success());
+    let text = envelope.raw.to_string();
+    assert!(
+        !text.contains("V-SECRET-1") && !text.contains("N-NOTE-2"),
+        "{text}"
+    );
+}
