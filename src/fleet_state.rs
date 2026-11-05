@@ -391,6 +391,29 @@ pub fn is_current(
         && state.payload.vault == vault_hashes(config_dir)?)
 }
 
+/// Refuses a repo whose signed state is older than the local pin. `action`
+/// completes "cannot ... a rolled-back fleet state" in the message.
+///
+/// A missing state is not checked here (the downgrade check in
+/// [`verify_with`] owns that); a state without a pin is fine.
+pub fn ensure_not_behind_pin(
+    config_dir: &Path,
+    state_dir: &Path,
+    action: &str,
+) -> Result<(), MusterError> {
+    let (Some(pin), Some(state)) = (TrustAnchor::load(state_dir)?, FleetState::load(config_dir)?)
+    else {
+        return Ok(());
+    };
+    if state.payload.epoch < pin.epoch {
+        return Err(MusterError::Security(format!(
+            "cannot {action} a rolled-back fleet state (epoch {} < pinned {}); restore the repo              from a trusted copy",
+            state.payload.epoch, pin.epoch
+        )));
+    }
+    Ok(())
+}
+
 /// Signs the current repository content as the next epoch (epoch 1 when there
 /// is no state yet) and advances the local pin. Returns `None` when nothing
 /// signed changed and `force` is false.
@@ -401,6 +424,8 @@ pub fn seal(
     signer: &Signer,
     force: bool,
 ) -> Result<Option<FleetState>, MusterError> {
+    // A seal must advance or preserve the pinned epoch, never launder an older state.
+    ensure_not_behind_pin(config_dir, state_dir, "re-sign")?;
     let current = FleetState::load(config_dir)?;
     if let Some(state) = &current {
         if !force && is_current(config_dir, manifest, state)? {
@@ -744,6 +769,19 @@ mod tests {
         assert_eq!(second.payload.epoch, 2);
         assert_eq!(second.payload.prev, Some(first.payload_hash().unwrap()));
         f.verify().unwrap();
+    }
+
+    #[test]
+    fn seal_refuses_when_current_epoch_is_behind_pinned() {
+        let f = fixture();
+        let first = f.seal();
+        assert_eq!(first.payload.epoch, 1);
+        fs::write(f.config.join("vault/app.age"), b"cipher").unwrap();
+        let second = f.seal();
+        assert_eq!(second.payload.epoch, 2);
+        first.save(&f.config).unwrap();
+        let err = seal(&f.config, &f.state, &f.manifest, &f.signer, true).unwrap_err();
+        assert!(message(err).contains("cannot re-sign a rolled-back fleet state"));
     }
 
     #[test]

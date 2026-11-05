@@ -105,6 +105,7 @@ fn run_show(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
 
 fn run_resign(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let manifest = Manifest::load(&ctx.config_dir)?;
+    fleet_state::ensure_not_behind_pin(&ctx.config_dir, &ctx.state_dir, "re-sign")?;
     let recovery = team::recovery_identity(ctx, params, &manifest)?;
     let signer = match recovery {
         Some(rec_id) => Signer::from_recovery(&rec_id)?,

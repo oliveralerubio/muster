@@ -578,3 +578,28 @@ fn legacy_string_approvals_are_ignored_with_warning() {
         "expected warning: {diags:?}"
     );
 }
+
+#[test]
+fn resign_after_a_local_rollback_is_refused() {
+    let alice = MusterEnv::new();
+    ok(&alice, &["init", "--yes"]);
+    let config = alice.config_dir();
+    let epoch_one_commit = git(&config, &["rev-parse", "HEAD"]);
+    add_secret(&alice, "app/api", "SEED-value-one");
+    assert_eq!(epoch(&alice), 2);
+
+    // The repo silently goes back to epoch 1 (the pin stays at 2).
+    git(&config, &["reset", "--hard", "--quiet", &epoch_one_commit]);
+    assert_eq!(state_epoch_on_disk(&config), 1);
+
+    let (code, raw) = fail(&alice, &["trust", "resign", "--yes"]);
+    assert_eq!(code, 5, "{raw}");
+    assert!(
+        raw.to_string().contains("cannot re-sign a rolled-back"),
+        "{raw}"
+    );
+    // Nothing was signed: the repo still shows epoch 1 and the pin epoch 2.
+    assert_eq!(state_epoch_on_disk(&config), 1);
+    let pin = ok(&alice, &["trust", "show"]);
+    assert_eq!(pin["result"]["trust_pin"]["epoch"], 2);
+}
