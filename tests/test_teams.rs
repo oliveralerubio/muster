@@ -395,6 +395,8 @@ fn revoking_member_revokes_all_associated_machines_and_lists_secrets_to_rotate()
     }
     let fleet = ok(&owner, &config, &["machine", "list"]);
     assert_eq!(names(&fleet["machines"]), ["owner-laptop"]);
+    let manifest_toml = std::fs::read_to_string(config.join("muster.toml")).unwrap();
+    assert!(manifest_toml.contains("revoked_recipients = ["));
 }
 
 #[test]
@@ -952,4 +954,48 @@ fn explicit_group_rekey_previews_access_and_requires_confirmation() {
     let again = ok(&owner, &config, &["group", "rekey", "prod", "--yes"]);
     assert_eq!(again["reencrypted_groups"], serde_json::json!([]));
     assert!(std::fs::read(config.join("vault/prod.age")).unwrap() == applied);
+}
+
+#[test]
+fn member_rm_fails_closed_when_sidecar_disagrees_with_ciphertext() {
+    let owner = MusterEnv::new();
+    let laptop = MusterEnv::new();
+    let recovery_key = init(&owner);
+    let config = owner.config_dir();
+    add_member(&owner, "alice", "member");
+    join(&owner, &laptop, "alice-laptop", "alice");
+    ok(
+        &owner,
+        &config,
+        &["group", "create", "engineering", "--reader", "alice"],
+    );
+    add_secret(&owner, &config, "engineering/api-key", "TOP_SECRET");
+
+    // Attacker tampers engineering.meta.json to remove alice's recipient
+    let meta_path = config.join("vault/engineering.meta.json");
+    let mut meta: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+    meta["recipients"] = serde_json::json!([]);
+    std::fs::write(&meta_path, meta.to_string()).unwrap();
+
+    // Even if the tamperer re-signs the state, member rm reads the real
+    // recipients from the ciphertext: it never silently skips the group.
+    ok(&owner, &config, &["trust", "resign", "--yes"]);
+    let mut cmd = owner.run(&[
+        "--format",
+        "json",
+        "--config",
+        config.to_str().unwrap(),
+        "member",
+        "rm",
+        "alice",
+        "--recovery-key-stdin",
+        "--yes",
+    ]);
+    cmd.write_stdin(recovery_key.as_bytes());
+    let (out, envelope) = support::json(cmd);
+    assert_eq!(out.status.code(), Some(5), "{}", envelope.raw);
+    // Nothing was committed: alice is still a member.
+    let manifest = std::fs::read_to_string(config.join("muster.toml")).unwrap();
+    assert!(manifest.contains("[members.alice]"), "{manifest}");
 }

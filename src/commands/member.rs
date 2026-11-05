@@ -396,11 +396,50 @@ fn rm(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     }
     // A key still used by a remaining machine keeps its access.
     revoked_recipients.retain(|r| !manifest.machines.values().any(|m| &m.recipient == r));
+    // Persist the revocation so no later command can encrypt to these keys again.
+    for r in &revoked_recipients {
+        if !manifest.revoked_recipients.contains(r) {
+            manifest.revoked_recipients.push(r.clone());
+        }
+    }
 
     let identity = team::unlock(ctx, params, &manifest)?;
-    let mut vault = Vault::open(&ctx.config_dir)?;
-    let exposed = team::exposed_secrets(&vault, &revoked_recipients)?;
-    let changes = team::pending_rekeys(ctx, &vault, &before, &manifest)?;
+    let mut vault = Vault::open(&ctx.config_dir)?.with_revoked(manifest.revoked_recipients.clone());
+    let mut changes = team::pending_rekeys(ctx, &vault, &before, &manifest)?;
+
+    // Readers and secrets come from the decrypted ciphertext, never from the
+    // unauthenticated sidecar (a tampered sidecar could hide a revoked key).
+    let mut exposed = Vec::new();
+    for group in vault.groups()? {
+        let view = match vault.group_view(&group, &identity) {
+            Ok(view) => view,
+            Err(ref err) if crate::vault::is_not_a_recipient(err) => {
+                if revoked_recipients.is_empty() && !changes.iter().any(|(g, _)| g == &group) {
+                    continue;
+                }
+                return Err(MusterError::Security(format!(
+                    "this machine cannot read secret group '{group}' to re-encrypt it; \
+                     run from a reader or pass --recovery-key"
+                )));
+            }
+            Err(err) => return Err(err),
+        };
+        if !view.readers.iter().any(|r| revoked_recipients.contains(r)) {
+            continue;
+        }
+        for secret in view.secrets {
+            exposed.push(json!({
+                "group": group,
+                "name": secret,
+                "reference": format!("native://{group}/{secret}"),
+            }));
+        }
+        let keep = |r: &String| !revoked_recipients.contains(r);
+        match changes.iter_mut().find(|(g, _)| g == &group) {
+            Some((_, planned)) => planned.retain(keep),
+            None => changes.push((group, view.readers.into_iter().filter(keep).collect())),
+        }
+    }
     team::check_can_rekey(&vault, &changes, &identity)?;
     let result = |groups: Vec<String>| {
         json!({
@@ -414,8 +453,9 @@ fn rm(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     if ctx.dry_run {
         return Ok(result(changes.into_iter().map(|(g, _)| g).collect()));
     }
-    manifest.save(&ctx.config_dir)?;
+    // Re-encrypt BEFORE saving the manifest: a failure leaves the fleet unchanged.
     let groups = team::rekey(&mut vault, &changes, &identity)?;
+    manifest.save(&ctx.config_dir)?;
     for machine in &member.machines {
         EnrollmentRequest::remove(&ctx.config_dir, machine)?;
     }
