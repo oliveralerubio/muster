@@ -78,6 +78,14 @@ Stored with permissions 0600 strictly outside the Git repository:
 - **Resign without a pin:** refused unless this machine is the only enrolled machine; the governance diff is always printed, against the last committed manifest that matches its signed state when no pin exists.
 - **Web panel:** the sync route accepts `expect_signer`; without it a first sync is a 403 Security error naming the fingerprint. Nothing is auto-accepted.
 
+### 9. Hardening (round 8)
+- **One pending decision for every consumer, bootstrap included:** a machine with no pin evaluates the latest governance transition (HEAD state against its predecessor in git history) with the same `check_transition` as the chain walk. If it is short of co-signatures, the machine pins the newest earlier state whose own transition was quorate (walking back through the history), reports `governance_pending` and applies nothing. Without usable git history for an epoch above 1 it refuses with a Security error.
+- **`doctor` reports only while pending:** `doctor --fix` is refused, and the `adapters`, `keys`, `providers` and `provider_api_keys` checks are skipped, so nothing is planned, rendered or resolved from unaccepted governance. `sync` returns before planning.
+
+### Known limitations
+- **History-squash migration bypass:** the legacy-migration guard reads git history and remote configuration. Someone with write access to this machine's config repo can squash history and drop the remote so a pin-less machine migrates without the typed confirmation. That needs local write access, which is outside the A1 threat model; machines that already pinned refuse first.
+- **No web cosign:** the web panel cannot inspect a pending quorum or co-sign. `muster trust show` and `muster trust cosign` are CLI only.
+
 ## Status
 
 Accepted and implemented in `hillclimb/secrets-hardening`.
