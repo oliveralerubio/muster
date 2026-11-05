@@ -288,6 +288,26 @@ fn hand_edit_of_machines_is_refused_until_trust_resign() {
 }
 
 #[test]
+fn hand_edit_is_not_laundered_by_an_unlisted_mutating_command() {
+    let env = MusterEnv::new();
+    ok(&env, &["init", "--yes", "--machine", "alpha"]);
+    let attacker = "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq";
+    let path = env.config_dir().join("muster.toml");
+    let mut text = manifest_text(&env);
+    text.push_str(&format!(
+        "\n[machines.evil]\nrecipient = \"{attacker}\"\nplatform = \"linux-x86_64\"\nmuster_version = \"0.1.0\"\n"
+    ));
+    std::fs::write(&path, text).unwrap();
+
+    let (code, raw) = fail(
+        &env,
+        &["profile", "set", "dev", "--toml", "[agents]\n", "--yes"],
+    );
+    assert_eq!(code, 5, "{raw}");
+    assert_eq!(state_epoch_on_disk(&env.config_dir()), 1);
+}
+
+#[test]
 fn new_machine_pins_the_signer_and_expect_signer_is_strict() {
     let (_guard, remote) = bare_remote();
     let remote = remote.to_str().unwrap();
@@ -656,7 +676,7 @@ fn non_security_mutating_command_refuses_when_repo_is_rolled_back() {
         &["profile", "set", "dev", "--toml", "[agents]\n", "--yes"],
     );
     assert_eq!(code, 5, "{raw}");
-    assert!(raw.to_string().contains("rolled-back"), "{raw}");
+    assert!(raw.to_string().contains("rollback refused"), "{raw}");
 }
 
 #[test]

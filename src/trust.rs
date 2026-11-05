@@ -24,11 +24,16 @@ const SECURITY_CONSUMING: &[&str] = &[
     "reject",
     "revoke",
     "enroll",
-    "machine.remove",
+    "machine.add",
+    "machine.rm",
+    "machine.assign",
+    "agents.apply",
+    "plan",
+    "effective",
     "member.add",
     "member.approve",
     "member.reject",
-    "member.revoke",
+    "member.rm",
     "member.role",
     "member.profile",
     "group.create",
@@ -36,7 +41,12 @@ const SECURITY_CONSUMING: &[&str] = &[
     "group.grant",
     "group.revoke",
     "secret.get",
-    "secret.resolve",
+    "secret.approve",
+    "secret.check",
+    "secret.deny",
+    "secret.revoke",
+    "secret.requests",
+    "secret.leases",
     "secret.add",
     "secret.rotate",
     "secret.rm",
@@ -50,31 +60,17 @@ pub fn guard(ctx: &mut Context, command: &str, mutating: bool) -> Result<(), Mus
     if command == "init" || command == "uninstall" || command.starts_with("trust.") {
         return Ok(());
     }
-    let consuming = SECURITY_CONSUMING.contains(&command);
-    if !consuming && !mutating {
+    // Every mutating command verifies in full, even one not listed as
+    // security-consuming: otherwise `seal_if_changed` would sign (launder) an
+    // attacker's edit to the working tree. A repo with neither a signed state
+    // nor a pin verifies as `Legacy` and is migrated below.
+    let consuming = SECURITY_CONSUMING.contains(&command) || mutating;
+    if !consuming {
         return Ok(());
     }
     let Ok(manifest) = Manifest::load(&ctx.config_dir) else {
         return Ok(());
     };
-    if !consuming {
-        // Unrelated mutation: never build on a rolled-back repo, and create
-        // the signed state of a legacy repo.
-        if !ctx.dry_run {
-            fleet_state::ensure_not_behind_pin(
-                &ctx.config_dir,
-                &ctx.state_dir,
-                "commit on top of",
-            )?;
-        }
-        if FleetState::load(&ctx.config_dir)?.is_none()
-            && TrustAnchor::load(&ctx.state_dir)?.is_none()
-            && !ctx.dry_run
-        {
-            migrate_legacy(ctx, manifest)?;
-        }
-        return Ok(());
-    }
     let verification = match verify(ctx, &manifest, !ctx.dry_run) {
         // `doctor` reports a failed verification next to its other findings.
         Err(MusterError::Security(message)) if command == "doctor" => {
