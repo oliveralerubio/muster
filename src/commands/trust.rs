@@ -466,7 +466,11 @@ fn run_reject(
             "refusing to reject: that would drop an epoch this machine already accepted".into(),
         ));
     }
-    let signer = match team::recovery_identity(ctx, params, manifest)? {
+    let signer = match team::recovery_identity_against(
+        ctx,
+        params,
+        proposal.accepted_recovery().as_ref(),
+    )? {
         Some(rec_id) => Signer::from_recovery(&rec_id)?,
         None => Signer::load_or_create(&ctx.state_dir)?,
     };

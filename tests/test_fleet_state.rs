@@ -1681,6 +1681,49 @@ fn cosigned_checkpoint_is_a_bootstrap_origin_for_a_fresh_machine() {
     assert_eq!(pinned_epoch(&dave), pinned_epoch(&bob));
 }
 
+/// `--expect-state` pins the exact origin of a fresh machine out of band.
+#[test]
+fn expect_state_pins_the_origin_of_a_fresh_machine() {
+    let (_guard, remote) = bare_remote();
+    let remote = remote.to_str().unwrap();
+    let (alice, bob, carol) = (MusterEnv::new(), MusterEnv::new(), MusterEnv::new());
+    quorum_fleet(remote, &alice, &bob, &carol);
+    let pin: Value =
+        serde_json::from_str(&std::fs::read_to_string(state_dir(&bob).join("trust.json")).unwrap())
+            .unwrap();
+    let hash = pin["payload_hash"].as_str().unwrap().to_string();
+
+    let wrong = MusterEnv::new();
+    let wrong_hash = "0".repeat(64);
+    let (code, _) = fail(
+        &wrong,
+        &[
+            "sync",
+            "--remote",
+            remote,
+            "--pull",
+            "--expect-state",
+            &wrong_hash,
+        ],
+    );
+    assert_ne!(code, 0);
+
+    let dave = MusterEnv::new();
+    let joined = ok(
+        &dave,
+        &[
+            "sync",
+            "--remote",
+            remote,
+            "--pull",
+            "--expect-state",
+            &hash,
+        ],
+    );
+    assert_eq!(joined["result"]["joined"], true, "{joined}");
+    assert_eq!(pinned_epoch(&dave), pinned_epoch(&bob));
+}
+
 /// A lone, unco-signed checkpoint proposal is just a pending change.
 #[test]
 fn a_lone_checkpoint_proposal_stays_pending_for_peers() {

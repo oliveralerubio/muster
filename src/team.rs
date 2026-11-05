@@ -307,11 +307,21 @@ pub fn recovery_identity(
     params: &Params,
     manifest: &Manifest,
 ) -> Result<Option<Identity>, MusterError> {
+    recovery_identity_against(ctx, params, manifest.recovery.as_ref())
+}
+
+/// Like [`recovery_identity`] but checked against an explicit recovery record
+/// (e.g. the one in the last ACCEPTED governance, not an unaccepted manifest).
+pub fn recovery_identity_against(
+    ctx: &mut Context,
+    params: &Params,
+    recovery: Option<&crate::manifest::Recovery>,
+) -> Result<Option<Identity>, MusterError> {
     let Some(key) = recovery_key(ctx, params)? else {
         return Ok(None);
     };
     let identity = Identity::from_secret(&key)?;
-    match &manifest.recovery {
+    match recovery {
         Some(r) if r.recipient == identity.recipient() => {
             ctx.recovery_signer = Some(Signer::from_recovery(&identity)?);
             Ok(Some(identity))

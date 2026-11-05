@@ -27,7 +27,7 @@ pub const STATE_FILE: &str = "fleet.state.json";
 pub const TRUST_FILE: &str = "trust.json";
 const STATE_DOMAIN: &[u8] = b"muster fleet state v1\n";
 const COSIGN_DOMAIN: &[u8] = b"muster fleet cosign v1\n";
-const REJECT_DOMAIN: &[u8] = b"muster fleet reject v1\n";
+const REJECT_DOMAIN: &[u8] = b"muster fleet reject v2\n";
 
 /// `fleet.state.json`: the payload and its detached signature (hex), plus the
 /// co-signatures of other admins over the same payload. Co-signatures are not
@@ -623,8 +623,11 @@ impl FleetState {
     }
 
     fn reject_message(&self) -> Result<Vec<u8>, MusterError> {
+        // Bound to the proposal by its payload hash (which covers the epoch and
+        // the predecessor), so a record collected for another proposal never
+        // verifies here.
         let mut msg = REJECT_DOMAIN.to_vec();
-        msg.extend(self.payload_bytes()?);
+        msg.extend(self.payload_hash()?.as_bytes());
         Ok(msg)
     }
 
@@ -1633,6 +1636,19 @@ pub struct PendingProposal {
 }
 
 impl PendingProposal {
+    /// The recovery record of the last ACCEPTED governance (never the
+    /// proposal's own, which may have removed or swapped it).
+    pub fn accepted_recovery(&self) -> Option<crate::manifest::Recovery> {
+        let r = self.prior.snapshot.as_ref()?.get("recovery")?;
+        Some(crate::manifest::Recovery {
+            recipient: r.get("recipient")?.as_str()?.to_string(),
+            signing_key: r
+                .get("signing_key")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        })
+    }
+
     /// Whether `key` may take part in deciding the fate of the proposal: an
     /// admin of the accepted state.
     pub fn is_admin(&self, key: &str) -> bool {
@@ -3792,6 +3808,51 @@ mod tests {
         let mut head = proposal.head.clone();
         head.add_rejection(&recovery_signer).unwrap();
         assert_eq!(proposal.reject_tally(&head), (2, 2));
+    }
+
+    #[test]
+    fn break_glass_reject_uses_the_accepted_recovery_not_the_proposals() {
+        let (mut f, _k2, _k3) = quorum_fixture();
+        let recovery = crate::identity::Identity::generate();
+        f.manifest.recovery = Some(crate::manifest::Recovery {
+            recipient: recovery.recipient(),
+            signing_key: Some(Signer::from_recovery(&recovery).unwrap().public()),
+        });
+        f.seal_adopted(vec![]);
+        // The lone proposal deletes the recovery record.
+        f.manifest.recovery = None;
+        f.seal_as(&f.signer, tempdir().unwrap().path(), vec![]);
+        let proposal = pending_proposal(&f.config, &f.state, &f.manifest).unwrap();
+        let accepted = proposal.accepted_recovery().expect("accepted recovery");
+        assert_eq!(accepted.recipient, recovery.recipient());
+        assert!(accepted.signing_key.is_some());
+    }
+
+    #[test]
+    fn a_rejection_collected_for_another_proposal_does_not_count_here() {
+        let (mut f, k2, _k3) = quorum_fixture();
+        f.manifest.revoked_recipients.push("age1gone".into());
+        f.seal_as(&f.signer, tempdir().unwrap().path(), vec![]);
+        let mut first = FleetState::load(&f.config).unwrap().unwrap();
+        first.add_rejection(&k2).unwrap();
+        first.add_rejection(&f.signer).unwrap();
+        assert_eq!(first.valid_rejecters().len(), 2);
+
+        // The same admins' records pasted onto a different proposal at the
+        // same epoch (the old one was dropped and another published).
+        f.manifest.revoked_recipients.push("age1other".into());
+        f.seal_as(&f.signer, tempdir().unwrap().path(), vec![]);
+        let mut second = FleetState::load(&f.config).unwrap().unwrap();
+        second.rejections = first.rejections.clone();
+        assert!(second.valid_rejecters().is_empty());
+        // And a signature over the bare payload (the old scheme) is not one.
+        let mut legacy = REJECT_DOMAIN.to_vec();
+        legacy.extend(second.payload_bytes().unwrap());
+        second.rejections = vec![Cosignature {
+            signer: k2.public(),
+            signature: k2.sign(&legacy),
+        }];
+        assert!(second.valid_rejecters().is_empty());
     }
 
     #[test]
