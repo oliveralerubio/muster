@@ -231,6 +231,8 @@ impl Vault {
 
     pub fn remove(&mut self, group: &str, name: &str, id: &Identity) -> Result<(), MusterError> {
         let mut data = self.read_verified_readers(group, id)?;
+        self.verify_recipients(group, &data.recipients)?;
+        self.verify_group_exact(group, &data.recipients)?;
         data.secrets
             .remove(name)
             .ok_or_else(|| not_found(group, name))?;

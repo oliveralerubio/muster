@@ -96,11 +96,8 @@ fn missing_or_unparsable_manifest_fails_closed_while_a_pin_exists() {
     ok(&env, &["status"]);
 }
 
-#[test]
-fn poisoned_payload_recipient_refuses_rotate_and_never_encrypts_to_it() {
-    let env = MusterEnv::new();
-    ok(&env, &["init", "--yes", "--machine", "alpha"]);
-
+/// Builds the poisoned `db` group (eve in payload and sidecar, state re-signed).
+fn poison_db_group(env: &MusterEnv) -> std::path::PathBuf {
     let out = env
         .run(&[
             "--format",
@@ -117,7 +114,7 @@ fn poisoned_payload_recipient_refuses_rotate_and_never_encrypts_to_it() {
 
     let eve_recipient = "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p";
     // Eve is an enrolled machine in the fleet (authorized fleet-wide), but NOT a reader of `db`.
-    let mut manifest = manifest_text(&env);
+    let mut manifest = manifest_text(env);
     manifest.push_str(&format!(
         "
 [machines.eve]
@@ -133,7 +130,7 @@ machines = [\"alpha\"]
 ",
     );
     std::fs::write(env.config_dir().join("muster.toml"), &manifest).unwrap();
-    ok(&env, &["trust", "resign", "--yes"]);
+    ok(env, &["trust", "resign", "--yes"]);
 
     let meta_path = env.config_dir().join("vault/db.meta.json");
     let meta_str = std::fs::read_to_string(&meta_path).unwrap();
@@ -185,7 +182,16 @@ machines = [\"alpha\"]
 
     // Re-sign the state so trust::guard verifies the vault hashes on disk.
     // This simulates the compromised admin having signed the vault-only update.
-    ok(&env, &["trust", "resign", "--yes"]);
+    ok(env, &["trust", "resign", "--yes"]);
+
+    age_path
+}
+
+#[test]
+fn poisoned_payload_recipient_refuses_rotate_and_never_encrypts_to_it() {
+    let env = MusterEnv::new();
+    ok(&env, &["init", "--yes", "--machine", "alpha"]);
+    let age_path = poison_db_group(&env);
 
     // Now try to rotate: it MUST be refused with Security!
     let out = env
@@ -207,6 +213,27 @@ machines = [\"alpha\"]
     // Verify the ciphertext on disk was NOT encrypted to eve with new_secret_value
     let current_age = std::fs::read_to_string(&age_path).unwrap();
     assert!(!current_age.contains("new_secret_value"));
+}
+
+#[test]
+fn poisoned_payload_recipient_refuses_remove_and_leaves_the_vault_untouched() {
+    let env = MusterEnv::new();
+    ok(&env, &["init", "--yes", "--machine", "alpha"]);
+    let age_path = poison_db_group(&env);
+    let before = std::fs::read(&age_path).unwrap();
+
+    let out = env
+        .run(&["--format", "json", "secret", "rm", "db/pw", "--yes"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(5),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("muster group rekey"));
+    assert_eq!(std::fs::read(&age_path).unwrap(), before);
 }
 
 #[test]
