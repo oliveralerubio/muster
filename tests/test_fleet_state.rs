@@ -636,3 +636,25 @@ fn tampered_sidecar_meta_json_is_refused_on_get_and_on_sync() {
     assert_eq!(code, 5, "{raw}");
     assert!(raw.to_string().contains("app.meta.json"), "{raw}");
 }
+
+#[test]
+fn non_security_mutating_command_refuses_when_repo_is_rolled_back() {
+    let alice = MusterEnv::new();
+    ok(&alice, &["init", "--yes"]);
+    let config = alice.config_dir();
+    let epoch_one_commit = git(&config, &["rev-parse", "HEAD"]);
+    add_secret(&alice, "app/api", "SEED-value-one");
+    assert_eq!(epoch(&alice), 2);
+
+    // Attacker rolls back local repo to epoch 1 commit. Pin remains at 2.
+    git(&config, &["reset", "--hard", "--quiet", &epoch_one_commit]);
+    assert_eq!(state_epoch_on_disk(&config), 1);
+
+    // Non-security mutating command must be refused.
+    let (code, raw) = fail(
+        &alice,
+        &["profile", "set", "dev", "--toml", "[agents]\n", "--yes"],
+    );
+    assert_eq!(code, 5, "{raw}");
+    assert!(raw.to_string().contains("rolled-back"), "{raw}");
+}

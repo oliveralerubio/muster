@@ -58,7 +58,15 @@ pub fn guard(ctx: &mut Context, command: &str, mutating: bool) -> Result<(), Mus
         return Ok(());
     };
     if !consuming {
-        // Unrelated mutation: only create the signed state of a legacy repo.
+        // Unrelated mutation: never build on a rolled-back repo, and create
+        // the signed state of a legacy repo.
+        if !ctx.dry_run {
+            fleet_state::ensure_not_behind_pin(
+                &ctx.config_dir,
+                &ctx.state_dir,
+                "commit on top of",
+            )?;
+        }
         if FleetState::load(&ctx.config_dir)?.is_none()
             && TrustAnchor::load(&ctx.state_dir)?.is_none()
             && !ctx.dry_run
@@ -178,6 +186,9 @@ fn migrate_legacy(ctx: &mut Context, mut manifest: Manifest) -> Result<(), Muste
 /// security fields or the vault changed. Replaces `git::commit_if_configured`
 /// for every command that can change them.
 pub fn commit(ctx: &mut Context, message: &str) -> Result<bool, MusterError> {
+    if !ctx.dry_run {
+        fleet_state::ensure_not_behind_pin(&ctx.config_dir, &ctx.state_dir, "commit on top of")?;
+    }
     seal_if_changed(ctx)?;
     git::commit_if_configured(&ctx.config_dir, message)
 }
