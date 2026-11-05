@@ -267,7 +267,9 @@ fn run_cosign(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> 
         .ok_or_else(|| MusterError::Security("the repo has no fleet state to co-sign".into()))?;
     state.verify_signature()?;
     let pin = TrustAnchor::load(&ctx.state_dir)?.ok_or_else(|| {
-        MusterError::Security("no local trust pin; cannot determine if this change is authorized".into())
+        MusterError::Security(
+            "no local trust pin; cannot determine if this change is authorized".into(),
+        )
     })?;
     if state.payload.epoch <= pin.epoch {
         return Ok(json!({
@@ -314,8 +316,10 @@ fn run_cosign(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> 
     }
     // Show the operator the exact governance diff vs their pinned baseline.
     let diff = fleet_state::governance_diff(pin.snapshot.as_ref(), &governance_content(&manifest));
-    eprintln!("Governance changes to co-sign:
-{diff}");
+    eprintln!(
+        "Governance changes to co-sign:
+{diff}"
+    );
     if params.get_bool("yes") {
         ctx.yes = true;
     }

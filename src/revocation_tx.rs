@@ -286,7 +286,9 @@ fn verify_journal_pin(
     if !allowed.contains(signer)
         || state.payload.prev.as_deref() != Some(current.payload_hash.as_str())
     {
-        return Err(refuse("its signer or predecessor is not authorized by the pin"));
+        return Err(refuse(
+            "its signer or predecessor is not authorized by the pin",
+        ));
     }
     Ok(())
 }
@@ -299,7 +301,8 @@ fn apply(
     journal: &Journal,
 ) -> Result<(), MusterError> {
     let shadow = root.join(SHADOW);
-    let checked = validate_journal(journal).and_then(|()| verify_journal_pin(&shadow, state_dir, journal));
+    let checked =
+        validate_journal(journal).and_then(|()| verify_journal_pin(&shadow, state_dir, journal));
     if let Err(e) = checked {
         let _ = fs::remove_dir_all(root);
         return Err(e);
@@ -467,13 +470,18 @@ mod tests {
 
         // A fleet sealed by an unauthorized key, with a pin that matches it.
         let evil_manifest = sealed_fleet(&evil_config, &evil_state, &evil);
-        let evil_state_file = fleet_state::FleetState::load(&evil_config).unwrap().unwrap();
+        let evil_state_file = fleet_state::FleetState::load(&evil_config)
+            .unwrap()
+            .unwrap();
         let evil_pin = TrustAnchor::for_state(&evil_state_file, &evil_manifest, false).unwrap();
         stage_journal(&state, &evil_config, evil_pin);
         let err = recover(&config, &state).unwrap_err();
         assert!(matches!(err, MusterError::Security(_)), "{err:?}");
         assert_eq!(TrustAnchor::load(&state).unwrap().unwrap(), real_pin);
-        assert!(!root(&state).exists(), "the staged transaction is discarded");
+        assert!(
+            !root(&state).exists(),
+            "the staged transaction is discarded"
+        );
 
         // A journal whose pin does not match the staged state (low epoch, own admins).
         let mut lowered = real_pin.clone();

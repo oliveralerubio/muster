@@ -1765,7 +1765,10 @@ fn ui_sync_on_first_use_surfaces_the_security_error_and_accepts_expect_signer() 
     let (status, _, body) = ui.request("POST", "/api/sync", Some(&cookie), Some("{}"));
     assert_eq!(status, 403, "{body}");
     assert!(body.contains("--expect-signer"), "{body}");
-    assert!(body.contains("SHA256:"), "the fingerprint is surfaced: {body}");
+    assert!(
+        body.contains("SHA256:"),
+        "the fingerprint is surfaced: {body}"
+    );
     assert!(!bob.path().join(".local/state/muster/trust.json").exists());
 
     let request = format!("{{\"expect_signer\": \"{signer}\"}}");

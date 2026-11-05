@@ -564,7 +564,8 @@ impl FleetState {
         };
         let mut valid: Vec<String> = Vec::new();
         for c in &self.cosignatures {
-            if !valid.contains(&c.signer) && signing::verify(&c.signer, &message, &c.signature).is_ok()
+            if !valid.contains(&c.signer)
+                && signing::verify(&c.signer, &message, &c.signature).is_ok()
             {
                 valid.push(c.signer.clone());
             }
@@ -885,7 +886,10 @@ fn check_transition(
 pub enum Transition {
     Accepted,
     /// Signed by fewer than `required` distinct admins of the prior state.
-    Pending { received: usize, required: usize },
+    Pending {
+        received: usize,
+        required: usize,
+    },
 }
 
 /// Who a signing key is for counting purposes: one vote per admin member (two
@@ -897,9 +901,10 @@ fn voter(snapshot: &Value, key: &str) -> String {
                 continue;
             }
             let owns = member["machines"].as_array().is_some_and(|machines| {
-                machines
-                    .iter()
-                    .any(|m| m.as_str().is_some_and(|m| snapshot["machines"][m]["signing_key"] == key))
+                machines.iter().any(|m| {
+                    m.as_str()
+                        .is_some_and(|m| snapshot["machines"][m]["signing_key"] == key)
+                })
             });
             if owns {
                 return format!("member:{name}");
@@ -944,13 +949,15 @@ fn enrollment_only(old: &Value, new: &Value) -> bool {
     let (Some(o), Some(n)) = (old.as_object(), new.as_object()) else {
         return false;
     };
-    if o.keys().chain(n.keys()).any(|k| {
-        !matches!(k.as_str(), "machines" | "members") && o.get(k) != n.get(k)
-    }) {
+    if o.keys()
+        .chain(n.keys())
+        .any(|k| !matches!(k.as_str(), "machines" | "members") && o.get(k) != n.get(k))
+    {
         return false;
     }
     let machines_kept = old["machines"].as_object().is_some_and(|ms| {
-        ms.iter().all(|(name, m)| new["machines"].get(name) == Some(m))
+        ms.iter()
+            .all(|(name, m)| new["machines"].get(name) == Some(m))
     });
     let subset = |a: &Value, b: &Value| {
         let (a, b) = (a.as_array(), b.as_array());

@@ -996,7 +996,11 @@ fn first_use_is_confirmed_by_every_command_not_only_sync() {
         .env("MUSTER_EXPECT_SIGNER", &signer)
         .output()
         .unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
     assert!(state_dir(&carol).join("trust.json").exists());
 }
 
@@ -1152,7 +1156,10 @@ fn quorum_two_admin_a_removing_admin_b_stays_pending_until_cosigned() {
     );
     ok(&carol, &["enroll", "--name", "carol-box"]);
     ok(&alice, &["sync", "--pull"]);
-    ok(&alice, &["approve", "carol-box", "--member", "carol", "--yes"]);
+    ok(
+        &alice,
+        &["approve", "carol-box", "--member", "carol", "--yes"],
+    );
 
     // Raise required_approvals = 2.
     let mut manifest = manifest_text(&alice);
@@ -1203,7 +1210,9 @@ fn quorum_two_admin_a_removing_admin_b_stays_pending_until_cosigned() {
     let mut state = muster::fleet_state::FleetState::load(&carol.config_dir())
         .unwrap()
         .unwrap();
-    let alice_key = muster::signing::Signer::load(&state_dir(&alice)).unwrap().unwrap();
+    let alice_key = muster::signing::Signer::load(&state_dir(&alice))
+        .unwrap()
+        .unwrap();
     let outsider_dir = tempfile::TempDir::new().unwrap();
     let outsider = muster::signing::Signer::load_or_create(outsider_dir.path()).unwrap();
     state.cosignatures.push(muster::fleet_state::Cosignature {
@@ -1212,7 +1221,9 @@ fn quorum_two_admin_a_removing_admin_b_stays_pending_until_cosigned() {
     });
     state.add_cosignature(&outsider).unwrap();
     state.add_cosignature(&alice_key).unwrap();
-    state.cosignatures.push(state.cosignatures.last().unwrap().clone());
+    state
+        .cosignatures
+        .push(state.cosignatures.last().unwrap().clone());
     state.save(&carol.config_dir()).unwrap();
     let held = ok(&carol, &["sync", "--pull"]);
     assert!(held["diagnostics"].to_string().contains("1 of 2"), "{held}");
