@@ -1210,10 +1210,14 @@ fn secret_approval_requires_a_human_and_leases_expire_and_revoke() {
     );
     let (_, requests) = env.run_json(&["secret", "requests", "--format", "json"]);
     assert_eq!(requests.result(), &json!([]));
-    // A person can still reveal with ordinary confirmation and no agent.
-    env.run(&["secret", "get", "native://app/key", "--reveal", "--yes"])
-        .assert()
-        .success();
+    // `--yes` alone never satisfies a per-use approval policy: an unnamed
+    // caller is refused instead of bypassing the lease.
+    let bare = env
+        .run(&["secret", "get", "native://app/key", "--reveal", "--yes"])
+        .output()
+        .unwrap();
+    assert_eq!(bare.status.code(), Some(5));
+    assert!(!String::from_utf8_lossy(&bare.stdout).contains(value));
     let events = muster::audit::events(&state).unwrap();
     for action in [
         "secret.request",
