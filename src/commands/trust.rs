@@ -36,6 +36,13 @@ pub const COSIGN: CommandSpec = CommandSpec {
             required: false,
             positional: false,
         },
+        ParamSpec {
+            name: "reject",
+            about: "Reject and discard the pending governance proposal, reverting to the last accepted pin",
+            kind: ParamKind::Bool,
+            required: false,
+            positional: false,
+        },
     ],
     mutating: true,
     handler: run_cosign,
@@ -289,6 +296,74 @@ fn run_cosign(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> 
             "no local trust pin; cannot determine if this change is authorized".into(),
         )
     })?;
+
+    if params.get_bool("reject") {
+        if state.payload.epoch <= pin.epoch {
+            return Err(MusterError::Usage(
+                "no pending proposal to reject; the repo state is already accepted".into(),
+            ));
+        }
+        let recovery = team::recovery_identity(ctx, params, &manifest)?;
+        let is_authorized_admin = match recovery {
+            Some(_) => true,
+            None => {
+                let s = Signer::load_or_create(&ctx.state_dir)?;
+                pin.admins.contains(&s.public())
+            }
+        };
+        if !is_authorized_admin {
+            return Err(MusterError::Security(
+                "cannot reject proposal: must be an admin of the last accepted state (or provide recovery key)".into(),
+            ));
+        }
+        if params.get_bool("yes") {
+            ctx.yes = true;
+        }
+        ctx.confirm(
+            "Discard the unaccepted pending proposal and revert to the last accepted state?",
+        )?;
+
+        let accepted =
+            git::commit_with_state(&ctx.config_dir, &pin.payload_hash).ok_or_else(|| {
+                MusterError::Security(
+                    "the accepted state of this machine's pin is not in the repository history; \
+                     restore the repo from a trusted copy"
+                        .into(),
+                )
+            })?;
+        let head = git::head_commit(&ctx.config_dir)?;
+        // The signed files only: state, governance and the whole vault.
+        let signed_paths = [fleet_state::STATE_FILE, crate::manifest::FILE_NAME, "vault"];
+        git::restore_paths(&ctx.config_dir, &accepted, &signed_paths)?;
+        let restored = Manifest::load(&ctx.config_dir).and_then(|m| {
+            fleet_state::verify_with(
+                &ctx.config_dir,
+                &ctx.state_dir,
+                &m,
+                &fleet_state::VerifyOptions {
+                    expect_signer: None,
+                    persist: false,
+                    check_content: true,
+                },
+            )
+        });
+        if !matches!(restored, Ok(Verification::Verified { .. })) {
+            git::restore_paths(&ctx.config_dir, &head, &signed_paths)?;
+            return Err(MusterError::Security(
+                "the accepted state could not be restored cleanly; nothing was changed".into(),
+            ));
+        }
+        git::commit_if_configured(
+            &ctx.config_dir,
+            "revert: discard unaccepted pending proposal",
+        )?;
+        let pushed = publish(ctx, "revert");
+        return Ok(json!({
+            "rejected": true,
+            "reverted_to_epoch": pin.epoch,
+            "pushed": pushed,
+        }));
+    }
     if state.payload.epoch <= pin.epoch {
         return Ok(json!({
             "cosigned": false,

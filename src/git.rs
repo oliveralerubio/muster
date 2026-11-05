@@ -384,3 +384,45 @@ pub fn commits_touching(dir: &Path, path: &str, limit: usize) -> Vec<String> {
         })
         .unwrap_or_default()
 }
+
+/// The commit whose `fleet.state.json` has payload hash `payload_hash`
+/// (newest first among the last 100 commits touching it).
+pub fn commit_with_state(dir: &Path, payload_hash: &str) -> Option<String> {
+    commits_touching(dir, crate::fleet_state::STATE_FILE, 100)
+        .into_iter()
+        .find(|commit| {
+            file_at(dir, commit, crate::fleet_state::STATE_FILE)
+                .and_then(|text| serde_json::from_str::<crate::fleet_state::FleetState>(&text).ok())
+                .and_then(|state| state.payload_hash().ok())
+                .as_deref()
+                == Some(payload_hash)
+        })
+}
+
+/// Makes `paths` (index and working tree) match `commit` exactly, deleting
+/// tracked files that `commit` does not have. Non-existent paths in `commit`
+/// are cleanly removed from the index and working tree.
+pub fn restore_paths(dir: &Path, commit: &str, paths: &[&str]) -> Result<(), MusterError> {
+    let source = format!("--source={commit}");
+    for path in paths {
+        // If path exists in the commit, restore it. Otherwise remove it if present.
+        let has_path = run(dir, &["cat-file", "-e", &format!("{commit}:{path}")])
+            .is_ok_and(|o| o.status.success());
+        if has_path {
+            check(
+                dir,
+                &[
+                    "restore",
+                    source.as_str(),
+                    "--staged",
+                    "--worktree",
+                    "--",
+                    path,
+                ],
+            )?;
+        } else if dir.join(path).exists() {
+            let _ = check(dir, &["rm", "-rf", "--quiet", "--ignore-unmatch", path]);
+        }
+    }
+    Ok(())
+}

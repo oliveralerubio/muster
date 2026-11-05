@@ -1479,3 +1479,58 @@ fn quorum_two_admin_a_removing_admin_b_stays_pending_until_cosigned() {
         .to_string()
         .contains(&bob_pk));
 }
+
+#[test]
+fn trust_cosign_reject_discards_a_pending_proposal_and_restores_the_pin() {
+    let (_guard, remote) = bare_remote();
+    let remote = remote.to_str().unwrap();
+    let alice = MusterEnv::new();
+    let bob = MusterEnv::new();
+    let carol = MusterEnv::new();
+    quorum_fleet(remote, &alice, &bob, &carol);
+
+    // Alice proposes removing Bob (epoch 3, pending on peers).
+    ok(&alice, &["member", "rm", "bob", "--yes"]);
+    ok(&alice, &["sync", "--push"]);
+
+    // Carol pulls: pending proposal arrives. Carol's ordinary commands fail closed.
+    ok(&carol, &["sync", "--pull"]);
+    let (code, _) = fail(&carol, &["status"]);
+    assert_eq!(code, 5);
+
+    // Carol rejects the pending proposal using --reject.
+    let out = ok(&carol, &["trust", "cosign", "--reject", "--yes"]);
+    assert_eq!(out["result"]["rejected"], true, "{out}");
+    assert!(out["result"]["reverted_to_epoch"].is_number(), "{out}");
+    ok(&carol, &["sync", "--push"]);
+
+    // Ordinary commands are unblocked on Carol: she is no longer frozen, and
+    // Bob is still an admin in the restored state.
+    ok(&carol, &["status"]);
+    let carol_pin = std::fs::read_to_string(state_dir(&carol).join("trust.json")).unwrap();
+    let bob_pk = muster::signing::Signer::load(&state_dir(&bob))
+        .unwrap()
+        .unwrap()
+        .public();
+    assert!(carol_pin.contains(&bob_pk));
+
+    // Alice pulls the rejection and is unblocked too.
+    ok(&alice, &["sync", "--pull"]);
+    ok(&alice, &["status"]);
+
+    // The honest quorum can now replace the proposer: Carol proposes removing
+    // Alice, Bob co-signs, no manual git repair needed.
+    let manifest: toml::Table = manifest_text(&carol).parse().unwrap();
+    let alice_member = manifest["members"]
+        .as_table()
+        .unwrap()
+        .iter()
+        .find(|(_, m)| m["machines"].to_string().contains("alice-box"))
+        .map(|(name, _)| name.clone())
+        .unwrap();
+    ok(&carol, &["member", "rm", &alice_member, "--yes"]);
+    ok(&carol, &["sync", "--push"]);
+    ok(&bob, &["sync", "--pull"]);
+    let cosigned = ok(&bob, &["trust", "cosign", "--yes"]);
+    assert_eq!(cosigned["result"]["accepted"], true, "{cosigned}");
+}
