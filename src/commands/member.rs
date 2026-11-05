@@ -172,30 +172,87 @@ fn approve(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let recovery = team::recovery_identity(ctx, params, &before)?;
     let by_recovery = recovery.is_some();
     let mut manifest = before.clone();
-    let mut approvals = {
+    let (mut approvals, member_role, member_invited) = {
         let member = existing(&mut manifest, &name)?;
         if member.status != MemberStatus::Pending {
             return Err(MusterError::Usage(format!(
                 "member '{name}' is not pending"
             )));
         }
+        let role = member.role;
+        let invited = member.invited_by.clone();
         member.status = MemberStatus::Active;
         member.approved_by = Some(actor.member.clone());
-        std::mem::take(&mut member.approvals)
+        (std::mem::take(&mut member.approvals), role, invited)
     };
     team::check_self_grant(ctx, &before, &manifest, &actor)?;
     ctx.confirm(&format!("Approve member '{name}'?"))?;
 
     // Quorum: below `[team] required_approvals` the invitation stays pending,
-    // with this admin's approval recorded in the manifest.
-    // The recovery key is break-glass and counts as a full approval.
+    // with this admin's signed approval recorded in the manifest.
     let quorum = if by_recovery {
         team::Quorum {
             received: before.required_approvals() as usize,
             required: before.required_approvals() as usize,
         }
     } else {
-        team::add_approval(ctx, &before, &mut approvals, &actor.member)?
+        let snapshot = crate::fleet_state::governance_content(&before);
+        let role_val = serde_json::to_value(member_role).unwrap_or(Value::Null);
+        let invited_val = serde_json::to_value(&member_invited).unwrap_or(Value::Null);
+        let already = crate::fleet_state::valid_member_approvals(
+            &snapshot,
+            &name,
+            &role_val,
+            &invited_val,
+            &approvals,
+        );
+        if already.contains(&actor.member) {
+            ctx.diag(crate::output::Diagnostic::new(
+                crate::output::Severity::Error,
+                "already_approved_by_caller",
+                format!(
+                    "'{}' already approved this request; another admin must approve it",
+                    actor.member
+                ),
+            ));
+            return Err(MusterError::Security(format!(
+                "'{}' already approved this request; the same admin cannot count twice",
+                actor.member
+            )));
+        }
+        let signer = crate::signing::Signer::load_or_create(&ctx.state_dir)?;
+        let entry = crate::fleet_state::sign_member_approval(
+            &actor.member,
+            &actor.machine,
+            &name,
+            &role_val,
+            &invited_val,
+            &signer,
+        )?;
+        approvals.push(entry);
+        let received = crate::fleet_state::valid_member_approvals(
+            &snapshot,
+            &name,
+            &role_val,
+            &invited_val,
+            &approvals,
+        )
+        .len();
+        let q = team::Quorum {
+            received,
+            required: before.required_approvals() as usize,
+        };
+        if !q.reached() {
+            ctx.diag(crate::output::Diagnostic::new(
+                crate::output::Severity::Info,
+                "approval_pending",
+                format!(
+                    "{} of {} required approvals; waiting for another admin",
+                    q.received, q.required
+                ),
+            ));
+        }
+        q
     };
     if !quorum.reached() {
         let mut pending = before.clone();

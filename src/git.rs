@@ -355,6 +355,21 @@ pub fn file_at(dir: &Path, commit: &str, path: &str) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Every commit touching `path`, oldest first.
+pub fn commits_touching_oldest_first(dir: &Path, path: &str) -> Result<Vec<String>, MusterError> {
+    let out = run(dir, &["log", "--reverse", "--format=%H", "--", path])?;
+    if !out.status.success() {
+        return Err(MusterError::Security(format!(
+            "cannot read the history of {path}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect())
+}
+
 /// Up to `limit` newest commits touching `path`.
 pub fn commits_touching(dir: &Path, path: &str, limit: usize) -> Vec<String> {
     let limit = format!("-n{limit}");

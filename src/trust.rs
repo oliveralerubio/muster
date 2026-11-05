@@ -232,7 +232,25 @@ fn seal_if_changed(ctx: &mut Context) -> Result<(), MusterError> {
             )))
         }
     };
-    fleet_state::seal(&ctx.config_dir, &ctx.state_dir, &manifest, signer, false)?;
+    if vault_only && !pin.admins.contains(&signer.public()) {
+        // A non-admin writer may only re-sign groups it can read.
+        let changed = fleet_state::changed_groups(
+            &state.payload.vault,
+            &state.payload.vault_meta,
+            &fleet_state::vault_hashes(&ctx.config_dir)?,
+            &fleet_state::vault_meta_hashes(&ctx.config_dir)?,
+        );
+        fleet_state::ensure_reads_groups(&manifest, &signer.public(), &changed)?;
+    }
+    let enrollments = std::mem::take(&mut ctx.enrollments);
+    fleet_state::seal_with(
+        &ctx.config_dir,
+        &ctx.state_dir,
+        &manifest,
+        signer,
+        false,
+        enrollments,
+    )?;
     Ok(())
 }
 

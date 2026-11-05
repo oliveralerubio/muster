@@ -50,7 +50,30 @@ pub struct StatePayload {
     /// (and are re-signed with digests by the next change).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub vault_meta: BTreeMap<String, String>,
+    /// Signed admin approvals behind machines this transition added while the
+    /// team quorum (`[team] required_approvals`) is above one. Omitted from
+    /// the canonical bytes when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enrollments: Vec<EnrollmentEvidence>,
     pub signer: String,
+}
+
+/// An enrollment request with the signed admin approvals that admitted it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EnrollmentEvidence {
+    pub name: String,
+    pub recipient: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    pub created_at: String,
+    pub nonce: String,
+    pub approvals: Vec<crate::fleet::SignedApproval>,
 }
 
 /// Local trust pin (`<state_dir>/trust.json`).
@@ -71,6 +94,16 @@ pub struct TrustAnchor {
     /// itself, are confirmed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub tofu: bool,
+    /// Vault hashes of the accepted state: the baseline that tells which
+    /// groups a later vault-only change touched. Empty on pins from before.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub vault: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub vault_meta: BTreeMap<String, String>,
+    /// Canonical governance content of the accepted state, to diff against the
+    /// next one (who was added, and by whom). `None` on pins from before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<Value>,
 }
 
 impl TrustAnchor {
@@ -107,6 +140,51 @@ impl TrustAnchor {
             admins,
             writers,
             tofu,
+            vault: state.payload.vault.clone(),
+            vault_meta: state.payload.vault_meta.clone(),
+            snapshot: Some(governance_content(manifest)),
+        })
+    }
+
+    fn as_prior(&self) -> Prior {
+        Prior {
+            epoch: self.epoch,
+            hash: self.payload_hash.clone(),
+            governance: self.governance.clone(),
+            admins: self.admins.clone(),
+            writers: self.writers.clone(),
+            vault: self.vault.clone(),
+            vault_meta: self.vault_meta.clone(),
+            snapshot: self.snapshot.clone(),
+        }
+    }
+}
+
+/// What a transition is checked against: the last accepted state, from the
+/// local pin or from an intermediate commit of the history walk.
+struct Prior {
+    epoch: u64,
+    hash: String,
+    governance: String,
+    admins: Vec<String>,
+    writers: Vec<String>,
+    vault: BTreeMap<String, String>,
+    vault_meta: BTreeMap<String, String>,
+    snapshot: Option<Value>,
+}
+
+impl Prior {
+    fn from_state(state: &FleetState, manifest: &Manifest) -> Result<Self, MusterError> {
+        let (admins, writers) = signer_sets(manifest);
+        Ok(Self {
+            epoch: state.payload.epoch,
+            hash: state.payload_hash()?,
+            governance: state.payload.governance.clone(),
+            admins,
+            writers,
+            vault: state.payload.vault.clone(),
+            vault_meta: state.payload.vault_meta.clone(),
+            snapshot: Some(governance_content(manifest)),
         })
     }
 }
@@ -496,6 +574,18 @@ pub fn seal(
     signer: &Signer,
     force: bool,
 ) -> Result<Option<FleetState>, MusterError> {
+    seal_with(config_dir, state_dir, manifest, signer, force, Vec::new())
+}
+
+/// [`seal`] carrying the signed enrollment approvals behind a quorum.
+pub fn seal_with(
+    config_dir: &Path,
+    state_dir: &Path,
+    manifest: &Manifest,
+    signer: &Signer,
+    force: bool,
+    enrollments: Vec<EnrollmentEvidence>,
+) -> Result<Option<FleetState>, MusterError> {
     // A seal must advance or preserve the pinned epoch, never launder an older state.
     ensure_not_behind_pin(config_dir, state_dir, "re-sign")?;
     let current = FleetState::load(config_dir)?;
@@ -515,6 +605,7 @@ pub fn seal(
         governance: governance_digest(manifest)?,
         vault: vault_hashes(config_dir)?,
         vault_meta: vault_meta_hashes(config_dir)?,
+        enrollments,
         signer: signer.public(),
     };
     let state = FleetState::sign(payload, signer)?;
@@ -526,6 +617,363 @@ pub fn seal(
 // ---------------------------------------------------------------------------
 // Verification
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Transitions: the chain from the pin to the current state
+// ---------------------------------------------------------------------------
+
+/// Verifies every transition from the pin to `state`. The next epoch is
+/// checked directly; a larger jump walks the git history of the state file so
+/// that each intermediate state is itself signed by someone the one before it
+/// authorized (a revoked admin key cannot skip ahead).
+fn verify_chain(
+    config_dir: &Path,
+    pin: &TrustAnchor,
+    state: &FleetState,
+    manifest: &Manifest,
+) -> Result<(), MusterError> {
+    if state.payload.epoch == pin.epoch + 1 {
+        return check_transition(&pin.as_prior(), state, manifest);
+    }
+    let jump = |why: String| {
+        MusterError::Security(format!(
+            "epoch jump without valid intermediate chain: {why}"
+        ))
+    };
+    if !crate::git::is_repo(config_dir) {
+        return Err(jump(format!(
+            "epochs {}..{} are not in a git history to check",
+            pin.epoch + 1,
+            state.payload.epoch
+        )));
+    }
+    let mut by_epoch: BTreeMap<u64, (FleetState, Manifest)> = BTreeMap::new();
+    for commit in crate::git::commits_touching_oldest_first(config_dir, STATE_FILE)? {
+        let Some(text) = crate::git::file_at(config_dir, &commit, STATE_FILE) else {
+            continue;
+        };
+        let Ok(past) = serde_json::from_str::<FleetState>(&text) else {
+            continue;
+        };
+        let epoch = past.payload.epoch;
+        if epoch <= pin.epoch || epoch > state.payload.epoch || by_epoch.contains_key(&epoch) {
+            continue;
+        }
+        let Some(manifest_text) =
+            crate::git::file_at(config_dir, &commit, crate::manifest::FILE_NAME)
+        else {
+            continue;
+        };
+        let Ok(past_manifest) = Manifest::parse(&manifest_text, crate::manifest::FILE_NAME) else {
+            continue;
+        };
+        by_epoch.insert(epoch, (past, past_manifest));
+    }
+    let mut prior = pin.as_prior();
+    for epoch in pin.epoch + 1..=state.payload.epoch {
+        let Some((step, step_manifest)) = by_epoch.get(&epoch) else {
+            return Err(jump(format!(
+                "epoch {epoch} is missing from the repository history"
+            )));
+        };
+        step.verify_signature()?;
+        if step.payload.governance != governance_digest(step_manifest)? {
+            return Err(jump(format!(
+                "epoch {epoch} does not match the muster.toml committed with it"
+            )));
+        }
+        let manifest_for_step = if epoch == state.payload.epoch {
+            if step.payload_hash()? != state.payload_hash()? {
+                return Err(jump(
+                    "the current state is not the end of the recorded history".into(),
+                ));
+            }
+            manifest
+        } else {
+            step_manifest
+        };
+        check_transition(&prior, step, manifest_for_step).map_err(|e| match e {
+            MusterError::Security(m) => jump(format!("epoch {epoch}: {m}")),
+            other => other,
+        })?;
+        prior = Prior::from_state(step, step_manifest)?;
+    }
+    Ok(())
+}
+
+/// One transition `prior` -> `state`: signer authorization (admin for
+/// governance changes, a reader of every touched group for vault-only ones),
+/// the predecessor link, and the signed quorum for added machines/members.
+fn check_transition(
+    prior: &Prior,
+    state: &FleetState,
+    manifest: &Manifest,
+) -> Result<(), MusterError> {
+    let signer = &state.payload.signer;
+    let vault_only = state.payload.governance == prior.governance;
+    let allowed = if vault_only {
+        &prior.writers
+    } else {
+        &prior.admins
+    };
+    if !allowed.contains(signer) {
+        return Err(MusterError::Security(format!(
+            "fleet state signed by {} which is not authorized {} under the last \
+             accepted state",
+            signing::fingerprint(signer),
+            if vault_only {
+                "to update the vault"
+            } else {
+                "to change governance"
+            }
+        )));
+    }
+    if state.payload.epoch != prior.epoch + 1
+        || state.payload.prev.as_deref() != Some(prior.hash.as_str())
+    {
+        return Err(MusterError::Security(
+            "fleet state history forked: its predecessor is not the accepted state".into(),
+        ));
+    }
+    if vault_only {
+        if prior.snapshot.is_some() && !prior.admins.contains(signer) {
+            let changed = changed_groups(
+                &prior.vault,
+                &prior.vault_meta,
+                &state.payload.vault,
+                &state.payload.vault_meta,
+            );
+            ensure_reads_groups(manifest, signer, &changed)?;
+        }
+    } else if let Some(old) = &prior.snapshot {
+        check_quorum(old, &governance_content(manifest), state)?;
+    }
+    Ok(())
+}
+
+/// Groups whose ciphertext or sidecar differs between two vault baselines.
+pub fn changed_groups(
+    old_vault: &BTreeMap<String, String>,
+    old_meta: &BTreeMap<String, String>,
+    new_vault: &BTreeMap<String, String>,
+    new_meta: &BTreeMap<String, String>,
+) -> Vec<String> {
+    let mut groups: Vec<String> = Vec::new();
+    for (old, new) in [(old_vault, new_vault), (old_meta, new_meta)] {
+        for name in old.keys().chain(new.keys()) {
+            if old.get(name) != new.get(name) && !groups.contains(name) {
+                groups.push(name.clone());
+            }
+        }
+    }
+    groups.sort();
+    groups
+}
+
+/// A signer that is not an admin may only touch groups it reads: its machine's
+/// age recipient must be among the group's recipients.
+pub fn ensure_reads_groups(
+    manifest: &Manifest,
+    signer: &str,
+    groups: &[String],
+) -> Result<(), MusterError> {
+    let recipient = manifest
+        .machines
+        .values()
+        .find(|m| m.signing_key.as_deref() == Some(signer))
+        .map(|m| m.recipient.clone());
+    for group in groups {
+        let reads = recipient
+            .as_ref()
+            .is_some_and(|r| crate::team::group_recipients(manifest, group).contains(r));
+        if !reads {
+            return Err(MusterError::Security(format!(
+                "fleet state signer {} changed vault group '{group}' but is neither an admin \
+                 nor a reader of that group",
+                signing::fingerprint(signer)
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn member_active_admin(old: &Value, member: &str, machine: &str, key: &str) -> bool {
+    let m = &old["members"][member];
+    m["role"] == "admin"
+        && m["status"] == "active"
+        && m["machines"]
+            .as_array()
+            .is_some_and(|ms| ms.iter().any(|x| x == machine))
+        && old["machines"][machine]["signing_key"] == key
+}
+
+/// Message an admin signs to approve a pending member (bound to its role and
+/// inviter, so an approval of a plain member cannot promote to admin).
+pub fn member_approval_message(
+    name: &str,
+    role: &Value,
+    invited_by: &Value,
+) -> Result<Vec<u8>, MusterError> {
+    canonical_bytes(&json!({
+        "domain": "muster member approval v1",
+        "member": name,
+        "role": role,
+        "invited_by": invited_by,
+    }))
+}
+
+/// A signed member approval as stored in `Member.approvals`:
+/// `<admin>:<machine>:<signature hex>`.
+pub fn sign_member_approval(
+    admin: &str,
+    machine: &str,
+    member: &str,
+    role: &Value,
+    invited_by: &Value,
+    signer: &Signer,
+) -> Result<String, MusterError> {
+    let message = member_approval_message(member, role, invited_by)?;
+    Ok(format!("{admin}:{machine}:{}", signer.sign(&message)))
+}
+
+/// Distinct admins (active in `snapshot`) whose entries in `approvals` verify.
+/// Bare names and anything malformed never count.
+pub fn valid_member_approvals(
+    snapshot: &Value,
+    member: &str,
+    role: &Value,
+    invited_by: &Value,
+    approvals: &[String],
+) -> Vec<String> {
+    let Ok(message) = member_approval_message(member, role, invited_by) else {
+        return Vec::new();
+    };
+    let mut valid: Vec<String> = Vec::new();
+    for entry in approvals {
+        let mut parts = entry.splitn(3, ':');
+        let (Some(admin), Some(machine), Some(signature)) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        let Some(key) = snapshot["machines"][machine]["signing_key"].as_str() else {
+            continue;
+        };
+        if admin != member
+            && member_active_admin(snapshot, admin, machine, key)
+            && !valid.iter().any(|a| a == admin)
+            && signing::verify(key, &message, signature).is_ok()
+        {
+            valid.push(admin.to_string());
+        }
+    }
+    valid
+}
+
+fn valid_enrollment_approvals(old: &Value, evidence: &EnrollmentEvidence) -> usize {
+    let request = crate::fleet::EnrollmentRequest {
+        name: evidence.name.clone(),
+        recipient: evidence.recipient.clone(),
+        signing_key: evidence.signing_key.clone(),
+        nonce: evidence.nonce.clone(),
+        platform: String::new(),
+        muster_version: String::new(),
+        agents: Vec::new(),
+        created_at: evidence.created_at.clone(),
+        approvals: Vec::new(),
+        role: evidence.role.clone(),
+        profile: evidence.profile.clone(),
+        member: evidence.member.clone(),
+    };
+    let Ok(message) = request.approval_message() else {
+        return 0;
+    };
+    let mut seen: Vec<&str> = Vec::new();
+    for approval in &evidence.approvals {
+        if member_active_admin(
+            old,
+            &approval.member,
+            &approval.machine,
+            &approval.signing_key,
+        ) && !seen.contains(&approval.member.as_str())
+            && signing::verify(&approval.signing_key, &message, &approval.signature).is_ok()
+        {
+            seen.push(&approval.member);
+        }
+    }
+    seen.len()
+}
+
+/// When the team requires several admins (`required_approvals > 1`), every
+/// machine or member a governance change adds must carry that many signed
+/// admin approvals. The recovery key is break-glass and stands alone.
+fn check_quorum(old: &Value, new: &Value, state: &FleetState) -> Result<(), MusterError> {
+    let required = old["required_approvals"].as_u64().unwrap_or(1) as usize;
+    let team_mode = old["members"]
+        .as_object()
+        .is_some_and(|members| !members.is_empty());
+    if required <= 1 || !team_mode {
+        return Ok(());
+    }
+    if old["recovery"]["signing_key"].as_str() == Some(state.payload.signer.as_str()) {
+        return Ok(());
+    }
+    let short = |what: String, found: usize| {
+        MusterError::Security(format!(
+            "governance change {what} without a quorum of {required} signed admin approvals \
+             (found {found}); bare names never count"
+        ))
+    };
+    if let Some(machines) = new["machines"].as_object() {
+        for (name, machine) in machines {
+            if old["machines"].get(name).is_some() {
+                continue;
+            }
+            let found = state
+                .payload
+                .enrollments
+                .iter()
+                .find(|e| {
+                    e.name == *name
+                        && Value::String(e.recipient.clone()) == machine["recipient"]
+                        && e.signing_key.as_deref() == machine["signing_key"].as_str()
+                })
+                .map(|e| valid_enrollment_approvals(old, e))
+                .unwrap_or(0);
+            if found < required {
+                return Err(short(format!("adds machine '{name}'"), found));
+            }
+        }
+    }
+    if let Some(members) = new["members"].as_object() {
+        for (name, member) in members {
+            let was_active = old["members"][name]["status"] == "active";
+            if member["status"] != "active" || was_active {
+                continue;
+            }
+            let approvals: Vec<String> = member["approvals"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let found = valid_member_approvals(
+                old,
+                name,
+                &member["role"],
+                &member["invited_by"],
+                &approvals,
+            )
+            .len();
+            if found < required {
+                return Err(short(format!("activates member '{name}'"), found));
+            }
+        }
+    }
+    Ok(())
+}
 
 /// What [`verify`] found.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -626,32 +1074,7 @@ pub fn verify_with(
                 )));
             }
             if state.payload.epoch > pin.epoch {
-                let vault_only = state.payload.governance == pin.governance;
-                let allowed = if vault_only {
-                    &pin.writers
-                } else {
-                    &pin.admins
-                };
-                if !allowed.contains(&signer) {
-                    return Err(MusterError::Security(format!(
-                        "fleet state signed by {} which is not authorized {} under the last \
-                         accepted state",
-                        signing::fingerprint(&signer),
-                        if vault_only {
-                            "to update the vault"
-                        } else {
-                            "to change governance"
-                        }
-                    )));
-                }
-                if state.payload.epoch == pin.epoch + 1
-                    && state.payload.prev.as_deref() != Some(pin.payload_hash.as_str())
-                {
-                    return Err(MusterError::Security(
-                        "fleet state history forked: its predecessor is not the accepted state"
-                            .into(),
-                    ));
-                }
+                verify_chain(config_dir, pin, &state, manifest)?;
             }
         }
         None => {
@@ -856,6 +1279,7 @@ mod tests {
                 governance: "g".into(),
                 vault: BTreeMap::from([("app".into(), "h".into())]),
                 vault_meta: BTreeMap::from([("app".into(), "m".into())]),
+                enrollments: vec![],
                 signer: "musterpk1ab".into(),
             },
             signature: String::new(),
@@ -1106,5 +1530,330 @@ mod tests {
         let absent = governance_digest(&f.manifest).unwrap();
         f.manifest.secrets.get_mut("native://app/k").unwrap().allow = Some(vec![]);
         assert_ne!(absent, governance_digest(&f.manifest).unwrap());
+    }
+
+    // ---- chain walk, per-group authorization and quorum --------------------
+
+    use crate::fleet::EnrollmentRequest;
+    use crate::manifest::{Group, Member, Readers, TeamConfig};
+
+    fn git_in(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+
+    fn machine_for(signer: &Signer, recipient: &str) -> Machine {
+        Machine {
+            recipient: recipient.into(),
+            signing_key: Some(signer.public()),
+            platform: "linux-x86_64".into(),
+            muster_version: "0.1.0".into(),
+            agents: vec![],
+            last_sync: None,
+            role: None,
+            profile: None,
+            applied_profile: None,
+        }
+    }
+
+    fn new_signer() -> (TempDir, Signer) {
+        let dir = tempdir().unwrap();
+        let signer = Signer::load_or_create(dir.path()).unwrap();
+        (dir, signer)
+    }
+
+    impl Fixture {
+        /// Writes the manifest and commits the config repo (history for the walk).
+        fn commit(&self) {
+            self.manifest.save(&self.config).unwrap();
+            git_in(&self.config, &["add", "-A"]);
+            git_in(
+                &self.config,
+                &["commit", "-q", "--allow-empty", "-m", "state"],
+            );
+        }
+        /// Seals as `signer` with a scratch pin so `self.state` (the peer's
+        /// pin) stays where it was.
+        fn seal_as(&self, signer: &Signer, scratch: &Path, evidence: Vec<EnrollmentEvidence>) {
+            self.manifest.save(&self.config).unwrap();
+            seal_with(
+                &self.config,
+                scratch,
+                &self.manifest,
+                signer,
+                false,
+                evidence,
+            )
+            .unwrap()
+            .unwrap();
+            self.commit();
+        }
+    }
+
+    fn jump_fixture(forger_is_revoked: bool) -> Fixture {
+        let mut f = fixture();
+        git_in(&f.config, &["init", "-q"]);
+        let (_k2dir, k2) = new_signer();
+        let scratch = tempdir().unwrap();
+        f.manifest
+            .machines
+            .insert("node2".into(), machine_for(&k2, "age1node2"));
+        f.seal_as(&f.signer, scratch.path(), vec![]);
+        // The peer accepts epoch 1 (both machines are admins in single-person mode).
+        f.verify().unwrap();
+        // Epoch 2: the admin revokes node2.
+        f.manifest.machines.remove("node2");
+        f.seal_as(&f.signer, scratch.path(), vec![]);
+        // Epoch 3 adds a rogue machine, signed by the revoked key or the real admin.
+        f.manifest
+            .machines
+            .insert("evil".into(), machine_for(&k2, "age1evil"));
+        let forger = if forger_is_revoked { &k2 } else { &f.signer };
+        f.seal_as(forger, scratch.path(), vec![]);
+        f
+    }
+
+    #[test]
+    fn epoch_jump_signed_by_a_revoked_admin_is_refused() {
+        let f = jump_fixture(true);
+        let msg = message(f.verify().unwrap_err());
+        assert!(
+            msg.contains("epoch jump without valid intermediate chain"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn epoch_jump_through_a_valid_chain_is_accepted() {
+        let f = jump_fixture(false);
+        f.verify().unwrap();
+    }
+
+    #[test]
+    fn epoch_jump_with_missing_history_is_refused() {
+        let f = fixture();
+        f.seal();
+        let first = FleetState::load(&f.config).unwrap().unwrap();
+        // Fabricate epoch 3 (valid signature, prev = epoch 1's hash): no repo history.
+        let payload = StatePayload {
+            epoch: 3,
+            prev: Some(first.payload_hash().unwrap()),
+            ..first.payload
+        };
+        FleetState::sign(payload, &f.signer)
+            .unwrap()
+            .save(&f.config)
+            .unwrap();
+        let msg = message(f.verify().unwrap_err());
+        assert!(
+            msg.contains("epoch jump without valid intermediate chain"),
+            "{msg}"
+        );
+    }
+
+    fn team_fixture() -> (Fixture, TempDir, Signer) {
+        let mut f = fixture();
+        git_in(&f.config, &["init", "-q"]);
+        let (k2dir, k2) = new_signer();
+        f.manifest
+            .machines
+            .insert("node2".into(), machine_for(&k2, "age1node2"));
+        f.manifest.members.insert(
+            "alice".into(),
+            Member {
+                role: Role::Admin,
+                status: MemberStatus::Active,
+                machines: vec!["node1".into()],
+                ..Member::default()
+            },
+        );
+        f.manifest.members.insert(
+            "bob".into(),
+            Member {
+                role: Role::Member,
+                status: MemberStatus::Active,
+                machines: vec!["node2".into()],
+                ..Member::default()
+            },
+        );
+        for (group, member) in [("ops", "alice"), ("dev", "bob")] {
+            f.manifest.groups.insert(
+                group.into(),
+                Group {
+                    readers: Readers {
+                        members: vec![member.into()],
+                        ..Readers::default()
+                    },
+                    profile: None,
+                },
+            );
+            fs::write(f.config.join(format!("vault/{group}.age")), b"v1").unwrap();
+            fs::write(f.config.join(format!("vault/{group}.meta.json")), b"{}").unwrap();
+        }
+        f.seal_as(&f.signer, &f.state, vec![]);
+        f.verify().unwrap();
+        (f, k2dir, k2)
+    }
+
+    #[test]
+    fn member_machine_cannot_sign_a_vault_change_to_a_group_it_does_not_read() {
+        let (f, _k, bob) = team_fixture();
+        let scratch = tempdir().unwrap();
+        fs::write(f.config.join("vault/ops.age"), b"tampered").unwrap();
+        f.seal_as(&bob, scratch.path(), vec![]);
+        let msg = message(f.verify().unwrap_err());
+        assert!(msg.contains("'ops'") && msg.contains("reader"), "{msg}");
+    }
+
+    #[test]
+    fn member_machine_may_sign_a_vault_change_to_a_group_it_reads() {
+        let (f, _k, bob) = team_fixture();
+        let scratch = tempdir().unwrap();
+        fs::write(f.config.join("vault/dev.age"), b"v2").unwrap();
+        f.seal_as(&bob, scratch.path(), vec![]);
+        f.verify().unwrap();
+    }
+
+    fn quorum_fixture() -> (Fixture, Signer, Signer) {
+        let (mut f, k2dir, k2) = team_fixture();
+        // Make bob a second admin and require two approvals.
+        f.manifest.members.get_mut("bob").unwrap().role = Role::Admin;
+        f.manifest.team = Some(TeamConfig {
+            required_approvals: 2,
+        });
+        f.seal_as(&f.signer, &f.state, vec![]);
+        f.verify().unwrap();
+        drop(k2dir);
+        let (_d, k3) = new_signer();
+        (f, k2, k3)
+    }
+
+    fn evidence(f: &Fixture, k2: &Signer, k3: &Signer, who: &[&str]) -> EnrollmentEvidence {
+        let mut request = EnrollmentRequest {
+            name: "node3".into(),
+            recipient: "age1node3".into(),
+            signing_key: Some(k3.public()),
+            nonce: "n0nce".into(),
+            platform: "linux".into(),
+            muster_version: "0.1.0".into(),
+            agents: vec![],
+            created_at: "now".into(),
+            approvals: vec![],
+            role: None,
+            profile: None,
+            member: Some("alice".into()),
+        };
+        for admin in who {
+            match *admin {
+                "alice" => request.sign_approval("alice", "node1", &f.signer).unwrap(),
+                _ => request.sign_approval("bob", "node2", k2).unwrap(),
+            }
+        }
+        EnrollmentEvidence {
+            name: "node3".into(),
+            recipient: request.recipient.clone(),
+            signing_key: request.signing_key.clone(),
+            member: request.member.clone(),
+            role: None,
+            profile: None,
+            created_at: request.created_at.clone(),
+            nonce: request.nonce.clone(),
+            approvals: request
+                .approvals
+                .iter()
+                .filter_map(|a| match a {
+                    crate::fleet::ApprovalEntry::Signed(s) => Some(s.clone()),
+                    crate::fleet::ApprovalEntry::Legacy(_) => None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn single_admin_adding_a_machine_under_quorum_two_is_refused_on_peers() {
+        let (mut f, k2, k3) = quorum_fixture();
+        let scratch = tempdir().unwrap();
+        f.manifest
+            .machines
+            .insert("node3".into(), machine_for(&k3, "age1node3"));
+        let one = evidence(&f, &k2, &k3, &["alice"]);
+        f.seal_as(&f.signer, scratch.path(), vec![one]);
+        let msg = message(f.verify().unwrap_err());
+        assert!(
+            msg.contains("without a quorum of 2 signed admin approvals"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn machine_without_any_evidence_is_refused_and_two_signed_approvals_pass() {
+        let (mut f, k2, k3) = quorum_fixture();
+        let scratch = tempdir().unwrap();
+        f.manifest
+            .machines
+            .insert("node3".into(), machine_for(&k3, "age1node3"));
+        f.seal_as(&f.signer, scratch.path(), vec![]);
+        assert!(message(f.verify().unwrap_err()).contains("quorum"));
+
+        // Re-seal (force) the same change carrying two verified approvals.
+        let two = evidence(&f, &k2, &k3, &["alice", "bob"]);
+        let scratch2 = tempdir().unwrap();
+        // Rebuild from the accepted pin: reset the repo to the accepted epoch.
+        git_in(&f.config, &["reset", "-q", "--hard", "HEAD~1"]);
+        f.manifest
+            .machines
+            .insert("node3".into(), machine_for(&k3, "age1node3"));
+        f.seal_as(&f.signer, scratch2.path(), vec![two]);
+        f.verify().unwrap();
+    }
+
+    #[test]
+    fn bare_member_approvals_never_count_but_signed_ones_do() {
+        let (mut f, _k2, _k3) = quorum_fixture();
+        let scratch = tempdir().unwrap();
+        f.manifest.members.insert(
+            "carol".into(),
+            Member {
+                role: Role::Member,
+                status: MemberStatus::Active,
+                invited_by: Some("alice".into()),
+                approvals: vec!["alice".into(), "bob".into()],
+                ..Member::default()
+            },
+        );
+        f.seal_as(&f.signer, scratch.path(), vec![]);
+        assert!(message(f.verify().unwrap_err()).contains("activates member 'carol'"));
+
+        git_in(&f.config, &["reset", "-q", "--hard", "HEAD~1"]);
+        let scratch2 = tempdir().unwrap();
+        let role = serde_json::to_value(Role::Member).unwrap();
+        let invited = json!("alice");
+        let (_d, k2) = (0, {
+            // bob's signer is the one fixture() created for node2
+            let machines = &f.manifest.machines;
+            machines["node2"].signing_key.clone().unwrap()
+        });
+        let _ = k2;
+        // Sign as alice (node1) only -> still short of 2.
+        let a =
+            sign_member_approval("alice", "node1", "carol", &role, &invited, &f.signer).unwrap();
+        f.manifest.members.insert(
+            "carol".into(),
+            Member {
+                role: Role::Member,
+                status: MemberStatus::Active,
+                invited_by: Some("alice".into()),
+                approvals: vec![a],
+                ..Member::default()
+            },
+        );
+        f.seal_as(&f.signer, scratch2.path(), vec![]);
+        assert!(message(f.verify().unwrap_err()).contains("found 1"));
     }
 }

@@ -325,6 +325,25 @@ pub(super) fn approve_with_identity(
     manifest.save(&ctx.config_dir)?;
     let reencrypted_groups = team::rekey(&mut vault, &changes, &approver_identity)?;
 
+    ctx.enrollments
+        .push(crate::fleet_state::EnrollmentEvidence {
+            name: name.to_string(),
+            recipient: req.recipient.clone(),
+            signing_key: req.signing_key.clone(),
+            member: req.member.clone(),
+            role: req.role.clone(),
+            profile: req.profile.clone(),
+            created_at: req.created_at.clone(),
+            nonce: req.nonce.clone(),
+            approvals: req
+                .approvals
+                .iter()
+                .filter_map(|a| match a {
+                    crate::fleet::ApprovalEntry::Signed(s) => Some(s.clone()),
+                    crate::fleet::ApprovalEntry::Legacy(_) => None,
+                })
+                .collect(),
+        });
     EnrollmentRequest::remove(&ctx.config_dir, name)?;
 
     let summary = format!("feat(fleet): approve machine {name}");
