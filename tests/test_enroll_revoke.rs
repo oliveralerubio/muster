@@ -361,6 +361,12 @@ fn reject_discards_the_partial_approvals_of_a_machine_request() {
         &config,
         &["member", "approve", "admin-two", "--yes"],
     );
+    on(
+        &owner,
+        &config,
+        &["member", "add", "worker", "--role", "member"],
+    );
+    on(&owner, &config, &["member", "approve", "worker", "--yes"]);
     assert_cli_success(
         &second_admin,
         &[
@@ -405,7 +411,11 @@ fn reject_discards_the_partial_approvals_of_a_machine_request() {
             "quorum-machine",
         ],
     );
-    let first = on(&owner, &config, &["approve", "quorum-machine", "--yes"]);
+    let first = on(
+        &owner,
+        &config,
+        &["approve", "quorum-machine", "--member", "worker", "--yes"],
+    );
     assert_eq!(first["status"], "pending", "{first}");
     let request = std::fs::read_to_string(config.join("enroll/quorum-machine.toml")).unwrap();
     assert!(
@@ -431,7 +441,11 @@ fn reject_discards_the_partial_approvals_of_a_machine_request() {
             "quorum-machine",
         ],
     );
-    let again = on(&owner, &config, &["approve", "quorum-machine", "--yes"]);
+    let again = on(
+        &owner,
+        &config,
+        &["approve", "quorum-machine", "--member", "worker", "--yes"],
+    );
     assert_eq!(again["status"], "pending", "{again}");
     assert_eq!(again["approvals_received"], 1, "{again}");
 }

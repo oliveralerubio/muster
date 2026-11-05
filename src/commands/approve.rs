@@ -146,6 +146,13 @@ pub(super) fn approve_with_identity(
     let profile = proposal(params, "profile", &mut req.profile)?;
     let member = proposal(params, "member", &mut req.member)?;
     let team_mode = !before.members.is_empty() || member.is_some();
+    if team_mode && member.is_none() {
+        return Err(MusterError::Usage(
+            "in team mode a machine is approved for a member: pass --member <name> (an \
+             approved machine enrolled under no member would outlive that member's removal)"
+                .into(),
+        ));
+    }
     let actor = if team_mode && !by_recovery {
         Some(team::admin(&before, &ctx.state_dir)?)
     } else {

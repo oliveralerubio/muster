@@ -709,6 +709,7 @@ fn team_quorum_requires_multiple_admin_approvals() {
         &["member", "approve", "admin-two", "--yes"],
     );
     join(&owner, &second_admin, "admin-two-laptop", "admin-two");
+    add_member(&owner, "worker", "member");
 
     // Raise the quorum once a second admin can approve (a quorum of 2 with a
     // single admin could only be met with the recovery key).
@@ -724,12 +725,20 @@ fn team_quorum_requires_multiple_admin_approvals() {
     );
     assert_eq!(enrollment["status"], "pending", "{enrollment}");
     let request_id = "quorum-machine";
-    let first = ok(&owner, &config, &["approve", request_id, "--yes"]);
+    let first = ok(
+        &owner,
+        &config,
+        &["approve", request_id, "--member", "worker", "--yes"],
+    );
     assert_eq!(first["status"], "pending", "{first}");
     assert_eq!(first["approvals_received"], 1, "{first}");
     assert_eq!(first["approvals_required"], 2, "{first}");
 
-    let (out, duplicate) = on(&owner, &config, &["approve", request_id, "--yes"]);
+    let (out, duplicate) = on(
+        &owner,
+        &config,
+        &["approve", request_id, "--member", "worker", "--yes"],
+    );
     assert!(
         !out.status.success(),
         "duplicate approval must fail: {}",
@@ -744,7 +753,11 @@ fn team_quorum_requires_multiple_admin_approvals() {
         duplicate.raw
     );
 
-    let approved = ok(&second_admin, &config, &["approve", request_id, "--yes"]);
+    let approved = ok(
+        &second_admin,
+        &config,
+        &["approve", request_id, "--member", "worker", "--yes"],
+    );
     assert_eq!(approved["status"], "active", "{approved}");
     let machines = ok(&owner, &config, &["machine", "list"]);
     assert!(
@@ -998,4 +1011,59 @@ fn member_rm_fails_closed_when_sidecar_disagrees_with_ciphertext() {
     // Nothing was committed: alice is still a member.
     let manifest = std::fs::read_to_string(config.join("muster.toml")).unwrap();
     assert!(manifest.contains("[members.alice]"), "{manifest}");
+}
+
+#[test]
+fn removing_member_revokes_every_machine_it_requested() {
+    let owner = MusterEnv::new();
+    let carol_laptop = MusterEnv::new();
+    init(&owner);
+    let config = owner.config_dir();
+    add_member(&owner, "carol", "member");
+    join(&owner, &carol_laptop, "carol-box", "carol");
+
+    // Carol's machine is active and has recipient
+    let manifest_before = std::fs::read_to_string(config.join("muster.toml")).unwrap();
+    assert!(manifest_before.contains("carol-box"));
+
+    // Revoke member carol
+    ok(&owner, &config, &["member", "rm", "carol", "--yes"]);
+
+    // carol-box MUST be revoked and purged from machines
+    let manifest_after = std::fs::read_to_string(config.join("muster.toml")).unwrap();
+    assert!(!manifest_after.contains("[machines.carol-box]"));
+    assert!(manifest_after.contains("revoked_recipients"));
+    assert!(manifest_after.contains("revoked_signing_keys"));
+
+    let parsed: toml::Table = manifest_after.parse().unwrap();
+    let machines = parsed.get("machines").and_then(|m| m.as_table()).unwrap();
+    assert!(!machines.contains_key("carol-box"));
+}
+
+#[test]
+fn approving_a_machine_in_team_mode_needs_the_member_it_joins() {
+    let owner = MusterEnv::new();
+    let laptop = MusterEnv::new();
+    init(&owner);
+    let config = owner.config_dir();
+    add_member(&owner, "carol", "member");
+    ok(&laptop, &config, &["enroll", "--name", "carol-box"]);
+    let (output, envelope) = owner.run_json(&[
+        "--format",
+        "json",
+        "--config",
+        config.to_str().unwrap(),
+        "approve",
+        "carol-box",
+        "--yes",
+    ]);
+    assert!(!output.status.success(), "{}", envelope.raw);
+    assert!(
+        envelope.raw.to_string().contains("--member"),
+        "{}",
+        envelope.raw
+    );
+    // Nothing was enrolled.
+    let manifest = std::fs::read_to_string(config.join("muster.toml")).unwrap();
+    assert!(!manifest.contains("[machines.carol-box]"));
 }

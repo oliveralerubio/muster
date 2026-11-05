@@ -1274,6 +1274,11 @@ fn enrollment_only(old: &Value, new: &Value, state: &FleetState) -> bool {
             }
         }
     }
+    // In team mode, every newly added machine must belong to an approved owner.
+    // An orphan machine is refused.
+    if !new_members.is_empty() && !added.iter().all(|m| owned.contains(&m.as_str())) {
+        return false;
+    }
     let subset = |a: &Value, b: &Value| {
         let (a, b) = (a.as_array(), b.as_array());
         a.is_none_or(|a| b.is_some_and(|b| a.iter().all(|x| b.contains(x))))
@@ -1587,28 +1592,39 @@ fn check_quorum(
             if found < required {
                 return Err(short(format!("adds machine '{name}'"), found));
             }
-            if let Some(e) = evidence {
-                if let Some(members) = new["members"].as_object() {
-                    for (member_name, member) in members {
-                        let has_m = member["machines"]
-                            .as_array()
-                            .is_some_and(|ms| ms.iter().any(|x| x.as_str() == Some(name)));
-                        if has_m {
-                            if e.member.as_deref() != Some(member_name.as_str()) {
-                                return Err(MusterError::Security(format!(
-                                    "machine '{name}' enrollment evidence approved member '{:?}' but machine is assigned to '{member_name}'",
-                                    e.member
-                                )));
-                            }
-                            if let Some(erole) = &e.role {
-                                if member["role"].as_str() != Some(erole) {
-                                    return Err(MusterError::Security(format!(
-                                        "machine '{name}' enrollment evidence approved role '{erole}' but member '{member_name}' has role '{:?}'",
-                                        member["role"].as_str()
-                                    )));
-                                }
-                            }
-                        }
+            if team_mode {
+                let Some(e) = evidence else {
+                    return Err(short(format!("adds machine '{name}'"), 0));
+                };
+                let Some(member_name) = e.member.as_deref() else {
+                    return Err(MusterError::Security(format!(
+                        "machine '{name}' enrollment evidence specifies no member in team mode"
+                    )));
+                };
+                let Some(members) = new["members"].as_object() else {
+                    return Err(MusterError::Security(format!(
+                        "machine '{name}' enrolled but no members exist in governance"
+                    )));
+                };
+                let Some(member) = members.get(member_name) else {
+                    return Err(MusterError::Security(format!(
+                        "machine '{name}' enrollment evidence approved member '{member_name}' which does not exist in governance"
+                    )));
+                };
+                let has_m = member["machines"]
+                    .as_array()
+                    .is_some_and(|ms| ms.iter().any(|x| x.as_str() == Some(name)));
+                if !has_m {
+                    return Err(MusterError::Security(format!(
+                        "machine '{name}' enrollment evidence approved member '{member_name}' but machine is not assigned to that member (orphan machine)"
+                    )));
+                }
+                if let Some(erole) = &e.role {
+                    if member["role"].as_str() != Some(erole) {
+                        return Err(MusterError::Security(format!(
+                            "machine '{name}' enrollment evidence approved role '{erole}' but member '{member_name}' has role '{:?}'",
+                            member["role"].as_str()
+                        )));
                     }
                 }
             }
@@ -2621,9 +2637,25 @@ mod tests {
     fn machine_without_any_evidence_is_refused_and_two_signed_approvals_pass() {
         let (mut f, k2, k3) = quorum_fixture();
         let scratch = tempdir().unwrap();
+        f.manifest.members.insert(
+            "carol".into(),
+            Member {
+                role: Role::Member,
+                status: MemberStatus::Active,
+                ..Member::default()
+            },
+        );
+        f.seal_as(&f.signer, &f.state, vec![]);
+        f.verify().unwrap();
         f.manifest
             .machines
             .insert("node3".into(), machine_for(&k3, "age1node3"));
+        f.manifest
+            .members
+            .get_mut("carol")
+            .unwrap()
+            .machines
+            .push("node3".into());
         f.seal_as(&f.signer, scratch.path(), vec![]);
         assert!(message(f.verify().unwrap_err()).contains("quorum"));
 
@@ -2631,10 +2663,7 @@ mod tests {
         let scratch2 = tempdir().unwrap();
         // Rebuild from the accepted pin: reset the repo to the accepted epoch.
         git_in(&f.config, &["reset", "-q", "--hard", "HEAD~1"]);
-        let two = evidence(&f, &k2, &k3, &["alice", "bob"]);
-        f.manifest
-            .machines
-            .insert("node3".into(), machine_for(&k3, "age1node3"));
+        let two = evidence_for(&f, &k2, &k3, &["alice", "bob"], "carol");
         f.seal_as(&f.signer, scratch2.path(), vec![two]);
         f.verify().unwrap();
     }
@@ -3204,6 +3233,86 @@ mod tests {
         state.add_cosignature(&k2).unwrap();
         assert_eq!(state.valid_cosigners(), vec![k2.public()]);
         assert_eq!(state.cosignatures.len(), 1);
+    }
+
+    /// In team mode, an approved machine that is not assigned to any member
+    /// (an orphan) is refused with Security by peers.
+    #[test]
+    fn orphan_approved_machine_in_team_mode_is_refused() {
+        let (mut f, k2, k3) = quorum_fixture();
+        f.manifest.members.insert(
+            "carol".into(),
+            Member {
+                role: Role::Member,
+                status: MemberStatus::Active,
+                ..Member::default()
+            },
+        );
+        f.seal_as(&f.signer, &f.state, vec![]);
+        f.verify().unwrap();
+
+        // One admin finalizes enrollment of node3 with valid evidence naming carol,
+        // but omits node3 from carol.machines (leaving it as an orphan).
+        f.manifest
+            .machines
+            .insert("node3".into(), machine_for(&k3, "age1node3"));
+        // NOT added to carol.machines!
+        let ev = evidence_for(&f, &k2, &k3, &["alice", "bob"], "carol");
+        let scratch = tempdir().unwrap();
+        f.seal_as(&f.signer, scratch.path(), vec![ev]);
+
+        let err = f.verify().unwrap_err();
+        let msg = message(err);
+        assert!(
+            msg.contains("machine 'node3'")
+                && (msg.contains("orphan") || msg.contains("not assigned")),
+            "{msg}"
+        );
+    }
+
+    /// In team mode, an approved machine assigned to a member different from
+    /// the one in its enrollment evidence is refused with Security.
+    #[test]
+    fn machine_assigned_to_wrong_member_is_refused() {
+        let (mut f, k2, k3) = quorum_fixture();
+        f.manifest.members.insert(
+            "carol".into(),
+            Member {
+                role: Role::Member,
+                status: MemberStatus::Active,
+                ..Member::default()
+            },
+        );
+        f.manifest.members.insert(
+            "dave".into(),
+            Member {
+                role: Role::Member,
+                status: MemberStatus::Active,
+                ..Member::default()
+            },
+        );
+        f.seal_as(&f.signer, &f.state, vec![]);
+        f.verify().unwrap();
+
+        f.manifest
+            .machines
+            .insert("node3".into(), machine_for(&k3, "age1node3"));
+        f.manifest
+            .members
+            .get_mut("dave")
+            .unwrap()
+            .machines
+            .push("node3".into());
+        let ev = evidence_for(&f, &k2, &k3, &["alice", "bob"], "carol");
+        let scratch = tempdir().unwrap();
+        f.seal_as(&f.signer, scratch.path(), vec![ev]);
+
+        let err = f.verify().unwrap_err();
+        let msg = message(err);
+        assert!(
+            msg.contains("machine 'node3'") && msg.contains("assigned"),
+            "{msg}"
+        );
     }
 
     mod forged_ciphertext_property {
