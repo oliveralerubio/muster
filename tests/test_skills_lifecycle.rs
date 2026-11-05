@@ -1363,3 +1363,178 @@ url = "fail://test"
     let err3 = sources.checkout("unknown-origin").unwrap_err();
     assert!(err3.contains("no longer declared"));
 }
+
+#[test]
+fn typed_lifecycle_check_plan_and_apply() {
+    use muster::manifest::Manifest;
+    use muster::skills::lifecycle::{
+        apply_update, check, plan_update, CheckFinding, CheckTarget, SkipReason, UpdateDiagnostic,
+        UpdateSelection,
+    };
+    use muster::skills::lock::SkillsLock;
+    use muster::skills::upstream::{GitFetcher, SkillStatus, StatusCache};
+
+    let up = Upstream::new();
+    let env = initialized();
+    let url = up.url();
+    ok(&env, &["skill", "add", "--url", &url, "--path", "skills"]);
+
+    let config_dir = env.config_dir();
+    let state = tempfile::tempdir().unwrap();
+    let state_dir = state.path();
+    let manifest = Manifest::load(&config_dir).expect("manifest loads");
+    let mut lock = SkillsLock::load(&config_dir).expect("lock loads");
+    let skills_dir = config_dir.join("skills");
+    let cache_dir = tempfile::tempdir().unwrap();
+    let fetcher = GitFetcher {
+        cache_dir: cache_dir.path().to_path_buf(),
+    };
+
+    // Initial check: both up to date, cache recorded in the state dir.
+    let report = check(
+        &CheckTarget::All,
+        &manifest,
+        &lock,
+        &fetcher,
+        state_dir,
+        "2026-11-05T00:00:00Z",
+    )
+    .expect("check all succeeds");
+    assert_eq!(report.skills.len(), 2);
+    assert!(report
+        .skills
+        .iter()
+        .all(|s| s.status == SkillStatus::UpToDate));
+    assert!(report
+        .findings
+        .iter()
+        .all(|f| matches!(f, CheckFinding::Status { .. })));
+    assert_eq!(report.checked_at, "2026-11-05T00:00:00Z");
+    let cache = StatusCache::load(state_dir);
+    assert_eq!(
+        cache.skills.get("pdf").map(|s| s.status),
+        Some(SkillStatus::UpToDate)
+    );
+    assert_eq!(cache.checked_at.as_deref(), Some("2026-11-05T00:00:00Z"));
+
+    // Named check of an unknown skill is a usage error.
+    let err = check(
+        &CheckTarget::Named("nonexistent".into()),
+        &manifest,
+        &lock,
+        &fetcher,
+        state_dir,
+        "2026-11-05T00:00:00Z",
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("not in skills.lock"), "{err}");
+
+    // A new upstream version makes pdf update_available.
+    up.write("skills/pdf/SKILL.md", PDF_V2);
+    let new_head = up.commit("pdf v2");
+    let report = check(
+        &CheckTarget::Named("pdf".into()),
+        &manifest,
+        &lock,
+        &fetcher,
+        state_dir,
+        "2026-11-05T00:01:00Z",
+    )
+    .expect("check named pdf succeeds");
+    assert_eq!(report.skills.len(), 1);
+    let pdf = &report.skills[0];
+    assert_eq!(pdf.name, "pdf");
+    assert_eq!(pdf.status, SkillStatus::UpdateAvailable);
+    assert_eq!(pdf.upstream_commit.as_deref(), Some(new_head.as_str()));
+    assert_eq!(pdf.upstream_version.as_deref(), Some("2.0.0"));
+    assert_eq!(
+        StatusCache::load(state_dir).skills["pdf"].status,
+        SkillStatus::UpdateAvailable
+    );
+
+    // Plan for --all: pdf only (xlsx is up to date and silently dropped).
+    let plan = plan_update(
+        &UpdateSelection::All,
+        false,
+        &manifest,
+        &skills_dir,
+        &lock,
+        &fetcher,
+    )
+    .expect("plan update succeeds");
+    assert_eq!(plan.planned.len(), 1);
+    assert_eq!(plan.planned[0].name, "pdf");
+    assert_eq!(plan.planned[0].diff.changed, vec!["SKILL.md"]);
+    assert!(!plan.planned[0].forced);
+    assert!(plan.skipped.is_empty());
+
+    // A local edit: --all skips with a warning finding, a named update refuses.
+    std::fs::write(skills_dir.join("pdf/SKILL.md"), "local edit").unwrap();
+    let skipped = plan_update(
+        &UpdateSelection::All,
+        false,
+        &manifest,
+        &skills_dir,
+        &lock,
+        &fetcher,
+    )
+    .expect("plan all with a modified skill succeeds");
+    assert!(skipped.planned.is_empty());
+    assert_eq!(skipped.skipped.len(), 1);
+    assert_eq!(skipped.skipped[0].name, "pdf");
+    assert_eq!(skipped.skipped[0].reason, SkipReason::Modified);
+    assert!(skipped
+        .diagnostics
+        .iter()
+        .any(|d| matches!(d, UpdateDiagnostic::SkillModified { name } if name == "pdf")));
+    let refused = plan_update(
+        &UpdateSelection::Named("pdf".into()),
+        false,
+        &manifest,
+        &skills_dir,
+        &lock,
+        &fetcher,
+    )
+    .unwrap_err();
+    assert!(
+        refused.to_string().contains("local modifications"),
+        "{refused}"
+    );
+
+    // --force plans it and flags it as forced; apply vendors, re-pins, caches.
+    let forced = plan_update(
+        &UpdateSelection::Named("pdf".into()),
+        true,
+        &manifest,
+        &skills_dir,
+        &lock,
+        &fetcher,
+    )
+    .expect("forced plan succeeds");
+    assert_eq!(forced.planned.len(), 1);
+    assert!(forced.planned[0].forced);
+    let applied = apply_update(
+        &forced,
+        &skills_dir,
+        &config_dir,
+        state_dir,
+        &mut lock,
+        "2026-11-05T00:02:00Z",
+    )
+    .expect("apply succeeds");
+    assert_eq!(applied.names, vec!["pdf"]);
+    assert!(applied.cache_error.is_none());
+    assert_eq!(read(&skills_dir.join("pdf/SKILL.md")), PDF_V2);
+    let entry = lock.get("pdf").expect("lock has pdf");
+    assert_eq!(entry.commit.as_deref(), Some(new_head.as_str()));
+    assert_eq!(entry.version.as_deref(), Some("2.0.0"));
+    assert_eq!(
+        lock_entry(&env, "pdf").unwrap()["commit"].as_str(),
+        Some(new_head.as_str()),
+        "apply_update saves skills.lock"
+    );
+    assert_eq!(
+        StatusCache::load(state_dir).skills["pdf"].status,
+        SkillStatus::UpToDate
+    );
+}

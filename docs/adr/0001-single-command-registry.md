@@ -11,12 +11,14 @@ list agents rely on.
 
 Every command is declared exactly once in a static registry,
 `src/registry.rs`: a dotted name (`secret.add`), help text, typed parameters
-(string, bool, int, list; optionally positional), a `mutating` flag, and one
+(string, bool, int, list, secret; optionally positional), a `mutating` flag, and one
 handler. By convention a handler does not print, exit or read stdin: it returns
 the envelope `result` and reports diagnostics and confirmations through the
 shared context (`ctx.diag`, `ctx.confirm`), with explicit exceptions — `init`
-prints the recovery key, `ui` serves and writes its startup output, and the
-secret commands and `provider.add --value-stdin` read values from stdin through
+prints the recovery key, `ui` serves and writes its startup output,
+secret commands take their values through the registry's zeroizing out-of-band secret
+parameter slot (filled from stdin via `--value-stdin` by the CLI, or from the JSON
+body by the web panel), and `provider.add --value-stdin` reads values from stdin through
 the context, and `provider.login` spawns the agent's native login command
 (interactive only from a terminal). The CLI, the web
 API and the MCP server are thin adapters over this registry — the CLI derives

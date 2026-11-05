@@ -61,6 +61,20 @@ pub static ADAPTER: Adapter = Adapter {
         Capability::Packages,
     ],
     files: &[MCP, SETTINGS, INSTRUCTIONS],
+    provider_kinds: &[],
+    runtime_key_helper: false,
+    login_kind: None,
+    provider_diagnostics: |_, _| Vec::new(),
+    sensitive_values: |_, _| Default::default(),
+    context_roots: super::ContextRoots {
+        base: Base::Home,
+        skills: ".pi/agent/skills",
+        project_skills: ".pi/skills",
+        subagents: Some(".pi/agent/agents"),
+        project_subagents: Some(".pi/agents"),
+    },
+    shared_project_instructions: true,
+    render_project: None,
     render: Some(render),
 };
 

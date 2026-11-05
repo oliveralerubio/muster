@@ -906,53 +906,14 @@ fn check_ai_providers(ctx: &Context, manifest: &Manifest) -> Check {
         let Some(ai_provider) = merged.ai_providers.get(id) else {
             continue;
         };
-        if agent == "claude"
-            && ai_provider.key.is_some()
-            && ai_provider.api_key_helper != Some(true)
-            && adapters::find(agent)
-                .is_some_and(|adapter| adapter.supports_ai_provider(ai_provider.kind))
-        {
-            diagnostics.push(
-                Diagnostic::new(
-                    Severity::Info,
-                    "provider_plaintext_key",
-                    format!("Claude Code stores provider `{id}` credentials in plaintext settings"),
-                )
-                .with_path(format!("providers.{id}"))
-                .with_suggestion(format!(
-                    "set providers.{id}.api_key_helper = true to resolve the key at runtime"
-                )),
-            );
-        }
-        if agent == "opencode"
-            && ai_provider
-                .key
-                .as_deref()
-                .is_some_and(|key| !key.starts_with("env://"))
-        {
-            diagnostics.push(
-                Diagnostic::new(
-                    Severity::Info,
-                    "provider_plaintext_key",
-                    format!("OpenCode stores provider `{id}` credentials in plaintext settings"),
-                )
-                .with_path(format!("providers.{id}"))
-                .with_suggestion("use an env:// reference and export it in OpenCode's environment"),
-            );
-        }
-        if ai_provider.key.is_some()
-            || !matches!(
-                (agent.as_str(), ai_provider.kind),
-                ("claude", adapters::config::AiProviderKind::Anthropic)
-                    | ("codex", adapters::config::AiProviderKind::Openai)
-            )
-        {
+        let Some(adapter) = adapters::find(agent) else {
+            continue;
+        };
+        diagnostics.extend(adapter.provider_diagnostics(id, ai_provider));
+        if ai_provider.key.is_some() || !adapter.subscription_login(ai_provider.kind) {
             continue;
         }
         let Some((status, _)) = crate::commands::provider::login_commands(agent) else {
-            continue;
-        };
-        let Some(adapter) = adapters::find(agent) else {
             continue;
         };
         if machine::find_executable(adapter.binary)

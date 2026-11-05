@@ -244,10 +244,22 @@ pub struct RenderPlan {
     pub diagnostics: Vec<Diagnostic>,
 }
 
+type ProjectRenderFn = fn(&Desired, &Current, Option<&str>, &mut RenderPlan);
+
 type RenderFn = fn(&Desired, &Current, &mut RenderPlan) -> Result<(), MusterError>;
 
+/// Native directories searched for installed context, in each target scope.
+#[derive(Clone, Copy)]
+pub struct ContextRoots {
+    pub base: Base,
+    pub skills: &'static str,
+    pub project_skills: &'static str,
+    pub subagents: Option<&'static str>,
+    pub project_subagents: Option<&'static str>,
+}
+
 /// One agent adapter. `render: None` means listed but not implemented.
-#[derive(Serialize)]
+#[derive(Clone, Copy, Serialize)]
 pub struct Adapter {
     pub id: &'static str,
     pub name: &'static str,
@@ -258,6 +270,23 @@ pub struct Adapter {
     pub min_version: &'static str,
     pub capabilities: &'static [Capability],
     pub files: &'static [ManagedFile],
+    #[serde(skip)]
+    pub context_roots: ContextRoots,
+    /// Whether project instructions share their destination with other agents.
+    #[serde(skip)]
+    pub shared_project_instructions: bool,
+    #[serde(skip)]
+    render_project: Option<ProjectRenderFn>,
+    #[serde(skip)]
+    pub provider_kinds: &'static [config::AiProviderKind],
+    #[serde(skip)]
+    pub runtime_key_helper: bool,
+    #[serde(skip)]
+    pub login_kind: Option<config::AiProviderKind>,
+    #[serde(skip)]
+    pub provider_diagnostics: fn(&str, &config::AiProvider) -> Vec<Diagnostic>,
+    #[serde(skip)]
+    sensitive_values: fn(&std::path::Path, &str) -> BTreeMap<String, SecretValue>,
     #[serde(skip)]
     render: Option<RenderFn>,
 }
@@ -272,12 +301,71 @@ impl Adapter {
     }
 
     pub(crate) fn supports_ai_provider(&self, kind: config::AiProviderKind) -> bool {
-        self.supports(Capability::AiProviders)
-            && !(self.id == "codex"
-                && matches!(
-                    kind,
-                    config::AiProviderKind::Anthropic | config::AiProviderKind::Google
-                ))
+        self.provider_kinds.contains(&kind)
+    }
+
+    pub fn uses_runtime_key_helper(&self, provider: &config::AiProvider) -> bool {
+        self.runtime_key_helper && provider.api_key_helper == Some(true)
+    }
+
+    pub fn subscription_login(&self, kind: config::AiProviderKind) -> bool {
+        self.login_kind == Some(kind)
+    }
+
+    pub fn provider_diagnostics(&self, id: &str, provider: &config::AiProvider) -> Vec<Diagnostic> {
+        (self.provider_diagnostics)(id, provider)
+    }
+
+    pub fn sensitive_values(
+        &self,
+        path: &std::path::Path,
+        contents: &str,
+    ) -> BTreeMap<String, SecretValue> {
+        (self.sensitive_values)(path, contents)
+    }
+
+    /// Compose canonical instructions with the overlay this destination can accept.
+    pub fn instruction_text(
+        &self,
+        canonical: Option<&str>,
+        overlay: Option<&str>,
+        project: bool,
+        enabled_agents: usize,
+    ) -> Option<String> {
+        let overlay = if project && (!self.shared_project_instructions || enabled_agents > 1) {
+            None
+        } else {
+            overlay
+        };
+        match (canonical, overlay) {
+            (Some(shared), Some(extra)) => Some(format!(
+                "{}\n\n## AGENTS.{}.md\n\n{}",
+                shared.trim_end(),
+                self.id,
+                extra
+            )),
+            (None, Some(extra)) => Some(format!("## AGENTS.{}.md\n\n{}", self.id, extra)),
+            _ => canonical.map(str::to_owned),
+        }
+    }
+
+    /// Render with project scope and a separate instruction overlay when needed.
+    /// The ordinary render entry point retains user-scope behavior for callers
+    /// that only need to discover native files and ownership.
+    pub fn render_scoped(
+        &self,
+        desired: &Desired,
+        current: &Current,
+        project: bool,
+        overlay: Option<&str>,
+    ) -> Result<RenderPlan, MusterError> {
+        let mut plan = self.render(desired, current)?;
+        if project {
+            if let Some(render) = self.render_project {
+                render(desired, current, overlay, &mut plan);
+            }
+        }
+        Ok(plan)
     }
 
     pub fn file(&self, path: &str) -> &'static ManagedFile {
@@ -596,7 +684,7 @@ fn selected_ai_provider<'a>(
         );
         return None;
     }
-    let runtime_helper = adapter.id == "claude" && provider.api_key_helper == Some(true);
+    let runtime_helper = adapter.uses_runtime_key_helper(provider);
     if let Some(reference) = &provider.key {
         let code = if !desired.access.allows(adapter.id, reference) {
             Some("secret_not_allowed_for_agent")
@@ -640,6 +728,118 @@ fn selected_ai_provider<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_rules_belong_to_adapters() {
+        use config::{AiProvider, AiProviderKind};
+        let provider = AiProvider {
+            kind: AiProviderKind::Anthropic,
+            base_url: None,
+            default_model: None,
+            key: Some("native://test/key".into()),
+            api_key_helper: Some(true),
+        };
+        assert!(claude::ADAPTER.uses_runtime_key_helper(&provider));
+        assert!(!codex::ADAPTER.uses_runtime_key_helper(&provider));
+        assert!(!codex::ADAPTER.supports_ai_provider(AiProviderKind::Anthropic));
+        assert!(claude::ADAPTER.supports_ai_provider(AiProviderKind::Anthropic));
+        assert!(claude::ADAPTER
+            .provider_diagnostics("test", &provider)
+            .is_empty());
+        assert_eq!(
+            opencode::ADAPTER.provider_diagnostics("test", &provider)[0].code,
+            "provider_plaintext_key"
+        );
+        assert!(claude::ADAPTER.subscription_login(AiProviderKind::Anthropic));
+        assert!(!claude::ADAPTER.subscription_login(AiProviderKind::Openai));
+    }
+
+    #[test]
+    fn native_credentials_are_declared_by_the_adapter() {
+        let values = claude::ADAPTER.sensitive_values(std::path::Path::new("/home/.claude/settings.json"),
+            r#"{"env":{"ANTHROPIC_API_KEY":"old-key","ANTHROPIC_AUTH_TOKEN":"old-token","OTHER":"public"}}"#);
+        assert_eq!(values.len(), 2);
+        assert_eq!(
+            values["claude-settings://ANTHROPIC_API_KEY"].expose(),
+            "old-key"
+        );
+        assert!(claude::ADAPTER
+            .sensitive_values(std::path::Path::new("/home/other.json"), "{}")
+            .is_empty());
+        assert!(codex::ADAPTER
+            .sensitive_values(std::path::Path::new("/home/.claude/settings.json"), "{}")
+            .is_empty());
+    }
+
+    #[test]
+    fn native_context_roots_belong_to_adapters() {
+        assert_eq!(opencode::ADAPTER.context_roots.base, Base::XdgConfig);
+        assert_eq!(opencode::ADAPTER.context_roots.skills, "opencode/skills");
+        assert_eq!(
+            opencode::ADAPTER.context_roots.project_skills,
+            ".opencode/skills"
+        );
+        assert_eq!(
+            antigravity::ADAPTER.context_roots.project_subagents,
+            Some(".agents/agents")
+        );
+        assert_eq!(hermes::ADAPTER.context_roots.subagents, None);
+    }
+
+    #[test]
+    fn project_instruction_destinations_belong_to_adapters() {
+        assert!(!claude::ADAPTER.shared_project_instructions);
+        assert!(codex::ADAPTER.shared_project_instructions);
+        assert!(hermes::ADAPTER.shared_project_instructions);
+        let desired = Desired {
+            config_dir: std::path::Path::new("/config"),
+            agents: &Default::default(),
+            ai_providers: &Default::default(),
+            mcp: &Default::default(),
+            instructions: Some("shared"),
+            secrets: &Default::default(),
+            access: &Default::default(),
+            skills: &Default::default(),
+            subagents: &Default::default(),
+        };
+        let plan = claude::ADAPTER
+            .render_scoped(&desired, &Current::new(), true, Some("overlay"))
+            .unwrap();
+        assert!(plan
+            .files
+            .iter()
+            .any(|f| f.file.project == Some("CLAUDE.md")
+                && f.contents
+                    .contains("@AGENTS.md\n\n## AGENTS.claude.md\n\noverlay")));
+    }
+
+    #[test]
+    fn project_scope_diagnostics_belong_to_adapters() {
+        let mut agents = config::AgentsConfig::default();
+        agents.models.insert("hermes".into(), "test-model".into());
+        let desired = Desired {
+            config_dir: std::path::Path::new("/config"),
+            agents: &agents,
+            ai_providers: &Default::default(),
+            mcp: &Default::default(),
+            instructions: None,
+            secrets: &Default::default(),
+            access: &Default::default(),
+            skills: &Default::default(),
+            subagents: &Default::default(),
+        };
+        assert!(hermes::ADAPTER
+            .render(&desired, &Current::new())
+            .unwrap()
+            .diagnostics
+            .is_empty());
+        let plan = hermes::ADAPTER
+            .render_scoped(&desired, &Current::new(), true, None)
+            .unwrap();
+        assert_eq!(plan.diagnostics.len(), 1);
+        assert_eq!(plan.diagnostics[0].code, "unsupported_feature");
+        assert_eq!(plan.diagnostics[0].message, "Hermes Agent MCP servers and model settings are user-scoped only; skipped for this project");
+    }
 
     #[test]
     fn markdown_block_replaces_only_its_own_block() {

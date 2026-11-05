@@ -69,6 +69,20 @@ pub static ADAPTER: Adapter = Adapter {
         Capability::Subagents,
     ],
     files: &[MCP, INSTRUCTIONS],
+    provider_kinds: &[],
+    runtime_key_helper: false,
+    login_kind: None,
+    provider_diagnostics: |_, _| Vec::new(),
+    sensitive_values: |_, _| Default::default(),
+    context_roots: super::ContextRoots {
+        base: Base::Home,
+        skills: SKILLS_DIR,
+        project_skills: PROJECT_SKILLS_DIR,
+        subagents: Some(AGENTS_DIR),
+        project_subagents: Some(PROJECT_AGENTS_DIR),
+    },
+    shared_project_instructions: true,
+    render_project: None,
     render: Some(render),
 };
 

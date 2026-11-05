@@ -4,6 +4,7 @@ pub mod doctor;
 pub mod effective;
 pub mod enroll;
 pub mod group;
+pub mod history;
 pub mod import;
 pub mod init;
 pub mod machine;

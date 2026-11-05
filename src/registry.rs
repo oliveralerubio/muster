@@ -4,12 +4,14 @@
 //! Subcommands use dotted names (e.g. `secret.add`).
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use serde_json::Value;
 
 use crate::context::Context;
 use crate::errors::MusterError;
+use crate::secrets::SecretValue;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -18,6 +20,9 @@ pub enum ParamKind {
     Bool,
     Int,
     List,
+    /// A secret value: never in argv, `cli_line`, audit, envelopes or Debug.
+    /// Adapters fill it out of band (CLI stdin, web body); see [`Params::set_secret`].
+    Secret,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -46,9 +51,35 @@ pub struct CommandSpec {
 #[derive(Debug, Default, Clone)]
 pub struct Params {
     values: HashMap<String, Value>,
+    /// Out-of-band secret input: not serialisable, redacted by `Debug`, and
+    /// consumed at most once so the plaintext leaves this slot as soon as used.
+    secret: SecretSlot,
+}
+
+#[derive(Default, Clone)]
+struct SecretSlot(Arc<Mutex<Option<SecretValue>>>);
+
+impl std::fmt::Debug for SecretSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
 }
 
 impl Params {
+    /// Hand the adapter-supplied secret to the command (web body, tests).
+    pub fn set_secret(&mut self, value: SecretValue) {
+        *self.secret.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(value);
+    }
+
+    /// Take the secret supplied by the adapter, if any (single use).
+    pub fn take_secret(&self) -> Option<SecretValue> {
+        self.secret
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    }
+
     pub fn set(&mut self, name: impl Into<String>, value: Value) {
         self.values.insert(name.into(), value);
     }
@@ -169,6 +200,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     crate::commands::trust::RESIGN,
     crate::commands::trust::COSIGN,
     crate::commands::trust::CHECKPOINT,
+    crate::commands::history::SPEC,
 ];
 
 pub fn find(name: &str) -> Option<&'static CommandSpec> {
@@ -178,4 +210,24 @@ pub fn find(name: &str) -> Option<&'static CommandSpec> {
 /// Machine-readable command list (`muster schema`, MCP, web).
 pub fn commands_json() -> Value {
     serde_json::to_value(COMMANDS).expect("commands serialize")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secret_slot_is_redacted_in_debug_and_single_use() {
+        let mut params = Params::default();
+        params.set_secret(SecretValue::new("registry-unit-secret".into()));
+        assert!(!format!("{params:?}").contains("registry-unit-secret"));
+        assert_eq!(
+            params
+                .take_secret()
+                .map(|s| s.expose().to_owned())
+                .as_deref(),
+            Some("registry-unit-secret")
+        );
+        assert!(params.take_secret().is_none());
+    }
 }

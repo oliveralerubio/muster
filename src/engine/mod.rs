@@ -16,6 +16,7 @@
 
 pub(crate) mod diff;
 pub mod dotfiles;
+pub mod effective;
 pub mod layer;
 mod ownership;
 pub(crate) mod store;
@@ -242,7 +243,9 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
     let mut secret_providers = Providers::new(&ctx.config_dir, &ctx.state_dir);
     for (id, ai_provider) in &merged.ai_providers {
         let needs_key = merged.agents.ai_providers.iter().any(|(agent, selected)| {
-            selected == id && (agent != "claude" || ai_provider.api_key_helper != Some(true))
+            selected == id
+                && !adapters::find(agent)
+                    .is_some_and(|adapter| adapter.uses_runtime_key_helper(ai_provider))
         });
         if !needs_key {
             continue;
@@ -445,7 +448,7 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
             .with_file_name(format!("AGENTS.{}.md", adapter.id));
         let overlay = read_optional(&overlay_path)?;
         let project_overlay = matches!(ctx_target, Target::Project(_));
-        let shared_project_overlay = project_overlay && adapter.id != "claude";
+        let shared_project_overlay = project_overlay && adapter.shared_project_instructions;
         let project_file_shared = shared_project_overlay && enabled_project_agents > 1;
         if project_file_shared && overlay.is_some() {
             ctx.diag(
@@ -470,25 +473,12 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
                 .with_path(overlay_path.display().to_string()),
             );
         }
-        let combined = match (
+        let combined = adapter.instruction_text(
             instructions.as_deref(),
-            if project_file_shared || (project_overlay && adapter.id == "claude") {
-                None
-            } else {
-                overlay.as_deref()
-            },
-        ) {
-            (Some(shared), Some(extra)) => Some(format!(
-                "{}\n\n## AGENTS.{}.md\n\n{}",
-                shared.trim_end(),
-                adapter.id,
-                extra
-            )),
-            // No canonical AGENTS.md: the overlay alone is still the agent's
-            // instructions, rendered under its own heading.
-            (None, Some(extra)) => Some(format!("## AGENTS.{}.md\n\n{}", adapter.id, extra)),
-            _ => instructions.clone(),
-        };
+            overlay.as_deref(),
+            project_overlay,
+            enabled_project_agents,
+        );
         let agent_skills = skills
             .iter()
             .filter(|(name, _)| merged.disabled("skill", name, adapter.id).is_none())
@@ -523,7 +513,7 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
             ctx_target,
             &ours,
             &entries,
-            if project_overlay && adapter.id == "claude" {
+            if project_overlay && !adapter.shared_project_instructions {
                 overlay.as_deref()
             } else {
                 None
@@ -611,26 +601,13 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
     // Native credentials can predate Muster ownership. Keep them out of diffs
     // even when runtime helpers deliberately skip provider resolution.
     for entry in entries.values() {
-        if entry.agents.contains(&"claude") && entry.path.ends_with(".claude/settings.json") {
-            if let Some(before) = entry
-                .before
-                .as_deref()
-                .and_then(|text| serde_json::from_str::<Value>(text).ok())
-            {
-                for key in ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"] {
-                    if let Some(value) = before["env"][key]
-                        .as_str()
-                        .filter(|value| !value.is_empty())
-                    {
-                        secrets.insert(
-                            format!("claude-settings://{key}"),
-                            SecretValue::new(value.to_owned()),
-                        );
-                    }
-                }
+        if let Some(before) = entry.before.as_deref() {
+            for adapter in entry.agents.iter().filter_map(|id| adapters::find(id)) {
+                secrets.extend(adapter.sensitive_values(&entry.path, before));
             }
         }
     }
+
     for entry in entries.values_mut() {
         entry.private |= is_agent_config(entry.format)
             || holds_secret(entry.before.as_deref(), &secrets)
@@ -809,27 +786,12 @@ fn plan_adapter(
         files.push((file, path, before, text));
     }
 
-    let mut rendered = adapter.render(desired, &current)?;
-    if let Some(overlay) = project_overlay {
-        if let Some(file) = rendered
-            .files
-            .iter_mut()
-            .find(|f| f.file.project == Some("CLAUDE.md"))
-        {
-            let body = format!("@AGENTS.md\n\n## AGENTS.claude.md\n\n{overlay}");
-            file.contents = adapters::markdown_block(current.get(file.file.path), &body);
-        }
-    }
-    if matches!(target, Target::Project(_))
-        && adapter.id == "hermes"
-        && (!desired.mcp.is_empty() || desired.agents.models.contains_key(adapter.id))
-    {
-        rendered.diagnostics.push(Diagnostic::new(
-            Severity::Warning,
-            "unsupported_feature",
-            "Hermes Agent MCP servers and model settings are user-scoped only; skipped for this project",
-        ).with_path(adapter.id));
-    }
+    let rendered = adapter.render_scoped(
+        desired,
+        &current,
+        matches!(target, Target::Project(_)),
+        project_overlay,
+    )?;
     let mut entries = Vec::new();
     for (file, path, before, pruned) in files {
         let record = ours(&path);
@@ -2486,6 +2448,50 @@ mod tests {
             ask: Vec::new(),
             deny: Vec::new(),
         })
+    }
+
+    #[test]
+    fn new_adapter_declares_shared_project_instructions_without_engine_changes() {
+        let mut adapter = adapters::codex::ADAPTER;
+        adapter.id = "future-agent";
+        let adapter = Box::leak(Box::new(adapter));
+        let instructions =
+            adapter.instruction_text(Some("canonical"), Some("private overlay"), true, 2);
+        assert_eq!(instructions.as_deref(), Some("canonical"));
+        let desired = Desired {
+            config_dir: Path::new("/config"),
+            agents: &Default::default(),
+            ai_providers: &Default::default(),
+            mcp: &Default::default(),
+            instructions: instructions.as_deref(),
+            secrets: &Default::default(),
+            access: &Default::default(),
+            skills: &Default::default(),
+            subagents: &Default::default(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let roots = Roots {
+            home: dir.path().into(),
+            xdg_config: dir.path().join("config"),
+        };
+        let (entries, diagnostics) = plan_adapter(
+            adapter,
+            &desired,
+            &roots,
+            &Target::Project(dir.path().to_path_buf()),
+            &|_| None,
+            &BTreeMap::new(),
+            None,
+        )
+        .unwrap();
+        assert!(diagnostics.is_empty());
+        let file = entries
+            .iter()
+            .find(|e| e.path == dir.path().join("AGENTS.md"))
+            .unwrap();
+        assert_eq!(file.agents, vec!["future-agent"]);
+        assert!(file.after.as_ref().unwrap().contains("canonical"));
+        assert!(!file.after.as_ref().unwrap().contains("private overlay"));
     }
 
     #[test]

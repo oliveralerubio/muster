@@ -78,6 +78,26 @@ pub static ADAPTER: Adapter = Adapter {
         Capability::Subagents,
     ],
     files: &[SETTINGS, MCP, INSTRUCTIONS, AGENTS_COPY],
+    provider_kinds: &[
+        super::config::AiProviderKind::Anthropic,
+        super::config::AiProviderKind::Openai,
+        super::config::AiProviderKind::OpenaiCompatible,
+        super::config::AiProviderKind::Ollama,
+        super::config::AiProviderKind::Google,
+    ],
+    runtime_key_helper: true,
+    login_kind: Some(super::config::AiProviderKind::Anthropic),
+    provider_diagnostics,
+    sensitive_values,
+    context_roots: super::ContextRoots {
+        base: Base::Home,
+        skills: SKILLS_DIR,
+        project_skills: SKILLS_DIR,
+        subagents: Some(AGENTS_DIR),
+        project_subagents: Some(AGENTS_DIR),
+    },
+    shared_project_instructions: false,
+    render_project: Some(render_project),
     render: Some(render),
 };
 
@@ -176,6 +196,15 @@ fn render_settings(
         }
     }
 
+    if let Some(extra) = desired.agents.settings.get("claude") {
+        for (key, value) in extra {
+            // Managed keys are never overridden by generic settings.
+            if !super::config::CLAUDE_RESERVED_SETTINGS.contains(&key.as_str()) {
+                object.insert(key.clone(), value.clone());
+            }
+        }
+    }
+
     plan.files.push(RenderedFile {
         file: &SETTINGS,
         contents: json_text(object),
@@ -256,6 +285,64 @@ fn api_key_helper(reference: &str, config_dir: &std::path::Path) -> String {
     format!(
         "muster secret get {quoted} --reveal --yes --format text --config {config} --agent claude"
     )
+}
+
+fn provider_diagnostics(
+    id: &str,
+    provider: &super::config::AiProvider,
+) -> Vec<crate::output::Diagnostic> {
+    if provider.key.is_some()
+        && !ADAPTER.uses_runtime_key_helper(provider)
+        && ADAPTER.supports_ai_provider(provider.kind)
+    {
+        vec![crate::output::Diagnostic::new(
+            crate::output::Severity::Info,
+            "provider_plaintext_key",
+            format!("Claude Code stores provider `{id}` credentials in plaintext settings"),
+        )
+        .with_path(format!("providers.{id}"))
+        .with_suggestion(format!(
+            "set providers.{id}.api_key_helper = true to resolve the key at runtime"
+        ))]
+    } else {
+        Vec::new()
+    }
+}
+
+fn sensitive_values(
+    path: &std::path::Path,
+    contents: &str,
+) -> std::collections::BTreeMap<String, crate::secrets::SecretValue> {
+    let mut values = std::collections::BTreeMap::new();
+    if path.ends_with(SETTINGS.path) {
+        if let Ok(before) = serde_json::from_str::<Value>(contents) {
+            for key in ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"] {
+                if let Some(value) = before["env"][key]
+                    .as_str()
+                    .filter(|value| !value.is_empty())
+                {
+                    values.insert(
+                        format!("claude-settings://{key}"),
+                        crate::secrets::SecretValue::new(value.to_owned()),
+                    );
+                }
+            }
+        }
+    }
+    values
+}
+
+fn render_project(_: &Desired, current: &Current, overlay: Option<&str>, plan: &mut RenderPlan) {
+    if let Some(overlay) = overlay {
+        if let Some(file) = plan
+            .files
+            .iter_mut()
+            .find(|f| f.file.path == INSTRUCTIONS.path)
+        {
+            let body = format!("@AGENTS.md\n\n## AGENTS.claude.md\n\n{overlay}");
+            file.contents = markdown_block(current.get(INSTRUCTIONS.path), &body);
+        }
+    }
 }
 
 #[cfg(test)]
