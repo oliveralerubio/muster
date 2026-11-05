@@ -1163,7 +1163,10 @@ fn quorum_fleet(remote: &str, alice: &MusterEnv, bob: &MusterEnv, carol: &Muster
 
     // Bob and Carol sync and accept this pin.
     ok(bob, &["sync", "--pull"]);
+    ok(bob, &["sync", "--push"]);
     ok(carol, &["sync", "--pull"]);
+    ok(carol, &["sync", "--push"]);
+    ok(alice, &["sync", "--pull"]);
     signer_a
 }
 
@@ -1498,11 +1501,21 @@ fn trust_cosign_reject_discards_a_pending_proposal_and_restores_the_pin() {
     let (code, _) = fail(&carol, &["status"]);
     assert_eq!(code, 5);
 
-    // Carol rejects the pending proposal using --reject.
-    let out = ok(&carol, &["trust", "cosign", "--reject", "--yes"]);
+    // One admin cannot discard the proposal alone: Carol's rejection is
+    // recorded (1 of 2) and shared, the proposal stays pending.
+    let first = ok(&carol, &["trust", "cosign", "--reject", "--yes"]);
+    assert_eq!(first["result"]["rejected"], false, "{first}");
+    assert_eq!(first["result"]["rejections_received"], 1, "{first}");
+    assert_eq!(first["result"]["rejections_required"], 2, "{first}");
+    let (code, _) = fail(&carol, &["status"]);
+    assert_eq!(code, 5, "still pending after a single rejection");
+
+    // The second admin of the accepted state (Bob) completes the rejection.
+    ok(&bob, &["sync", "--pull"]);
+    let out = ok(&bob, &["trust", "cosign", "--reject", "--yes"]);
     assert_eq!(out["result"]["rejected"], true, "{out}");
     assert!(out["result"]["reverted_to_epoch"].is_number(), "{out}");
-    ok(&carol, &["sync", "--push"]);
+    ok(&carol, &["sync", "--pull"]);
 
     // Ordinary commands are unblocked on Carol: she is no longer frozen, and
     // Bob is still an admin in the restored state.
@@ -1532,5 +1545,103 @@ fn trust_cosign_reject_discards_a_pending_proposal_and_restores_the_pin() {
     ok(&carol, &["sync", "--push"]);
     ok(&bob, &["sync", "--pull"]);
     let cosigned = ok(&bob, &["trust", "cosign", "--yes"]);
+    assert_eq!(cosigned["result"]["accepted"], true, "{cosigned}");
+}
+
+fn pinned_epoch(env: &MusterEnv) -> u64 {
+    let pin: Value =
+        serde_json::from_str(&std::fs::read_to_string(state_dir(env).join("trust.json")).unwrap())
+            .unwrap();
+    pin["epoch"].as_u64().unwrap()
+}
+
+/// Appends a top-level `revoked_recipients` entry by hand and re-signs.
+fn propose_revocation(env: &MusterEnv, recipient: &str) {
+    let text = manifest_text(env);
+    let edited = if text.contains("revoked_recipients") {
+        text.replace(
+            "revoked_recipients = [",
+            &format!("revoked_recipients = [\"{recipient}\", "),
+        )
+    } else {
+        format!("revoked_recipients = [\"{recipient}\"]\n{text}")
+    };
+    std::fs::write(env.config_dir().join("muster.toml"), edited).unwrap();
+    ok(env, &["trust", "resign", "--yes"]);
+}
+
+const GONE_ONE: &str = "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p";
+const GONE_TWO: &str = "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq";
+
+/// Opus R12 F1: a quorate revocation (epoch E+1) followed by a lone pending
+/// proposal (E+2). Carol was still pinned at E. Neither her pull nor a reject
+/// may bring the revocation back.
+#[test]
+fn quorate_revocation_then_lone_proposal_then_reject_keeps_the_revocation() {
+    let (_guard, remote) = bare_remote();
+    let remote = remote.to_str().unwrap();
+    let (alice, bob, carol) = (MusterEnv::new(), MusterEnv::new(), MusterEnv::new());
+    quorum_fleet(remote, &alice, &bob, &carol);
+    let start = pinned_epoch(&carol);
+
+    // E+1: alice proposes, bob co-signs: quorate.
+    propose_revocation(&alice, GONE_ONE);
+    ok(&alice, &["sync", "--push"]);
+    ok(&bob, &["sync", "--pull"]);
+    let cosigned = ok(&bob, &["trust", "cosign", "--yes"]);
+    assert_eq!(cosigned["result"]["accepted"], true, "{cosigned}");
+    ok(&bob, &["sync", "--push"]);
+
+    // E+2: alice alone proposes something else (pending).
+    ok(&alice, &["sync", "--pull"]);
+    assert_eq!(pinned_epoch(&alice), start + 1);
+    propose_revocation(&alice, GONE_TWO);
+    ok(&alice, &["sync", "--push"]);
+
+    // Carol pulls: her pin passes the quorate E+1 and only holds E+2.
+    let pulled = ok(&carol, &["sync", "--pull"]);
+    assert_eq!(pulled["result"]["applied"], false, "{pulled}");
+    assert_eq!(pinned_epoch(&carol), start + 1, "pin must reach E+1");
+    let pin = std::fs::read_to_string(state_dir(&carol).join("trust.json")).unwrap();
+    assert!(pin.contains(GONE_ONE) && !pin.contains(GONE_TWO), "{pin}");
+
+    // Two admins reject; the restored state is E+1, never E.
+    let first = ok(&carol, &["trust", "cosign", "--reject", "--yes"]);
+    assert_eq!(first["result"]["rejected"], false, "{first}");
+    ok(&bob, &["sync", "--pull"]);
+    let second = ok(&bob, &["trust", "cosign", "--reject", "--yes"]);
+    assert_eq!(second["result"]["rejected"], true, "{second}");
+    assert_eq!(second["result"]["reverted_to_epoch"], start + 1, "{second}");
+
+    for env in [&alice, &bob, &carol] {
+        ok(env, &["sync", "--pull"]);
+        let manifest = manifest_text(env);
+        assert!(manifest.contains(GONE_ONE), "revocation stays in force");
+        assert!(!manifest.contains(GONE_TWO), "the proposal is gone");
+        ok(env, &["status"]);
+    }
+    assert_eq!(pinned_epoch(&alice), start + 1);
+}
+
+/// Opus R12 F3 / Sol F4: a lone admin (here the one a proposal removes) cannot
+/// reject; it needs the other admins, or the recovery key.
+#[test]
+fn a_lone_admin_cannot_reject_its_own_removal() {
+    let (_guard, remote) = bare_remote();
+    let remote = remote.to_str().unwrap();
+    let (alice, bob, carol) = (MusterEnv::new(), MusterEnv::new(), MusterEnv::new());
+    quorum_fleet(remote, &alice, &bob, &carol);
+
+    ok(&alice, &["member", "rm", "bob", "--yes"]);
+    ok(&alice, &["sync", "--push"]);
+    ok(&bob, &["sync", "--pull"]);
+    let attempt = ok(&bob, &["trust", "cosign", "--reject", "--yes"]);
+    assert_eq!(attempt["result"]["rejected"], false, "{attempt}");
+    ok(&bob, &["sync", "--push"]);
+
+    // The honest quorum still removes bob: carol co-signs the proposal that
+    // carries bob's lone rejection.
+    ok(&carol, &["sync", "--pull"]);
+    let cosigned = ok(&carol, &["trust", "cosign", "--yes"]);
     assert_eq!(cosigned["result"]["accepted"], true, "{cosigned}");
 }

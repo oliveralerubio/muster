@@ -291,6 +291,18 @@ fn run_cosign(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> 
     let mut state = FleetState::load(&ctx.config_dir)?
         .ok_or_else(|| MusterError::Security("the repo has no fleet state to co-sign".into()))?;
     state.verify_signature()?;
+    // Take every quorate epoch before the proposal first (best effort: the
+    // checks below refuse anything that does not verify).
+    let _ = fleet_state::verify_with(
+        &ctx.config_dir,
+        &ctx.state_dir,
+        &manifest,
+        &fleet_state::VerifyOptions {
+            expect_signer: None,
+            persist: true,
+            check_content: true,
+        },
+    );
     let pin = TrustAnchor::load(&ctx.state_dir)?.ok_or_else(|| {
         MusterError::Security(
             "no local trust pin; cannot determine if this change is authorized".into(),
@@ -298,71 +310,7 @@ fn run_cosign(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> 
     })?;
 
     if params.get_bool("reject") {
-        if state.payload.epoch <= pin.epoch {
-            return Err(MusterError::Usage(
-                "no pending proposal to reject; the repo state is already accepted".into(),
-            ));
-        }
-        let recovery = team::recovery_identity(ctx, params, &manifest)?;
-        let is_authorized_admin = match recovery {
-            Some(_) => true,
-            None => {
-                let s = Signer::load_or_create(&ctx.state_dir)?;
-                pin.admins.contains(&s.public())
-            }
-        };
-        if !is_authorized_admin {
-            return Err(MusterError::Security(
-                "cannot reject proposal: must be an admin of the last accepted state (or provide recovery key)".into(),
-            ));
-        }
-        if params.get_bool("yes") {
-            ctx.yes = true;
-        }
-        ctx.confirm(
-            "Discard the unaccepted pending proposal and revert to the last accepted state?",
-        )?;
-
-        let accepted =
-            git::commit_with_state(&ctx.config_dir, &pin.payload_hash).ok_or_else(|| {
-                MusterError::Security(
-                    "the accepted state of this machine's pin is not in the repository history; \
-                     restore the repo from a trusted copy"
-                        .into(),
-                )
-            })?;
-        let head = git::head_commit(&ctx.config_dir)?;
-        // The signed files only: state, governance and the whole vault.
-        let signed_paths = [fleet_state::STATE_FILE, crate::manifest::FILE_NAME, "vault"];
-        git::restore_paths(&ctx.config_dir, &accepted, &signed_paths)?;
-        let restored = Manifest::load(&ctx.config_dir).and_then(|m| {
-            fleet_state::verify_with(
-                &ctx.config_dir,
-                &ctx.state_dir,
-                &m,
-                &fleet_state::VerifyOptions {
-                    expect_signer: None,
-                    persist: false,
-                    check_content: true,
-                },
-            )
-        });
-        if !matches!(restored, Ok(Verification::Verified { .. })) {
-            git::restore_paths(&ctx.config_dir, &head, &signed_paths)?;
-            return Err(MusterError::Security(
-                "the accepted state could not be restored cleanly; nothing was changed".into(),
-            ));
-        }
-        git::commit_if_configured(
-            &ctx.config_dir,
-            "revert: discard unaccepted pending proposal",
-        )?;
-        let pushed = publish(ctx, "revert");
-        return Ok(json!({
-            "rejected": true,
-            "reverted_to_epoch": pin.epoch,
-            "pushed": pushed,
-        }));
+        return run_reject(ctx, params, &manifest, state, &pin);
     }
     if state.payload.epoch <= pin.epoch {
         return Ok(json!({
@@ -473,5 +421,105 @@ fn run_cosign(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> 
         "fingerprint": signing::fingerprint(&public),
         "cosigners": state.valid_cosigners(),
         "vault_groups_changed": groups,
+    }))
+}
+
+/// `trust cosign --reject`: discards the pending proposal at the head of the
+/// repo and restores the newest ACCEPTED state, recomputed from the history
+/// (the local pin may lag behind quorate epochs). It takes as many distinct
+/// admins of the accepted state as the team requires, collected as signed
+/// rejections in `fleet.state.json` the same way co-signatures are, or the
+/// recovery key alone. A lone admin can therefore never veto a proposal, least
+/// of all its own removal.
+fn run_reject(
+    ctx: &mut Context,
+    params: &Params,
+    manifest: &Manifest,
+    mut state: FleetState,
+    pin: &TrustAnchor,
+) -> Result<Value, MusterError> {
+    let proposal = fleet_state::pending_proposal(&ctx.config_dir, &ctx.state_dir, manifest)?;
+    if proposal.accepted_epoch < pin.epoch {
+        return Err(MusterError::Security(
+            "refusing to reject: that would drop an epoch this machine already accepted".into(),
+        ));
+    }
+    let signer = match team::recovery_identity(ctx, params, manifest)? {
+        Some(rec_id) => Signer::from_recovery(&rec_id)?,
+        None => Signer::load_or_create(&ctx.state_dir)?,
+    };
+    let public = signer.public();
+    if !proposal.is_admin(&public) {
+        return Err(MusterError::Security(
+            "cannot reject proposal: must be an admin of the last accepted state (or provide \
+             the recovery key)"
+                .into(),
+        ));
+    }
+    if params.get_bool("yes") {
+        ctx.yes = true;
+    }
+    ctx.confirm("Reject the unaccepted pending proposal (and revert to the last accepted state once enough admins did)?")?;
+
+    state.add_rejection(&signer)?;
+    let (received, required) = proposal.reject_tally(&state);
+    if received < required {
+        // Recorded and shared; the revert waits for the other admins.
+        state.save(&ctx.config_dir)?;
+        git::commit_if_configured(&ctx.config_dir, "feat(security): record proposal rejection")?;
+        let pushed = publish(ctx, "rejection");
+        return Ok(json!({
+            "rejected": false,
+            "rejections_received": received,
+            "rejections_required": required,
+            "pushed": pushed,
+            "message": format!(
+                "rejection recorded ({received} of {required}); another admin of the accepted \
+                 state must run `muster trust cosign --reject` too"
+            ),
+        }));
+    }
+
+    let accepted =
+        git::commit_with_state(&ctx.config_dir, &proposal.accepted_hash).ok_or_else(|| {
+            MusterError::Security(
+                "the accepted state is not in the repository history; restore the repo from a \
+                 trusted copy"
+                    .into(),
+            )
+        })?;
+    let head = git::head_commit(&ctx.config_dir)?;
+    // The signed files only: state, governance and the whole vault.
+    let signed_paths = [fleet_state::STATE_FILE, crate::manifest::FILE_NAME, "vault"];
+    git::restore_paths(&ctx.config_dir, &accepted, &signed_paths)?;
+    let restored = Manifest::load(&ctx.config_dir).and_then(|m| {
+        fleet_state::verify_with(
+            &ctx.config_dir,
+            &ctx.state_dir,
+            &m,
+            &fleet_state::VerifyOptions {
+                expect_signer: None,
+                persist: true,
+                check_content: true,
+            },
+        )
+    });
+    if !matches!(restored, Ok(Verification::Verified { .. })) {
+        git::restore_paths(&ctx.config_dir, &head, &signed_paths)?;
+        return Err(MusterError::Security(
+            "the accepted state could not be restored cleanly; nothing was changed".into(),
+        ));
+    }
+    git::commit_if_configured(
+        &ctx.config_dir,
+        "revert: discard unaccepted pending proposal",
+    )?;
+    let pushed = publish(ctx, "revert");
+    Ok(json!({
+        "rejected": true,
+        "reverted_to_epoch": proposal.accepted_epoch,
+        "rejections_received": received,
+        "rejections_required": required,
+        "pushed": pushed,
     }))
 }

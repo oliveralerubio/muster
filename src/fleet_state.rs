@@ -27,6 +27,7 @@ pub const STATE_FILE: &str = "fleet.state.json";
 pub const TRUST_FILE: &str = "trust.json";
 const STATE_DOMAIN: &[u8] = b"muster fleet state v1\n";
 const COSIGN_DOMAIN: &[u8] = b"muster fleet cosign v1\n";
+const REJECT_DOMAIN: &[u8] = b"muster fleet reject v1\n";
 
 /// `fleet.state.json`: the payload and its detached signature (hex), plus the
 /// co-signatures of other admins over the same payload. Co-signatures are not
@@ -37,6 +38,11 @@ pub struct FleetState {
     pub signature: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cosignatures: Vec<Cosignature>,
+    /// Admins' signatures rejecting this payload (`muster fleet reject v1`):
+    /// like co-signatures they sit outside the signed payload. Enough of them
+    /// discard a pending proposal (`muster trust cosign --reject`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rejections: Vec<Cosignature>,
 }
 
 /// One admin's signature over a state payload (`muster fleet cosign v1`).
@@ -610,11 +616,50 @@ impl FleetState {
         valid
     }
 
+    fn reject_message(&self) -> Result<Vec<u8>, MusterError> {
+        let mut msg = REJECT_DOMAIN.to_vec();
+        msg.extend(self.payload_bytes()?);
+        Ok(msg)
+    }
+
+    /// Adds `signer`'s rejection of this payload (once per key; a placeholder
+    /// naming the key is replaced).
+    pub fn add_rejection(&mut self, signer: &Signer) -> Result<(), MusterError> {
+        let key = signer.public();
+        if self.valid_rejecters().contains(&key) {
+            return Ok(());
+        }
+        self.rejections.retain(|c| c.signer != key);
+        let signature = signer.sign(&self.reject_message()?);
+        self.rejections.push(Cosignature {
+            signer: key,
+            signature,
+        });
+        Ok(())
+    }
+
+    /// Keys whose rejection verifies over this payload, once each.
+    pub fn valid_rejecters(&self) -> Vec<String> {
+        let Ok(message) = self.reject_message() else {
+            return Vec::new();
+        };
+        let mut valid: Vec<String> = Vec::new();
+        for c in &self.rejections {
+            if !valid.contains(&c.signer)
+                && signing::verify(&c.signer, &message, &c.signature).is_ok()
+            {
+                valid.push(c.signer.clone());
+            }
+        }
+        valid
+    }
+
     fn sign(payload: StatePayload, signer: &Signer) -> Result<Self, MusterError> {
         let mut state = Self {
             payload,
             signature: String::new(),
             cosignatures: Vec::new(),
+            rejections: Vec::new(),
         };
         state.signature = signer.sign(&state.signed_message()?);
         Ok(state)
@@ -767,6 +812,19 @@ fn seal_inner(
 // Transitions: the chain from the pin to the current state
 // ---------------------------------------------------------------------------
 
+/// What walking the transitions from the pin to the current state found.
+struct Chain {
+    /// How the current state itself fared.
+    outcome: Transition,
+    /// The newest accepted intermediate state (strictly between the pin and
+    /// the current state) with its manifest, `None` when the current state
+    /// directly follows the pin. The pin advances to it while the current
+    /// state is pending.
+    accepted: Option<(FleetState, Manifest)>,
+    /// The last accepted state the current state is judged against.
+    prior: Prior,
+}
+
 /// Verifies every transition from the pin to `state`. The next epoch is
 /// checked directly; a larger jump walks the git history of the state file so
 /// that each intermediate state is itself signed by someone the one before it
@@ -776,9 +834,13 @@ fn verify_chain(
     pin: &TrustAnchor,
     state: &FleetState,
     manifest: &Manifest,
-) -> Result<Transition, MusterError> {
+) -> Result<Chain, MusterError> {
     if state.payload.epoch == pin.epoch + 1 {
-        return check_transition(&pin.as_prior(), state, manifest);
+        return Ok(Chain {
+            outcome: check_transition(&pin.as_prior(), state, manifest)?,
+            accepted: None,
+            prior: pin.as_prior(),
+        });
     }
     let jump = |why: String| {
         MusterError::Security(format!(
@@ -795,6 +857,8 @@ fn verify_chain(
     let by_epoch = history_chain(config_dir, pin.epoch + 1, state, manifest)?;
     let mut prior = pin.as_prior();
     let mut outcome = Transition::Accepted;
+    let mut accepted: Option<(FleetState, Manifest)> = None;
+    let mut accepted_prior = pin.as_prior();
     for epoch in pin.epoch + 1..=state.payload.epoch {
         let Some((step, step_manifest)) = by_epoch.get(&epoch) else {
             return Err(jump(format!(
@@ -833,8 +897,16 @@ fn verify_chain(
             )));
         }
         prior = Prior::from_state(step, step_manifest)?;
+        if epoch != state.payload.epoch {
+            accepted = Some((step.clone(), step_manifest.clone()));
+            accepted_prior = Prior::from_state(step, step_manifest)?;
+        }
     }
-    Ok(outcome)
+    Ok(Chain {
+        outcome,
+        accepted,
+        prior: accepted_prior,
+    })
 }
 
 /// The chain of signed states ending at `head`, oldest epoch `min`, each with
@@ -1361,6 +1433,104 @@ pub fn pending_quorum(
     })
 }
 
+/// A governance change this machine has not accepted, with the state it
+/// would replace.
+pub struct PendingProposal {
+    /// The current (unaccepted) state, with the signatures it carries.
+    pub head: FleetState,
+    /// Newest accepted state, recomputed from the history (never the possibly
+    /// stale local pin): payload hash and epoch.
+    pub accepted_hash: String,
+    pub accepted_epoch: u64,
+    prior: Prior,
+}
+
+impl PendingProposal {
+    /// Whether `key` may take part in deciding the fate of the proposal: an
+    /// admin of the accepted state.
+    pub fn is_admin(&self, key: &str) -> bool {
+        self.prior.admins.contains(&key.to_string())
+    }
+
+    /// `(received, required)` reject votes: distinct admins of the accepted
+    /// state whose rejection signature verifies, so one compromised admin
+    /// never decides alone. The recovery key alone is enough (break-glass).
+    pub fn reject_tally(&self, state: &FleetState) -> (usize, usize) {
+        let Some(old) = self.prior.snapshot.as_ref() else {
+            return (1, 1);
+        };
+        let team_mode = old["members"].as_object().is_some_and(|m| !m.is_empty());
+        let required = if team_mode {
+            old["required_approvals"].as_u64().unwrap_or(1).max(1) as usize
+        } else {
+            1
+        };
+        let recovery = old["recovery"]["signing_key"].as_str();
+        let mut voters: Vec<String> = Vec::new();
+        for key in state.valid_rejecters() {
+            if recovery == Some(key.as_str()) {
+                return (required, required);
+            }
+            if !self.prior.admins.contains(&key) {
+                continue;
+            }
+            let v = voter(old, &key);
+            if !voters.contains(&v) {
+                voters.push(v);
+            }
+        }
+        (voters.len(), required)
+    }
+}
+
+/// The unaccepted proposal at the head of the repo, found by walking the
+/// accepted transitions forward from the local pin. Errors with `Usage` when
+/// the head is accepted (or already pinned) and with `Security` when the
+/// history does not chain.
+pub fn pending_proposal(
+    config_dir: &Path,
+    state_dir: &Path,
+    manifest: &Manifest,
+) -> Result<PendingProposal, MusterError> {
+    let nothing = || {
+        MusterError::Usage(
+            "no pending proposal to reject; the repo state is already accepted".into(),
+        )
+    };
+    let pin = TrustAnchor::load(state_dir)?.ok_or_else(|| {
+        MusterError::Security("no local trust pin; cannot determine which state is accepted".into())
+    })?;
+    let head = FleetState::load(config_dir)?
+        .ok_or_else(|| MusterError::Security("the repo has no fleet state".into()))?;
+    head.verify_signature()?;
+    if head.payload.epoch <= pin.epoch {
+        return Err(nothing());
+    }
+    let chain = verify_chain(config_dir, &pin, &head, manifest)?;
+    if chain.outcome == Transition::Accepted {
+        return Err(nothing());
+    }
+    let (accepted_hash, accepted_epoch) = match &chain.accepted {
+        Some((step, _)) => (step.payload_hash()?, step.payload.epoch),
+        None => (pin.payload_hash.clone(), pin.epoch),
+    };
+    // Never drop an accepted epoch: the proposal must directly follow the
+    // newest accepted state.
+    if head.payload.prev.as_deref() != Some(accepted_hash.as_str())
+        || head.payload.epoch != accepted_epoch + 1
+    {
+        return Err(MusterError::Security(
+            "the pending proposal does not directly follow the newest accepted state".into(),
+        ));
+    }
+    Ok(PendingProposal {
+        head,
+        accepted_hash,
+        accepted_epoch,
+        prior: chain.prior,
+    })
+}
+
 /// Groups whose ciphertext or sidecar differs between two vault baselines.
 pub fn changed_groups(
     old_vault: &BTreeMap<String, String>,
@@ -1803,8 +1973,9 @@ pub fn verify_with(
     let signer = state.payload.signer.clone();
     let hash = state.payload_hash()?;
     let mut outcome = Transition::Accepted;
-    // No pin and the latest governance change is short of its co-signatures:
-    // the newest quorate state in the history, to pin instead of this one.
+    // The latest governance change is short of its co-signatures: the newest
+    // quorate state in the history, to pin instead of this one (a machine
+    // with no pin takes it from genesis, a pinned one from its pin forward).
     let mut bootstrap: Option<(FleetState, Manifest)> = None;
 
     match &anchor {
@@ -1823,7 +1994,9 @@ pub fn verify_with(
                 )));
             }
             if state.payload.epoch > pin.epoch {
-                outcome = verify_chain(config_dir, pin, &state, manifest)?;
+                let chain = verify_chain(config_dir, pin, &state, manifest)?;
+                outcome = chain.outcome;
+                bootstrap = chain.accepted;
             }
         }
         None => {
@@ -1854,8 +2027,8 @@ pub fn verify_with(
     let pending = |outcome: Transition| match outcome {
         Transition::Pending { received, required } => {
             let base = match (&anchor, &bootstrap) {
-                (Some(pin), _) => pin.snapshot.clone(),
-                (None, Some((_, m))) => Some(governance_content(m)),
+                (_, Some((_, m))) => Some(governance_content(m)),
+                (Some(pin), None) => pin.snapshot.clone(),
                 _ => None,
             };
             Some(Verification::Pending {
@@ -1946,9 +2119,13 @@ pub fn verify_with(
     // Pending: content was checked above, but the pin stays where it is (a
     // machine with no pin gets the last quorate state, never the pending one).
     if let Some(held) = pending(outcome) {
-        if let (true, None, Some((step, step_manifest))) = (options.persist, &anchor, &bootstrap) {
+        if let (true, Some((step, step_manifest))) = (options.persist, &bootstrap) {
             let confirmed = expect_signer.is_some_and(|e| signing::signer_matches(e, &signer));
-            TrustAnchor::for_state(step, step_manifest, !confirmed)?.save(state_dir)?;
+            let tofu = match &anchor {
+                Some(pin) => pin.tofu && !confirmed,
+                None => !confirmed,
+            };
+            TrustAnchor::for_state(step, step_manifest, tofu)?.save(state_dir)?;
         }
         return Ok(held);
     }
@@ -2067,6 +2244,7 @@ mod tests {
             },
             signature: String::new(),
             cosignatures: Vec::new(),
+            rejections: Vec::new(),
         };
         assert_eq!(
             String::from_utf8(state.payload_bytes().unwrap()).unwrap(),
@@ -2080,6 +2258,7 @@ mod tests {
             },
             signature: String::new(),
             cosignatures: Vec::new(),
+            rejections: Vec::new(),
         };
         assert_eq!(
             String::from_utf8(legacy.payload_bytes().unwrap()).unwrap(),
@@ -3313,6 +3492,68 @@ mod tests {
             msg.contains("machine 'node3'") && msg.contains("assigned"),
             "{msg}"
         );
+    }
+
+    fn quorum_fixture_pair() -> (Fixture, Signer, u64) {
+        let (f, k2, _k3) = quorum_fixture();
+        let epoch = TrustAnchor::load(&f.state).unwrap().unwrap().epoch;
+        (f, k2, epoch)
+    }
+
+    /// A quorate change followed by a lone pending proposal: a peer pinned
+    /// before both still takes the quorate one and only holds the pending one.
+    fn accepted_then_pending() -> (Fixture, Signer, u64) {
+        let (mut f, k2, _k3) = quorum_fixture();
+        let start = TrustAnchor::load(&f.state).unwrap().unwrap().epoch;
+        let scratch = tempdir().unwrap();
+        f.manifest.revoked_recipients.push("age1gone".into());
+        f.seal_as(&f.signer, scratch.path(), vec![]);
+        let mut state = FleetState::load(&f.config).unwrap().unwrap();
+        state.add_cosignature(&k2).unwrap();
+        state.save(&f.config).unwrap();
+        f.commit();
+        f.manifest.revoked_recipients.push("age1gone2".into());
+        f.seal_as(&f.signer, scratch.path(), vec![]);
+        (f, k2, start)
+    }
+
+    #[test]
+    fn pin_advances_through_accepted_epochs_while_head_is_pending() {
+        let (f, _k2, start) = accepted_then_pending();
+        match f.verify() {
+            Ok(Verification::Pending { .. }) => {}
+            other => panic!("expected the head to be pending: {other:?}"),
+        }
+        let pin = TrustAnchor::load(&f.state).unwrap().unwrap();
+        assert_eq!(pin.epoch, start + 1, "the accepted epoch is pinned");
+        assert!(
+            pin.snapshot.as_ref().unwrap()["revoked_recipients"]
+                .to_string()
+                .contains("age1gone"),
+            "the quorate revocation is part of the pinned state"
+        );
+        assert!(
+            !pin.snapshot.as_ref().unwrap()["revoked_recipients"]
+                .to_string()
+                .contains("age1gone2"),
+            "the pending proposal is not"
+        );
+    }
+
+    #[test]
+    fn pending_proposal_names_the_newest_accepted_state_not_the_stale_pin() {
+        let (f, _k2, start) = accepted_then_pending();
+        // The pin is still where the peer left it: it has not verified yet.
+        assert_eq!(TrustAnchor::load(&f.state).unwrap().unwrap().epoch, start);
+        let proposal = pending_proposal(&f.config, &f.state, &f.manifest).unwrap();
+        assert_eq!(proposal.accepted_epoch, start + 1);
+        assert_eq!(proposal.head.payload.epoch, start + 2);
+    }
+
+    #[test]
+    fn pending_proposal_refuses_when_nothing_is_pending() {
+        let (f, _k2, _start) = quorum_fixture_pair();
+        assert!(pending_proposal(&f.config, &f.state, &f.manifest).is_err());
     }
 
     mod forged_ciphertext_property {
