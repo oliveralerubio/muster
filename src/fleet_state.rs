@@ -769,7 +769,7 @@ fn verify_chain(
             state.payload.epoch
         )));
     }
-    let by_epoch = history_states(config_dir, pin.epoch + 1, state.payload.epoch)?;
+    let by_epoch = history_chain(config_dir, pin.epoch + 1, state, manifest)?;
     let mut prior = pin.as_prior();
     let mut outcome = Transition::Accepted;
     for epoch in pin.epoch + 1..=state.payload.epoch {
@@ -814,21 +814,25 @@ fn verify_chain(
     Ok(outcome)
 }
 
-/// Every signed state recorded in git history with an epoch in `min..=max`,
-/// with the `muster.toml` committed alongside it.
+/// The chain of signed states ending at `head`, oldest epoch `min`, each with
+/// the `muster.toml` committed alongside it. Epochs below `min` and gaps end
+/// the chain (the caller reports the missing epoch).
 ///
-/// A pair is only usable when the state's signature verifies and the manifest
-/// recomputes the governance digest the state signed: anything else (a
-/// manifest swapped in a later commit beside a re-serialized state, say) is
-/// skipped, so no admin or signer set is ever derived from an unauthenticated
-/// manifest. For one payload the version with the most valid co-signatures
-/// wins; a different payload at an epoch is a fork and the first one wins.
-fn history_states(
+/// The chain is followed through `prev` links starting from `head`, never by
+/// commit order: for each epoch only the state whose payload hash `prev` names
+/// is taken, so a junk or forked state committed earlier at the same epoch
+/// cannot displace the real one. A candidate is usable only when its signature
+/// verifies and the manifest recomputes the governance digest it signed, so no
+/// admin or signer set is ever derived from an unauthenticated manifest.
+/// Versions of one payload are merged: every co-signature that verifies is
+/// kept (only co-signers the predecessor authorized ever count).
+fn history_chain(
     config_dir: &Path,
     min: u64,
-    max: u64,
+    head: &FleetState,
+    head_manifest: &Manifest,
 ) -> Result<BTreeMap<u64, (FleetState, Manifest)>, MusterError> {
-    let mut by_epoch: BTreeMap<u64, (FleetState, Manifest)> = BTreeMap::new();
+    let mut candidates: BTreeMap<String, (FleetState, Manifest)> = BTreeMap::new();
     for commit in crate::git::commits_touching_oldest_first(config_dir, STATE_FILE)? {
         let Some(text) = crate::git::file_at(config_dir, &commit, STATE_FILE) else {
             continue;
@@ -837,7 +841,18 @@ fn history_states(
             continue;
         };
         let epoch = past.payload.epoch;
-        if epoch < min || epoch > max || past.verify_signature().is_err() {
+        if epoch < min || epoch >= head.payload.epoch || past.verify_signature().is_err() {
+            continue;
+        }
+        let Ok(hash) = past.payload_hash() else {
+            continue;
+        };
+        if let Some((seen, _)) = candidates.get_mut(&hash) {
+            for c in past.cosignatures {
+                if !seen.cosignatures.iter().any(|x| x.signer == c.signer) {
+                    seen.cosignatures.push(c);
+                }
+            }
             continue;
         }
         let Some(manifest_text) =
@@ -851,75 +866,90 @@ fn history_states(
         if governance_digest(&past_manifest).ok().as_deref() != Some(&past.payload.governance) {
             continue;
         }
-        if let Some((seen, _)) = by_epoch.get(&epoch) {
-            let same = seen.payload_hash().ok() == past.payload_hash().ok();
-            if !same || seen.valid_cosigners().len() > past.valid_cosigners().len() {
-                continue;
-            }
-        }
-        by_epoch.insert(epoch, (past, past_manifest));
+        candidates.insert(hash, (past, past_manifest));
     }
-    Ok(by_epoch)
+    let mut chain = BTreeMap::new();
+    chain.insert(head.payload.epoch, (head.clone(), head_manifest.clone()));
+    let mut want = head.payload.prev.clone();
+    for epoch in (min..head.payload.epoch).rev() {
+        let Some((prev, prev_manifest)) = want.as_ref().and_then(|h| candidates.get(h)) else {
+            break;
+        };
+        if prev.payload.epoch != epoch {
+            break;
+        }
+        want = prev.payload.prev.clone();
+        chain.insert(epoch, (prev.clone(), prev_manifest.clone()));
+    }
+    Ok(chain)
 }
 
-/// A machine with no pin must not adopt a governance change that lacks its
-/// admin co-signatures. Evaluates `state` against its predecessor in git
-/// history; when it is short of quorum, walks back to the newest state whose
-/// own transition was quorate (the one to pin). `None` means `state` itself is
-/// quorate (or is the genesis state).
+/// A machine with no pin must not adopt authority from a history that was
+/// never accepted. The history is evaluated as one forward sequence of
+/// transitions from genesis (epoch 1, `prev` empty, signed by a key its own
+/// governance authorizes): a state supplies authority only when its own
+/// transition was accepted (quorate), so a pending intermediate state ends
+/// the accepted prefix even if a later transition would pass in isolation.
+/// Returns `None` when `state` itself is the end of an accepted chain;
+/// otherwise the first non-accepted outcome with the newest accepted state
+/// (the one to pin).
 fn bootstrap_hold(
     config_dir: &Path,
     state: &FleetState,
     manifest: &Manifest,
 ) -> Result<Option<(Transition, FleetState, Manifest)>, MusterError> {
     let epoch = state.payload.epoch;
-    if epoch <= 1 {
-        return Ok(None);
-    }
     let refuse = |why: String| {
         MusterError::Security(format!(
             "cannot pin this fleet: {why}; ask an admin to confirm the state out of band"
         ))
     };
+    if epoch <= 1 {
+        if state.payload.prev.is_some() {
+            return Err(refuse("its first state names a predecessor".into()));
+        }
+        return Ok(None);
+    }
     if !crate::git::is_repo(config_dir) {
         return Err(refuse(format!(
             "its state is at epoch {epoch} but there is no git history to check the admin signatures \
-             of its last change"
+             of its changes"
         )));
     }
-    let history = history_states(config_dir, 1, epoch)?;
-    let transition_of = |e: u64| -> Result<Transition, MusterError> {
-        let (pred, pred_manifest) = history.get(&(e - 1)).ok_or_else(|| {
-            refuse(format!(
-                "epoch {} is missing from the repository history",
-                e - 1
-            ))
-        })?;
-        let prior = Prior::from_state(pred, pred_manifest)?;
-        let (step, step_manifest) = if e == epoch {
-            (state, manifest)
-        } else {
-            let (s, m) = history.get(&e).ok_or_else(|| {
-                refuse(format!("epoch {e} is missing from the repository history"))
-            })?;
-            (s, m)
-        };
-        check_transition(&prior, step, step_manifest)
-    };
-    let head = transition_of(epoch)?;
-    if head == Transition::Accepted {
-        return Ok(None);
-    }
-    for e in (1..epoch).rev() {
-        let (step, step_manifest) = history
-            .get(&e)
-            .ok_or_else(|| refuse(format!("epoch {e} is missing from the repository history")))?;
-        step.verify_signature()?;
-        if e == 1 || transition_of(e)? == Transition::Accepted {
-            return Ok(Some((head, step.clone(), step_manifest.clone())));
+    let chain = history_chain(config_dir, 1, state, manifest)?;
+    for e in 1..=epoch {
+        if !chain.contains_key(&e) {
+            return Err(refuse(format!(
+                "epoch {e} is missing from the repository history (or does not chain to the \
+                 current state)"
+            )));
         }
     }
-    Err(refuse("no quorate state found in its history".into()))
+    let (genesis, genesis_manifest) = &chain[&1];
+    if genesis.payload.prev.is_some() {
+        return Err(refuse("its first state names a predecessor".into()));
+    }
+    let (admins, writers) = signer_sets(genesis_manifest);
+    if !admins.contains(&genesis.payload.signer) && !writers.contains(&genesis.payload.signer) {
+        return Err(refuse(
+            "its first state is signed by a key its own governance does not authorize".into(),
+        ));
+    }
+    let mut prior = Prior::from_state(genesis, genesis_manifest)?;
+    let mut accepted = (genesis.clone(), genesis_manifest.clone());
+    for e in 2..=epoch {
+        let (step, step_manifest) = &chain[&e];
+        let outcome = check_transition(&prior, step, step_manifest).map_err(|err| match err {
+            MusterError::Security(m) if e < epoch => refuse(format!("epoch {e}: {m}")),
+            other => other,
+        })?;
+        if outcome != Transition::Accepted {
+            return Ok(Some((outcome, accepted.0, accepted.1)));
+        }
+        prior = Prior::from_state(step, step_manifest)?;
+        accepted = (step.clone(), step_manifest.clone());
+    }
+    Ok(None)
 }
 
 /// One transition `prior` -> `state`: signer authorization (admin for
@@ -2602,7 +2632,6 @@ mod tests {
         request
             .sign_approval("bob", "node2", &k2, at.as_deref())
             .unwrap();
-        let _ = k3;
         let signed = request
             .approvals
             .iter()
@@ -2962,5 +2991,143 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// k=2 fleet whose compromised admin alice signs, alone, a threshold-lowering
+    /// epoch 3 (never co-signed) and then a linked epoch 4 that passes under the
+    /// lowered threshold in isolation.
+    fn lowered_threshold_history() -> Fixture {
+        use crate::adapters::config::{AiProvider, AiProviderKind};
+        let (mut f, _k2, _k3) = quorum_fixture();
+        f.manifest.team = Some(TeamConfig {
+            required_approvals: 1,
+        });
+        f.seal_as(&f.signer, tempdir().unwrap().path(), vec![]);
+        f.manifest.ai_providers.insert(
+            "gw".into(),
+            AiProvider {
+                kind: AiProviderKind::Anthropic,
+                base_url: Some("https://evil.example".into()),
+                default_model: None,
+                key: Some("native://app/key".into()),
+                api_key_helper: None,
+            },
+        );
+        f.seal_as(&f.signer, tempdir().unwrap().path(), vec![]);
+        f
+    }
+
+    #[test]
+    fn fresh_machine_never_pins_past_a_pending_intermediate_state() {
+        for expected in [false, true] {
+            let f = lowered_threshold_history();
+            let fresh = tempdir().unwrap();
+            let fp = signing::fingerprint(&f.signer.public());
+            let result = verify(
+                &f.config,
+                fresh.path(),
+                &f.manifest,
+                expected.then_some(fp.as_str()),
+            )
+            .unwrap();
+            assert!(
+                matches!(result, Verification::Pending { required: 2, .. }),
+                "expected={expected}: {result:?}"
+            );
+            let pin = TrustAnchor::load(fresh.path()).unwrap().unwrap();
+            assert_eq!(pin.epoch, 2, "only the accepted prefix is pinned");
+        }
+    }
+
+    #[test]
+    fn bootstrap_refuses_a_history_with_no_genesis() {
+        let f = lowered_threshold_history();
+        // Cut the history so epochs 1..2 are no longer reachable.
+        let state = FleetState::load(&f.config).unwrap().unwrap();
+        let fresh = tempdir().unwrap();
+        git_in(&f.config, &["checkout", "-q", "--orphan", "squashed"]);
+        git_in(&f.config, &["add", "-A"]);
+        git_in(&f.config, &["commit", "-q", "-m", "squash"]);
+        assert_eq!(state.payload.epoch, 4);
+        let err = verify(&f.config, fresh.path(), &f.manifest, None).unwrap_err();
+        assert!(message(err).contains("missing from the repository history"));
+    }
+
+    #[test]
+    fn a_junk_fork_committed_first_cannot_block_the_real_chain() {
+        let (mut f, k2, _k3) = quorum_fixture();
+        // The real epoch 3 (alice, co-signed by bob), committed AFTER a junk
+        // self-signed state at the same epoch.
+        let (_d, junk) = new_signer();
+        let junk_payload = StatePayload {
+            epoch: 3,
+            prev: Some("0".repeat(64)),
+            ..FleetState::load(&f.config).unwrap().unwrap().payload
+        };
+        let junk_payload = StatePayload {
+            signer: junk.public(),
+            ..junk_payload
+        };
+        let junk_state = FleetState::sign(junk_payload, &junk).unwrap();
+        let real = FleetState::load(&f.config).unwrap().unwrap();
+        junk_state.save(&f.config).unwrap();
+        f.commit();
+        real.save(&f.config).unwrap();
+        f.commit();
+        f.manifest.profiles.clear();
+        fs::write(f.config.join("vault/ops.age"), b"alice rewrites ops").unwrap();
+        f.seal_as(&f.signer, tempdir().unwrap().path(), vec![]);
+        // A machine two epochs behind (pin 2, state 4) walks the history.
+        fs::write(f.config.join("vault/ops.age"), b"alice rewrites ops again").unwrap();
+        f.seal_as(&f.signer, tempdir().unwrap().path(), vec![]);
+        f.verify().unwrap();
+        let _ = k2;
+        // And so does a fresh machine.
+        let fresh = tempdir().unwrap();
+        verify(&f.config, fresh.path(), &f.manifest, None).unwrap();
+    }
+
+    #[test]
+    fn unauthorized_padding_cosignatures_do_not_beat_the_quorate_version() {
+        let (f, k2, _k3) = quorum_fixture();
+        // Epoch 3: alice changes governance; bob co-signs. The quorate version
+        // is committed, then a later commit re-serializes it padded with
+        // unrelated valid keys but without bob.
+        let mut f = f;
+        f.manifest.team = Some(TeamConfig {
+            required_approvals: 2,
+        });
+        f.manifest.revoked_recipients.push("age1gone".into());
+        f.manifest.save(&f.config).unwrap();
+        let mut state = seal_with(&f.config, &f.state, &f.manifest, &f.signer, false, vec![])
+            .unwrap()
+            .unwrap();
+        state.add_cosignature(&k2).unwrap();
+        state.save(&f.config).unwrap();
+        f.commit();
+        let quorate = state.clone();
+        let mut padded = FleetState {
+            cosignatures: Vec::new(),
+            ..quorate
+        };
+        for _ in 0..3 {
+            let (_d, extra) = new_signer();
+            padded.add_cosignature(&extra).unwrap();
+        }
+        padded.save(&f.config).unwrap();
+        f.commit();
+        // Epoch 4 on top (vault-only, alice reads ops).
+        quorate_restore(&f, &state);
+        fs::write(f.config.join("vault/ops.age"), b"alice updates ops").unwrap();
+        f.seal_as(&f.signer, tempdir().unwrap().path(), vec![]);
+        f.verify().unwrap();
+        let fresh = tempdir().unwrap();
+        verify(&f.config, fresh.path(), &f.manifest, None).unwrap();
+    }
+
+    /// Sets the working-tree state file back to `state` and commits it.
+    fn quorate_restore(f: &Fixture, state: &FleetState) {
+        state.save(&f.config).unwrap();
+        f.commit();
     }
 }
