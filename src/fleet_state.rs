@@ -3709,6 +3709,46 @@ mod tests {
     }
 
     #[test]
+    fn reject_needs_k_admins_or_the_recovery_key() {
+        let (mut f, k2, _k3) = quorum_fixture();
+        let recovery = crate::identity::Identity::generate();
+        let recovery_signer = Signer::from_recovery(&recovery).unwrap();
+        f.manifest.recovery = Some(crate::manifest::Recovery {
+            recipient: recovery.recipient(),
+            signing_key: Some(recovery_signer.public()),
+        });
+        f.seal_adopted(vec![]);
+        // A lone proposal by alice.
+        f.manifest.revoked_recipients.push("age1gone".into());
+        f.seal_as(&f.signer, tempdir().unwrap().path(), vec![]);
+        let proposal = pending_proposal(&f.config, &f.state, &f.manifest).unwrap();
+        let mut head = proposal.head.clone();
+        let outsider = new_signer().1;
+
+        // An outsider's rejection and a lone admin's rejection are not enough.
+        head.add_rejection(&outsider).unwrap();
+        assert_eq!(proposal.reject_tally(&head), (0, 2));
+        head.add_rejection(&k2).unwrap();
+        head.add_rejection(&k2).unwrap();
+        assert_eq!(proposal.reject_tally(&head), (1, 2));
+        // A placeholder naming an admin counts for nothing.
+        head.rejections.push(Cosignature {
+            signer: f.signer.public(),
+            signature: "00".repeat(64),
+        });
+        assert_eq!(proposal.reject_tally(&head), (1, 2));
+        // The second distinct admin completes it.
+        head.add_rejection(&f.signer).unwrap();
+        assert_eq!(proposal.reject_tally(&head), (2, 2));
+        assert!(proposal.is_admin(&k2.public()) && !proposal.is_admin(&outsider.public()));
+
+        // The recovery key alone is enough.
+        let mut head = proposal.head.clone();
+        head.add_rejection(&recovery_signer).unwrap();
+        assert_eq!(proposal.reject_tally(&head), (2, 2));
+    }
+
+    #[test]
     fn pending_proposal_refuses_when_nothing_is_pending() {
         let (f, _k2, _start) = quorum_fixture_pair();
         assert!(pending_proposal(&f.config, &f.state, &f.manifest).is_err());
