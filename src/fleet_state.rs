@@ -587,6 +587,14 @@ pub fn verify_with(
     let expect_signer = options.expect_signer;
     let anchor = TrustAnchor::load(state_dir)?;
     let Some(state) = FleetState::load(config_dir)? else {
+        if let Some(expected) = expect_signer {
+            if anchor.is_none() {
+                return Err(MusterError::Security(format!(
+                    "expected signed fleet state from {expected}, but the remote repository is \
+                     unsigned"
+                )));
+            }
+        }
         return if anchor.is_some() {
             Err(MusterError::Security(
                 "fleet.state.json is missing from the config repo but this machine has accepted \
@@ -648,7 +656,7 @@ pub fn verify_with(
         }
         None => {
             if let Some(expected) = expect_signer {
-                if expected != signer && expected != signing::fingerprint(&signer) {
+                if !signing::signer_matches(expected, &signer) {
                     return Err(MusterError::Security(format!(
                         "fleet state is signed by {} but {expected} was expected",
                         signing::fingerprint(&signer)
@@ -741,8 +749,7 @@ pub fn verify_with(
     if options.persist {
         // A first-use pin stays unconfirmed until a run names the signer with
         // `--expect-signer`; a pin that was already confirmed stays so.
-        let confirmed =
-            expect_signer.is_some_and(|e| e == signer || e == signing::fingerprint(&signer));
+        let confirmed = expect_signer.is_some_and(|e| signing::signer_matches(e, &signer));
         let tofu = match &anchor {
             Some(pin) => pin.tofu && !confirmed,
             None => !confirmed,

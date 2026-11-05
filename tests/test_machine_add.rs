@@ -134,7 +134,7 @@ fn adds_a_remote_machine_end_to_end_with_muster_already_installed() {
     assert!(result["applied"].is_boolean());
     assert!(!fleet.calls().contains("scp "), "{}", fleet.calls());
     // The new host must be told which signer to trust (no blind TOFU).
-    let fingerprint = ok(&fleet.alice, &["trust", "show"])["fleet_state"]["signer_fingerprint"]
+    let fingerprint = ok(&fleet.alice, &["trust", "show"])["fleet_state"]["signer"]
         .as_str()
         .unwrap()
         .to_string();

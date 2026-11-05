@@ -38,7 +38,7 @@ pub struct Context {
     /// Break-glass signing key derived from the recovery key, set when the
     /// command received the recovery key (see `team::recovery_identity`).
     pub recovery_signer: Option<Signer>,
-    /// `--expect-signer`: fingerprint (or public key) the fleet state's first
+    /// `--expect-signer`: full 256-bit fingerprint or full public key the fleet state's first
     /// signer must have when this machine pins it for the first time.
     pub expect_signer: Option<String>,
     diagnostics: Vec<Diagnostic>,

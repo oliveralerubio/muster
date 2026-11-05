@@ -344,12 +344,11 @@ fn add(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
             Some(state) => state.payload.signer,
             None => crate::signing::Signer::load_or_create(&ctx.state_dir)?.public(),
         };
-        let fingerprint = crate::signing::fingerprint(&signer);
         remote.muster_ok(
             "joining the config repo",
             &format!(
                 "{bin} --format json sync --expect-signer {} --remote {} --pull",
-                shell_quote(&fingerprint),
+                shell_quote(&signer),
                 shell_quote(&url)
             ),
             &format!("{host} needs its own git access to {url} (deploy key, ssh agent or credential helper); Muster does not copy credentials"),

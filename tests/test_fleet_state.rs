@@ -361,6 +361,115 @@ fn new_machine_pins_the_signer_and_expect_signer_is_strict() {
 }
 
 #[test]
+fn sync_expect_signer_refuses_unsigned_remote_repo() {
+    let (_guard, remote) = bare_remote();
+    let remote_str = remote.to_str().unwrap();
+
+    // Push a commit with muster.toml but NO fleet.state.json (unsigned legacy repo).
+    let pusher = TempDir::new().unwrap();
+    let dir = pusher.path();
+    git(dir, &["init"]);
+    git(dir, &["remote", "add", "origin", remote_str]);
+    std::fs::write(
+        dir.join("muster.toml"),
+        "version = 1
+[machines.node1]
+recipient = 'age1abc'
+platform = 'linux-x86_64'
+muster_version = '0.1.0'
+",
+    )
+    .unwrap();
+    git(dir, &["add", "muster.toml"]);
+    git(dir, &["commit", "-m", "legacy unsigned commit"]);
+    git(dir, &["push", "origin", "HEAD"]);
+
+    // Client syncs with --expect-signer: must refuse with code 5
+    let client = MusterEnv::new();
+    let (code, raw) = fail(
+        &client,
+        &[
+            "sync",
+            "--remote",
+            remote_str,
+            "--pull",
+            "--expect-signer",
+            "musterpk10000000000000000000000000000000000000000000000000000000000000000",
+        ],
+    );
+    assert_eq!(code, 5, "{raw}");
+    let msg = raw["diagnostics"][0]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("expected signed fleet state") && msg.contains("unsigned"),
+        "{msg}"
+    );
+    assert!(!state_dir(&client).join("trust.json").exists());
+}
+
+#[test]
+fn expect_signer_accepts_full_key_or_256bit_fingerprint_and_rejects_prefixes() {
+    let (_guard, remote) = bare_remote();
+    let remote = remote.to_str().unwrap();
+    let alice = MusterEnv::new();
+    ok(&alice, &["init", "--yes"]);
+    ok(&alice, &["sync", "--remote", remote]);
+    let show = ok(&alice, &["trust", "show"])["result"]["fleet_state"].clone();
+    let public_key = show["signer"].as_str().unwrap().to_string();
+    let fingerprint = show["signer_fingerprint"].as_str().unwrap().to_string();
+
+    // 1. Short public key prefix rejected
+    let bob = MusterEnv::new();
+    let (code, raw) = fail(
+        &bob,
+        &[
+            "sync",
+            "--remote",
+            remote,
+            "--pull",
+            "--expect-signer",
+            &public_key[..20],
+        ],
+    );
+    assert_eq!(code, 5, "{raw}");
+
+    // 2. Short 64-bit fingerprint prefix rejected
+    let (code, raw) = fail(
+        &bob,
+        &[
+            "sync",
+            "--remote",
+            remote,
+            "--pull",
+            "--expect-signer",
+            &fingerprint[..23],
+        ],
+    );
+    assert_eq!(code, 5, "{raw}");
+
+    // 3. Full public key accepted
+    let carol = MusterEnv::new();
+    let joined = ok(
+        &carol,
+        &[
+            "sync",
+            "--remote",
+            remote,
+            "--pull",
+            "--expect-signer",
+            &public_key,
+        ],
+    );
+    assert!(state_dir(&carol).join("trust.json").exists());
+    let codes: Vec<&str> = joined["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["code"].as_str().unwrap())
+        .collect();
+    assert!(codes.contains(&"fleet_signer_pinned"), "{codes:?}");
+}
+
+#[test]
 fn crafted_ciphertext_is_refused_on_get_and_on_sync() {
     let (_guard, remote) = bare_remote();
     let remote = remote.to_str().unwrap();

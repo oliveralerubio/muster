@@ -18,7 +18,7 @@ pub const SPEC: CommandSpec = CommandSpec {
     params: &[
         ParamSpec {
             name: "expect-signer",
-            about: "Fingerprint (SHA256:...) the fleet signer must have when this machine pins the fleet for the first time",
+            about: "Full public key (musterpk1...) or full 256-bit fingerprint (SHA256:<64 hex>) the fleet signer must have when this machine pins the fleet for the first time",
             kind: ParamKind::String,
             required: false,
             positional: false,

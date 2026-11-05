@@ -129,10 +129,19 @@ pub fn verify(public: &str, message: &[u8], signature: &str) -> Result<(), Muste
         .map_err(|_| bad())
 }
 
-/// Short human-checkable fingerprint of a public key: `SHA256:` + 16 hex chars.
+/// Full 256-bit fingerprint of a public key: `SHA256:` + 64 hex chars. Short
+/// prefixes are deliberately not accepted anywhere (they can be ground by an
+/// attacker); see [`signer_matches`].
 pub fn fingerprint(public: &str) -> String {
     let digest = Sha256::digest(public.as_bytes());
-    format!("SHA256:{}", to_hex(&digest[..8]))
+    format!("SHA256:{}", to_hex(&digest))
+}
+
+/// Whether `expected` (what the operator pinned with `--expect-signer`) names
+/// `public`: the complete `musterpk1...` key or its full 256-bit fingerprint.
+pub fn signer_matches(expected: &str, public: &str) -> bool {
+    let expected = expected.trim();
+    expected == public || expected.eq_ignore_ascii_case(&fingerprint(public))
 }
 
 pub fn to_hex(bytes: &[u8]) -> String {
@@ -229,6 +238,10 @@ mod tests {
         let signer = Signer::load_or_create(dir.path()).unwrap();
         let fp = fingerprint(&signer.public());
         assert!(fp.starts_with("SHA256:"));
-        assert_eq!(fp.len(), 7 + 16);
+        assert_eq!(fp.len(), 7 + 64);
+        assert!(signer_matches(&fp, &signer.public()));
+        assert!(signer_matches(&signer.public(), &signer.public()));
+        assert!(!signer_matches(&fp[..23], &signer.public()));
+        assert!(!signer_matches(&signer.public()[..20], &signer.public()));
     }
 }
