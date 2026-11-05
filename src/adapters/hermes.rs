@@ -47,6 +47,20 @@ pub static ADAPTER: Adapter = Adapter {
         Capability::Skills,
     ],
     files: &[CONFIG, INSTRUCTIONS],
+    provider_kinds: &[],
+    runtime_key_helper: false,
+    login_kind: None,
+    provider_diagnostics: |_, _| Vec::new(),
+    sensitive_values: |_, _| Default::default(),
+    context_roots: super::ContextRoots {
+        base: Base::Home,
+        skills: ".hermes/skills",
+        project_skills: ".hermes/skills",
+        subagents: None,
+        project_subagents: None,
+    },
+    shared_project_instructions: true,
+    render_project: Some(render_project),
     render: Some(render),
 };
 
@@ -110,4 +124,14 @@ fn string_map(map: std::collections::BTreeMap<String, String>) -> Yaml {
             .map(|(k, v)| (yaml::key(&k), yaml::key(&v)))
             .collect(),
     )
+}
+
+fn render_project(desired: &Desired, _: &Current, _: Option<&str>, plan: &mut RenderPlan) {
+    if !desired.mcp.is_empty() || desired.agents.models.contains_key(ADAPTER.id) {
+        plan.diagnostics.push(crate::output::Diagnostic::new(
+            crate::output::Severity::Warning,
+            "unsupported_feature",
+            "Hermes Agent MCP servers and model settings are user-scoped only; skipped for this project",
+        ).with_path(ADAPTER.id));
+    }
 }

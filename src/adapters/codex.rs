@@ -61,6 +61,24 @@ pub static ADAPTER: Adapter = Adapter {
         Capability::Subagents,
     ],
     files: &[CONFIG, INSTRUCTIONS],
+    provider_kinds: &[
+        super::config::AiProviderKind::Openai,
+        super::config::AiProviderKind::OpenaiCompatible,
+        super::config::AiProviderKind::Ollama,
+    ],
+    runtime_key_helper: false,
+    login_kind: Some(super::config::AiProviderKind::Openai),
+    provider_diagnostics: |_, _| Vec::new(),
+    sensitive_values: |_, _| Default::default(),
+    context_roots: super::ContextRoots {
+        base: Base::Home,
+        skills: SKILLS_DIR,
+        project_skills: SKILLS_DIR,
+        subagents: Some(AGENTS_DIR),
+        project_subagents: Some(AGENTS_DIR),
+    },
+    shared_project_instructions: true,
+    render_project: None,
     render: Some(render),
 };
 

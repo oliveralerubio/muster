@@ -66,6 +66,26 @@ pub static ADAPTER: Adapter = Adapter {
         Capability::Subagents,
     ],
     files: &[CONFIG, INSTRUCTIONS],
+    provider_kinds: &[
+        super::config::AiProviderKind::Anthropic,
+        super::config::AiProviderKind::Openai,
+        super::config::AiProviderKind::OpenaiCompatible,
+        super::config::AiProviderKind::Ollama,
+        super::config::AiProviderKind::Google,
+    ],
+    runtime_key_helper: false,
+    login_kind: None,
+    provider_diagnostics,
+    sensitive_values: |_, _| Default::default(),
+    context_roots: super::ContextRoots {
+        base: Base::XdgConfig,
+        skills: SKILLS_DIR,
+        project_skills: PROJECT_SKILLS_DIR,
+        subagents: Some(AGENTS_DIR),
+        project_subagents: Some(PROJECT_AGENTS_DIR),
+    },
+    shared_project_instructions: true,
+    render_project: None,
     render: Some(render),
 };
 
@@ -223,4 +243,27 @@ fn string_map(map: std::collections::BTreeMap<String, String>) -> Value {
             .map(|(k, v)| (k, Value::String(v)))
             .collect(),
     )
+}
+
+fn provider_diagnostics(
+    id: &str,
+    provider: &super::config::AiProvider,
+) -> Vec<crate::output::Diagnostic> {
+    if provider
+        .key
+        .as_deref()
+        .is_some_and(|key| !key.starts_with("env://"))
+    {
+        vec![crate::output::Diagnostic::new(
+            crate::output::Severity::Info,
+            "provider_plaintext_key",
+            format!("OpenCode stores provider `{id}` credentials in plaintext settings"),
+        )
+        .with_path(format!("providers.{id}"))
+        .with_suggestion(
+            "use an env:// reference and export it in OpenCode's environment".to_string(),
+        )]
+    } else {
+        Vec::new()
+    }
 }
