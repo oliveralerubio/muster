@@ -170,6 +170,7 @@ impl Txn {
             message: message.to_string(),
             pin,
         };
+        validate_journal(&journal)?;
         // The commit point: from here a crash is rolled forward on the next run.
         let bytes = serde_json::to_vec_pretty(&journal)
             .map_err(|e| MusterError::Operational(format!("cannot serialize journal: {e}")))?;
@@ -195,6 +196,46 @@ fn injected_failure(written: usize) -> Result<(), MusterError> {
     Ok(())
 }
 
+/// A journal path must be a plain relative path to a tracked file: either one
+/// of [`TRACKED_FILES`] or something below a [`TRACKED_DIRS`] directory. No
+/// absolute paths, `..`, control characters or empty/`.` components, so
+/// `config_dir.join(rel)` can never leave the config dir.
+fn validate_rel_path(rel: &str) -> Result<(), MusterError> {
+    use std::path::Component;
+    let bad = |why: &str| {
+        MusterError::Security(format!(
+            "revocation journal has an unsafe path {rel:?}: {why}"
+        ))
+    };
+    if rel.is_empty() || rel.chars().any(|c| c.is_control() || c == '\\') {
+        return Err(bad("empty, control or backslash characters"));
+    }
+    let mut parts = Vec::new();
+    for component in Path::new(rel).components() {
+        match component {
+            Component::Normal(part) => parts.push(part),
+            _ => return Err(bad("absolute, `.` or `..` components")),
+        }
+    }
+    let allowed = match parts.as_slice() {
+        [file] => TRACKED_FILES.iter().any(|f| file.to_str() == Some(f)),
+        [dir, _rest @ ..] => TRACKED_DIRS.iter().any(|d| dir.to_str() == Some(d)),
+        [] => false,
+    };
+    if !allowed {
+        return Err(bad("not a file the transaction owns"));
+    }
+    Ok(())
+}
+
+fn validate_journal(journal: &Journal) -> Result<(), MusterError> {
+    journal
+        .write
+        .iter()
+        .chain(&journal.delete)
+        .try_for_each(|rel| validate_rel_path(rel))
+}
+
 /// Idempotent: every step can be repeated after a crash.
 fn apply(
     config_dir: &Path,
@@ -202,6 +243,7 @@ fn apply(
     root: &Path,
     journal: &Journal,
 ) -> Result<(), MusterError> {
+    validate_journal(journal)?;
     let shadow = root.join(SHADOW);
     for (i, rel) in journal.write.iter().enumerate() {
         let bytes = fs::read(shadow.join(rel)).map_err(|e| io(&shadow.join(rel), e))?;
@@ -246,4 +288,59 @@ pub fn recover(config_dir: &Path, state_dir: &Path) -> Result<bool, MusterError>
     })?;
     apply(config_dir, state_dir, &root, &journal)?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_unsafe_journal_paths() {
+        for bad in [
+            "../../etc/passwd",
+            "vault/../../x",
+            "/etc/passwd",
+            "vault/a\nb",
+            "",
+            "./muster.toml",
+            "other.txt",
+            "vault",
+        ] {
+            assert!(
+                matches!(validate_rel_path(bad), Err(MusterError::Security(_))),
+                "{bad:?} must be refused"
+            );
+        }
+        for ok in [
+            "muster.toml",
+            "fleet.state.json",
+            "vault/g.age",
+            "enroll/x/y.json",
+        ] {
+            assert!(validate_rel_path(ok).is_ok(), "{ok:?} must be allowed");
+        }
+    }
+
+    #[test]
+    fn forged_journal_is_refused_before_anything_is_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (config, state) = (tmp.path().join("config"), tmp.path().join("state"));
+        fs::create_dir_all(&config).unwrap();
+        let shadow = root(&state).join(SHADOW);
+        fs::create_dir_all(&shadow).unwrap();
+        let pin = serde_json::json!({
+            "epoch": 1, "payload_hash": "", "governance": "", "admins": [], "writers": []
+        });
+        let forged = serde_json::json!({
+            "write": ["muster.toml", "../../escaped"],
+            "delete": [],
+            "message": "x",
+            "pin": pin,
+        });
+        fs::write(shadow.join("muster.toml"), "x").unwrap();
+        fs::write(root(&state).join(JOURNAL), forged.to_string()).unwrap();
+        let err = recover(&config, &state).unwrap_err();
+        assert!(matches!(err, MusterError::Security(_)), "{err:?}");
+        assert!(!config.join("muster.toml").exists());
+    }
 }
