@@ -445,6 +445,11 @@ fn rm(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     for machine in &member.machines {
         if let Some(m) = manifest.machines.remove(machine) {
             revoked_recipients.push(m.recipient);
+            if let Some(key) = m.signing_key {
+                if !manifest.revoked_signing_keys.contains(&key) {
+                    manifest.revoked_signing_keys.push(key);
+                }
+            }
         }
         team::forget_machine(&mut manifest, machine);
     }

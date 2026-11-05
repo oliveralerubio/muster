@@ -102,6 +102,8 @@ pub(super) fn approve_with_identity(
         )));
     }
     let mut req = EnrollmentRequest::load(&ctx.config_dir, name)?;
+    // Approvals are given against, and only count for, the current fleet state.
+    let state_hash = crate::fleet_state::current_hash(&ctx.config_dir)?;
 
     // Authorization: either via caller machine identity or via recovery key.
     let by_recovery = recovery.is_some();
@@ -181,7 +183,7 @@ pub(super) fn approve_with_identity(
     // The recovery key is break-glass and counts as a full approval.
     let quorum = match &actor {
         Some(actor) => {
-            let check = req.check_approvals(&before);
+            let check = req.check_approvals(&before, state_hash.as_deref());
             if check.legacy > 0 {
                 ctx.diag(crate::output::Diagnostic::new(
                     crate::output::Severity::Warning,
@@ -197,7 +199,7 @@ pub(super) fn approve_with_identity(
                     crate::output::Severity::Warning,
                     "invalid_approval_ignored",
                     format!(
-                        "ignoring {} invalid approval(s) (altered request, unknown signer, wrong key, or duplicate)",
+                        "ignoring {} invalid approval(s) (altered request, unknown signer, wrong key, duplicate, or given against an older fleet state)",
                         check.invalid
                     ),
                 ));
@@ -243,9 +245,14 @@ pub(super) fn approve_with_identity(
                      on it as an admin to publish it"
                 )));
             }
-            req.sign_approval(&actor.member, &caller_machine, &signer)?;
+            req.sign_approval(
+                &actor.member,
+                &caller_machine,
+                &signer,
+                state_hash.as_deref(),
+            )?;
 
-            let final_check = req.check_approvals(&before);
+            let final_check = req.check_approvals(&before, state_hash.as_deref());
             req.approvals = final_check
                 .valid
                 .into_iter()

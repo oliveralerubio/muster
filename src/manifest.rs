@@ -31,6 +31,11 @@ pub struct Manifest {
     /// enrollment refuse them, so a stale reader list cannot re-grant access.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub revoked_recipients: Vec<String>,
+    /// Signing keys of machines removed by `muster revoke` or `muster member
+    /// rm`. Signed governance: a machine with one of these keys can never be
+    /// enrolled again, and the list only shrinks with the full admin quorum.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub revoked_signing_keys: Vec<String>,
     /// Offline recovery key: its public recipient is added to every secret group.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery: Option<Recovery>,
@@ -348,6 +353,7 @@ impl Manifest {
         Self {
             version: 1,
             revoked_recipients: Vec::new(),
+            revoked_signing_keys: Vec::new(),
             recovery: None,
             machines: BTreeMap::new(),
             members: BTreeMap::new(),

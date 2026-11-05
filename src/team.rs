@@ -185,7 +185,7 @@ pub fn group_recipients(manifest: &Manifest, group: &str) -> Vec<String> {
         out.push(recovery.recipient.clone());
     }
     let mut seen = BTreeSet::new();
-    out.retain(|r| seen.insert(r.clone()));
+    out.retain(|r| seen.insert(r.clone()) && !manifest.revoked_recipients.contains(r));
     out
 }
 

@@ -379,7 +379,7 @@ pub fn governance_content(manifest: &Manifest) -> Value {
             (name.clone(), overrides)
         })
         .collect();
-    json!({
+    let mut content = json!({
         "machines": machines,
         "members": members,
         "groups": groups,
@@ -395,7 +395,21 @@ pub fn governance_content(manifest: &Manifest) -> Value {
             "recipient": r.recipient,
             "signing_key": r.signing_key,
         })),
-    })
+    });
+    // Omitted when empty so governance digests signed before revoked keys
+    // were recorded stay the same.
+    if !manifest.revoked_signing_keys.is_empty() {
+        content["revoked_signing_keys"] = json!(sorted(&manifest.revoked_signing_keys));
+    }
+    content
+}
+
+/// Payload hash of the signed state in `config_dir` (`None` when unsigned):
+/// what an enrollment or member approval is given against.
+pub fn current_hash(config_dir: &Path) -> Result<Option<String>, MusterError> {
+    FleetState::load(config_dir)?
+        .map(|s| s.payload_hash())
+        .transpose()
 }
 
 pub fn governance_digest(manifest: &Manifest) -> Result<String, MusterError> {
@@ -965,7 +979,7 @@ fn check_transition(
         }
     } else if let Some(old) = &prior.snapshot {
         let new = governance_content(manifest);
-        check_quorum(old, &new, state)?;
+        check_quorum(old, &new, state, &prior.hash)?;
         return Ok(transition_outcome(prior, state, &new));
     }
     Ok(Transition::Accepted)
@@ -1032,6 +1046,25 @@ fn quorum_count(prior: &Prior, state: &FleetState) -> Option<(usize, usize)> {
     Some((voters.len(), required))
 }
 
+/// A machine `new` adds (absent from `old`) whose age recipient is in the old
+/// `revoked_recipients` or whose signing key is in the old
+/// `revoked_signing_keys`.
+fn revoked_machine_added(old: &Value, new: &Value) -> Option<String> {
+    let listed = |field: &str, value: &Value| {
+        value.is_string()
+            && old[field]
+                .as_array()
+                .is_some_and(|list| list.iter().any(|x| x == value))
+    };
+    new["machines"].as_object()?.iter().find_map(|(name, m)| {
+        let known = old["machines"].get(name).is_some_and(|o| o == m);
+        (!known
+            && (listed("revoked_recipients", &m["recipient"])
+                || listed("revoked_signing_keys", &m["signing_key"])))
+        .then(|| name.clone())
+    })
+}
+
 /// Whether the diff only enrolls brand-new machines whose own signed
 /// approvals (checked by [`check_quorum`]) already carry the quorum, and
 /// activates members that carry theirs. A machine is brand new when its name,
@@ -1068,6 +1101,9 @@ fn enrollment_only(old: &Value, new: &Value, state: &FleetState) -> bool {
             && (old_machines.values().any(|m| &m[field] == value)
                 || old["recovery"].get(field) == Some(value))
     };
+    if revoked_machine_added(old, new).is_some() {
+        return false;
+    }
     let added: Vec<&String> = new_machines
         .keys()
         .filter(|name| !old_machines.contains_key(*name))
@@ -1232,7 +1268,8 @@ pub fn ensure_reads_groups(
         .machines
         .values()
         .find(|m| m.signing_key.as_deref() == Some(signer))
-        .map(|m| m.recipient.clone());
+        .map(|m| m.recipient.clone())
+        .filter(|r| !manifest.revoked_recipients.contains(r));
     for group in groups {
         let reads = recipient
             .as_ref()
@@ -1321,7 +1358,7 @@ pub fn valid_member_approvals(
     valid
 }
 
-fn valid_enrollment_approvals(old: &Value, evidence: &EnrollmentEvidence) -> usize {
+fn valid_enrollment_approvals(old: &Value, evidence: &EnrollmentEvidence, state: &str) -> usize {
     let request = crate::fleet::EnrollmentRequest {
         name: evidence.name.clone(),
         recipient: evidence.recipient.clone(),
@@ -1336,7 +1373,7 @@ fn valid_enrollment_approvals(old: &Value, evidence: &EnrollmentEvidence) -> usi
         profile: evidence.profile.clone(),
         member: evidence.member.clone(),
     };
-    let Ok(message) = request.approval_message() else {
+    let Ok(message) = request.approval_message(Some(state)) else {
         return 0;
     };
     let mut seen: Vec<&str> = Vec::new();
@@ -1358,15 +1395,30 @@ fn valid_enrollment_approvals(old: &Value, evidence: &EnrollmentEvidence) -> usi
 /// When the team requires several admins (`required_approvals > 1`), every
 /// machine or member a governance change adds must carry that many signed
 /// admin approvals. The recovery key is break-glass and stands alone.
-fn check_quorum(old: &Value, new: &Value, state: &FleetState) -> Result<(), MusterError> {
+fn check_quorum(
+    old: &Value,
+    new: &Value,
+    state: &FleetState,
+    prior_hash: &str,
+) -> Result<(), MusterError> {
     let required = old["required_approvals"].as_u64().unwrap_or(1) as usize;
     let team_mode = old["members"]
         .as_object()
         .is_some_and(|members| !members.is_empty());
-    if required <= 1 || !team_mode {
-        return Ok(());
+    let by_recovery =
+        old["recovery"]["signing_key"].as_str() == Some(state.payload.signer.as_str());
+    if !by_recovery {
+        // A revoked machine or key never comes back through an enrollment,
+        // whatever approvals it carries; un-revoking is a separate governance
+        // change that needs the full quorum.
+        if let Some(name) = revoked_machine_added(old, new) {
+            return Err(MusterError::Security(format!(
+                "governance change re-adds machine '{name}' whose age recipient or signing key \
+                 was revoked; revocation is permanent"
+            )));
+        }
     }
-    if old["recovery"]["signing_key"].as_str() == Some(state.payload.signer.as_str()) {
+    if required <= 1 || !team_mode || by_recovery {
         return Ok(());
     }
     let short = |what: String, found: usize| {
@@ -1402,7 +1454,7 @@ fn check_quorum(old: &Value, new: &Value, state: &FleetState) -> Result<(), Must
                     && e.signing_key.as_deref() == machine["signing_key"].as_str()
             });
             let found = evidence
-                .map(|e| valid_enrollment_approvals(old, e))
+                .map(|e| valid_enrollment_approvals(old, e, prior_hash))
                 .unwrap_or(0);
             if found < required {
                 return Err(short(format!("adds machine '{name}'"), found));
@@ -2275,6 +2327,16 @@ mod tests {
     }
 
     fn evidence(f: &Fixture, k2: &Signer, k3: &Signer, who: &[&str]) -> EnrollmentEvidence {
+        evidence_for(f, k2, k3, who, "alice")
+    }
+
+    fn evidence_for(
+        f: &Fixture,
+        k2: &Signer,
+        k3: &Signer,
+        who: &[&str],
+        member: &str,
+    ) -> EnrollmentEvidence {
         let mut request = EnrollmentRequest {
             name: "node3".into(),
             recipient: "age1node3".into(),
@@ -2287,12 +2349,17 @@ mod tests {
             approvals: vec![],
             role: None,
             profile: None,
-            member: Some("alice".into()),
+            member: Some(member.into()),
         };
+        let at = current_hash(&f.config).unwrap();
         for admin in who {
             match *admin {
-                "alice" => request.sign_approval("alice", "node1", &f.signer).unwrap(),
-                _ => request.sign_approval("bob", "node2", k2).unwrap(),
+                "alice" => request
+                    .sign_approval("alice", "node1", &f.signer, at.as_deref())
+                    .unwrap(),
+                _ => request
+                    .sign_approval("bob", "node2", k2, at.as_deref())
+                    .unwrap(),
             }
         }
         EnrollmentEvidence {
@@ -2342,10 +2409,10 @@ mod tests {
         assert!(message(f.verify().unwrap_err()).contains("quorum"));
 
         // Re-seal (force) the same change carrying two verified approvals.
-        let two = evidence(&f, &k2, &k3, &["alice", "bob"]);
         let scratch2 = tempdir().unwrap();
         // Rebuild from the accepted pin: reset the repo to the accepted epoch.
         git_in(&f.config, &["reset", "-q", "--hard", "HEAD~1"]);
+        let two = evidence(&f, &k2, &k3, &["alice", "bob"]);
         f.manifest
             .machines
             .insert("node3".into(), machine_for(&k3, "age1node3"));
@@ -2500,8 +2567,13 @@ mod tests {
             profile: None,
             member: Some("carol".into()),
         };
-        request.sign_approval("alice", "node1", &f.signer).unwrap();
-        request.sign_approval("bob", "node2", &k2).unwrap();
+        let at = current_hash(&f.config).unwrap();
+        request
+            .sign_approval("alice", "node1", &f.signer, at.as_deref())
+            .unwrap();
+        request
+            .sign_approval("bob", "node2", &k2, at.as_deref())
+            .unwrap();
         let _ = k3;
         let signed = request
             .approvals
@@ -2555,5 +2627,118 @@ mod tests {
         fs::write(f.config.join("vault/ops.age"), b"alice updates ops").unwrap();
         f.seal_as(&f.signer, scratch.path(), vec![]);
         assert!(matches!(f.verify().unwrap(), Verification::Verified { .. }));
+    }
+
+    #[test]
+    fn replayed_evidence_reinstating_a_revoked_machine_is_refused_on_peers() {
+        let (mut f, k2, k3) = quorum_fixture();
+
+        // 1. node3 was legitimately enrolled with 2 admin approvals
+        f.manifest.members.insert(
+            "carol".into(),
+            Member {
+                role: Role::Member,
+                status: MemberStatus::Active,
+                ..Member::default()
+            },
+        );
+        f.seal_as(&f.signer, &f.state, vec![]);
+        f.verify().unwrap();
+        f.manifest
+            .machines
+            .insert("node3".into(), machine_for(&k3, "age1node3"));
+        f.manifest
+            .members
+            .get_mut("carol")
+            .unwrap()
+            .machines
+            .push("node3".into());
+        let ev = evidence_for(&f, &k2, &k3, &["alice", "bob"], "carol");
+        f.seal_as(&f.signer, &f.state, vec![ev.clone()]);
+        f.verify().unwrap();
+
+        // 2. node3 is later revoked with quorum (recorded in revoked_recipients & revoked_signing_keys)
+        f.manifest.machines.remove("node3");
+        f.manifest
+            .members
+            .get_mut("carol")
+            .unwrap()
+            .machines
+            .retain(|m| m != "node3");
+        f.manifest.revoked_recipients.push("age1node3".to_string());
+        f.manifest.revoked_signing_keys.push(k3.public());
+        // Quorum-backed revocation (both admins sign or cosign)
+        f.manifest.save(&f.config).unwrap();
+        let mut state = seal_with(&f.config, &f.state, &f.manifest, &f.signer, false, vec![])
+            .unwrap()
+            .unwrap();
+        state.add_cosignature(&k2).unwrap();
+        state.save(&f.config).unwrap();
+        f.commit();
+        f.verify().unwrap();
+
+        // 3. One compromised admin (alice) attempts to re-add node3 using the old replayed evidence
+        f.manifest
+            .machines
+            .insert("node3".into(), machine_for(&k3, "age1node3"));
+        f.manifest
+            .members
+            .get_mut("carol")
+            .unwrap()
+            .machines
+            .push("node3".into());
+        let scratch3 = tempdir().unwrap();
+        f.seal_as(&f.signer, scratch3.path(), vec![ev]);
+
+        // Verifier must refuse: revocation is permanent at the verifier
+        let err = f.verify().unwrap_err();
+        let msg = message(err);
+        assert!(
+            msg.contains("revoked") && msg.contains("permanent"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn approvals_given_against_another_state_do_not_count() {
+        let (mut f, k2, k3) = quorum_fixture();
+        let scratch = tempdir().unwrap();
+        f.manifest
+            .machines
+            .insert("node3".into(), machine_for(&k3, "age1node3"));
+        // Both admins signed, but against a state that is not the one the new
+        // epoch chains to.
+        let mut ev = evidence(&f, &k2, &k3, &["alice", "bob"]);
+        let mut request = EnrollmentRequest {
+            name: "node3".into(),
+            recipient: "age1node3".into(),
+            signing_key: Some(k3.public()),
+            nonce: "n0nce".into(),
+            platform: "linux".into(),
+            muster_version: "0.1.0".into(),
+            agents: vec![],
+            created_at: "now".into(),
+            approvals: vec![],
+            role: None,
+            profile: None,
+            member: Some("alice".into()),
+        };
+        request
+            .sign_approval("alice", "node1", &f.signer, Some("stale"))
+            .unwrap();
+        request
+            .sign_approval("bob", "node2", &k2, Some("stale"))
+            .unwrap();
+        ev.approvals = request
+            .approvals
+            .iter()
+            .filter_map(|a| match a {
+                crate::fleet::ApprovalEntry::Signed(s) => Some(s.clone()),
+                crate::fleet::ApprovalEntry::Legacy(_) => None,
+            })
+            .collect();
+        f.seal_as(&f.signer, scratch.path(), vec![ev]);
+        let msg = message(f.verify().unwrap_err());
+        assert!(msg.contains("without a quorum of 2"), "{msg}");
     }
 }

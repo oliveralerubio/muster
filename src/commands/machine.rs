@@ -569,10 +569,11 @@ fn list(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
 
     // Pending enrollment requests waiting for approval (or rejection).
     let approvals_required = manifest.required_approvals() as usize;
+    let state_hash = crate::fleet_state::current_hash(&ctx.config_dir)?;
     let pending: Vec<Value> = EnrollmentRequest::pending(&ctx.config_dir)?
         .into_iter()
         .map(|req| {
-            let check = req.check_approvals(&manifest);
+            let check = req.check_approvals(&manifest, state_hash.as_deref());
             json!({
                 "name": req.name,
                 "recipient": req.recipient,

@@ -1464,6 +1464,18 @@ fn quorum_two_admin_a_removing_admin_b_stays_pending_until_cosigned() {
     ok(&carol, &["sync", "--push"]);
 
     // Now Carol's pin HAS advanced and Bob is removed.
-    let carol_pin_after = std::fs::read_to_string(state_dir(&carol).join("trust.json")).unwrap();
-    assert!(!carol_pin_after.contains(&bob_pk));
+    let carol_pin_after: Value = serde_json::from_str(
+        &std::fs::read_to_string(state_dir(&carol).join("trust.json")).unwrap(),
+    )
+    .unwrap();
+    for set in ["admins", "writers"] {
+        assert!(
+            !carol_pin_after[set].to_string().contains(&bob_pk),
+            "{set} still lists bob"
+        );
+    }
+    // The removed admin's signing key is recorded as permanently revoked.
+    assert!(carol_pin_after["snapshot"]["revoked_signing_keys"]
+        .to_string()
+        .contains(&bob_pk));
 }

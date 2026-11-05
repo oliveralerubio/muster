@@ -214,7 +214,11 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     if !manifest.revoked_recipients.contains(&target_recipient) {
         manifest.revoked_recipients.push(target_recipient.clone());
     }
-    manifest.machines.remove(name);
+    if let Some(key) = manifest.machines.remove(name).and_then(|m| m.signing_key) {
+        if !manifest.revoked_signing_keys.contains(&key) {
+            manifest.revoked_signing_keys.push(key);
+        }
+    }
     crate::team::forget_machine(&mut manifest, name);
     manifest.save(&shadow)?;
 

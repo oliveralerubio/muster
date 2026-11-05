@@ -78,9 +78,15 @@ impl EnrollmentRequest {
     /// Canonical bytes an admin signs: every field that decides what the
     /// approval grants, plus the random request nonce. Changing any of them
     /// (for example swapping the recipient) invalidates earlier approvals.
-    pub fn approval_message(&self) -> Result<Vec<u8>, MusterError> {
+    ///
+    /// `state` is the payload hash of the fleet state the approver was looking
+    /// at; the verifier demands the state the new one is chained to, so an
+    /// approval is good for exactly one transition and cannot be replayed
+    /// later (for example to bring a revoked machine back).
+    pub fn approval_message(&self, state: Option<&str>) -> Result<Vec<u8>, MusterError> {
         crate::fleet_state::canonical_bytes(&serde_json::json!({
             "domain": APPROVAL_DOMAIN,
+            "state": state,
             "name": self.name,
             "recipient": self.recipient,
             "signing_key": self.signing_key,
@@ -92,14 +98,16 @@ impl EnrollmentRequest {
         }))
     }
 
-    /// Signs the request as `member`'s `machine` and records it.
+    /// Signs the request as `member`'s `machine` against the fleet state with
+    /// payload hash `state`, and records it.
     pub fn sign_approval(
         &mut self,
         member: &str,
         machine: &str,
         signer: &Signer,
+        state: Option<&str>,
     ) -> Result<(), MusterError> {
-        let signature = signer.sign(&self.approval_message()?);
+        let signature = signer.sign(&self.approval_message(state)?);
         self.approvals.push(ApprovalEntry::Signed(SignedApproval {
             member: member.to_string(),
             machine: machine.to_string(),
@@ -123,10 +131,11 @@ impl EnrollmentRequest {
 
     /// Verifies recorded approvals against the (already verified) governance in
     /// `manifest`: the signer must be a machine of an active admin that
-    /// publishes exactly that signing key, and each admin counts once.
-    pub fn check_approvals(&self, manifest: &Manifest) -> ApprovalCheck {
+    /// publishes exactly that signing key, and each admin counts once. Only
+    /// approvals given against the fleet state `state` count.
+    pub fn check_approvals(&self, manifest: &Manifest, state: Option<&str>) -> ApprovalCheck {
         let mut check = ApprovalCheck::default();
-        let Ok(message) = self.approval_message() else {
+        let Ok(message) = self.approval_message(state) else {
             check.invalid = self.approvals.len();
             return check;
         };
