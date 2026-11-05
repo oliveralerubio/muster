@@ -561,15 +561,36 @@ impl FleetState {
     /// Adds `signer`'s co-signature over this payload (once per key).
     pub fn add_cosignature(&mut self, signer: &Signer) -> Result<(), MusterError> {
         let key = signer.public();
-        if self.cosignatures.iter().any(|c| c.signer == key) {
+        if self.valid_cosigners().contains(&key) {
             return Ok(());
         }
+        // An entry that names this key but does not verify is a placeholder:
+        // it is replaced, never allowed to shadow the genuine signature.
+        self.cosignatures.retain(|c| c.signer != key);
         let signature = signer.sign(&self.cosign_message()?);
         self.cosignatures.push(Cosignature {
             signer: key,
             signature,
         });
         Ok(())
+    }
+
+    /// Drops every co-signature that does not verify over this payload (and
+    /// repeats), so merging by signer can never let junk shadow a valid entry.
+    fn retain_valid_cosignatures(&mut self) {
+        let Ok(message) = self.cosign_message() else {
+            self.cosignatures.clear();
+            return;
+        };
+        let mut seen: Vec<String> = Vec::new();
+        self.cosignatures.retain(|c| {
+            let ok = !seen.contains(&c.signer)
+                && signing::verify(&c.signer, &message, &c.signature).is_ok();
+            if ok {
+                seen.push(c.signer.clone());
+            }
+            ok
+        });
     }
 
     /// Keys whose co-signature verifies over this payload, once each. The
@@ -839,7 +860,7 @@ fn history_chain(
         let Some(text) = crate::git::file_at(config_dir, &commit, STATE_FILE) else {
             continue;
         };
-        let Ok(past) = serde_json::from_str::<FleetState>(&text) else {
+        let Ok(mut past) = serde_json::from_str::<FleetState>(&text) else {
             continue;
         };
         let epoch = past.payload.epoch;
@@ -849,6 +870,8 @@ fn history_chain(
         let Ok(hash) = past.payload_hash() else {
             continue;
         };
+        // Only co-signatures that verify are ever merged by signer.
+        past.retain_valid_cosignatures();
         if let Some((seen, _)) = candidates.get_mut(&hash) {
             for c in past.cosignatures {
                 if !seen.cosignatures.iter().any(|x| x.signer == c.signer) {
@@ -2365,6 +2388,25 @@ mod tests {
         }
     }
 
+    impl Fixture {
+        /// A governance change sealed by alice alone (pending under k=2).
+        fn seal_pending_revocation(&self) -> FleetState {
+            let mut manifest = self.manifest.clone();
+            manifest.revoked_recipients.push("age1gone".into());
+            manifest.save(&self.config).unwrap();
+            seal_with(
+                &self.config,
+                tempdir().unwrap().path(),
+                &manifest,
+                &self.signer,
+                false,
+                vec![],
+            )
+            .unwrap()
+            .unwrap()
+        }
+    }
+
     fn jump_fixture(forger_is_revoked: bool) -> Fixture {
         let mut f = fixture();
         git_in(&f.config, &["init", "-q"]);
@@ -3119,6 +3161,49 @@ mod tests {
             } => {}
             other => panic!("bundled enrollment rewrite accepted with one signature: {other:?}"),
         }
+    }
+
+    /// An unauthorized or junk signature sitting in an older copy of a state
+    /// never hides the genuine co-signature of the same admin.
+    #[test]
+    fn junk_cosignature_in_history_does_not_hide_the_genuine_one() {
+        let (mut f, k2, _k3) = quorum_fixture();
+        let scratch = tempdir().unwrap();
+        f.manifest.revoked_recipients.push("age1gone".into());
+        f.seal_as(&f.signer, scratch.path(), vec![]);
+        let mut junk = FleetState::load(&f.config).unwrap().unwrap();
+        junk.cosignatures.push(Cosignature {
+            signer: k2.public(),
+            signature: "00".repeat(64),
+        });
+        junk.save(&f.config).unwrap();
+        f.commit();
+        let mut genuine = FleetState::load(&f.config).unwrap().unwrap();
+        genuine.cosignatures.clear();
+        genuine.add_cosignature(&k2).unwrap();
+        genuine.save(&f.config).unwrap();
+        f.commit();
+        f.manifest.revoked_recipients.push("age1gone2".into());
+        f.seal_as(&f.signer, scratch.path(), vec![]);
+        match f.verify() {
+            Ok(Verification::Pending { .. }) => {}
+            other => panic!("the genuine co-signature must count: {other:?}"),
+        }
+    }
+
+    /// A placeholder entry never blocks the real signature from being added.
+    #[test]
+    fn add_cosignature_replaces_an_invalid_placeholder() {
+        let (f, k2, _k3) = quorum_fixture();
+        let mut state = f.seal_pending_revocation();
+        state.cosignatures.push(Cosignature {
+            signer: k2.public(),
+            signature: "00".repeat(64),
+        });
+        assert!(state.valid_cosigners().is_empty());
+        state.add_cosignature(&k2).unwrap();
+        assert_eq!(state.valid_cosigners(), vec![k2.public()]);
+        assert_eq!(state.cosignatures.len(), 1);
     }
 
     mod forged_ciphertext_property {
