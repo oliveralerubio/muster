@@ -802,6 +802,13 @@ fn verify_chain(
 
 /// Every signed state recorded in git history with an epoch in `min..=max`,
 /// with the `muster.toml` committed alongside it.
+///
+/// A pair is only usable when the state's signature verifies and the manifest
+/// recomputes the governance digest the state signed: anything else (a
+/// manifest swapped in a later commit beside a re-serialized state, say) is
+/// skipped, so no admin or signer set is ever derived from an unauthenticated
+/// manifest. For one payload the version with the most valid co-signatures
+/// wins; a different payload at an epoch is a fork and the first one wins.
 fn history_states(
     config_dir: &Path,
     min: u64,
@@ -816,15 +823,7 @@ fn history_states(
             continue;
         };
         let epoch = past.payload.epoch;
-        if epoch < min || epoch > max {
-            continue;
-        }
-        // Later versions of the same payload carry more co-signatures; a
-        // different payload at that epoch is a fork and the first one wins.
-        if by_epoch
-            .get(&epoch)
-            .is_some_and(|(seen, _)| seen.payload_hash().ok() != past.payload_hash().ok())
-        {
+        if epoch < min || epoch > max || past.verify_signature().is_err() {
             continue;
         }
         let Some(manifest_text) =
@@ -835,6 +834,15 @@ fn history_states(
         let Ok(past_manifest) = Manifest::parse(&manifest_text, crate::manifest::FILE_NAME) else {
             continue;
         };
+        if governance_digest(&past_manifest).ok().as_deref() != Some(&past.payload.governance) {
+            continue;
+        }
+        if let Some((seen, _)) = by_epoch.get(&epoch) {
+            let same = seen.payload_hash().ok() == past.payload_hash().ok();
+            if !same || seen.valid_cosigners().len() > past.valid_cosigners().len() {
+                continue;
+            }
+        }
         by_epoch.insert(epoch, (past, past_manifest));
     }
     Ok(by_epoch)
@@ -1013,10 +1021,15 @@ fn quorum_count(prior: &Prior, state: &FleetState) -> Option<(usize, usize)> {
     Some((voters.len(), required))
 }
 
-/// Whether the diff only adds machines and members whose own signed approvals
-/// (checked by [`check_quorum`]) already carry the quorum: nothing else moved,
-/// nothing active was removed, no role or reader changed.
-fn enrollment_only(old: &Value, new: &Value) -> bool {
+/// Whether the diff only enrolls brand-new machines whose own signed
+/// approvals (checked by [`check_quorum`]) already carry the quorum, and
+/// activates members that carry theirs. A machine is brand new when its name,
+/// age recipient and signing key appear nowhere in the prior governance. Who
+/// owns a signing key is itself governance: any change to the machine list of
+/// an existing machine's owner, a re-assignment, a re-keying, or a machine
+/// listed under two members needs the full co-signature quorum. Every added
+/// machine must join exactly the member its approved request named.
+fn enrollment_only(old: &Value, new: &Value, state: &FleetState) -> bool {
     let (Some(o), Some(n)) = (old.as_object(), new.as_object()) else {
         return false;
     };
@@ -1026,15 +1039,86 @@ fn enrollment_only(old: &Value, new: &Value) -> bool {
     {
         return false;
     }
-    let machines_kept = old["machines"].as_object().is_some_and(|ms| {
-        ms.iter()
-            .all(|(name, m)| new["machines"].get(name) == Some(m))
-    });
+    let (Some(old_machines), Some(new_machines)) =
+        (old["machines"].as_object(), new["machines"].as_object())
+    else {
+        return false;
+    };
+    if !old_machines
+        .iter()
+        .all(|(name, m)| new_machines.get(name) == Some(m))
+    {
+        return false;
+    }
+    // Everything the prior governance already knows: no key or recipient of a
+    // new machine may be one of these.
+    let known = |field: &str, value: &Value| {
+        value.is_string()
+            && (old_machines.values().any(|m| &m[field] == value)
+                || old["recovery"].get(field) == Some(value))
+    };
+    let added: Vec<&String> = new_machines
+        .keys()
+        .filter(|name| !old_machines.contains_key(*name))
+        .collect();
+    for (i, name) in added.iter().enumerate() {
+        let m = &new_machines[*name];
+        if known("recipient", &m["recipient"]) || known("signing_key", &m["signing_key"]) {
+            return false;
+        }
+        // Two new machines may not share a recipient or key either.
+        if added[..i].iter().any(|other| {
+            new_machines[*other]["recipient"] == m["recipient"]
+                || (m["signing_key"].is_string()
+                    && new_machines[*other]["signing_key"] == m["signing_key"])
+        }) {
+            return false;
+        }
+    }
+    // Every machine of a member that is not already in the member's prior list
+    // must be a new machine whose approved request named this member.
+    let Some(new_members) = new["members"].as_object() else {
+        return false;
+    };
+    let joins_rightly = |member: &str, machine: &Value| {
+        let Some(machine) = machine.as_str() else {
+            return false;
+        };
+        if new_members[member]["role"] == "admin" || old["members"][member]["role"] == "admin" {
+            return false;
+        }
+        added.iter().any(|a| a.as_str() == machine)
+            && state.payload.enrollments.iter().any(|e| {
+                e.name == machine
+                    && e.member.as_deref() == Some(member)
+                    && Value::String(e.recipient.clone()) == new_machines[machine]["recipient"]
+                    && e.signing_key.as_deref() == new_machines[machine]["signing_key"].as_str()
+            })
+    };
+    let mut owned: Vec<&str> = Vec::new();
+    for (name, nm) in new_members {
+        let om = &old["members"][name];
+        let old_list: Vec<&Value> = om["machines"]
+            .as_array()
+            .map(|a| a.iter().collect())
+            .unwrap_or_default();
+        for machine in nm["machines"].as_array().into_iter().flatten() {
+            if let Some(m) = machine.as_str() {
+                if owned.contains(&m) {
+                    return false;
+                }
+                owned.push(m);
+            }
+            if !old_list.contains(&machine) && !joins_rightly(name, machine) {
+                return false;
+            }
+        }
+    }
     let subset = |a: &Value, b: &Value| {
         let (a, b) = (a.as_array(), b.as_array());
         a.is_none_or(|a| b.is_some_and(|b| a.iter().all(|x| b.contains(x))))
     };
-    let members_kept = old["members"].as_object().is_some_and(|ms| {
+    old["members"].as_object().is_some_and(|ms| {
         ms.iter().all(|(name, om)| {
             let nm = &new["members"][name];
             // Dropping an invitation that never became active takes nothing away.
@@ -1053,8 +1137,7 @@ fn enrollment_only(old: &Value, new: &Value) -> bool {
                 && subset(&om["machines"], &nm["machines"])
                 && subset(&om["approvals"], &nm["approvals"])
         })
-    });
-    machines_kept && members_kept
+    })
 }
 
 fn transition_outcome(prior: &Prior, state: &FleetState, new: &Value) -> Transition {
@@ -1062,7 +1145,7 @@ fn transition_outcome(prior: &Prior, state: &FleetState, new: &Value) -> Transit
     else {
         return Transition::Accepted;
     };
-    if received >= required || enrollment_only(old, new) {
+    if received >= required || enrollment_only(old, new, state) {
         Transition::Accepted
     } else {
         Transition::Pending { received, required }
@@ -1274,24 +1357,62 @@ fn check_quorum(old: &Value, new: &Value, state: &FleetState) -> Result<(), Must
              (found {found}); bare names never count"
         ))
     };
+    if let Some(members) = new["members"].as_object() {
+        let mut seen = std::collections::BTreeSet::new();
+        for member in members.values() {
+            if let Some(ms) = member["machines"].as_array() {
+                for m in ms {
+                    if let Some(m_str) = m.as_str() {
+                        if !seen.insert(m_str) {
+                            return Err(MusterError::Security(format!(
+                                "machine '{m_str}' is assigned to multiple members in governance"
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+    }
     if let Some(machines) = new["machines"].as_object() {
         for (name, machine) in machines {
             if old["machines"].get(name).is_some() {
                 continue;
             }
-            let found = state
-                .payload
-                .enrollments
-                .iter()
-                .find(|e| {
-                    e.name == *name
-                        && Value::String(e.recipient.clone()) == machine["recipient"]
-                        && e.signing_key.as_deref() == machine["signing_key"].as_str()
-                })
+            let evidence = state.payload.enrollments.iter().find(|e| {
+                e.name == *name
+                    && Value::String(e.recipient.clone()) == machine["recipient"]
+                    && e.signing_key.as_deref() == machine["signing_key"].as_str()
+            });
+            let found = evidence
                 .map(|e| valid_enrollment_approvals(old, e))
                 .unwrap_or(0);
             if found < required {
                 return Err(short(format!("adds machine '{name}'"), found));
+            }
+            if let Some(e) = evidence {
+                if let Some(members) = new["members"].as_object() {
+                    for (member_name, member) in members {
+                        let has_m = member["machines"]
+                            .as_array()
+                            .is_some_and(|ms| ms.iter().any(|x| x.as_str() == Some(name)));
+                        if has_m {
+                            if e.member.as_deref() != Some(member_name.as_str()) {
+                                return Err(MusterError::Security(format!(
+                                    "machine '{name}' enrollment evidence approved member '{:?}' but machine is assigned to '{member_name}'",
+                                    e.member
+                                )));
+                            }
+                            if let Some(erole) = &e.role {
+                                if member["role"].as_str() != Some(erole) {
+                                    return Err(MusterError::Security(format!(
+                                        "machine '{name}' enrollment evidence approved role '{erole}' but member '{member_name}' has role '{:?}'",
+                                        member["role"].as_str()
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -2256,5 +2377,134 @@ mod tests {
         );
         f.seal_as(&f.signer, scratch2.path(), vec![]);
         assert!(message(f.verify().unwrap_err()).contains("found 1"));
+    }
+
+    /// alice and bob are admins at k=2; carol is a plain member who owns node3.
+    fn graft_fixture() -> (Fixture, Signer, Signer) {
+        let (mut f, k2dir, k2) = team_fixture();
+        let (_d3, k3) = new_signer();
+        f.manifest
+            .machines
+            .insert("node3".into(), machine_for(&k3, "age1node3"));
+        f.manifest.members.get_mut("bob").unwrap().role = Role::Admin;
+        f.manifest.members.insert(
+            "carol".into(),
+            Member {
+                role: Role::Member,
+                status: MemberStatus::Active,
+                machines: vec!["node3".into()],
+                ..Member::default()
+            },
+        );
+        f.manifest.team = Some(TeamConfig {
+            required_approvals: 2,
+        });
+        f.seal_as(&f.signer, &f.state, vec![]);
+        f.verify().unwrap();
+        drop(k2dir);
+        (f, k2, k3)
+    }
+
+    #[test]
+    fn grafting_an_existing_machine_onto_another_admin_needs_the_quorum() {
+        let (mut f, _k2, _k3) = graft_fixture();
+        let scratch = tempdir().unwrap();
+        f.manifest
+            .members
+            .get_mut("bob")
+            .unwrap()
+            .machines
+            .push("node3".into());
+        f.seal_as(&f.signer, scratch.path(), vec![]);
+        // Either held for co-signatures or refused outright, never accepted:
+        // carol's machine must not become one of bob's votes.
+        match f.verify() {
+            Ok(Verification::Pending { required: 2, .. }) | Err(MusterError::Security(_)) => {}
+            other => panic!("grafted machine accepted with one signature: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rekeying_or_reassigning_an_existing_machine_is_not_enrollment() {
+        let (mut f, _k2, _k3) = graft_fixture();
+        let scratch = tempdir().unwrap();
+        // alice alone swaps carol's machine for another one of alice's.
+        f.manifest.members.get_mut("carol").unwrap().machines = vec!["node1".into()];
+        f.seal_as(&f.signer, scratch.path(), vec![]);
+        assert!(!matches!(f.verify(), Ok(Verification::Verified { .. })));
+    }
+
+    #[test]
+    fn evidence_must_name_the_member_the_machine_joins() {
+        let (mut f, k2, k3) = quorum_fixture();
+        let scratch = tempdir().unwrap();
+        f.manifest
+            .machines
+            .insert("node3".into(), machine_for(&k3, "age1node3"));
+        // The approved request named alice, the manifest gives node3 to bob.
+        f.manifest
+            .members
+            .get_mut("bob")
+            .unwrap()
+            .machines
+            .push("node3".into());
+        let two = evidence(&f, &k2, &k3, &["alice", "bob"]);
+        f.seal_as(&f.signer, scratch.path(), vec![two]);
+        let msg = message(f.verify().unwrap_err());
+        assert!(msg.contains("enrollment evidence approved member"), "{msg}");
+    }
+
+    #[test]
+    fn a_new_machine_with_its_own_quorum_joining_a_plain_member_is_accepted() {
+        let (mut f, k2, k3) = graft_fixture();
+        let scratch = tempdir().unwrap();
+        let (_d4, k4) = new_signer();
+        f.manifest
+            .machines
+            .insert("node4".into(), machine_for(&k4, "age1node4"));
+        f.manifest
+            .members
+            .get_mut("carol")
+            .unwrap()
+            .machines
+            .push("node4".into());
+        let mut request = EnrollmentRequest {
+            name: "node4".into(),
+            recipient: "age1node4".into(),
+            signing_key: Some(k4.public()),
+            nonce: "n".into(),
+            platform: "linux".into(),
+            muster_version: "0.1.0".into(),
+            agents: vec![],
+            created_at: "now".into(),
+            approvals: vec![],
+            role: None,
+            profile: None,
+            member: Some("carol".into()),
+        };
+        request.sign_approval("alice", "node1", &f.signer).unwrap();
+        request.sign_approval("bob", "node2", &k2).unwrap();
+        let _ = k3;
+        let signed = request
+            .approvals
+            .iter()
+            .filter_map(|a| match a {
+                crate::fleet::ApprovalEntry::Signed(s) => Some(s.clone()),
+                crate::fleet::ApprovalEntry::Legacy(_) => None,
+            })
+            .collect();
+        let ev = EnrollmentEvidence {
+            name: "node4".into(),
+            recipient: request.recipient.clone(),
+            signing_key: request.signing_key.clone(),
+            member: request.member.clone(),
+            role: None,
+            profile: None,
+            created_at: request.created_at.clone(),
+            nonce: request.nonce.clone(),
+            approvals: signed,
+        };
+        f.seal_as(&f.signer, scratch.path(), vec![ev]);
+        assert!(matches!(f.verify().unwrap(), Verification::Verified { .. }));
     }
 }

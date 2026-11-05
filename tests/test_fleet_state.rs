@@ -1216,6 +1216,95 @@ fn fresh_machine_does_not_pin_a_pending_governance_change() {
     );
 }
 
+/// Clones `remote`, lets `edit` rewrite the working tree and commit by hand,
+/// then pushes the forged history back. The server side of an attacker with
+/// push access and no signing key.
+fn forge_remote(remote: &str, edit: impl FnOnce(&std::path::Path)) {
+    let work = TempDir::new().unwrap();
+    let dir = work.path().join("forge");
+    let status = Command::new("git")
+        .args(["clone", "--quiet", remote])
+        .arg(&dir)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    edit(&dir);
+    git(&dir, &["push", "--quiet", "origin", "HEAD"]);
+}
+
+fn payload_epoch(text: &str) -> u64 {
+    let v: Value = serde_json::from_str(text).unwrap();
+    v["payload"]["epoch"].as_u64().unwrap()
+}
+
+#[test]
+fn forged_predecessor_manifest_in_history_never_pins_attacker_admins() {
+    let (_guard, remote) = bare_remote();
+    let remote = remote.to_str().unwrap();
+    let (alice, bob, carol) = (MusterEnv::new(), MusterEnv::new(), MusterEnv::new());
+    let signer_a = quorum_fleet(remote, &alice, &bob, &carol);
+    ok(&alice, &["member", "rm", "bob", "--yes"]);
+    ok(&alice, &["sync", "--push"]);
+
+    // The attacker has push access and no key. Two hand-made commits on top of
+    // the honest head: the predecessor's state, re-serialized (same payload
+    // hash) beside a muster.toml that lowers the quorum to one admin, then the
+    // honest head files restored. HEAD's tree is byte-identical to the honest
+    // one; only the history carries the forged pair.
+    forge_remote(remote, |dir| {
+        let head_state = std::fs::read_to_string(dir.join("fleet.state.json")).unwrap();
+        let head_epoch = payload_epoch(&head_state);
+        let head_manifest = std::fs::read_to_string(dir.join("muster.toml")).unwrap();
+        let log = git(dir, &["log", "--format=%H", "--", "fleet.state.json"]);
+        let pred = log
+            .lines()
+            .find(|c| {
+                payload_epoch(&git(dir, &["show", &format!("{c}:fleet.state.json")]))
+                    == head_epoch - 1
+            })
+            .expect("predecessor commit");
+        let pred_state = git(dir, &["show", &format!("{pred}:fleet.state.json")]);
+        let reformatted: Value = serde_json::from_str(&pred_state).unwrap();
+        std::fs::write(
+            dir.join("fleet.state.json"),
+            serde_json::to_string_pretty(&reformatted).unwrap(),
+        )
+        .unwrap();
+        let forged = head_manifest.replace("required_approvals = 2", "required_approvals = 1");
+        assert_ne!(forged, head_manifest);
+        std::fs::write(dir.join("muster.toml"), forged).unwrap();
+        git(dir, &["commit", "-qam", "forge predecessor"]);
+        std::fs::write(dir.join("fleet.state.json"), &head_state).unwrap();
+        std::fs::write(dir.join("muster.toml"), &head_manifest).unwrap();
+        git(dir, &["commit", "-qam", "restore head"]);
+    });
+
+    let dave = MusterEnv::new();
+    let joined = ok(
+        &dave,
+        &[
+            "sync",
+            "--remote",
+            remote,
+            "--pull",
+            "--expect-signer",
+            &signer_a,
+        ],
+    );
+    assert_eq!(joined["result"]["applied"], false, "{joined}");
+    let bob_pk = muster::signing::Signer::load(&state_dir(&bob))
+        .unwrap()
+        .unwrap()
+        .public();
+    let pin = std::fs::read_to_string(state_dir(&dave).join("trust.json")).unwrap();
+    assert!(
+        pin.contains(&bob_pk),
+        "the forged predecessor must not let the pending change be pinned"
+    );
+    let (code, raw) = fail(&dave, &["status"]);
+    assert_eq!(code, 5, "{raw}");
+}
+
 #[test]
 fn doctor_reports_but_never_fixes_or_applies_pending_governance() {
     let (_guard, remote) = bare_remote();
@@ -1242,6 +1331,56 @@ fn doctor_reports_but_never_fixes_or_applies_pending_governance() {
             .contains("governance_pending"),
         "{report}"
     );
+}
+
+/// Alice alone rewrites bob's and carol's machine lists in `muster.toml`.
+fn graft(alice: &MusterEnv, carol_keeps_machine: bool) {
+    let manifest = manifest_text(alice);
+    let mut grafted = manifest.replace(
+        "machines = [\"bob-box\"]",
+        "machines = [\"bob-box\", \"carol-box\"]",
+    );
+    if !carol_keeps_machine {
+        grafted = grafted.replace("machines = [\"carol-box\"]", "machines = []");
+    }
+    assert_ne!(grafted, manifest, "{manifest}");
+    std::fs::write(alice.config_dir().join("muster.toml"), grafted).unwrap();
+    ok(alice, &["trust", "resign", "--yes"]);
+}
+
+#[test]
+fn a_machine_listed_under_two_members_is_refused() {
+    let (_guard, remote) = bare_remote();
+    let remote = remote.to_str().unwrap();
+    let (alice, bob, carol) = (MusterEnv::new(), MusterEnv::new(), MusterEnv::new());
+    quorum_fleet(remote, &alice, &bob, &carol);
+    graft(&alice, true);
+    let (code, raw) = fail(&alice, &["sync", "--push"]);
+    assert_eq!(code, 5, "{raw}");
+    assert!(
+        raw.to_string().contains("assigned to multiple members"),
+        "{raw}"
+    );
+}
+
+#[test]
+fn moving_an_existing_machine_to_another_admin_stays_pending_on_peers() {
+    let (_guard, remote) = bare_remote();
+    let remote = remote.to_str().unwrap();
+    let (alice, bob, carol) = (MusterEnv::new(), MusterEnv::new(), MusterEnv::new());
+    quorum_fleet(remote, &alice, &bob, &carol);
+    graft(&alice, false);
+    ok(&alice, &["sync", "--push"]);
+
+    let pulled = ok(&bob, &["sync", "--pull"]);
+    assert!(
+        pulled["diagnostics"]
+            .to_string()
+            .contains("governance_pending"),
+        "the move must wait for a second admin: {pulled}"
+    );
+    let (code, raw) = fail(&bob, &["status"]);
+    assert_eq!(code, 5, "{raw}");
 }
 
 #[test]
