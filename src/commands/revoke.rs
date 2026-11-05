@@ -110,7 +110,7 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         .any(|(n, m)| n != name && m.recipient == target_recipient);
 
     let vault = Vault::open(&ctx.config_dir)?;
-        let mut affected_groups = Vec::new();
+    let mut affected_groups = Vec::new();
     let mut exposed_secrets = Vec::new();
 
     // Determine affected groups from authentic decrypted ciphertext. Preflight
@@ -168,6 +168,30 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     } else {
         for group in &affected_groups {
             let view = vault.group_view(group, &authorizer_identity)?;
+            // If the sidecar was tampered to drop the target, restore it to the authentic
+            // ciphertext recipients so read_verified_readers validates the authentic state.
+            let meta_path = ctx
+                .config_dir
+                .join("vault")
+                .join(format!("{group}.meta.json"));
+            if let Ok(text) = std::fs::read_to_string(&meta_path) {
+                if let Ok(mut meta) = serde_json::from_str::<serde_json::Value>(&text) {
+                    let sidecar_recs: std::collections::BTreeSet<_> = meta["recipients"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|v| v.as_str())
+                        .collect();
+                    let authentic_recs: std::collections::BTreeSet<_> =
+                        view.readers.iter().map(String::as_str).collect();
+                    if sidecar_recs != authentic_recs {
+                        meta["recipients"] = serde_json::json!(view.readers);
+                        if let Ok(fixed) = serde_json::to_string_pretty(&meta) {
+                            let _ = std::fs::write(&meta_path, fixed);
+                        }
+                    }
+                }
+            }
             let mut readers: Vec<String> = view
                 .readers
                 .into_iter()

@@ -669,7 +669,9 @@ fn rerun_finishes_rekeying_when_machine_is_already_out_of_the_manifest() {
     add_secret(&alice, "grp/s", "secval");
     // Simulate a partial revoke: manifest entry was removed and recorded in revoked_recipients,
     // but vault groups were not yet re-encrypted.
-    let bob_rec = Manifest::load(&alice.config_dir()).unwrap().machines["bob"].recipient.clone();
+    let bob_rec = Manifest::load(&alice.config_dir()).unwrap().machines["bob"]
+        .recipient
+        .clone();
     let mut manifest = Manifest::load(&alice.config_dir()).unwrap();
     manifest.machines.remove("bob");
     manifest.revoked_recipients.push(bob_rec);

@@ -330,12 +330,7 @@ impl Vault {
         new_recipients: &[String],
         id: &Identity,
     ) -> Result<(), MusterError> {
-        self.ensure_pair(group)?;
-        let mut data = match self.read_verified_readers(group, id) {
-            Ok(data) => data,
-            Err(MusterError::Security(_)) => self.read(group, id)?,
-            Err(e) => return Err(e),
-        };
+        let mut data = self.read_verified_readers(group, id)?;
         data.recipients = new_recipients.to_vec();
         self.write(group, &data)
     }
