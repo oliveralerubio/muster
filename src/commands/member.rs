@@ -221,12 +221,8 @@ fn approve(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
             nonce: &nonce_val,
             state: &state_val,
         };
-        let already = crate::fleet_state::valid_member_approvals(
-            &snapshot,
-            &name,
-            invitation,
-            &approvals,
-        );
+        let already =
+            crate::fleet_state::valid_member_approvals(&snapshot, &name, invitation, &approvals);
         if already.contains(&actor.member) {
             ctx.diag(crate::output::Diagnostic::new(
                 crate::output::Severity::Error,
@@ -250,13 +246,9 @@ fn approve(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
             &signer,
         )?;
         approvals.push(entry);
-        let received = crate::fleet_state::valid_member_approvals(
-            &snapshot,
-            &name,
-            invitation,
-            &approvals,
-        )
-        .len();
+        let received =
+            crate::fleet_state::valid_member_approvals(&snapshot, &name, invitation, &approvals)
+                .len();
         let q = team::Quorum {
             received,
             required: before.required_approvals() as usize,

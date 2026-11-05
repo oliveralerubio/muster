@@ -1600,7 +1600,9 @@ fn check_quorum(
                 continue;
             }
             if member["invited_at_state"].as_str() != Some(prior_hash)
-                || !member["invite_nonce"].as_str().is_some_and(|n| !n.is_empty())
+                || !member["invite_nonce"]
+                    .as_str()
+                    .is_some_and(|n| !n.is_empty())
             {
                 return Err(MusterError::Security(format!(
                     "invites member '{name}' without a fresh nonce bound to the accepted state"
@@ -2661,10 +2663,15 @@ mod tests {
         f.verify().unwrap();
 
         // Re-inviting with the old nonce is refused outright.
+        f.manifest.members.insert(
+            "carol".into(),
+            invited(&f, "n1", MemberStatus::Pending, vec![]),
+        );
         f.manifest
             .members
-            .insert("carol".into(), invited(&f, "n1", MemberStatus::Pending, vec![]));
-        f.manifest.members.get_mut("carol").unwrap().invited_at_state = Some("00".into());
+            .get_mut("carol")
+            .unwrap()
+            .invited_at_state = Some("00".into());
         f.seal_as(&f.signer, tempdir().unwrap().path(), vec![]);
         assert!(message(f.verify().unwrap_err()).contains("fresh nonce"));
         git_in(&f.config, &["reset", "-q", "--hard", "HEAD~1"]);

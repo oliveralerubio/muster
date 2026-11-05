@@ -107,8 +107,8 @@ Stored with permissions 0600 strictly outside the Git repository:
 - **Pending-proposal freeze (mitigated):** one compromised admin can still push a single-signed governance change and re-push it after each `trust cosign --reject`; peers refuse everything except `sync`, `doctor` and the reject until it is discarded. Serving read-only commands from the last accepted state while a proposal is pending, and competing proposals at the same epoch, are not implemented.
 - **Legacy quorum evidence:** enrollment evidence signed before approvals were state-bound no longer verifies. A fleet with `required_approvals > 1` and such enrollments in its history needs a fresh checkpoint (`muster trust resign` by the recovery key) before a new machine can bootstrap through that history.
 - **No web cosign:** the web panel cannot inspect a pending quorum or co-sign. `muster trust show` and `muster trust cosign` are CLI only.
+- **No sidecar downgrade.** Once an accepted state carries `vault_meta` digests, a later state with empty `vault_meta` but a non-empty vault is refused: the legacy grace window (section 1) only exists for states that were never signed with digests.
 
 ## Status
 
 Accepted and implemented in `hillclimb/secrets-hardening`.
-- **No sidecar downgrade.** Once an accepted state carries `vault_meta` digests, a later state with empty `vault_meta` but a non-empty vault is refused: the legacy grace window (section 1) only exists for states that were never signed with digests.
