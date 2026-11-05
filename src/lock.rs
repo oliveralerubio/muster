@@ -24,6 +24,11 @@ const DEFAULT_WAIT: Duration = Duration::from_secs(5);
 /// A lock file that nobody has written yet is given this long before it counts as stale.
 const WRITE_GRACE: Duration = Duration::from_secs(2);
 
+/// A lock older than this is stale even if its recorded owner looks alive: no
+/// legitimate mutation runs this long, and a planted lock must never freeze
+/// mutations forever.
+const MAX_LOCK_AGE: Duration = Duration::from_secs(600);
+
 thread_local! {
     static HELD_BY_THIS_THREAD: Cell<bool> = const { Cell::new(false) };
 }
@@ -168,8 +173,17 @@ fn is_stale(path: &Path) -> bool {
     if !process_alive(pid) {
         return true;
     }
-    // The pid is alive; a different start time means it was reused.
-    started != 0 && process_start(pid).is_some_and(|now| now != started)
+    // The pid is alive. Only a lock whose recorded start time matches the
+    // live process is credible; zero, unverifiable or different (pid reused)
+    // is stale, as is any lock past the age cap.
+    if started == 0 || process_start(pid) != Some(started) {
+        return true;
+    }
+    fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| SystemTime::now().duration_since(t).ok())
+        .is_some_and(|age| age > MAX_LOCK_AGE)
 }
 
 fn process_alive(pid: u32) -> bool {
@@ -256,6 +270,35 @@ mod tests {
             format!("{parent} {}\n", real + 12345),
         )
         .unwrap();
+        assert!(try_acquire(dir.path()).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_planted_lock_with_zero_start_time_is_stale() {
+        let dir = tempdir().unwrap();
+        let parent = std::os::unix::process::parent_id();
+        fs::write(dir.path().join(LOCK_FILE), format!("{parent} 0\n")).unwrap();
+        assert!(try_acquire(dir.path()).unwrap().is_some());
+    }
+
+    #[test]
+    fn an_old_lock_of_a_live_owner_is_stale() {
+        let dir = tempdir().unwrap();
+        let parent = std::os::unix::process::parent_id();
+        let Some(real) = process_start(parent) else {
+            return;
+        };
+        let path = dir.path().join(LOCK_FILE);
+        fs::write(&path, format!("{parent} {real}\n")).unwrap();
+        // Fresh and credible: respected.
+        assert!(try_acquire(dir.path()).unwrap().is_none());
+        let old = SystemTime::now() - MAX_LOCK_AGE - Duration::from_secs(60);
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
         assert!(try_acquire(dir.path()).unwrap().is_some());
     }
 

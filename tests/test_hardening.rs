@@ -236,6 +236,45 @@ fn poisoned_payload_recipient_refuses_remove_and_leaves_the_vault_untouched() {
     assert_eq!(std::fs::read(&age_path).unwrap(), before);
 }
 
+/// Start time (clock ticks) of a live process, as the lock records it.
+fn live_start_time(pid: u32) -> u64 {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    stat.rsplit_once(')')
+        .unwrap()
+        .1
+        .split_whitespace()
+        .nth(19)
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+#[test]
+fn a_planted_lock_with_zero_start_time_does_not_freeze_mutations() {
+    let env = MusterEnv::new();
+    ok(&env, &["init", "--yes", "--machine", "alpha"]);
+    let state = env.path().join(".local/state/muster");
+    std::fs::write(state.join("mutation.lock"), "1 0\n").unwrap();
+    let out = env
+        .run(&[
+            "--format",
+            "json",
+            "secret",
+            "add",
+            "app/key",
+            "--value-stdin",
+        ])
+        .env("MUSTER_LOCK_WAIT_MS", "100")
+        .write_stdin(b"secret_val")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 #[test]
 fn concurrent_mutating_command_fails_with_another_command_is_running() {
     let env = MusterEnv::new();
@@ -245,7 +284,8 @@ fn concurrent_mutating_command_fails_with_another_command_is_running() {
     // Acquire the mutation lock as another process (using parent process PID)
     let parent = std::os::unix::process::parent_id();
     let lock_file = state.join("mutation.lock");
-    std::fs::write(&lock_file, format!("{parent} 0\n")).unwrap();
+    let started = live_start_time(parent);
+    std::fs::write(&lock_file, format!("{parent} {started}\n")).unwrap();
 
     // A mutating command (secret add) must wait briefly and fail with Operational:
     // "another muster command is running"
@@ -309,7 +349,8 @@ fn read_only_command_preserves_live_revocation_stage_owned_by_another_command() 
     // The mutation lock is held by another live process
     let parent = std::os::unix::process::parent_id();
     let lock_file = state.join("mutation.lock");
-    std::fs::write(&lock_file, format!("{parent} 0\n")).unwrap();
+    let started = live_start_time(parent);
+    std::fs::write(&lock_file, format!("{parent} {started}\n")).unwrap();
 
     // A read-only command runs
     let out = env.run(&["--format", "json", "status"]).output().unwrap();
