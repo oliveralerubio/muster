@@ -114,3 +114,104 @@ fn secret_never_leaks_to_format_metadata_or_files() {
         assert!(!String::from_utf8_lossy(&fs::read(p).unwrap()).contains(value));
     }
 }
+
+fn forge(dir: &std::path::Path, file: &str, payload: &serde_json::Value, to: &Identity) {
+    use std::io::Write;
+    let recipient: age::x25519::Recipient = to.recipient().parse().unwrap();
+    let encryptor =
+        age::Encryptor::with_recipients(std::iter::once(&recipient as &dyn age::Recipient))
+            .unwrap();
+    let mut out = Vec::new();
+    let armor =
+        age::armor::ArmoredWriter::wrap_output(&mut out, age::armor::Format::AsciiArmor).unwrap();
+    let mut w = encryptor.wrap_output(armor).unwrap();
+    w.write_all(payload.to_string().as_bytes()).unwrap();
+    w.finish().unwrap().finish().unwrap();
+    fs::write(dir.join("vault").join(file), out).unwrap();
+}
+
+fn is_security<T: std::fmt::Debug>(r: Result<T, muster::errors::MusterError>) -> bool {
+    matches!(r, Err(muster::errors::MusterError::Security(_)))
+}
+
+#[test]
+fn copying_one_group_over_another_is_rejected() {
+    let d = tempdir().unwrap();
+    let id = Identity::generate();
+    let mut v = Vault::open(d.path()).unwrap();
+    let rec = [id.recipient()];
+    v.add("low", "n", SecretValue::new("low-value".into()), &rec, &id)
+        .unwrap();
+    v.add(
+        "high",
+        "n",
+        SecretValue::new("high-value".into()),
+        &rec,
+        &id,
+    )
+    .unwrap();
+    fs::copy(
+        d.path().join("vault/low.age"),
+        d.path().join("vault/high.age"),
+    )
+    .unwrap();
+    assert!(is_security(v.get("high", "n", &id)));
+    assert!(is_security(v.rotate(
+        "high",
+        "n",
+        SecretValue::new("x".into()),
+        &id
+    )));
+    assert!(is_security(v.add(
+        "high",
+        "m",
+        SecretValue::new("x".into()),
+        &rec,
+        &id
+    )));
+}
+
+#[test]
+fn forged_payload_group_never_writes_outside_the_vault() {
+    let d = tempdir().unwrap();
+    let outer = d.path().join("cfg");
+    fs::create_dir_all(&outer).unwrap();
+    let id = Identity::generate();
+    let mut v = Vault::open(&outer).unwrap();
+    let rec = [id.recipient()];
+    v.add("g", "n", SecretValue::new("x".into()), &rec, &id)
+        .unwrap();
+    let payload = serde_json::json!({
+        "group": "../../x",
+        "recipients": rec,
+        "secrets": {"n": {"name": "n", "ciphertext_or_value": "y",
+            "created_at": "t", "updated_at": "t"}}
+    });
+    forge(&outer, "g.age", &payload, &id);
+    assert!(is_security(v.rotate(
+        "g",
+        "n",
+        SecretValue::new("z".into()),
+        &id
+    )));
+    assert!(!d.path().join("x.age").exists());
+    assert!(!d.path().join("x.meta.json").exists());
+}
+
+#[test]
+fn forged_secret_key_not_matching_entry_name_is_rejected() {
+    let d = tempdir().unwrap();
+    let id = Identity::generate();
+    let mut v = Vault::open(d.path()).unwrap();
+    let rec = [id.recipient()];
+    v.add("g", "n", SecretValue::new("x".into()), &rec, &id)
+        .unwrap();
+    let payload = serde_json::json!({
+        "group": "g",
+        "recipients": rec,
+        "secrets": {"../evil": {"name": "../evil", "ciphertext_or_value": "y",
+            "created_at": "t", "updated_at": "t"}}
+    });
+    forge(d.path(), "g.age", &payload, &id);
+    assert!(is_security(v.get("g", "n", &id)));
+}

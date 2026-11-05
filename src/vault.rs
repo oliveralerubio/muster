@@ -144,7 +144,7 @@ impl Vault {
                 updated_by: self.actor.clone(),
             },
         );
-        self.write(&data)
+        self.write(group, &data)
     }
 
     pub fn get(&self, group: &str, name: &str, id: &Identity) -> Result<SecretValue, MusterError> {
@@ -172,7 +172,7 @@ impl Vault {
         entry.ciphertext_or_value = value.expose().to_owned();
         entry.updated_at = now();
         entry.updated_by = self.actor.clone();
-        self.write(&data)
+        self.write(group, &data)
     }
 
     pub fn remove(&mut self, group: &str, name: &str, id: &Identity) -> Result<(), MusterError> {
@@ -180,7 +180,7 @@ impl Vault {
         data.secrets
             .remove(name)
             .ok_or_else(|| not_found(group, name))?;
-        self.write(&data)
+        self.write(group, &data)
     }
 
     /// Metadata for every secret in `group`, sorted by name. Needs no identity.
@@ -231,7 +231,7 @@ impl Vault {
     ) -> Result<(), MusterError> {
         let mut data = self.read_verified_readers(group, id)?;
         data.recipients = new_recipients.to_vec();
-        self.write(&data)
+        self.write(group, &data)
     }
 
     fn read_verified_readers(&self, group: &str, id: &Identity) -> Result<GroupData, MusterError> {
@@ -370,19 +370,43 @@ impl Vault {
         }
         let armored = fs::read(&path).map_err(|e| io_err(&path, e))?;
         let plaintext = decrypt(&armored, id)?;
-        serde_json::from_slice(&plaintext).map_err(|e| MusterError::InvalidConfig {
-            message: format!("corrupt vault group: {e}"),
-            path: Some(path.display().to_string()),
-        })
+        let data: GroupData =
+            serde_json::from_slice(&plaintext).map_err(|e| MusterError::InvalidConfig {
+                message: format!("corrupt vault group: {e}"),
+                path: Some(path.display().to_string()),
+            })?;
+        // The ciphertext is untrusted input: bind it to the file it came from.
+        if data.group != group {
+            return Err(MusterError::Security(format!(
+                "vault group binding mismatch: '{group}.age' holds another group's data"
+            )));
+        }
+        for (key, entry) in &data.secrets {
+            if *key != entry.name || validate_segment("secret name", key).is_err() {
+                return Err(MusterError::Security(format!(
+                    "vault group '{group}' holds a secret whose name does not match its key"
+                )));
+            }
+        }
+        Ok(data)
     }
 
-    fn write(&self, data: &GroupData) -> Result<(), MusterError> {
+    /// Paths always derive from the caller's validated `group`, never from
+    /// the decrypted payload.
+    fn write(&self, group: &str, data: &GroupData) -> Result<(), MusterError> {
+        validate_segment("group", group)?;
+        if data.group != group {
+            return Err(MusterError::Security(format!(
+                "refusing to write group data for '{}' into '{group}'",
+                data.group
+            )));
+        }
         let plaintext = Zeroizing::new(
             serde_json::to_vec(data)
                 .map_err(|e| MusterError::Operational(format!("cannot serialize group: {e}")))?,
         );
         write_atomic(
-            &self.age_path(&data.group),
+            &self.age_path(group),
             &encrypt(&plaintext, &data.recipients)?,
         )?;
         let meta = GroupMeta {
@@ -402,7 +426,7 @@ impl Vault {
         };
         let json = serde_json::to_vec_pretty(&meta)
             .map_err(|e| MusterError::Operational(format!("cannot serialize metadata: {e}")))?;
-        write_atomic(&self.meta_path(&data.group), &json)
+        write_atomic(&self.meta_path(group), &json)
     }
 }
 
