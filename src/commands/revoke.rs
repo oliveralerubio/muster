@@ -187,7 +187,7 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
                     if sidecar_recs != authentic_recs {
                         meta["recipients"] = serde_json::json!(view.readers);
                         if let Ok(fixed) = serde_json::to_string_pretty(&meta) {
-                            let _ = std::fs::write(&meta_path, fixed);
+                            let _ = crate::vault::write_atomic(&meta_path, fixed.as_bytes());
                         }
                     }
                 }
@@ -217,10 +217,7 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
 
     let _ = EnrollmentRequest::remove(&ctx.config_dir, name);
 
-    git::commit_if_configured(
-        &ctx.config_dir,
-        &format!("feat(fleet): revoke machine {name}"),
-    )?;
+    crate::trust::commit(ctx, &format!("feat(fleet): revoke machine {name}"))?;
     if git::has_remote(&ctx.config_dir) {
         if let Err(e) = git::push(&ctx.config_dir) {
             ctx.diag(Diagnostic::new(

@@ -943,6 +943,9 @@ allow = ["claude"]
 "#,
     );
     std::fs::write(&manifest_path, manifest).unwrap();
+    env.run(&["trust", "resign", "--config", config_arg, "--yes"])
+        .assert()
+        .success();
     env.run(&["agents", "apply", "--config", config_arg, "--yes"])
         .assert()
         .success();

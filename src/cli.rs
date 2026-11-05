@@ -51,7 +51,8 @@ pub fn execute(
     params: &Params,
     interactive: bool,
 ) -> (Envelope, i32) {
-    execute_with(spec, globals, interactive, |ctx| {
+    let expect_signer = params.get_string("expect-signer").map(str::to_owned);
+    execute_with(spec, globals, interactive, expect_signer, |ctx| {
         (spec.handler)(ctx, params)
     })
 }
@@ -61,12 +62,15 @@ pub(crate) fn execute_with(
     spec: &'static CommandSpec,
     globals: Globals,
     interactive: bool,
+    expect_signer: Option<String>,
     handler: impl FnOnce(&mut Context) -> Result<Value, MusterError>,
 ) -> (Envelope, i32) {
     let (result, mut diagnostics, failed) = match Context::new(globals) {
         Ok(mut ctx) => {
             ctx.is_tty &= interactive;
-            let result = handler(&mut ctx);
+            ctx.expect_signer = expect_signer;
+            let result = crate::trust::guard(&mut ctx, spec.name, spec.mutating)
+                .and_then(|()| handler(&mut ctx));
             (result, ctx.take_diagnostics(), ctx.failed())
         }
         Err(err) => (Err(err), Vec::new(), false),

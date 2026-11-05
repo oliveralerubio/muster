@@ -27,6 +27,7 @@ pub mod secrets;
 pub mod signing;
 pub mod skills;
 pub mod team;
+pub mod trust;
 pub mod usage;
 pub mod vault;
 pub mod web;

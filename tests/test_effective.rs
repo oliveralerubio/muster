@@ -33,7 +33,9 @@ fn effective_reports_instruction_disk_states() {
         .assert()
         .success();
     let config = env.config_dir();
-    std::fs::write(config.join("muster.toml"), "version = 1\n[agents]\nenabled = [\"claude\", \"codex\"]\nskip_instructions = [\"codex\"]\n[agents.instructions]\nsource = \"AGENTS.md\"\n").unwrap();
+    let mut manifest = std::fs::read_to_string(config.join("muster.toml")).unwrap();
+    manifest.push_str("\n[agents]\nenabled = [\"claude\", \"codex\"]\nskip_instructions = [\"codex\"]\n[agents.instructions]\nsource = \"AGENTS.md\"\n");
+    std::fs::write(config.join("muster.toml"), manifest).unwrap();
     std::fs::write(config.join("AGENTS.md"), "Be kind.\n").unwrap();
     let (_, before) = env.run_json(&["effective", "--format", "json"]);
     assert_eq!(

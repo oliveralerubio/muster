@@ -24,6 +24,7 @@ use crate::manifest::{Manifest, Member, MemberStatus, Role};
 use crate::output::{Diagnostic, Severity};
 use crate::registry::{ParamKind, ParamSpec, Params};
 use crate::secrets::SecretValue;
+use crate::signing::Signer;
 use crate::vault::Vault;
 
 /// The single member of a manifest without `[members]`.
@@ -306,7 +307,10 @@ pub fn recovery_identity(
     };
     let identity = Identity::from_secret(&key)?;
     match &manifest.recovery {
-        Some(r) if r.recipient == identity.recipient() => Ok(Some(identity)),
+        Some(r) if r.recipient == identity.recipient() => {
+            ctx.recovery_signer = Some(Signer::from_recovery(&identity)?);
+            Ok(Some(identity))
+        }
         Some(_) => Err(MusterError::Security(
             "provided recovery key does not match manifest recovery recipient".into(),
         )),
@@ -486,7 +490,7 @@ pub fn exposed_secrets(vault: &Vault, recipients: &[String]) -> Result<Vec<Value
 /// Commit an administrative change, naming its actor, and push if a remote exists.
 pub fn commit(ctx: &mut Context, actor: &Actor, summary: &str) -> Result<(), MusterError> {
     let message = format!("{summary}\n\n{}", actor.trailer());
-    git::commit_if_configured(&ctx.config_dir, &message)?;
+    crate::trust::commit(ctx, &message)?;
     if git::has_remote(&ctx.config_dir) {
         if let Err(e) = git::push(&ctx.config_dir) {
             ctx.diag(Diagnostic::new(

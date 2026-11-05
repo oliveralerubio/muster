@@ -8,7 +8,6 @@ use serde_json::{json, Value};
 
 use crate::context::Context;
 use crate::errors::MusterError;
-use crate::git;
 use crate::identity::Identity;
 use crate::machine;
 use crate::manifest::{validate_allow_entry, Manifest, SecretApproval, SecretPolicy};
@@ -188,10 +187,7 @@ pub(crate) fn add_with_value(
         manifest.save(&ctx.config_dir)?;
     }
 
-    git::commit_if_configured(
-        &ctx.config_dir,
-        &format!("feat(secret): add {group}/{name}"),
-    )?;
+    crate::trust::commit(ctx, &format!("feat(secret): add {group}/{name}"))?;
 
     Ok(json!({
         "group": group,
@@ -262,10 +258,7 @@ pub(crate) fn rotate_with_value(
     crate::audit::record(&ctx.state_dir, "secret.rotate", &format!("{group}/{name}"))?;
     vault.rotate(&group, &name, value, &identity)?;
 
-    git::commit_if_configured(
-        &ctx.config_dir,
-        &format!("feat(secret): rotate {group}/{name}"),
-    )?;
+    crate::trust::commit(ctx, &format!("feat(secret): rotate {group}/{name}"))?;
 
     Ok(json!({
         "rotated": format!("{group}/{name}"),
@@ -307,10 +300,7 @@ fn rm(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         manifest.save(&ctx.config_dir)?;
     }
 
-    git::commit_if_configured(
-        &ctx.config_dir,
-        &format!("feat(secret): remove {group}/{name}"),
-    )?;
+    crate::trust::commit(ctx, &format!("feat(secret): remove {group}/{name}"))?;
 
     Ok(json!({ "removed": format!("{group}/{name}") }))
 }

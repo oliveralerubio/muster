@@ -683,6 +683,7 @@ fn secret_reveal_returns_only_the_explicitly_allowed_secret() {
         manifest_text(&env)
     );
     std::fs::write(env.config_dir().join("muster.toml"), manifest).unwrap();
+    env.run(&["trust", "resign", "--yes"]).assert().success();
 
     let mut server = McpServer::spawn(&env);
     server.initialize_as("claude-code");
@@ -708,6 +709,7 @@ fn reveal_granted_to_claude(env: &MusterEnv) {
         manifest_text(env)
     );
     std::fs::write(env.config_dir().join("muster.toml"), manifest).unwrap();
+    env.run(&["trust", "resign", "--yes"]).assert().success();
 }
 
 #[test]
@@ -817,6 +819,7 @@ fn secret_reveal_requires_a_lease_and_does_not_expose_approval_tools_or_agent_ov
     let mut text = std::fs::read_to_string(&path).unwrap();
     text.push_str("approval = 'each'\n");
     std::fs::write(&path, text).unwrap();
+    env.run(&["trust", "resign", "--yes"]).assert().success();
     let mut server = McpServer::spawn(&env);
     server.initialize_as("claude-code");
     for id in [2, 3] {

@@ -1066,6 +1066,7 @@ fn secret_approval_requires_a_human_and_leases_expire_and_revoke() {
     let mut text = std::fs::read_to_string(&manifest).unwrap();
     text.push_str("\n[secrets.'native://app/key']\nallow = ['claude']\napproval = 'each'\napproval_ttl = '15m'\n");
     std::fs::write(&manifest, &text).unwrap();
+    env.run(&["trust", "resign", "--yes"]).assert().success();
     let state = env.path().join(".local/state/muster");
     let store_path = state.join("secret-leases.json");
     let reveal = [
@@ -1175,6 +1176,7 @@ fn secret_approval_requires_a_human_and_leases_expire_and_revoke() {
         }
         if cycle == 0 {
             std::fs::write(&manifest, text.replace("allow = ['claude']", "allow = []")).unwrap();
+            env.run(&["trust", "resign", "--yes"]).assert().success();
             let (out, envelope) = env.run_json(&reveal);
             assert_eq!(out.status.code(), Some(5));
             assert!(envelope
@@ -1184,6 +1186,7 @@ fn secret_approval_requires_a_human_and_leases_expire_and_revoke() {
                 .iter()
                 .any(|d| d["code"] == "secret_not_allowed_for_agent"));
             std::fs::write(&manifest, &text).unwrap();
+            env.run(&["trust", "resign", "--yes"]).assert().success();
             let mut data: Value = serde_json::from_str(&stored).unwrap();
             data["leases"][0]["expires_at"] = json!(1);
             std::fs::write(&store_path, data.to_string()).unwrap();

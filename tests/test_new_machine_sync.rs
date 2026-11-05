@@ -400,9 +400,10 @@ fn rollback_reports_that_agent_binaries_are_not_downgraded() {
 fn custom_binary_name_is_shared_by_manual_install_sync_status_and_doctor() {
     let env = MusterEnv::new();
     init(&env);
+    let manifest = std::fs::read_to_string(env.config_dir().join("muster.toml")).unwrap();
     write(
         &env.config_dir().join("muster.toml"),
-        "version = 1\n[agents]\nenabled = [\"claude\"]\n",
+        &format!("{manifest}\n[agents]\nenabled = [\"claude\"]\n"),
     );
     let (url, sha256) = claude_artifact(&env);
     write(&env.config_dir().join("muster.lock"), &format!(

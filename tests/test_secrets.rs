@@ -295,6 +295,7 @@ fn adapter_apply_resolves_native_mcp_environment_without_persisting_plaintext_or
          [mcp.api]\ncommand = \"api-mcp\"\nenv = { API_KEY = \"native://app/api\", PLAIN = \"visible\" }\n",
     );
     std::fs::write(&manifest_path, manifest).unwrap();
+    env.run(&["trust", "resign", "--yes"]).assert().success();
 
     let (output, envelope) = env.run_json(&["--format", "json", "agents", "apply", "--yes"]);
     assert!(output.status.success(), "{}", envelope.raw);
@@ -370,6 +371,7 @@ fn unresolvable_mcp_secret_reports_typed_provider_code_and_is_not_written() {
          [mcp.api]\ncommand = \"api-mcp\"\nenv = { API_KEY = \"native://app/missing\" }\n",
     );
     std::fs::write(&manifest_path, manifest).unwrap();
+    env.run(&["trust", "resign", "--yes"]).assert().success();
     let (output, envelope) = env.run_json(&["--format", "json", "agents", "apply", "--yes"]);
     assert!(output.status.success(), "{}", envelope.raw);
     let text = envelope.raw.to_string();
@@ -517,6 +519,7 @@ fn secret_isolation_denies_by_default_to_agents() {
          [mcp.leaky]\ncommand = \"leaky-mcp\"\nenv = { TOKEN = \"env://GLOBAL_SECRET\" }\n",
     );
     std::fs::write(&manifest_path, manifest).unwrap();
+    env.run(&["trust", "resign", "--yes"]).assert().success();
 
     let (output, envelope) = apply_for(&env, "claude", &[("GLOBAL_SECRET", DENY_BY_DEFAULT_VALUE)]);
     assert!(output.status.success(), "{}", envelope.raw);
@@ -545,6 +548,7 @@ fn secret_isolation_injects_only_allowed_secrets_per_agent() {
          [mcp.github]\ncommand = \"api-mcp\"\nenv = { KEY = \"env://ANTHROPIC_API_KEY\" }\n",
     );
     std::fs::write(&manifest_path, manifest).unwrap();
+    env.run(&["trust", "resign", "--yes"]).assert().success();
 
     // Claude is in the allow list: the resolved secret lands in its config.
     let (claude_out, claude_env) =
@@ -588,6 +592,7 @@ fn secret_isolation_allows_human_cli_access() {
     // A policy entry with no `allow`: no agent may receive it.
     manifest.push_str("\n[secrets.\"native://app/api\"]\n");
     std::fs::write(&manifest_path, manifest).unwrap();
+    env.run(&["trust", "resign", "--yes"]).assert().success();
 
     let added = add(&env, "app/api", SEED);
     assert!(
@@ -621,6 +626,7 @@ fn secret_isolation_agent_at_project_grants_only_in_that_project() {
          [mcp.github]\ncommand = \"api-mcp\"\nenv = { TOKEN = \"env://REPO_TOKEN\" }\n",
     );
     std::fs::write(&manifest_path, manifest).unwrap();
+    env.run(&["trust", "resign", "--yes"]).assert().success();
 
     // In user/global scope, `claude@my-repo` does NOT grant to claude.
     let (global_out, global_env) =
@@ -746,6 +752,7 @@ fn concurrent_secret_requests_are_deduplicated_without_losing_state() {
         "\n[secrets.'env://MUSTER_CONCURRENT_KEY']\nallow = ['claude']\napproval = 'each'\n",
     );
     std::fs::write(path, text).unwrap();
+    env.run(&["trust", "resign", "--yes"]).assert().success();
     std::thread::scope(|scope| {
         let jobs: Vec<_> =
             (0..8)
@@ -795,6 +802,7 @@ fn secret_get_reveal_without_agent_enforces_policy_and_refuses_yes_alone() {
     let mut text = std::fs::read_to_string(&path).unwrap();
     text.push_str("\n[secrets.'env://POLICY_KEY']\nallow = ['claude']\napproval = 'each'\n");
     std::fs::write(&path, text).unwrap();
+    env.run(&["trust", "resign", "--yes"]).assert().success();
 
     // Human runs `secret get --reveal --yes` without --agent: must fail
     let out = env

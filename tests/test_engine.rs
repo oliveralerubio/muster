@@ -28,12 +28,9 @@ fn init_and_seed(env: &MusterEnv, extra_manifest: &str) {
 
     let cfg = env.config_dir();
     std::fs::write(cfg.join("AGENTS.md"), "# Shared rules\n\nBe concise.\n").expect("AGENTS.md");
-    std::fs::write(
-        cfg.join("muster.toml"),
-        format!(
-            r#"
-version = 1
-
+    let mut text = std::fs::read_to_string(cfg.join("muster.toml")).unwrap();
+    text.push_str(&format!(
+        r#"
 [agents]
 enabled = ["claude"]
 
@@ -48,9 +45,8 @@ args = ["-y", "@modelcontextprotocol/server-github"]
 [mcp.github.env]
 GITHUB_TOKEN = "native://tokens/github"
 "#
-        ),
-    )
-    .expect("write manifest");
+    ));
+    std::fs::write(cfg.join("muster.toml"), text).expect("write manifest");
 
     // The vault group holding the secret value the ref points at.
     let secret_value = "ghp_SUPERSECRETVALUE0123456789";
@@ -299,30 +295,15 @@ fn new_hook_without_approval_is_not_installed_non_tty_fails_exit_2() {
 
     // Declare a NEW hook in the manifest.
     let cfg = env.config_dir();
-    std::fs::write(
-        cfg.join("muster.toml"),
+    let mut text = std::fs::read_to_string(cfg.join("muster.toml")).unwrap();
+    text.push_str(
         r#"
-version = 1
-
-[agents]
-enabled = ["claude"]
-
-[agents.instructions]
-source = "AGENTS.md"
-
 [agents.hooks.pre_tool_use]
 command = "/bin/echo hook-ran"
 matcher = "Bash"
-
-[mcp.github]
-command = "npx"
-args = ["-y", "@modelcontextprotocol/server-github"]
-
-[mcp.github.env]
-GITHUB_TOKEN = "native://tokens/github"
 "#,
-    )
-    .expect("manifest with new hook");
+    );
+    std::fs::write(cfg.join("muster.toml"), text).expect("manifest with new hook");
 
     // No TTY and no --yes: must refuse with exit code 2 (confirmation required).
     let (out, envelope) = all_json(&env, &["sync"]);
@@ -545,11 +526,9 @@ fn removed_mcp_server_is_pruned_but_user_servers_are_kept() {
 
     // github is no longer declared.
     let cfg = env.config_dir();
-    std::fs::write(
-        cfg.join("muster.toml"),
-        "version = 1\n\n[agents]\nenabled = [\"claude\"]\n\n[agents.instructions]\nsource = \"AGENTS.md\"\n",
-    )
-    .expect("manifest without github");
+    let text = std::fs::read_to_string(cfg.join("muster.toml")).unwrap();
+    let text = text.split("[mcp.github]").next().unwrap();
+    std::fs::write(cfg.join("muster.toml"), text).expect("manifest without github");
 
     let (out, envelope) = all_json(&env, &["sync", "--yes"]);
     assert!(out.status.success(), "{}", envelope.raw);
@@ -696,11 +675,9 @@ fn plan_and_sync_hide_json_and_toml_escaped_secret_forms() {
         .assert()
         .code(0);
     std::fs::write(env.config_dir().join("AGENTS.md"), "# Rules\n").unwrap();
-    std::fs::write(
-        env.config_dir().join("muster.toml"),
+    let mut text = std::fs::read_to_string(env.config_dir().join("muster.toml")).unwrap();
+    text.push_str(
         r#"
-version = 1
-
 [agents]
 enabled = ["claude", "codex"]
 
@@ -714,8 +691,9 @@ allow = ["claude", "codex"]
 command = "tricky-mcp"
 env = { KEY = "env://TRICKY" }
 "#,
-    )
-    .unwrap();
+    );
+    std::fs::write(env.config_dir().join("muster.toml"), text).unwrap();
+    env.run(&["trust", "resign", "--yes"]).assert().success();
 
     let secret = "pa\"ss\\w\nor\td-\u{e9}\u{20ac}-tail";
     let forms = [

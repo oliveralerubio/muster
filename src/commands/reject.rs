@@ -88,7 +88,7 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     match &actor {
         Some(actor) => team::commit(ctx, actor, &summary)?,
         None => {
-            git::commit_if_configured(&ctx.config_dir, &summary)?;
+            crate::trust::commit(ctx, &summary)?;
             if git::has_remote(&ctx.config_dir) {
                 if let Err(e) = git::push(&ctx.config_dir) {
                     ctx.diag(Diagnostic::new(

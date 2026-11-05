@@ -602,10 +602,7 @@ fn rm(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
             return Ok(json!({ "dry_run": true, "removed": name, "pending_request": pending }));
         }
         let _ = EnrollmentRequest::remove(&ctx.config_dir, name);
-        crate::git::commit_if_configured(
-            &ctx.config_dir,
-            &format!("chore(fleet): remove machine record {name}"),
-        )?;
+        crate::trust::commit(ctx, &format!("chore(fleet): remove machine record {name}"))?;
         Ok(json!({
             "removed": name,
             "pending_request": pending,
@@ -696,7 +693,7 @@ fn assign(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     match &actor {
         Some(actor) => team::commit(ctx, actor, &summary)?,
         None => {
-            crate::git::commit_if_configured(&ctx.config_dir, &summary)?;
+            crate::trust::commit(ctx, &summary)?;
         }
     }
     Ok(result)

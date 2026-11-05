@@ -137,7 +137,7 @@ fn edit(ctx: &mut Context, params: &Params, action: &str) -> Result<Value, Muste
         if let Some(actor) = actor {
             crate::team::commit(ctx, &actor, &format!("feat: {action} {item}"))?;
         } else {
-            crate::git::commit_if_configured(&ctx.config_dir, &format!("feat: {action} {item}"))?;
+            crate::trust::commit(ctx, &format!("feat: {action} {item}"))?;
         }
     }
     Ok(result)

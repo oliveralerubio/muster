@@ -226,6 +226,7 @@ fn member_reject_cleans_partial_quorum_approvals() {
         format!("{manifest}\n[team]\nrequired_approvals = 2\n"),
     )
     .unwrap();
+    ok(&owner, &config, &["trust", "resign", "--yes"]);
 
     ok(
         &owner,
@@ -429,6 +430,7 @@ members = ["owner"]
 "#,
     );
     std::fs::write(config.join("muster.toml"), manifest).unwrap();
+    ok(&owner, &config, &["trust", "resign", "--yes"]);
 
     let explain = ok(&owner, &config, &["plan", "--explain"])["explain"].clone();
     assert_eq!(
@@ -614,6 +616,7 @@ fn team_status_reports_member_and_machine_profile_drift() {
     let mut manifest = std::fs::read_to_string(config.join("muster.toml")).unwrap();
     manifest.push_str("\n[agents.models]\nclaude = \"new-team-model\"\n");
     std::fs::write(config.join("muster.toml"), manifest).unwrap();
+    ok(&owner, &config, &["trust", "resign", "--yes"]);
     let now = drift(&owner);
     assert_eq!(
         names(&now["machines"]),
@@ -678,6 +681,7 @@ fn machine_status_tracks_convergence_and_apply_records_last_sync() {
     let mut manifest = std::fs::read_to_string(config.join("muster.toml")).unwrap();
     manifest.push_str("\n[agents.models]\nclaude = \"new-team-model\"\n");
     std::fs::write(config.join("muster.toml"), manifest).unwrap();
+    ok(&owner, &config, &["trust", "resign", "--yes"]);
     assert_eq!(alice_row(&owner)["status"], "drifted");
     assert_eq!(status_row(&owner)["status"], "drifted");
 
@@ -709,6 +713,7 @@ fn team_quorum_requires_multiple_admin_approvals() {
     let mut manifest = std::fs::read_to_string(config.join("muster.toml")).unwrap();
     manifest.push_str("\n[team]\nrequired_approvals = 2\n");
     std::fs::write(config.join("muster.toml"), manifest).unwrap();
+    ok(&owner, &config, &["trust", "resign", "--yes"]);
 
     let enrollment = ok(
         &joining_machine,
@@ -797,6 +802,7 @@ fn member_quorum_requires_multiple_admin_approvals() {
     let mut manifest = std::fs::read_to_string(config.join("muster.toml")).unwrap();
     manifest.push_str("\n[team]\nrequired_approvals = 2\n");
     std::fs::write(config.join("muster.toml"), manifest).unwrap();
+    ok(&owner, &config, &["trust", "resign", "--yes"]);
 
     ok(
         &owner,
@@ -855,6 +861,7 @@ fn creating_a_group_preserves_unrelated_reader_drift() {
         .recipients
         .push(extra.clone());
     manifest.save(&config).unwrap();
+    ok(&owner, &config, &["trust", "resign", "--yes"]);
 
     let (out, envelope) = on(&owner, &config, &["group", "create", "unrelated"]);
     assert!(out.status.success(), "{}", envelope.raw);
@@ -914,6 +921,7 @@ fn explicit_group_rekey_previews_access_and_requires_confirmation() {
         .recipients
         .push(muster::identity::Identity::generate().recipient());
     manifest.save(&config).unwrap();
+    ok(&owner, &config, &["trust", "resign", "--yes"]);
     let config_before = std::fs::read(config.join("muster.toml")).unwrap();
 
     let preview = ok(&owner, &config, &["group", "rekey", "prod", "--dry-run"]);

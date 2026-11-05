@@ -107,6 +107,8 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         },
     );
     manifest.save(&config_dir)?;
+    let _ = crate::fleet_state::seal(&config_dir, &state_dir, &manifest, &signer, true)?;
+    let _ = crate::git::commit_if_configured(&config_dir, "chore(fleet): initialize fleet")?;
 
     if !agents.is_empty() {
         ctx.diag(Diagnostic::new(

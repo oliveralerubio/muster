@@ -13,7 +13,6 @@ use crate::adapters::config::{AgentsConfig, DEFAULT_INSTRUCTIONS_SOURCE};
 use crate::context::Context;
 use crate::engine::dotfiles;
 use crate::errors::MusterError;
-use crate::git;
 use crate::identity::Identity;
 use crate::importers::{chezmoi, cuartel};
 use crate::machine;
@@ -161,8 +160,8 @@ fn import_bws(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> 
         vault.add(&group, &name, value, &readers, &identity)?;
         ctx.detail(&format!("imported native://{group}/{name}"));
     }
-    git::commit_if_configured(
-        &ctx.config_dir,
+    crate::trust::commit(
+        ctx,
         &format!(
             "feat(import): import {} secret(s) from Bitwarden into {group}",
             imported.len()
@@ -317,8 +316,8 @@ fn import_chezmoi(ctx: &mut Context, params: &Params) -> Result<Value, MusterErr
     if added > 0 || providers_added {
         manifest.save(&ctx.config_dir)?;
     }
-    git::commit_if_configured(
-        &ctx.config_dir,
+    crate::trust::commit(
+        ctx,
         &format!("feat(import): import {added} dotfile(s) from chezmoi"),
     )?;
     ctx.progress(&format!(
@@ -435,10 +434,7 @@ fn import_cuartel(ctx: &mut Context, params: &Params) -> Result<Value, MusterErr
     if let Some((path, text)) = &write_instructions {
         write(path, text)?;
     }
-    git::commit_if_configured(
-        &ctx.config_dir,
-        "feat(import): import Cuartel configuration",
-    )?;
+    crate::trust::commit(ctx, "feat(import): import Cuartel configuration")?;
     Ok(result)
 }
 

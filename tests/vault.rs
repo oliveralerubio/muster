@@ -368,3 +368,18 @@ fn rotate_and_add_refuse_a_group_with_an_unauthorized_recipient() {
     // The attacker never gains the new value: the ciphertext was not rewritten.
     assert!(v.get("g", "n", &attacker).unwrap().expose() == "old");
 }
+
+#[test]
+fn reencrypt_enforces_authorized_and_revoked_policy() {
+    let d = tempdir().unwrap();
+    let a = Identity::generate();
+    let b = Identity::generate();
+    let mut v = Vault::open(d.path()).unwrap();
+    v.add("g", "n", SecretValue::new("x".into()), &[a.recipient()], &a)
+        .unwrap();
+
+    // Revoked recipient is rejected
+    let mut v_revoked = Vault::open(d.path()).unwrap().with_revoked([b.recipient()]);
+    let err = v_revoked.reencrypt("g", &[b.recipient()], &a).unwrap_err();
+    assert!(matches!(err, muster::errors::MusterError::Security(_)));
+}

@@ -62,7 +62,7 @@ pub struct TrustAnchor {
 }
 
 impl TrustAnchor {
-    fn path(state_dir: &Path) -> PathBuf {
+    pub fn path(state_dir: &Path) -> PathBuf {
         state_dir.join(TRUST_FILE)
     }
 
@@ -457,6 +457,36 @@ pub fn verify(
     manifest: &Manifest,
     expect_signer: Option<&str>,
 ) -> Result<Verification, MusterError> {
+    verify_with(
+        config_dir,
+        state_dir,
+        manifest,
+        &VerifyOptions {
+            expect_signer,
+            persist: true,
+            check_content: true,
+        },
+    )
+}
+
+/// How [`verify_with`] behaves.
+#[derive(Debug, Clone, Copy)]
+pub struct VerifyOptions<'a> {
+    pub expect_signer: Option<&'a str>,
+    /// Advance (or create) the local pin on success.
+    pub persist: bool,
+    /// Compare `muster.toml` and the vault with the signed digests. Off only
+    /// for `muster trust resign`, which exists to sign a changed repo.
+    pub check_content: bool,
+}
+
+pub fn verify_with(
+    config_dir: &Path,
+    state_dir: &Path,
+    manifest: &Manifest,
+    options: &VerifyOptions,
+) -> Result<Verification, MusterError> {
+    let expect_signer = options.expect_signer;
     let anchor = TrustAnchor::load(state_dir)?;
     let Some(state) = FleetState::load(config_dir)? else {
         return if anchor.is_some() {
@@ -538,6 +568,13 @@ pub fn verify(
         }
     }
 
+    if !options.check_content {
+        return Ok(Verification::Verified {
+            epoch: state.payload.epoch,
+            signer,
+            first_use: anchor.is_none(),
+        });
+    }
     if state.payload.governance != governance_digest(manifest)? {
         return Err(MusterError::Security(
             "security fields of muster.toml (machines, members, groups, recovery, revoked \
@@ -572,7 +609,9 @@ pub fn verify(
         )));
     }
 
-    TrustAnchor::for_state(&state, manifest)?.save(state_dir)?;
+    if options.persist {
+        TrustAnchor::for_state(&state, manifest)?.save(state_dir)?;
+    }
     Ok(Verification::Verified {
         epoch: state.payload.epoch,
         signer,

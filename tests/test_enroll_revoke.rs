@@ -20,8 +20,9 @@ fn assert_cli_success(env: &support::MusterEnv, args: &[&str]) -> Value {
     let (output, envelope) = env.run_json(args);
     assert!(
         output.status.success(),
-        "{args:?}: {}",
-        String::from_utf8_lossy(&output.stderr)
+        "{args:?}: {} {}",
+        String::from_utf8_lossy(&output.stderr),
+        envelope.raw
     );
     assert!(envelope.ok(), "{args:?}: {}", envelope.raw);
     envelope.raw["result"].clone()
@@ -354,6 +355,7 @@ fn reject_discards_the_partial_approvals_of_a_machine_request() {
         format!("{manifest}\n[team]\nrequired_approvals = 2\n"),
     )
     .unwrap();
+    on(&owner, &config, &["trust", "resign", "--yes"]);
 
     assert_cli_success(
         &joining,
@@ -675,6 +677,7 @@ fn rerun_finishes_rekeying_when_machine_is_already_out_of_the_manifest() {
     manifest.machines.remove("bob");
     manifest.revoked_recipients.push(bob_rec);
     manifest.save(&alice.config_dir()).unwrap();
+    on(&alice, &alice.config_dir(), &["trust", "resign", "--yes"]);
     assert!(bob_reads(&bob, &alice, "native://grp/s"));
 
     let (out, env) = revoke(&alice, "bob");
@@ -700,6 +703,7 @@ fn stale_group_reader_recipient_cannot_regrant_and_revoked_cannot_reenroll() {
         },
     );
     manifest.save(&alice.config_dir()).unwrap();
+    on(&alice, &alice.config_dir(), &["trust", "resign", "--yes"]);
 
     let (out, env) = revoke(&alice, "bob");
     assert!(out.status.success(), "{}", env.raw);

@@ -315,3 +315,57 @@ fn check(dir: &Path, args: &[&str]) -> Result<(), MusterError> {
         )))
     }
 }
+
+/// Undoes a pull that produced a state this machine refuses: back to `previous`,
+/// or, when the repo had no commits before the pull, back to an empty repo
+/// (the files the pull checked out are removed).
+pub fn restore_after_pull(dir: &Path, previous: Option<&str>) -> Result<(), MusterError> {
+    match previous {
+        Some(commit) => check(dir, &["reset", "--quiet", "--hard", commit]),
+        None => {
+            let listed = run(dir, &["ls-files", "-z"])?;
+            for rel in String::from_utf8_lossy(&listed.stdout).split('\0') {
+                if !rel.is_empty() {
+                    let _ = std::fs::remove_file(dir.join(rel));
+                }
+            }
+            check(dir, &["update-ref", "-d", "HEAD"])?;
+            check(
+                dir,
+                &["rm", "-r", "--cached", "--quiet", "--ignore-unmatch", "."],
+            )
+        }
+    }
+}
+
+/// The commit `HEAD` points at, or `None` for a repo without commits.
+pub fn head_commit_opt(dir: &Path) -> Option<String> {
+    if has_commits(dir) {
+        head_commit(dir).ok()
+    } else {
+        None
+    }
+}
+
+/// `path` as of `commit` (`git show <commit>:<path>`), if it existed.
+pub fn file_at(dir: &Path, commit: &str, path: &str) -> Option<String> {
+    let out = run(dir, &["show", &format!("{commit}:{path}")]).ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Up to `limit` newest commits touching `path`.
+pub fn commits_touching(dir: &Path, path: &str, limit: usize) -> Vec<String> {
+    let limit = format!("-n{limit}");
+    run(dir, &["log", "--format=%H", &limit, "--", path])
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}

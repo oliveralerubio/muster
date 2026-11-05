@@ -17,6 +17,13 @@ pub const SPEC: CommandSpec = CommandSpec {
     about: "Pull/push the config repo, then apply the desired state (backup, generation)",
     params: &[
         ParamSpec {
+            name: "expect-signer",
+            about: "Fingerprint (SHA256:...) the fleet signer must have when this machine pins the fleet for the first time",
+            kind: ParamKind::String,
+            required: false,
+            positional: false,
+        },
+        ParamSpec {
             name: "remote",
             about: "Set the git remote URL of the config repo (joins an existing fleet)",
             kind: ParamKind::String,
@@ -179,7 +186,18 @@ fn transport(
     let mut pulled = Value::Null;
     if do_pull {
         ctx.progress("Pulling config repo…");
-        pulled = match git::pull(&ctx.config_dir)? {
+        let previous = git::head_commit_opt(&ctx.config_dir);
+        let pull_result = git::pull(&ctx.config_dir)?;
+        // Refuse (and undo) a pull that rolls the fleet back, forges its vault or
+        // changes its governance without a valid signature from an authorized signer.
+        let joined = matches!(pull_result, Pulled::Joined { .. });
+        crate::trust::verify_pulled(
+            ctx,
+            previous.as_deref(),
+            joined,
+            params.get_string("remote").is_some(),
+        )?;
+        pulled = match pull_result {
             Pulled::Empty => json!("remote_empty"),
             Pulled::Updated => json!("updated"),
             Pulled::Joined { backup } => {

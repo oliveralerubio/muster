@@ -270,7 +270,7 @@ pub(super) fn approve_with_identity(
                 "approvals_required": quorum.required,
             }));
         }
-        None => git::commit_if_configured(&ctx.config_dir, &summary)?,
+        None => crate::trust::commit(ctx, &summary)?,
     };
 
     if git::has_remote(&ctx.config_dir) {

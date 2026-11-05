@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use crate::errors::MusterError;
 use crate::output::{Diagnostic, Format};
 use crate::secrets::SecretValue;
+use crate::signing::Signer;
 
 /// Global options after CLI/`MUSTER_*` precedence has been applied.
 #[derive(Debug, Clone, Default)]
@@ -34,6 +35,12 @@ pub struct Context {
     pub audit_actor: Option<String>,
     pub web_approval: bool,
     pub is_tty: bool,
+    /// Break-glass signing key derived from the recovery key, set when the
+    /// command received the recovery key (see `team::recovery_identity`).
+    pub recovery_signer: Option<Signer>,
+    /// `--expect-signer`: fingerprint (or public key) the fleet state's first
+    /// signer must have when this machine pins it for the first time.
+    pub expect_signer: Option<String>,
     diagnostics: Vec<Diagnostic>,
     failed: bool,
 }
@@ -56,6 +63,8 @@ impl Context {
             audit_actor: globals.audit_actor,
             web_approval: globals.web_approval,
             is_tty: std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
+            recovery_signer: None,
+            expect_signer: None,
             diagnostics: Vec::new(),
             failed: false,
         })
@@ -194,6 +203,8 @@ mod tests {
             audit_actor: None,
             web_approval: false,
             is_tty: false,
+            recovery_signer: None,
+            expect_signer: None,
             diagnostics: Vec::new(),
             failed: false,
         }
