@@ -303,3 +303,68 @@ fn mutating_ops_fail_if_sidecar_readers_differ_from_ciphertext() {
     assert!(is_security(v.remove("g", "s", &id)));
     assert!(is_security(v.reencrypt("g", &rec, &id)));
 }
+
+#[test]
+fn rotate_and_add_refuse_a_group_with_an_unauthorized_recipient() {
+    let d = tempdir().unwrap();
+    let id = Identity::generate();
+    let attacker = Identity::generate();
+    fs::write(
+        d.path().join("muster.toml"),
+        format!(
+            "version = 1\n[machines.me]\nrecipient = \"{}\"\nplatform = \"linux-x86_64\"\nmuster_version = \"0.1.0\"\n",
+            id.recipient()
+        ),
+    )
+    .unwrap();
+    let mut v = Vault::open(d.path()).unwrap();
+    let rec = [id.recipient()];
+    v.add("g", "n", SecretValue::new("old".into()), &rec, &id)
+        .unwrap();
+
+    // A remote writer swaps in ciphertext (and sidecar) that also encrypts to them.
+    let both = [id.recipient(), attacker.recipient()];
+    let payload = serde_json::json!({
+        "group": "g",
+        "recipients": both,
+        "secrets": {"n": {"name": "n", "ciphertext_or_value": "old",
+            "created_at": "t", "updated_at": "t"}}
+    });
+    let recipients: Vec<age::x25519::Recipient> = both.iter().map(|r| r.parse().unwrap()).collect();
+    {
+        use std::io::Write;
+        let enc =
+            age::Encryptor::with_recipients(recipients.iter().map(|r| r as &dyn age::Recipient))
+                .unwrap();
+        let mut out = Vec::new();
+        let armor =
+            age::armor::ArmoredWriter::wrap_output(&mut out, age::armor::Format::AsciiArmor)
+                .unwrap();
+        let mut w = enc.wrap_output(armor).unwrap();
+        w.write_all(payload.to_string().as_bytes()).unwrap();
+        w.finish().unwrap().finish().unwrap();
+        fs::write(d.path().join("vault/g.age"), out).unwrap();
+    }
+    let meta_path = d.path().join("vault/g.meta.json");
+    let mut meta: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+    meta["recipients"] = serde_json::json!(both);
+    fs::write(&meta_path, meta.to_string()).unwrap();
+
+    let new_value = "brand-new-value";
+    assert!(is_security(v.rotate(
+        "g",
+        "n",
+        SecretValue::new(new_value.into()),
+        &id
+    )));
+    assert!(is_security(v.add(
+        "g",
+        "m",
+        SecretValue::new(new_value.into()),
+        &rec,
+        &id
+    )));
+    // The attacker never gains the new value: the ciphertext was not rewritten.
+    assert!(v.get("g", "n", &attacker).unwrap().expose() == "old");
+}
