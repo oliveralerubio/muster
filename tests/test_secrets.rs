@@ -787,3 +787,67 @@ fn concurrent_secret_requests_are_deduplicated_without_losing_state() {
         1
     );
 }
+
+#[test]
+fn secret_get_reveal_without_agent_enforces_policy_and_refuses_yes_alone() {
+    let env = initialized();
+    let path = env.config_dir().join("muster.toml");
+    let mut text = std::fs::read_to_string(&path).unwrap();
+    text.push_str("\n[secrets.'env://POLICY_KEY']\nallow = ['claude']\napproval = 'each'\n");
+    std::fs::write(&path, text).unwrap();
+
+    // Human runs `secret get --reveal --yes` without --agent: must fail
+    let out = env
+        .run(&[
+            "--format",
+            "json",
+            "secret",
+            "get",
+            "env://POLICY_KEY",
+            "--reveal",
+            "--yes",
+        ])
+        .env("POLICY_KEY", "super-secret-value-must-not-leak")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(5),
+        "reveal without --agent must fail code 5 when policy set: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("super-secret-value-must-not-leak"));
+
+    // Also test with allow list only (approval = none)
+    let mut manifest: muster::manifest::Manifest =
+        muster::manifest::Manifest::load(&env.config_dir()).unwrap();
+    manifest
+        .secrets
+        .get_mut("env://POLICY_KEY")
+        .unwrap()
+        .approval = muster::manifest::SecretApproval::None;
+    manifest.save(&env.config_dir()).unwrap();
+
+    let out2 = env
+        .run(&[
+            "--format",
+            "json",
+            "secret",
+            "get",
+            "env://POLICY_KEY",
+            "--reveal",
+            "--yes",
+        ])
+        .env("POLICY_KEY", "super-secret-value-must-not-leak")
+        .output()
+        .unwrap();
+    assert_eq!(
+        out2.status.code(),
+        Some(5),
+        "reveal without --agent must fail code 5 when allow list set: {}",
+        String::from_utf8_lossy(&out2.stdout)
+    );
+    assert!(!String::from_utf8_lossy(&out2.stdout).contains("super-secret-value-must-not-leak"));
+}

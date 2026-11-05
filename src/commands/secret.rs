@@ -11,7 +11,7 @@ use crate::errors::MusterError;
 use crate::git;
 use crate::identity::Identity;
 use crate::machine;
-use crate::manifest::{validate_allow_entry, Manifest, SecretPolicy};
+use crate::manifest::{validate_allow_entry, Manifest, SecretApproval, SecretPolicy};
 use crate::output::{Diagnostic, Severity};
 use crate::providers::Providers;
 use crate::registry::{CommandSpec, ParamKind, ParamSpec, Params};
@@ -322,6 +322,27 @@ fn get(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         .get_string("agent")
         .map(str::to_owned)
         .or_else(|| ctx.audit_actor.clone());
+    // A secret with an allow list or per-use approval is never revealed to an
+    // unnamed caller: `--yes` alone does not satisfy a policy.
+    if reveal && actor.is_none() {
+        let restricted = Manifest::load(&ctx.config_dir).ok().is_some_and(|m| {
+            m.secrets
+                .get(reference.as_str())
+                .is_some_and(|p| !p.allow.is_empty() || p.approval == SecretApproval::Each)
+        });
+        if restricted {
+            ctx.diag(Diagnostic::error(
+                "secret_policy_requires_agent",
+                format!(
+                    "{reference} has an access policy; reveal it with --agent <id> so the \
+                     policy (and any approval lease) can be enforced"
+                ),
+            ));
+            return Err(MusterError::Security(
+                "secret policy requires an agent identity".into(),
+            ));
+        }
+    }
     // Check current policy before resolving any value, including MCP calls.
     let _lease_guard = if let Some(agent) = actor.as_deref().filter(|_| reveal) {
         crate::secret_leases::authorize(ctx, reference.as_str(), agent)?
