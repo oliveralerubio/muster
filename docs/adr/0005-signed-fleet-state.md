@@ -60,6 +60,14 @@ Stored with permissions 0600 strictly outside the Git repository:
 - Quorum counts only distinct active admin members whose signature verifies against the machine's published signing key in verified governance.
 - Legacy string approvals are ignored with a warning diagnostic (`legacy_approval_ignored`) and never count toward quorum.
 
+### 7. Hardening (round 5)
+- **Governance scope:** provider destinations (`kind`, `base_url`, `key`, `api_key_helper`, including profile overrides), `mcp_server.reveal` and an explicit `allow = []` (distinct from an absent list) are signed. New or changed provider destinations need approval at apply time (`ai_provider`); unattended apply exits 2.
+- **Contiguous chain:** an epoch jump larger than one is verified by walking the git history of `fleet.state.json`: each intermediate state must be signed by a key its predecessor authorized and link by `prev`. Missing history is refused ("epoch jump without valid intermediate chain").
+- **Bootstrap:** `--expect-signer` against an unsigned repo is a security error; it accepts only the full `musterpk1...` key or the full 256-bit `SHA256:` fingerprint.
+- **Per-group writers:** a vault-only transition signed by a non-admin is accepted only if the signer's machine is a recipient of every group whose ciphertext or sidecar changed. The pin stores the vault baseline and a governance snapshot for this.
+- **Signed quorum:** with `required_approvals > 1`, an added machine carries its signed admin approvals in the state (`enrollments`), and an activated member carries signed approvals in `Member.approvals` (`<admin>:<machine>:<signature>`). Bare names never count; the recovery key stands alone (break-glass). Group reader grants and role promotions are not yet quorum-gated.
+- **Recoverable revocation:** `revoke` and `member rm` stage all changes in a shadow directory under the state dir, validate the sealed result, write a journal, then copy files into place; the next command completes an interrupted journal (or discards an unjournaled stage) automatically.
+
 ## Status
 
 Accepted and implemented in `hillclimb/secrets-hardening`.

@@ -751,3 +751,67 @@ fn stale_group_reader_recipient_cannot_regrant_and_revoked_cannot_reenroll() {
         "vault must refuse a revoked recipient"
     );
 }
+
+#[test]
+fn interrupted_revocation_publication_is_completed_by_the_next_run() {
+    let (alice, bob, _key) = alice_and_bob();
+    add_secret(&alice, "g1/s", "sec1");
+    add_secret(&alice, "g2/s", "sec2");
+    assert!(bob_reads(&bob, &alice, "native://g1/s"));
+    assert!(bob_reads(&bob, &alice, "native://g2/s"));
+
+    // Crash after the first file of the publication was written.
+    let out = alice
+        .run_isolated(&["--format", "json", "revoke", "bob", "--yes"])
+        .env("MUSTER_TEST_REVOCATION_FAIL_AFTER", "1")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "the injected failure must surface");
+    let state_dir = alice.path().join(".local/state/muster");
+    assert!(
+        state_dir.join("revocation-tx/journal.json").exists(),
+        "the journal survives the crash"
+    );
+
+    // Any later command finishes the job on its own.
+    let (out, env) = alice.run_json(&["--format", "json", "machine", "list"]);
+    assert!(out.status.success(), "{}", env.raw);
+    assert!(
+        env.raw.to_string().contains("revocation_recovered"),
+        "{}",
+        env.raw
+    );
+    assert!(!state_dir.join("revocation-tx").exists());
+    assert!(!bob_reads(&bob, &alice, "native://g1/s"));
+    assert!(!bob_reads(&bob, &alice, "native://g2/s"));
+    let manifest = Manifest::load(&alice.config_dir()).unwrap();
+    assert!(!manifest.machines.contains_key("bob"));
+    let (out, env) = alice.run_json(&["--format", "json", "trust", "show"]);
+    assert!(out.status.success());
+    assert_eq!(env.raw["result"]["status"], "verified", "{}", env.raw);
+}
+
+#[test]
+fn revocation_that_fails_before_the_journal_changes_nothing_and_rerun_completes() {
+    let (alice, bob, _key) = alice_and_bob();
+    add_secret(&alice, "g1/s", "sec1");
+    let before = fs::read_to_string(alice.config_dir().join("muster.toml")).unwrap();
+    let digest = vault_digest(&alice.config_dir());
+    // Not a valid failure point for the journaled phase (0 never matches), so
+    // break staging instead: a corrupt group fails the rekey before any publish.
+    let age = alice.config_dir().join("vault/g1.age");
+    let good = fs::read(&age).unwrap();
+    fs::write(&age, b"corrupt").unwrap();
+    let (out, _env) = revoke(&alice, "bob");
+    assert!(!out.status.success());
+    fs::write(&age, &good).unwrap();
+    assert_eq!(
+        fs::read_to_string(alice.config_dir().join("muster.toml")).unwrap(),
+        before
+    );
+    assert_eq!(vault_digest(&alice.config_dir()), digest);
+    assert!(bob_reads(&bob, &alice, "native://g1/s"));
+    let (out, env) = revoke(&alice, "bob");
+    assert!(out.status.success(), "{}", env.raw);
+    assert!(!bob_reads(&bob, &alice, "native://g1/s"));
+}

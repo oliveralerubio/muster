@@ -67,6 +67,11 @@ impl Actor {
     fn trailer(&self) -> String {
         format!("Muster-Actor: {} (machine {})", self.member, self.machine)
     }
+
+    /// Commit message for `summary`, naming this actor.
+    pub fn message(&self, summary: &str) -> String {
+        format!("{summary}\n\n{}", self.trailer())
+    }
 }
 
 /// Members, with the implicit single member when none are declared.
@@ -494,6 +499,12 @@ pub fn exposed_secrets(vault: &Vault, recipients: &[String]) -> Result<Vec<Value
 pub fn commit(ctx: &mut Context, actor: &Actor, summary: &str) -> Result<(), MusterError> {
     let message = format!("{summary}\n\n{}", actor.trailer());
     crate::trust::commit(ctx, &message)?;
+    publish(ctx);
+    Ok(())
+}
+
+/// Pushes the config repo when it has a remote (a failed push is a warning).
+pub fn publish(ctx: &mut Context) {
     if git::has_remote(&ctx.config_dir) {
         if let Err(e) = git::push(&ctx.config_dir) {
             ctx.diag(Diagnostic::new(
@@ -503,7 +514,6 @@ pub fn commit(ctx: &mut Context, actor: &Actor, summary: &str) -> Result<(), Mus
             ));
         }
     }
-    Ok(())
 }
 
 /// After a global apply (`result` from the engine) that wrote every adapter,

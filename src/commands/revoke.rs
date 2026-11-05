@@ -155,7 +155,13 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     }
 
     // Rekey every affected group BEFORE modifying or saving the manifest.
-    let mut vault = vault.with_revoked([target_recipient.clone()]);
+    // Everything below is staged in a shadow copy and published as one
+    // recoverable transaction (see `revocation_tx`).
+    crate::fleet_state::ensure_not_behind_pin(&ctx.config_dir, &ctx.state_dir, "commit on top of")?;
+    let txn = crate::revocation_tx::Txn::begin(ctx)?;
+    let shadow = txn.dir().to_path_buf();
+    drop(vault);
+    let mut vault = Vault::open(&shadow)?.with_revoked([target_recipient.clone()]);
     let mut reencrypted_groups = Vec::new();
     if shared_key {
         ctx.diag(Diagnostic::new(
@@ -170,10 +176,7 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
             let view = vault.group_view(group, &authorizer_identity)?;
             // If the sidecar was tampered to drop the target, restore it to the authentic
             // ciphertext recipients so read_verified_readers validates the authentic state.
-            let meta_path = ctx
-                .config_dir
-                .join("vault")
-                .join(format!("{group}.meta.json"));
+            let meta_path = shadow.join("vault").join(format!("{group}.meta.json"));
             if let Ok(text) = std::fs::read_to_string(&meta_path) {
                 if let Ok(mut meta) = serde_json::from_str::<serde_json::Value>(&text) {
                     let sidecar_recs: std::collections::BTreeSet<_> = meta["recipients"]
@@ -213,11 +216,11 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     }
     manifest.machines.remove(name);
     crate::team::forget_machine(&mut manifest, name);
-    manifest.save(&ctx.config_dir)?;
+    manifest.save(&shadow)?;
 
-    let _ = EnrollmentRequest::remove(&ctx.config_dir, name);
+    let _ = EnrollmentRequest::remove(&shadow, name);
 
-    crate::trust::commit(ctx, &format!("feat(fleet): revoke machine {name}"))?;
+    txn.commit(ctx, &format!("feat(fleet): revoke machine {name}"))?;
     if git::has_remote(&ctx.config_dir) {
         if let Err(e) = git::push(&ctx.config_dir) {
             ctx.diag(Diagnostic::new(

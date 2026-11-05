@@ -131,7 +131,11 @@ impl TrustAnchor {
         write_atomic(&Self::path(state_dir), &bytes)
     }
 
-    fn for_state(state: &FleetState, manifest: &Manifest, tofu: bool) -> Result<Self, MusterError> {
+    pub(crate) fn for_state(
+        state: &FleetState,
+        manifest: &Manifest,
+        tofu: bool,
+    ) -> Result<Self, MusterError> {
         let (admins, writers) = signer_sets(manifest);
         Ok(Self {
             epoch: state.payload.epoch,
@@ -586,6 +590,46 @@ pub fn seal_with(
     force: bool,
     enrollments: Vec<EnrollmentEvidence>,
 ) -> Result<Option<FleetState>, MusterError> {
+    seal_inner(
+        config_dir,
+        state_dir,
+        manifest,
+        signer,
+        force,
+        enrollments,
+        true,
+    )
+}
+
+/// Like [`seal_with`] but leaves the local pin alone: the caller publishes the
+/// state later (see `revocation_tx`) and advances the pin only then.
+pub fn seal_unpinned(
+    config_dir: &Path,
+    state_dir: &Path,
+    manifest: &Manifest,
+    signer: &Signer,
+    enrollments: Vec<EnrollmentEvidence>,
+) -> Result<Option<FleetState>, MusterError> {
+    seal_inner(
+        config_dir,
+        state_dir,
+        manifest,
+        signer,
+        false,
+        enrollments,
+        false,
+    )
+}
+
+fn seal_inner(
+    config_dir: &Path,
+    state_dir: &Path,
+    manifest: &Manifest,
+    signer: &Signer,
+    force: bool,
+    enrollments: Vec<EnrollmentEvidence>,
+    save_pin: bool,
+) -> Result<Option<FleetState>, MusterError> {
     // A seal must advance or preserve the pinned epoch, never launder an older state.
     ensure_not_behind_pin(config_dir, state_dir, "re-sign")?;
     let current = FleetState::load(config_dir)?;
@@ -610,7 +654,9 @@ pub fn seal_with(
     };
     let state = FleetState::sign(payload, signer)?;
     state.save(config_dir)?;
-    TrustAnchor::for_state(&state, manifest, false)?.save(state_dir)?;
+    if save_pin {
+        TrustAnchor::for_state(&state, manifest, false)?.save(state_dir)?;
+    }
     Ok(Some(state))
 }
 

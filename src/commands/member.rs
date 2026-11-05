@@ -461,7 +461,7 @@ fn rm(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     }
 
     let identity = team::unlock(ctx, params, &manifest)?;
-    let mut vault = Vault::open(&ctx.config_dir)?.with_revoked(manifest.revoked_recipients.clone());
+    let vault = Vault::open(&ctx.config_dir)?.with_revoked(manifest.revoked_recipients.clone());
     let mut changes = team::pending_rekeys(ctx, &vault, &before, &manifest)?;
 
     // Readers and secrets come from the decrypted ciphertext, never from the
@@ -511,12 +511,22 @@ fn rm(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         return Ok(result(changes.into_iter().map(|(g, _)| g).collect()));
     }
     // Re-encrypt BEFORE saving the manifest: a failure leaves the fleet unchanged.
+    // Stage everything in a shadow copy; one recoverable transaction publishes it.
+    crate::fleet_state::ensure_not_behind_pin(&ctx.config_dir, &ctx.state_dir, "commit on top of")?;
+    let txn = crate::revocation_tx::Txn::begin(ctx)?;
+    let shadow = txn.dir().to_path_buf();
+    drop(vault);
+    let mut vault = Vault::open(&shadow)?.with_revoked(manifest.revoked_recipients.clone());
     let groups = team::rekey(&mut vault, &changes, &identity)?;
-    manifest.save(&ctx.config_dir)?;
+    manifest.save(&shadow)?;
     for machine in &member.machines {
-        EnrollmentRequest::remove(&ctx.config_dir, machine)?;
+        EnrollmentRequest::remove(&shadow, machine)?;
     }
-    team::commit(ctx, &actor, &format!("feat(team): revoke member {name}"))?;
+    txn.commit(
+        ctx,
+        &actor.message(&format!("feat(team): revoke member {name}")),
+    )?;
+    team::publish(ctx);
     if !exposed.is_empty() {
         ctx.diag(Diagnostic::new(
             Severity::Warning,

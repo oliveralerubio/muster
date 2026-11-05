@@ -57,6 +57,15 @@ const SECURITY_CONSUMING: &[&str] = &[
 /// repo has one (a pin or a `fleet.state.json`), and migrate a legacy repo
 /// when a mutating command runs on an enrolled machine.
 pub fn guard(ctx: &mut Context, command: &str, mutating: bool) -> Result<(), MusterError> {
+    // A revocation interrupted mid-publication is completed (or discarded)
+    // before anything reads the repo: no user action needed.
+    if !ctx.dry_run && crate::revocation_tx::recover(&ctx.config_dir, &ctx.state_dir)? {
+        ctx.diag(Diagnostic::new(
+            Severity::Warning,
+            "revocation_recovered",
+            "an interrupted revocation was completed automatically",
+        ));
+    }
     if command == "init" || command == "uninstall" || command.starts_with("trust.") {
         return Ok(());
     }
@@ -193,14 +202,27 @@ fn seal_if_changed(ctx: &mut Context) -> Result<(), MusterError> {
     if ctx.dry_run || !git::is_repo(&ctx.config_dir) {
         return Ok(());
     }
-    let Ok(manifest) = Manifest::load(&ctx.config_dir) else {
-        return Ok(());
+    let dir = ctx.config_dir.clone();
+    seal_in(ctx, &dir, true)?;
+    Ok(())
+}
+
+/// Re-signs the repository content under `dir` when it changed. With
+/// `persist_pin` false the local pin is left alone (a staged transaction
+/// advances it when it publishes).
+pub(crate) fn seal_in(
+    ctx: &mut Context,
+    dir: &Path,
+    persist_pin: bool,
+) -> Result<Option<FleetState>, MusterError> {
+    let Ok(manifest) = Manifest::load(dir) else {
+        return Ok(None);
     };
-    let Some(state) = FleetState::load(&ctx.config_dir)? else {
-        return Ok(());
+    let Some(state) = FleetState::load(dir)? else {
+        return Ok(None);
     };
-    if fleet_state::is_current(&ctx.config_dir, &manifest, &state)? {
-        return Ok(());
+    if fleet_state::is_current(dir, &manifest, &state)? {
+        return Ok(None);
     }
     let pin = TrustAnchor::load(&ctx.state_dir)?.ok_or_else(|| {
         MusterError::Security("no local trust pin; run `muster sync` to pin the fleet first".into())
@@ -237,21 +259,17 @@ fn seal_if_changed(ctx: &mut Context) -> Result<(), MusterError> {
         let changed = fleet_state::changed_groups(
             &state.payload.vault,
             &state.payload.vault_meta,
-            &fleet_state::vault_hashes(&ctx.config_dir)?,
-            &fleet_state::vault_meta_hashes(&ctx.config_dir)?,
+            &fleet_state::vault_hashes(dir)?,
+            &fleet_state::vault_meta_hashes(dir)?,
         );
         fleet_state::ensure_reads_groups(&manifest, &signer.public(), &changed)?;
     }
     let enrollments = std::mem::take(&mut ctx.enrollments);
-    fleet_state::seal_with(
-        &ctx.config_dir,
-        &ctx.state_dir,
-        &manifest,
-        signer,
-        false,
-        enrollments,
-    )?;
-    Ok(())
+    if persist_pin {
+        fleet_state::seal_with(dir, &ctx.state_dir, &manifest, signer, false, enrollments)
+    } else {
+        fleet_state::seal_unpinned(dir, &ctx.state_dir, &manifest, signer, enrollments)
+    }
 }
 
 /// Runs [`verify`] after a pull. On refusal the pull is undone, so the repo
