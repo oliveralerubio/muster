@@ -97,6 +97,8 @@ fn secret_check_confirms_a_native_secret_from_metadata_without_decrypting_it() {
     add_secret(&env, "app/api", "s3cr3t-value");
     // Unreadable ciphertext: anything that decrypts would fail now.
     std::fs::write(env.config_dir().join("vault/app.age"), "not age").unwrap();
+    // `secret check` verifies the signed fleet state first: sign the damaged file.
+    ok(&env, &["trust", "resign", "--yes"]);
 
     let result = ok(&env, &["secret", "check", "native://app/api"]);
     assert_eq!(result["reference"], "native://app/api");
@@ -547,6 +549,8 @@ fn uninstall_removes_state_and_units_leaving_agent_files_in_place() {
     write(&cfg.join("AGENTS.md"), "# Canonical Instructions\n");
     let manifest = "version = 1\n\n[agents]\nenabled = [\"claude\"]\n\n[agents.instructions]\nsource = \"AGENTS.md\"\n";
     write(&cfg.join("muster.toml"), manifest);
+    // `agents apply` verifies the signed fleet state first.
+    ok(&env, &["trust", "resign", "--yes"]);
 
     let apply_res = ok(&env, &["agents", "apply", "--yes"]);
     assert_eq!(apply_res["applied"], true);
