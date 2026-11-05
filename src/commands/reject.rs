@@ -69,7 +69,7 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         let mut value = json!({
             "rejected": name,
             "kind": "machine",
-            "approvals_discarded": request.approvals,
+            "approvals_discarded": request.approval_members(),
         });
         if dry_run {
             value["dry_run"] = Value::Bool(true);

@@ -560,6 +560,7 @@ fn list(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
     let pending: Vec<Value> = EnrollmentRequest::pending(&ctx.config_dir)?
         .into_iter()
         .map(|req| {
+            let check = req.check_approvals(&manifest);
             json!({
                 "name": req.name,
                 "recipient": req.recipient,
@@ -567,8 +568,8 @@ fn list(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
                 "version": req.muster_version,
                 "agents": req.agents,
                 "created_at": req.created_at,
-                "approvals": req.approvals,
-                "approvals_received": req.approvals.len(),
+                "approvals": check.valid.iter().map(|a| a.member.clone()).collect::<Vec<_>>(),
+                "approvals_received": check.valid.len(),
                 "approvals_required": approvals_required,
                 "role": req.role,
                 "profile": req.profile,

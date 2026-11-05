@@ -390,3 +390,191 @@ fn crafted_ciphertext_is_refused_on_get_and_on_sync() {
     assert_eq!(code, 5, "{raw}");
     assert!(raw.to_string().contains("'app'"), "{raw}");
 }
+
+#[test]
+fn signed_approvals_require_valid_signatures_and_bound_fields_prevent_tampering() {
+    let owner = MusterEnv::new();
+    let second_admin = MusterEnv::new();
+    let candidate = MusterEnv::new();
+    let config = owner.config_dir();
+
+    ok(&owner, &["init", "--yes", "--machine", "owner-laptop"]);
+    ok(&owner, &["member", "add", "admin-two", "--role", "admin"]);
+    ok(&owner, &["member", "approve", "admin-two", "--yes"]);
+    ok(&owner, &["member", "add", "candidate", "--role", "member"]);
+    ok(&owner, &["member", "approve", "candidate", "--yes"]);
+
+    // Enroll and approve second admin's machine
+    ok(
+        &second_admin,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "enroll",
+            "--name",
+            "admin-two-laptop",
+        ],
+    );
+    ok(
+        &owner,
+        &[
+            "approve",
+            "admin-two-laptop",
+            "--member",
+            "admin-two",
+            "--yes",
+        ],
+    );
+
+    // Require 2 approvals
+    let mut manifest = std::fs::read_to_string(config.join("muster.toml")).unwrap();
+    manifest.push_str("\n[team]\nrequired_approvals = 2\n");
+    std::fs::write(config.join("muster.toml"), manifest).unwrap();
+    ok(&owner, &["trust", "resign", "--yes"]);
+
+    // Candidate enrolls
+    ok(
+        &candidate,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "enroll",
+            "--name",
+            "candidate-laptop",
+        ],
+    );
+
+    // 1. Owner approves (partial approval 1/2)
+    let first = ok(
+        &owner,
+        &[
+            "approve",
+            "candidate-laptop",
+            "--member",
+            "candidate",
+            "--yes",
+        ],
+    );
+    assert_eq!(first["result"]["status"], "pending");
+    assert_eq!(first["result"]["approvals_received"], 1);
+
+    // Verify TOML carries signed approval with signature
+    let req_path = config.join("enroll/candidate-laptop.toml");
+    let req_toml = std::fs::read_to_string(&req_path).unwrap();
+    assert!(req_toml.contains("signature = "));
+
+    // 2. Tampering test: attacker edits the recipient in the pending enrollment file!
+    let tampered: String = req_toml
+        .lines()
+        .map(|line| {
+            if line.starts_with("recipient = ") {
+                "recipient = \"age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq\""
+                    .to_string()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&req_path, tampered).unwrap();
+
+    // Second admin tries to approve: the tampered recipient invalidates the first approval!
+    // So the first approval is ignored and second admin's approval only brings count to 1/2.
+    let second = ok(
+        &second_admin,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "approve",
+            "candidate-laptop",
+            "--member",
+            "candidate",
+            "--yes",
+        ],
+    );
+    assert_eq!(second["result"]["status"], "pending");
+    assert_eq!(
+        second["result"]["approvals_received"], 1,
+        "tampered approval was dropped"
+    );
+}
+
+#[test]
+fn legacy_string_approvals_are_ignored_with_warning() {
+    let owner = MusterEnv::new();
+    let second_admin = MusterEnv::new();
+    let candidate = MusterEnv::new();
+    let config = owner.config_dir();
+
+    ok(&owner, &["init", "--yes", "--machine", "owner-laptop"]);
+    ok(&owner, &["member", "add", "admin-two", "--role", "admin"]);
+    ok(&owner, &["member", "approve", "admin-two", "--yes"]);
+    ok(&owner, &["member", "add", "candidate", "--role", "member"]);
+    ok(&owner, &["member", "approve", "candidate", "--yes"]);
+    ok(
+        &second_admin,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "enroll",
+            "--name",
+            "admin-two-laptop",
+        ],
+    );
+    ok(
+        &owner,
+        &[
+            "approve",
+            "admin-two-laptop",
+            "--member",
+            "admin-two",
+            "--yes",
+        ],
+    );
+
+    let mut manifest = std::fs::read_to_string(config.join("muster.toml")).unwrap();
+    manifest.push_str("\n[team]\nrequired_approvals = 2\n");
+    std::fs::write(config.join("muster.toml"), manifest).unwrap();
+    ok(&owner, &["trust", "resign", "--yes"]);
+
+    ok(
+        &candidate,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "enroll",
+            "--name",
+            "candidate-laptop",
+        ],
+    );
+
+    // Inject legacy unsigned approval string into the request TOML
+    let req_path = config.join("enroll/candidate-laptop.toml");
+    let mut req_toml = std::fs::read_to_string(&req_path).unwrap();
+    req_toml.push_str("\napprovals = [\"owner\"]\n");
+    std::fs::write(&req_path, req_toml).unwrap();
+
+    // Second admin approves: the legacy approval must NOT count toward quorum.
+    let second = ok(
+        &second_admin,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "approve",
+            "candidate-laptop",
+            "--member",
+            "candidate",
+            "--yes",
+        ],
+    );
+    assert_eq!(second["result"]["status"], "pending");
+    assert_eq!(second["result"]["approvals_received"], 1);
+    let diags: Vec<&str> = second["diagnostics"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|d| d["code"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        diags.contains(&"legacy_approval_ignored"),
+        "expected warning: {diags:?}"
+    );
+}

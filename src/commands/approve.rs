@@ -181,18 +181,90 @@ pub(super) fn approve_with_identity(
     // The recovery key is break-glass and counts as a full approval.
     let quorum = match &actor {
         Some(actor) => {
-            let admins: std::collections::BTreeSet<_> = team::members(&before)
-                .into_iter()
-                .filter(|(_, member)| {
-                    member.role == crate::manifest::Role::Admin
-                        && member.status == crate::manifest::MemberStatus::Active
+            let check = req.check_approvals(&before);
+            if check.legacy > 0 {
+                ctx.diag(crate::output::Diagnostic::new(
+                    crate::output::Severity::Warning,
+                    "legacy_approval_ignored",
+                    format!(
+                        "ignoring {} unsigned legacy approval(s); approvals must be signed by an admin key",
+                        check.legacy
+                    ),
+                ));
+            }
+            if check.invalid > 0 {
+                ctx.diag(crate::output::Diagnostic::new(
+                    crate::output::Severity::Warning,
+                    "invalid_approval_ignored",
+                    format!(
+                        "ignoring {} invalid approval(s) (altered request, unknown signer, wrong key, or duplicate)",
+                        check.invalid
+                    ),
+                ));
+            }
+            if check.valid.iter().any(|a| a.member == actor.member) {
+                ctx.diag(crate::output::Diagnostic::new(
+                    crate::output::Severity::Error,
+                    "already_approved_by_caller",
+                    format!(
+                        "'{}' already approved this request; another admin must approve it",
+                        actor.member
+                    ),
+                ));
+                return Err(MusterError::Security(format!(
+                    "'{}' already approved this request; the same admin cannot count twice",
+                    actor.member
+                )));
+            }
+
+            let caller_machine = crate::machine::load_name(&ctx.state_dir)
+                .or_else(|| {
+                    let caller_id = Identity::load(&ctx.state_dir).ok()?;
+                    before
+                        .machines
+                        .iter()
+                        .find(|(_, m)| m.recipient == caller_id.recipient())
+                        .map(|(n, _)| n.clone())
                 })
-                .map(|(name, _)| name)
+                .ok_or_else(|| {
+                    MusterError::Security(
+                        "cannot identify local machine name to sign approval".into(),
+                    )
+                })?;
+            let signer = crate::signing::Signer::load_or_create(&ctx.state_dir)?;
+            let published = before
+                .machines
+                .get(&caller_machine)
+                .and_then(|m| m.signing_key.as_deref());
+            if published != Some(signer.public().as_str()) {
+                return Err(MusterError::Security(format!(
+                    "machine '{caller_machine}' does not publish this signing key in the fleet \
+                     manifest, so its approval cannot be verified; run a mutating muster command \
+                     on it as an admin to publish it"
+                )));
+            }
+            req.sign_approval(&actor.member, &caller_machine, &signer)?;
+
+            let final_check = req.check_approvals(&before);
+            req.approvals = final_check
+                .valid
+                .into_iter()
+                .map(crate::fleet::ApprovalEntry::Signed)
                 .collect();
-            validate_recorded_approvals(&admins, &req.approvals)?;
-            let mut approvals = req.approvals.clone();
-            let quorum = team::add_approval(ctx, &before, &mut approvals, &actor.member)?;
-            req.approvals = approvals;
+            let quorum = team::Quorum {
+                received: req.approvals.len(),
+                required: before.required_approvals() as usize,
+            };
+            if !quorum.reached() {
+                ctx.diag(crate::output::Diagnostic::new(
+                    crate::output::Severity::Info,
+                    "approval_pending",
+                    format!(
+                        "{} of {} required approvals; waiting for another admin",
+                        quorum.received, quorum.required
+                    ),
+                ));
+            }
             quorum
         }
         None => team::Quorum {
@@ -204,7 +276,7 @@ pub(super) fn approve_with_identity(
         let result = json!({
             "machine": name,
             "status": "pending",
-            "approvals": req.approvals,
+            "approvals": req.approval_members(),
             "approvals_received": quorum.received,
             "approvals_required": quorum.required,
         });
@@ -265,7 +337,7 @@ pub(super) fn approve_with_identity(
                 "recipient": req.recipient,
                 "member": member,
                 "reencrypted_groups": reencrypted_groups,
-                "approvals": req.approvals,
+                "approvals": req.approval_members(),
                 "approvals_received": quorum.received,
                 "approvals_required": quorum.required,
             }));
