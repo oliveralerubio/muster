@@ -1076,3 +1076,109 @@ fn instruction_overlays_match_snapshots() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Generic per-adapter settings (`[agents.settings.<adapter>]`)
+// ---------------------------------------------------------------------------
+
+fn write_manifest(env: &MusterEnv, body: &str) {
+    let cfg = env.config_dir();
+    std::fs::create_dir_all(&cfg).expect("config repo dir");
+    std::fs::write(cfg.join("AGENTS.md"), "# Shared rules\n").expect("AGENTS.md");
+    std::fs::write(cfg.join("muster.toml"), body).expect("write manifest");
+}
+
+fn read_claude_settings(env: &MusterEnv) -> Value {
+    serde_json::from_str(
+        &std::fs::read_to_string(env.path().join(".claude/settings.json")).expect("read"),
+    )
+    .expect("valid JSON")
+}
+
+const OUTPUT_STYLE_MANIFEST: &str = r#"
+version = 1
+
+[agents]
+enabled = ["claude"]
+
+[agents.instructions]
+source = "AGENTS.md"
+
+[agents.models]
+claude = "opus"
+
+[agents.hooks.stop]
+command = "echo done"
+
+[agents.settings.claude]
+outputStyle = "Proactive"
+"#;
+
+#[test]
+fn claude_settings_block_renders_and_coexists_with_other_keys() {
+    let env = MusterEnv::new();
+    write_manifest(&env, OUTPUT_STYLE_MANIFEST);
+    let claude_dir = env.path().join(".claude");
+    std::fs::create_dir_all(&claude_dir).expect("claude dir");
+    std::fs::write(claude_dir.join("settings.json"), r#"{ "theme": "dark" }"#).expect("seed");
+
+    env.run(&["agents", "apply", "--agent", "claude", "--yes"])
+        .assert()
+        .code(0);
+
+    let settings = read_claude_settings(&env);
+    assert_eq!(settings["outputStyle"], "Proactive");
+    assert_eq!(settings["theme"], "dark", "unmanaged key must survive");
+    assert_eq!(settings["model"], "opus", "managed model must coexist");
+    assert!(settings["hooks"]["Stop"].is_array(), "{settings}");
+}
+
+#[test]
+fn claude_settings_block_is_pruned_when_removed_and_keeps_user_keys() {
+    let env = MusterEnv::new();
+    write_manifest(&env, OUTPUT_STYLE_MANIFEST);
+    let claude_dir = env.path().join(".claude");
+    std::fs::create_dir_all(&claude_dir).expect("claude dir");
+    std::fs::write(claude_dir.join("settings.json"), r#"{ "theme": "dark" }"#).expect("seed");
+    env.run(&["agents", "apply", "--agent", "claude", "--yes"])
+        .assert()
+        .code(0);
+    assert_eq!(read_claude_settings(&env)["outputStyle"], "Proactive");
+
+    write_manifest(
+        &env,
+        "version = 1\n\n[agents]\nenabled = [\"claude\"]\n\n[agents.instructions]\nsource = \"AGENTS.md\"\n",
+    );
+    env.run(&["agents", "apply", "--agent", "claude", "--yes"])
+        .assert()
+        .code(0);
+
+    let settings = read_claude_settings(&env);
+    assert!(
+        settings.get("outputStyle").is_none(),
+        "stale key: {settings}"
+    );
+    assert!(settings.get("model").is_none(), "stale model: {settings}");
+    assert_eq!(settings["theme"], "dark", "user key must survive pruning");
+}
+
+#[test]
+fn claude_settings_block_rejects_keys_muster_manages() {
+    let env = MusterEnv::new();
+    write_manifest(
+        &env,
+        r#"
+version = 1
+
+[agents]
+enabled = ["claude"]
+
+[agents.settings.claude]
+apiKeyHelper = "evil"
+"#,
+    );
+    env.run(&["agents", "apply", "--agent", "claude", "--yes"])
+        .assert()
+        .failure();
+    assert!(!env.path().join(".claude/settings.json").exists());
+}

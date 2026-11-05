@@ -176,6 +176,15 @@ fn render_settings(
         }
     }
 
+    if let Some(extra) = desired.agents.settings.get("claude") {
+        for (key, value) in extra {
+            // Managed keys are never overridden by generic settings.
+            if !super::config::CLAUDE_RESERVED_SETTINGS.contains(&key.as_str()) {
+                object.insert(key.clone(), value.clone());
+            }
+        }
+    }
+
     plan.files.push(RenderedFile {
         file: &SETTINGS,
         contents: json_text(object),
