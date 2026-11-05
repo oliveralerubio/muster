@@ -65,6 +65,12 @@ pub struct TrustAnchor {
     /// Keys that may re-sign when only vault ciphertext changed (any active
     /// member's machine, plus `admins`).
     pub writers: Vec<String>,
+    /// The pin was created by trust on first use without `--expect-signer`:
+    /// nobody confirmed the signer's fingerprint out of band yet (`doctor`
+    /// flags it). Pins from before this field, and pins this machine signed
+    /// itself, are confirmed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tofu: bool,
 }
 
 impl TrustAnchor {
@@ -92,7 +98,7 @@ impl TrustAnchor {
         write_atomic(&Self::path(state_dir), &bytes)
     }
 
-    fn for_state(state: &FleetState, manifest: &Manifest) -> Result<Self, MusterError> {
+    fn for_state(state: &FleetState, manifest: &Manifest, tofu: bool) -> Result<Self, MusterError> {
         let (admins, writers) = signer_sets(manifest);
         Ok(Self {
             epoch: state.payload.epoch,
@@ -100,6 +106,7 @@ impl TrustAnchor {
             governance: state.payload.governance.clone(),
             admins,
             writers,
+            tofu,
         })
     }
 }
@@ -466,7 +473,7 @@ pub fn seal(
     };
     let state = FleetState::sign(payload, signer)?;
     state.save(config_dir)?;
-    TrustAnchor::for_state(&state, manifest)?.save(state_dir)?;
+    TrustAnchor::for_state(&state, manifest, false)?.save(state_dir)?;
     Ok(Some(state))
 }
 
@@ -686,7 +693,15 @@ pub fn verify_with(
     }
 
     if options.persist {
-        TrustAnchor::for_state(&state, manifest)?.save(state_dir)?;
+        // A first-use pin stays unconfirmed until a run names the signer with
+        // `--expect-signer`; a pin that was already confirmed stays so.
+        let confirmed =
+            expect_signer.is_some_and(|e| e == signer || e == signing::fingerprint(&signer));
+        let tofu = match &anchor {
+            Some(pin) => pin.tofu && !confirmed,
+            None => !confirmed,
+        };
+        TrustAnchor::for_state(&state, manifest, tofu)?.save(state_dir)?;
     }
     Ok(Verification::Verified {
         epoch: state.payload.epoch,
@@ -915,7 +930,7 @@ mod tests {
         payload.epoch = 1;
         let old = FleetState::sign(payload, &f.signer).unwrap();
         old.save(&f.config).unwrap();
-        TrustAnchor::for_state(&old, &f.manifest)
+        TrustAnchor::for_state(&old, &f.manifest, false)
             .unwrap()
             .save(&f.state)
             .unwrap();
@@ -955,6 +970,29 @@ mod tests {
         let other = tempdir().unwrap();
         seal(&f.config, other.path(), &f.manifest, &stranger, true).unwrap();
         assert!(message(f.verify().unwrap_err()).contains("not authorized"));
+    }
+
+    #[test]
+    fn auto_first_use_pin_is_unconfirmed_until_the_signer_is_named() {
+        let f = fixture();
+        f.seal();
+        // The machine that signed the state confirmed it by definition.
+        assert!(!TrustAnchor::load(&f.state).unwrap().unwrap().tofu);
+
+        let fresh = tempdir().unwrap();
+        verify(&f.config, fresh.path(), &f.manifest, None).unwrap();
+        assert!(TrustAnchor::load(fresh.path()).unwrap().unwrap().tofu);
+        // Advancing the pin keeps it unconfirmed...
+        verify(&f.config, fresh.path(), &f.manifest, None).unwrap();
+        assert!(TrustAnchor::load(fresh.path()).unwrap().unwrap().tofu);
+        // ...until a run names the signer.
+        let fp = signing::fingerprint(&f.signer.public());
+        verify(&f.config, fresh.path(), &f.manifest, Some(&fp)).unwrap();
+        assert!(!TrustAnchor::load(fresh.path()).unwrap().unwrap().tofu);
+
+        let named = tempdir().unwrap();
+        verify(&f.config, named.path(), &f.manifest, Some(&fp)).unwrap();
+        assert!(!TrustAnchor::load(named.path()).unwrap().unwrap().tofu);
     }
 
     #[test]

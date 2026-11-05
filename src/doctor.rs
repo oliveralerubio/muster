@@ -631,6 +631,29 @@ fn check_repo(ctx: &Context) -> Check {
         )),
         None => {}
     }
+    if let Ok(Some(pin)) = crate::fleet_state::TrustAnchor::load(&ctx.state_dir) {
+        if pin.tofu {
+            let fingerprint = crate::fleet_state::FleetState::load(&ctx.config_dir)
+                .ok()
+                .flatten()
+                .map(|s| crate::signing::fingerprint(&s.payload.signer))
+                .unwrap_or_else(|| "unknown".into());
+            diags.push(
+                Diagnostic::new(
+                    Severity::Info,
+                    "trust_pin_unconfirmed",
+                    format!(
+                        "trust_pin_unconfirmed: verify signer fingerprint out-of-band: \
+                         {fingerprint}"
+                    ),
+                )
+                .with_suggestion(
+                    "ask the admin who approved you for the fingerprint, then run \
+                     `muster sync --pull --expect-signer <fingerprint>` to confirm the pin",
+                ),
+            );
+        }
+    }
     Check::new("repo", diags)
 }
 

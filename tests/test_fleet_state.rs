@@ -658,3 +658,64 @@ fn non_security_mutating_command_refuses_when_repo_is_rolled_back() {
     assert_eq!(code, 5, "{raw}");
     assert!(raw.to_string().contains("rolled-back"), "{raw}");
 }
+
+#[test]
+fn doctor_flags_unconfirmed_tofu_pin_until_confirmed_with_expect_signer() {
+    let (_guard, remote) = bare_remote();
+    let remote = remote.to_str().unwrap();
+    let alice = MusterEnv::new();
+    ok(&alice, &["init", "--yes"]);
+    ok(&alice, &["sync", "--remote", remote]);
+    let fingerprint = ok(&alice, &["trust", "show"])["result"]["fleet_state"]["signer_fingerprint"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Bob syncs without --expect-signer (auto-TOFU)
+    let bob = MusterEnv::new();
+    ok(&bob, &["sync", "--remote", remote, "--pull"]);
+
+    // Bob runs doctor: must flag unconfirmed pin with info diagnostic
+    let (_, envelope) = bob.run_json(&["--format", "json", "doctor"]);
+    let doc = envelope.raw;
+    let diags: Vec<&str> = doc["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|d| d["code"].as_str())
+        .collect();
+    assert!(
+        diags.contains(&"trust_pin_unconfirmed"),
+        "expected trust_pin_unconfirmed in {diags:?}"
+    );
+
+    // Finding contains the expected message with fingerprint
+    let d = doc["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["code"] == "trust_pin_unconfirmed")
+        .unwrap();
+    assert!(
+        d["message"].as_str().unwrap().contains(&format!(
+            "trust_pin_unconfirmed: verify signer fingerprint out-of-band: {fingerprint}"
+        )),
+        "{}",
+        d["message"]
+    );
+
+    // Once Bob confirms the pin with --expect-signer, the diagnostic clears
+    ok(&bob, &["sync", "--expect-signer", &fingerprint]);
+    let (_, envelope_after) = bob.run_json(&["--format", "json", "doctor"]);
+    let doc_after = envelope_after.raw;
+    let diags_after: Vec<&str> = doc_after["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|d| d["code"].as_str())
+        .collect();
+    assert!(
+        !diags_after.contains(&"trust_pin_unconfirmed"),
+        "unexpected trust_pin_unconfirmed after confirmation: {diags_after:?}"
+    );
+}
