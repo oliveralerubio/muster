@@ -39,6 +39,10 @@ struct Journal {
     delete: Vec<String>,
     message: String,
     pin: TrustAnchor,
+    /// The staged state is a proposal short of its admin signatures: publish
+    /// the files but leave this machine's pin where it is.
+    #[serde(default)]
+    pending: bool,
 }
 
 /// A staged revocation. Dropping it without [`Txn::commit`] discards it.
@@ -124,7 +128,7 @@ impl Txn {
             })?,
         };
         // Validate the staged result exactly as a peer would, without moving the pin.
-        fleet_state::verify_with(
+        let checked = fleet_state::verify_with(
             &self.shadow,
             &ctx.state_dir,
             &manifest,
@@ -134,6 +138,7 @@ impl Txn {
                 check_content: true,
             },
         )?;
+        let pending = matches!(checked, fleet_state::Verification::Pending { .. });
         let pin = TrustAnchor::for_state(&state, &manifest, false)?;
 
         let mut staged = Vec::new();
@@ -169,6 +174,7 @@ impl Txn {
             delete,
             message: message.to_string(),
             pin,
+            pending,
         };
         validate_journal(&journal)?;
         // The commit point: from here a crash is rolled forward on the next run.
@@ -314,7 +320,9 @@ fn apply(
             Err(e) => return Err(io(&config_dir.join(rel), e)),
         }
     }
-    journal.pin.save(state_dir)?;
+    if !journal.pending {
+        journal.pin.save(state_dir)?;
+    }
     crate::git::commit_if_configured(config_dir, &journal.message)?;
     fs::remove_dir_all(root).map_err(|e| io(root, e))
 }
@@ -438,6 +446,7 @@ mod tests {
             delete: vec![],
             message: "x".into(),
             pin,
+            pending: false,
         };
         fs::write(
             root(state).join(JOURNAL),

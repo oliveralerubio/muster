@@ -23,6 +23,24 @@ pub const SHOW: CommandSpec = CommandSpec {
     handler: run_show,
 };
 
+pub const COSIGN: CommandSpec = CommandSpec {
+    name: "trust.cosign",
+    about: "Add an admin co-signature to a pending governance change",
+    params: &[
+        team::RECOVERY_KEY_PARAM,
+        team::RECOVERY_KEY_STDIN_PARAM,
+        ParamSpec {
+            name: "yes",
+            about: "Confirm the co-signing without an interactive prompt",
+            kind: ParamKind::Bool,
+            required: false,
+            positional: false,
+        },
+    ],
+    mutating: true,
+    handler: run_cosign,
+};
+
 pub const RESIGN: CommandSpec = CommandSpec {
     name: "trust.resign",
     about: "Re-sign fleet state after deliberate manual changes to muster.toml (admins only)",
@@ -95,6 +113,7 @@ fn run_show(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
     );
     let status = match inspected {
         Ok(Verification::Verified { .. }) => "verified",
+        Ok(Verification::Pending { .. }) => "pending_signatures",
         Ok(Verification::Legacy) => "legacy_uninitialized",
         Err(e) => {
             ctx.diag(Diagnostic::new(
@@ -240,4 +259,94 @@ fn last_signed_governance(config_dir: &std::path::Path) -> Option<Value> {
         }
     }
     None
+}
+
+fn run_cosign(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
+    let manifest = Manifest::load(&ctx.config_dir)?;
+    let mut state = FleetState::load(&ctx.config_dir)?
+        .ok_or_else(|| MusterError::Security("the repo has no fleet state to co-sign".into()))?;
+    state.verify_signature()?;
+    let pin = TrustAnchor::load(&ctx.state_dir)?.ok_or_else(|| {
+        MusterError::Security("no local trust pin; cannot determine if this change is authorized".into())
+    })?;
+    if state.payload.epoch <= pin.epoch {
+        return Ok(json!({
+            "cosigned": false,
+            "message": "the current fleet state is already accepted by this machine",
+            "epoch": state.payload.epoch,
+        }));
+    }
+    if state.payload.epoch != pin.epoch + 1 {
+        return Err(MusterError::Security(format!(
+            "cannot co-sign an epoch jump (state epoch {} > pinned {} + 1)",
+            state.payload.epoch, pin.epoch
+        )));
+    }
+    let recovery = team::recovery_identity(ctx, params, &manifest)?;
+    let signer = match recovery {
+        Some(rec_id) => Signer::from_recovery(&rec_id)?,
+        None => {
+            let s = Signer::load_or_create(&ctx.state_dir)?;
+            if !manifest.members.is_empty() {
+                let _ = team::admin(&manifest, &ctx.state_dir)?;
+            }
+            s
+        }
+    };
+    let public = signer.public();
+    if !pin.admins.contains(&public) {
+        return Err(MusterError::Security(format!(
+            "cannot co-sign: signer {} was not an admin of the last accepted state",
+            signing::fingerprint(&public)
+        )));
+    }
+    if state.payload.signer == public {
+        return Err(MusterError::Security(
+            "this machine signed the proposal; a different admin must co-sign it".into(),
+        ));
+    }
+    if state.valid_cosigners().contains(&public) {
+        return Ok(json!({
+            "cosigned": false,
+            "message": "this machine has already co-signed the proposal",
+            "epoch": state.payload.epoch,
+        }));
+    }
+    // Show the operator the exact governance diff vs their pinned baseline.
+    let diff = fleet_state::governance_diff(pin.snapshot.as_ref(), &governance_content(&manifest));
+    eprintln!("Governance changes to co-sign:
+{diff}");
+    if params.get_bool("yes") {
+        ctx.yes = true;
+    }
+    ctx.confirm("Add your admin co-signature to this governance change?")?;
+
+    state.add_cosignature(&signer)?;
+    state.save(&ctx.config_dir)?;
+
+    // If the new signature completed the quorum, advance the pin.
+    let verified = fleet_state::verify_with(
+        &ctx.config_dir,
+        &ctx.state_dir,
+        &manifest,
+        &fleet_state::VerifyOptions {
+            expect_signer: None,
+            persist: true,
+            check_content: true,
+        },
+    )?;
+    let accepted = matches!(verified, Verification::Verified { .. });
+
+    git::commit_if_configured(&ctx.config_dir, "feat(security): co-sign governance change")?;
+    if git::has_remote(&ctx.config_dir) {
+        let _ = git::push(&ctx.config_dir);
+    }
+    Ok(json!({
+        "cosigned": true,
+        "epoch": state.payload.epoch,
+        "accepted": accepted,
+        "signer": public,
+        "fingerprint": signing::fingerprint(&public),
+        "cosigners": state.valid_cosigners(),
+    }))
 }

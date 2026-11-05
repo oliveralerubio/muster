@@ -1103,3 +1103,132 @@ fn resign_without_a_pin_on_a_single_machine_fleet_shows_the_full_diff() {
     // so the unchanged machine entry is not listed as added.
     assert!(!diff.contains("+    \"alpha\""), "{diff}");
 }
+
+#[test]
+fn quorum_two_admin_a_removing_admin_b_stays_pending_until_cosigned() {
+    let (_guard, remote) = bare_remote();
+    let remote = remote.to_str().unwrap();
+
+    let alice = MusterEnv::new();
+    let bob = MusterEnv::new();
+    let carol = MusterEnv::new();
+
+    // 1. Setup: 3 admins in team mode, required_approvals = 2.
+    ok(&alice, &["init", "--yes", "--machine", "alice-box"]);
+    ok(&alice, &["sync", "--remote", remote]);
+    let signer_a = support::fleet_signer(&alice.config_dir());
+
+    ok(&alice, &["member", "add", "bob", "--role", "admin"]);
+    ok(&alice, &["member", "approve", "bob", "--yes"]);
+    ok(&alice, &["member", "add", "carol", "--role", "admin"]);
+    ok(&alice, &["member", "approve", "carol", "--yes"]);
+
+    // Enroll Bob and Carol
+    ok(
+        &bob,
+        &[
+            "sync",
+            "--remote",
+            remote,
+            "--pull",
+            "--expect-signer",
+            &signer_a,
+        ],
+    );
+    ok(&bob, &["enroll", "--name", "bob-box"]);
+    ok(&alice, &["sync", "--pull"]);
+    ok(&alice, &["approve", "bob-box", "--member", "bob", "--yes"]);
+
+    ok(
+        &carol,
+        &[
+            "sync",
+            "--remote",
+            remote,
+            "--pull",
+            "--expect-signer",
+            &signer_a,
+        ],
+    );
+    ok(&carol, &["enroll", "--name", "carol-box"]);
+    ok(&alice, &["sync", "--pull"]);
+    ok(&alice, &["approve", "carol-box", "--member", "carol", "--yes"]);
+
+    // Raise required_approvals = 2.
+    let mut manifest = manifest_text(&alice);
+    manifest.push_str("\n[team]\nrequired_approvals = 2\n");
+    std::fs::write(alice.config_dir().join("muster.toml"), manifest).unwrap();
+    ok(&alice, &["trust", "resign", "--yes"]);
+    ok(&alice, &["sync", "--push"]);
+
+    // Bob and Carol sync and accept this pin.
+    ok(&bob, &["sync", "--pull"]);
+    ok(&carol, &["sync", "--pull"]);
+    let pinned_bob = std::fs::read_to_string(state_dir(&bob).join("trust.json")).unwrap();
+    assert!(pinned_bob.contains("bob-box"));
+
+    // 2. Admin A (Alice) removes Admin B (Bob) ALONE.
+    ok(&alice, &["member", "rm", "bob", "--yes"]);
+    ok(&alice, &["sync", "--push"]);
+
+    // 3. Carol pulls the proposal: she does NOT advance her pin, Bob is STILL an admin for her.
+    let pull_env = ok(&carol, &["sync", "--pull"]);
+    assert_eq!(pull_env["result"]["applied"], false, "{pull_env}");
+    assert!(
+        pull_env["diagnostics"]
+            .to_string()
+            .contains("governance_pending"),
+        "{pull_env}"
+    );
+
+    // Carol's trust pin has NOT advanced: Bob is still an admin in her accepted state.
+    let carol_pin = std::fs::read_to_string(state_dir(&carol).join("trust.json")).unwrap();
+    let bob_pk = muster::signing::Signer::load(&state_dir(&bob))
+        .unwrap()
+        .unwrap()
+        .public();
+    assert!(
+        carol_pin.contains(&bob_pk),
+        "Bob must still be an authorized admin in Carol's accepted pin"
+    );
+
+    // Commands that would consume the new governance (like secret reads using new policies) fail closed.
+    let (code, raw) = fail(&carol, &["status"]);
+    assert_eq!(code, 5, "{raw}");
+    assert!(raw.to_string().contains("governance change"), "{raw}");
+
+    // Forged, non-admin and duplicate co-signatures do not count.
+    let state_path = carol.config_dir().join("fleet.state.json");
+    let original = std::fs::read_to_string(&state_path).unwrap();
+    let mut state = muster::fleet_state::FleetState::load(&carol.config_dir())
+        .unwrap()
+        .unwrap();
+    let alice_key = muster::signing::Signer::load(&state_dir(&alice)).unwrap().unwrap();
+    let outsider_dir = tempfile::TempDir::new().unwrap();
+    let outsider = muster::signing::Signer::load_or_create(outsider_dir.path()).unwrap();
+    state.cosignatures.push(muster::fleet_state::Cosignature {
+        signer: bob_pk.clone(),
+        signature: "00".repeat(64),
+    });
+    state.add_cosignature(&outsider).unwrap();
+    state.add_cosignature(&alice_key).unwrap();
+    state.cosignatures.push(state.cosignatures.last().unwrap().clone());
+    state.save(&carol.config_dir()).unwrap();
+    let held = ok(&carol, &["sync", "--pull"]);
+    assert!(held["diagnostics"].to_string().contains("1 of 2"), "{held}");
+    assert_eq!(held["result"]["applied"], false, "{held}");
+    std::fs::write(&state_path, original).unwrap();
+
+    let (code, _) = fail(&alice, &["trust", "cosign", "--yes"]);
+    assert_eq!(code, 5, "the proposer cannot co-sign its own proposal");
+
+    // 4. Carol co-signs the governance change.
+    let cosigned = ok(&carol, &["trust", "cosign", "--yes"]);
+    assert_eq!(cosigned["result"]["cosigned"], true, "{cosigned}");
+    assert_eq!(cosigned["result"]["accepted"], true, "{cosigned}");
+    ok(&carol, &["sync", "--push"]);
+
+    // Now Carol's pin HAS advanced and Bob is removed.
+    let carol_pin_after = std::fs::read_to_string(state_dir(&carol).join("trust.json")).unwrap();
+    assert!(!carol_pin_after.contains(&bob_pk));
+}

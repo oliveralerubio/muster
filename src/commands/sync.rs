@@ -138,6 +138,16 @@ fn sync(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     } else {
         transport(ctx, params, true)?
     };
+    // A governance change is waiting for admin co-signatures: the pull above
+    // may bring them, but nothing is applied from the unaccepted state.
+    if ctx.governance_pending {
+        return Ok(json!({
+            "applied": false,
+            "governance_pending": true,
+            "transport": transport,
+            "skills_updated": skills_updated,
+        }));
+    }
     let global = target == engine::Target::Global;
     let plan = engine::plan(
         ctx,

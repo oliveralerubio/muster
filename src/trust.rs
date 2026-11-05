@@ -96,6 +96,20 @@ pub fn guard(ctx: &mut Context, command: &str, mutating: bool) -> Result<(), Mus
     if verification == Verification::Legacy && mutating && !ctx.dry_run {
         migrate_legacy(ctx, manifest)?;
     }
+    // A governance change short of its admin co-signatures is held: this
+    // machine keeps its last accepted state, so a command that would consume
+    // the repo's new recipients, roles or policies fails closed. `sync` still
+    // pulls (to receive the co-signatures) and applies nothing; `doctor`
+    // reports; `trust cosign` is how an admin completes the quorum.
+    if ctx.governance_pending && !matches!(command, "sync" | "doctor") {
+        return Err(MusterError::Security(format!(
+            "`muster {}` refused: the repo holds a governance change that has not gathered \
+             enough admin signatures, and this machine keeps using the last accepted state. \
+             An admin reviews it with `muster trust cosign`; run `muster sync --pull` to \
+             receive the co-signatures",
+            command.replace('.', " ")
+        )));
+    }
     Ok(())
 }
 
@@ -178,6 +192,27 @@ pub fn verify(
             check_content: true,
         },
     )?;
+    ctx.governance_pending = false;
+    if let Verification::Pending {
+        epoch,
+        signer,
+        received,
+        required,
+        diff,
+    } = &result
+    {
+        ctx.governance_pending = true;
+        ctx.diag(Diagnostic::new(
+            Severity::Warning,
+            "governance_pending",
+            format!(
+                "governance change at epoch {epoch} signed by {} has {received} of {required} \
+                 required admin signatures and is NOT accepted; this machine keeps using the \
+                 last accepted state. Change:\n{diff}",
+                signing::fingerprint(signer)
+            ),
+        ));
+    }
     if let Verification::Verified {
         epoch,
         signer,
@@ -379,11 +414,28 @@ pub(crate) fn seal_in(
         fleet_state::ensure_reads_groups(&manifest, &signer.public(), &changed)?;
     }
     let enrollments = std::mem::take(&mut ctx.enrollments);
-    if persist_pin {
-        fleet_state::seal_with(dir, &ctx.state_dir, &manifest, signer, false, enrollments)
+    let sealed = if persist_pin {
+        fleet_state::seal_with(dir, &ctx.state_dir, &manifest, signer, false, enrollments)?
     } else {
-        fleet_state::seal_unpinned(dir, &ctx.state_dir, &manifest, signer, enrollments)
+        fleet_state::seal_unpinned(dir, &ctx.state_dir, &manifest, signer, enrollments)?
+    };
+    if let Some(state) = &sealed {
+        if let Some((received, required)) =
+            fleet_state::pending_quorum(&ctx.state_dir, state, &manifest)?
+        {
+            ctx.diag(Diagnostic::new(
+                Severity::Warning,
+                "governance_pending",
+                format!(
+                    "this governance change has {received} of {required} required admin \
+                     signatures and is pending: other machines keep the last accepted state \
+                     until {} more admin(s) run `muster trust cosign`",
+                    required - received
+                ),
+            ));
+        }
     }
+    Ok(sealed)
 }
 
 /// Runs [`verify`] after a pull. On refusal the pull is undone, so the repo

@@ -26,11 +26,23 @@ use crate::vault::write_atomic;
 pub const STATE_FILE: &str = "fleet.state.json";
 pub const TRUST_FILE: &str = "trust.json";
 const STATE_DOMAIN: &[u8] = b"muster fleet state v1\n";
+const COSIGN_DOMAIN: &[u8] = b"muster fleet cosign v1\n";
 
-/// `fleet.state.json`: the payload and its detached signature (hex).
+/// `fleet.state.json`: the payload and its detached signature (hex), plus the
+/// co-signatures of other admins over the same payload. Co-signatures are not
+/// part of the signed payload (so adding one never changes the payload hash).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FleetState {
     pub payload: StatePayload,
+    pub signature: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cosignatures: Vec<Cosignature>,
+}
+
+/// One admin's signature over a state payload (`muster fleet cosign v1`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Cosignature {
+    pub signer: String,
     pub signature: String,
 }
 
@@ -524,10 +536,47 @@ impl FleetState {
         .map_err(|_| MusterError::Security("fleet state signature is invalid".into()))
     }
 
+    fn cosign_message(&self) -> Result<Vec<u8>, MusterError> {
+        let mut msg = COSIGN_DOMAIN.to_vec();
+        msg.extend(self.payload_bytes()?);
+        Ok(msg)
+    }
+
+    /// Adds `signer`'s co-signature over this payload (once per key).
+    pub fn add_cosignature(&mut self, signer: &Signer) -> Result<(), MusterError> {
+        let key = signer.public();
+        if self.cosignatures.iter().any(|c| c.signer == key) {
+            return Ok(());
+        }
+        let signature = signer.sign(&self.cosign_message()?);
+        self.cosignatures.push(Cosignature {
+            signer: key,
+            signature,
+        });
+        Ok(())
+    }
+
+    /// Keys whose co-signature verifies over this payload, once each. The
+    /// proposer's own seal is not listed here.
+    pub fn valid_cosigners(&self) -> Vec<String> {
+        let Ok(message) = self.cosign_message() else {
+            return Vec::new();
+        };
+        let mut valid: Vec<String> = Vec::new();
+        for c in &self.cosignatures {
+            if !valid.contains(&c.signer) && signing::verify(&c.signer, &message, &c.signature).is_ok()
+            {
+                valid.push(c.signer.clone());
+            }
+        }
+        valid
+    }
+
     fn sign(payload: StatePayload, signer: &Signer) -> Result<Self, MusterError> {
         let mut state = Self {
             payload,
             signature: String::new(),
+            cosignatures: Vec::new(),
         };
         state.signature = signer.sign(&state.signed_message()?);
         Ok(state)
@@ -633,6 +682,16 @@ fn seal_inner(
     // A seal must advance or preserve the pinned epoch, never launder an older state.
     ensure_not_behind_pin(config_dir, state_dir, "re-sign")?;
     let current = FleetState::load(config_dir)?;
+    if let (Some(pin), Some(state)) = (TrustAnchor::load(state_dir)?, &current) {
+        if state.payload.epoch > pin.epoch {
+            return Err(MusterError::Security(format!(
+                "cannot sign on top of fleet state epoch {} which this machine has not \
+                 accepted (pinned epoch {}); a governance change may be waiting for admin \
+                 co-signatures (`muster trust cosign`)",
+                state.payload.epoch, pin.epoch
+            )));
+        }
+    }
     if let Some(state) = &current {
         if !force && is_current(config_dir, manifest, state)? {
             return Ok(None);
@@ -654,7 +713,9 @@ fn seal_inner(
     };
     let state = FleetState::sign(payload, signer)?;
     state.save(config_dir)?;
-    if save_pin {
+    // A governance change short of its admin quorum is proposed, not accepted:
+    // this machine does not move its own pin either.
+    if save_pin && pending_quorum(state_dir, &state, manifest)?.is_none() {
         TrustAnchor::for_state(&state, manifest, false)?.save(state_dir)?;
     }
     Ok(Some(state))
@@ -677,7 +738,7 @@ fn verify_chain(
     pin: &TrustAnchor,
     state: &FleetState,
     manifest: &Manifest,
-) -> Result<(), MusterError> {
+) -> Result<Transition, MusterError> {
     if state.payload.epoch == pin.epoch + 1 {
         return check_transition(&pin.as_prior(), state, manifest);
     }
@@ -702,7 +763,15 @@ fn verify_chain(
             continue;
         };
         let epoch = past.payload.epoch;
-        if epoch <= pin.epoch || epoch > state.payload.epoch || by_epoch.contains_key(&epoch) {
+        if epoch <= pin.epoch || epoch > state.payload.epoch {
+            continue;
+        }
+        // Later versions of the same payload carry more co-signatures; a
+        // different payload at that epoch is a fork and the first one wins.
+        if by_epoch
+            .get(&epoch)
+            .is_some_and(|(seen, _)| seen.payload_hash().ok() != past.payload_hash().ok())
+        {
             continue;
         }
         let Some(manifest_text) =
@@ -716,6 +785,7 @@ fn verify_chain(
         by_epoch.insert(epoch, (past, past_manifest));
     }
     let mut prior = pin.as_prior();
+    let mut outcome = Transition::Accepted;
     for epoch in pin.epoch + 1..=state.payload.epoch {
         let Some((step, step_manifest)) = by_epoch.get(&epoch) else {
             return Err(jump(format!(
@@ -738,13 +808,24 @@ fn verify_chain(
         } else {
             step_manifest
         };
-        check_transition(&prior, step, manifest_for_step).map_err(|e| match e {
+        // The current state carries the co-signatures seen so far.
+        let to_check = if epoch == state.payload.epoch {
+            state
+        } else {
+            step
+        };
+        outcome = check_transition(&prior, to_check, manifest_for_step).map_err(|e| match e {
             MusterError::Security(m) => jump(format!("epoch {epoch}: {m}")),
             other => other,
         })?;
+        if epoch != state.payload.epoch && outcome != Transition::Accepted {
+            return Err(jump(format!(
+                "epoch {epoch} never gathered its required admin signatures"
+            )));
+        }
         prior = Prior::from_state(step, step_manifest)?;
     }
-    Ok(())
+    Ok(outcome)
 }
 
 /// One transition `prior` -> `state`: signer authorization (admin for
@@ -754,7 +835,7 @@ fn check_transition(
     prior: &Prior,
     state: &FleetState,
     manifest: &Manifest,
-) -> Result<(), MusterError> {
+) -> Result<Transition, MusterError> {
     let signer = &state.payload.signer;
     let vault_only = state.payload.governance == prior.governance;
     let allowed = if vault_only {
@@ -792,9 +873,154 @@ fn check_transition(
             ensure_reads_groups(manifest, signer, &changed)?;
         }
     } else if let Some(old) = &prior.snapshot {
-        check_quorum(old, &governance_content(manifest), state)?;
+        let new = governance_content(manifest);
+        check_quorum(old, &new, state)?;
+        return Ok(transition_outcome(prior, state, &new));
     }
-    Ok(())
+    Ok(Transition::Accepted)
+}
+
+/// How a transition fared against the k-of-n rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transition {
+    Accepted,
+    /// Signed by fewer than `required` distinct admins of the prior state.
+    Pending { received: usize, required: usize },
+}
+
+/// Who a signing key is for counting purposes: one vote per admin member (two
+/// machines of one admin are still one admin), the recovery key on its own.
+fn voter(snapshot: &Value, key: &str) -> String {
+    if let Some(members) = snapshot["members"].as_object() {
+        for (name, member) in members {
+            if member["role"] != "admin" || member["status"] != "active" {
+                continue;
+            }
+            let owns = member["machines"].as_array().is_some_and(|machines| {
+                machines
+                    .iter()
+                    .any(|m| m.as_str().is_some_and(|m| snapshot["machines"][m]["signing_key"] == key))
+            });
+            if owns {
+                return format!("member:{name}");
+            }
+        }
+    }
+    format!("key:{key}")
+}
+
+/// `(received, required)` when the prior state demands several admins for a
+/// governance change (team mode, `required_approvals > 1`), `None` otherwise.
+/// The recovery key alone always satisfies it (break-glass).
+fn quorum_count(prior: &Prior, state: &FleetState) -> Option<(usize, usize)> {
+    let old = prior.snapshot.as_ref()?;
+    let required = old["required_approvals"].as_u64().unwrap_or(1) as usize;
+    let team_mode = old["members"].as_object().is_some_and(|m| !m.is_empty());
+    if required <= 1 || !team_mode {
+        return None;
+    }
+    let mut keys = vec![state.payload.signer.clone()];
+    keys.extend(state.valid_cosigners());
+    if keys
+        .iter()
+        .any(|k| old["recovery"]["signing_key"].as_str() == Some(k.as_str()))
+    {
+        return Some((required, required));
+    }
+    let mut voters: Vec<String> = Vec::new();
+    for key in keys.iter().filter(|k| prior.admins.contains(k)) {
+        let v = voter(old, key);
+        if !voters.contains(&v) {
+            voters.push(v);
+        }
+    }
+    Some((voters.len(), required))
+}
+
+/// Whether the diff only adds machines and members whose own signed approvals
+/// (checked by [`check_quorum`]) already carry the quorum: nothing else moved,
+/// nothing active was removed, no role or reader changed.
+fn enrollment_only(old: &Value, new: &Value) -> bool {
+    let (Some(o), Some(n)) = (old.as_object(), new.as_object()) else {
+        return false;
+    };
+    if o.keys().chain(n.keys()).any(|k| {
+        !matches!(k.as_str(), "machines" | "members") && o.get(k) != n.get(k)
+    }) {
+        return false;
+    }
+    let machines_kept = old["machines"].as_object().is_some_and(|ms| {
+        ms.iter().all(|(name, m)| new["machines"].get(name) == Some(m))
+    });
+    let subset = |a: &Value, b: &Value| {
+        let (a, b) = (a.as_array(), b.as_array());
+        a.is_none_or(|a| b.is_some_and(|b| a.iter().all(|x| b.contains(x))))
+    };
+    let members_kept = old["members"].as_object().is_some_and(|ms| {
+        ms.iter().all(|(name, om)| {
+            let nm = &new["members"][name];
+            // Dropping an invitation that never became active takes nothing away.
+            let dropped_invitation = nm.is_null()
+                && om["status"] != "active"
+                && om["machines"].as_array().is_none_or(|m| m.is_empty());
+            if dropped_invitation {
+                return true;
+            }
+            let activated = om["status"] != "active" && nm["status"] == "active";
+            nm.is_object()
+                && om["role"] == nm["role"]
+                && om["invited_by"] == nm["invited_by"]
+                && (om["status"] == nm["status"] || activated)
+                && (om["approved_by"] == nm["approved_by"] || activated)
+                && subset(&om["machines"], &nm["machines"])
+                && subset(&om["approvals"], &nm["approvals"])
+        })
+    });
+    machines_kept && members_kept
+}
+
+fn transition_outcome(prior: &Prior, state: &FleetState, new: &Value) -> Transition {
+    let (Some(old), Some((received, required))) = (&prior.snapshot, quorum_count(prior, state))
+    else {
+        return Transition::Accepted;
+    };
+    if received >= required || enrollment_only(old, new) {
+        Transition::Accepted
+    } else {
+        Transition::Pending { received, required }
+    }
+}
+
+/// Unified diff of the governance content, for the operator to review.
+pub fn governance_diff(old: Option<&Value>, new: &Value) -> String {
+    let render = |v: &Value| serde_json::to_string_pretty(v).unwrap_or_default();
+    crate::engine::diff::unified(
+        &old.map(render).unwrap_or_default(),
+        &render(new),
+        "governance",
+        false,
+    )
+}
+
+/// After sealing: `(received, required)` when the new state lacks the admin
+/// signatures the pin's team demands, i.e. peers will hold it as pending.
+pub fn pending_quorum(
+    state_dir: &Path,
+    state: &FleetState,
+    manifest: &Manifest,
+) -> Result<Option<(usize, usize)>, MusterError> {
+    let Some(pin) = TrustAnchor::load(state_dir)? else {
+        return Ok(None);
+    };
+    if state.payload.governance == pin.governance || state.payload.epoch != pin.epoch + 1 {
+        return Ok(None);
+    }
+    Ok(
+        match transition_outcome(&pin.as_prior(), state, &governance_content(manifest)) {
+            Transition::Pending { received, required } => Some((received, required)),
+            Transition::Accepted => None,
+        },
+    )
 }
 
 /// Groups whose ciphertext or sidecar differs between two vault baselines.
@@ -1032,6 +1258,17 @@ pub enum Verification {
         /// The pin was created by this call (trust on first use).
         first_use: bool,
     },
+    /// A governance change signed by fewer admins than the last accepted state
+    /// requires. Not accepted: the pin does not move and security decisions
+    /// stay on the last accepted state until enough admins co-sign.
+    Pending {
+        epoch: u64,
+        signer: String,
+        received: usize,
+        required: usize,
+        /// Governance diff against the last accepted state.
+        diff: String,
+    },
 }
 
 /// Verifies the repository against the local pin and advances the pin.
@@ -1103,6 +1340,7 @@ pub fn verify_with(
     state.verify_signature()?;
     let signer = state.payload.signer.clone();
     let hash = state.payload_hash()?;
+    let mut outcome = Transition::Accepted;
 
     match &anchor {
         Some(pin) => {
@@ -1120,7 +1358,7 @@ pub fn verify_with(
                 )));
             }
             if state.payload.epoch > pin.epoch {
-                verify_chain(config_dir, pin, &state, manifest)?;
+                outcome = verify_chain(config_dir, pin, &state, manifest)?;
             }
         }
         None => {
@@ -1143,7 +1381,20 @@ pub fn verify_with(
         }
     }
 
+    let pending = |outcome: Transition| match (outcome, &anchor) {
+        (Transition::Pending { received, required }, Some(pin)) => Some(Verification::Pending {
+            epoch: state.payload.epoch,
+            signer: state.payload.signer.clone(),
+            received,
+            required,
+            diff: governance_diff(pin.snapshot.as_ref(), &governance_content(manifest)),
+        }),
+        _ => None,
+    };
     if !options.check_content {
+        if let Some(held) = pending(outcome) {
+            return Ok(held);
+        }
         return Ok(Verification::Verified {
             epoch: state.payload.epoch,
             signer,
@@ -1215,6 +1466,10 @@ pub fn verify_with(
         }
     }
 
+    // Pending: content was checked above, but the pin stays where it is.
+    if let Some(held) = pending(outcome) {
+        return Ok(held);
+    }
     if options.persist {
         // A first-use pin stays unconfirmed until a run names the signer with
         // `--expect-signer`; a pin that was already confirmed stays so.
@@ -1329,6 +1584,7 @@ mod tests {
                 signer: "musterpk1ab".into(),
             },
             signature: String::new(),
+            cosignatures: Vec::new(),
         };
         assert_eq!(
             String::from_utf8(state.payload_bytes().unwrap()).unwrap(),
@@ -1341,6 +1597,7 @@ mod tests {
                 ..state.payload
             },
             signature: String::new(),
+            cosignatures: Vec::new(),
         };
         assert_eq!(
             String::from_utf8(legacy.payload_bytes().unwrap()).unwrap(),

@@ -44,6 +44,10 @@ pub struct Context {
     /// Signed enrollment approvals the next fleet-state seal carries (set by
     /// `approve` when a quorum admitted a machine).
     pub enrollments: Vec<crate::fleet_state::EnrollmentEvidence>,
+    /// The repo holds a governance change that is short of its admin
+    /// co-signatures: this machine keeps using the last accepted state and
+    /// commands that would consume the new one refuse (see `trust::guard`).
+    pub governance_pending: bool,
     diagnostics: Vec<Diagnostic>,
     failed: bool,
 }
@@ -69,6 +73,7 @@ impl Context {
             recovery_signer: None,
             expect_signer: None,
             enrollments: Vec::new(),
+            governance_pending: false,
             diagnostics: Vec::new(),
             failed: false,
         })
@@ -210,6 +215,7 @@ mod tests {
             recovery_signer: None,
             expect_signer: None,
             enrollments: Vec::new(),
+            governance_pending: false,
             diagnostics: Vec::new(),
             failed: false,
         }
