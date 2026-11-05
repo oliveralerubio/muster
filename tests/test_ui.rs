@@ -1727,3 +1727,132 @@ fn web_skill_import_all_and_auto_update_routes_match_cli() {
     );
     assert_eq!(status, 400, "{reply}");
 }
+
+fn web_json(
+    ui: &mut Ui,
+    method: &str,
+    path: &str,
+    cookie: &str,
+    body: Option<&str>,
+) -> (u16, Value) {
+    let (status, _, text) = ui.request(method, path, Some(cookie), body);
+    (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+}
+
+#[test]
+fn history_is_a_registry_command_matching_the_web_route() {
+    let env = support::MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    env.run(&["--yes", "secret", "add", "hist/one", "--value-stdin"])
+        .write_stdin("history-dummy-1")
+        .assert()
+        .success();
+    let (out, cli) = env.run_json(&["--format", "json", "history"]);
+    assert!(out.status.success(), "{}", cli.raw);
+    assert_eq!(cli.command(), "history");
+    let mut ui = Ui::start(&env);
+    let cookie = ui.session();
+    let (status, web) = web_json(&mut ui, "GET", "/api/history", &cookie, None);
+    assert_eq!(status, 200);
+    assert_eq!(web["command"], "history");
+    assert_eq!(web["result"], *cli.result());
+    assert_eq!(web["cli"], "muster rollback <generation>");
+    assert!(web["result"]["events"].as_array().is_some());
+    assert!(web["result"]["generations"].as_array().is_some());
+}
+
+#[test]
+fn web_secret_write_matches_cli_stdin_write() {
+    let cli_env = support::MusterEnv::new();
+    cli_env.run(&["--yes", "init"]).assert().success();
+    cli_env
+        .run(&["--yes", "secret", "add", "same/token", "--value-stdin"])
+        .write_stdin("parity-dummy-1")
+        .assert()
+        .success();
+    let web_env = support::MusterEnv::new();
+    web_env.run(&["--yes", "init"]).assert().success();
+    let mut ui = Ui::start(&web_env);
+    let cookie = ui.session();
+    let body = r#"{"path":"same/token","value":"parity-dummy-1","confirm":true}"#;
+    let (status, web) = web_json(&mut ui, "POST", "/api/secret/add", &cookie, Some(body));
+    assert_eq!(status, 200);
+    let audit = |env: &support::MusterEnv| -> Vec<(String, String)> {
+        std::fs::read_to_string(env.path().join(".local/state/muster/history.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .map(|v| {
+                (
+                    v["action"].as_str().unwrap().to_owned(),
+                    v["subject"].as_str().unwrap().to_owned(),
+                )
+            })
+            .filter(|(a, _)| a == "secret.add")
+            .collect()
+    };
+    assert_eq!(audit(&cli_env), audit(&web_env));
+    assert_eq!(web["result"]["reference"], "native://same/token");
+    // Same handler, same diagnostics: a duplicate add fails identically.
+    let (status, again) = web_json(&mut ui, "POST", "/api/secret/add", &cookie, Some(body));
+    assert_eq!(status, 400);
+    let dup = cli_env
+        .run(&[
+            "--format",
+            "json",
+            "--yes",
+            "secret",
+            "add",
+            "same/token",
+            "--value-stdin",
+        ])
+        .write_stdin("parity-dummy-1")
+        .output()
+        .unwrap();
+    let dup: Value = serde_json::from_slice(&dup.stdout).unwrap();
+    assert_eq!(again["diagnostics"], dup["diagnostics"]);
+}
+
+#[test]
+fn secret_value_never_appears_in_schema_history_or_cli_line() {
+    let env = support::MusterEnv::new();
+    env.run(&["--yes", "init"]).assert().success();
+    let (_, schema) = env.run_json(&["--format", "json", "schema"]);
+    let add = schema.result()["commands"]
+        .as_array()
+        .cloned()
+        .or_else(|| schema.result().as_array().cloned())
+        .unwrap()
+        .into_iter()
+        .find(|c| c["name"] == "secret.add")
+        .unwrap();
+    assert!(add["params"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p["name"] == "value" && p["kind"] == "secret"));
+    // The CLI has no --value flag: values never travel in argv.
+    env.run(&["secret", "add", "x/y", "--value", "nope"])
+        .assert()
+        .failure();
+    let mut ui = Ui::start(&env);
+    let cookie = ui.session();
+    let sentinel = "registry-sentinel-777";
+    let body = format!(r#"{{"path":"leak/check","value":"{sentinel}","confirm":true}}"#);
+    let (_, _, text) = ui.request("POST", "/api/secret/add", Some(&cookie), Some(&body));
+    assert!(!text.contains(sentinel));
+    for path in ["/api/history", "/api/secrets"] {
+        let (_, _, text) = ui.request("GET", path, Some(&cookie), None);
+        assert!(!text.contains(sentinel));
+    }
+    // Invalid shapes keep their status.
+    for (body, expected) in [
+        (r#"{"path":"a/b","confirm":true}"#, 400),
+        (r#"{"path":"a/b","value":5,"confirm":true}"#, 400),
+        (r#"{"path":"a/b","value":"v"}"#, 400),
+    ] {
+        let (status, _, text) = ui.request("POST", "/api/secret/add", Some(&cookie), Some(body));
+        assert_eq!(status, expected, "{body}");
+        assert!(!text.contains("\"v\""));
+    }
+}

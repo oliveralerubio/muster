@@ -37,6 +37,13 @@ pub const ADD: CommandSpec = CommandSpec {
             positional: false,
         },
         ParamSpec {
+            name: "value",
+            about: "The secret value, supplied out of band (stdin for the CLI, request body for the panel); never an argument",
+            kind: ParamKind::Secret,
+            required: false,
+            positional: false,
+        },
+        ParamSpec {
             name: "allow",
             about: "Agent allowed to receive the secret (repeatable): <agent> everywhere or \
                     <agent>@<project> only in that project. Without it no agent receives it",
@@ -72,6 +79,13 @@ pub const ROTATE: CommandSpec = CommandSpec {
             name: "value-stdin",
             about: "Read the new secret value from stdin",
             kind: ParamKind::Bool,
+            required: false,
+            positional: false,
+        },
+        ParamSpec {
+            name: "value",
+            about: "The secret value, supplied out of band (stdin for the CLI, request body for the panel); never an argument",
+            kind: ParamKind::Secret,
             required: false,
             positional: false,
         },
@@ -449,6 +463,9 @@ fn parse_path(params: &Params) -> Result<(String, String), MusterError> {
 
 /// The value for add/rotate: stdin only, never argv.
 fn read_value(ctx: &Context, params: &Params) -> Result<SecretValue, MusterError> {
+    if let Some(value) = params.take_secret() {
+        return Ok(value);
+    }
     if !params.get_bool("value-stdin") {
         return Err(MusterError::Usage(
             "pass --value-stdin and pipe the value (values are never taken from arguments)".into(),
