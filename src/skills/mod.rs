@@ -10,14 +10,19 @@ pub mod lock;
 pub mod upstream;
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
 use crate::errors::MusterError;
 use crate::hash::sha256_hex;
 
-pub use lifecycle::{evaluate_update_action, read_upstream, Sources, UpdateAction, UpstreamSkill};
+pub use lifecycle::{
+    apply_update, check, evaluate_update_action, plan_update, read_upstream, AppliedUpdates,
+    CheckFinding, CheckReport, CheckTarget, CheckedSkill, PlannedUpdate, SkillDiff, SkipReason,
+    SkippedUpdate, Sources, UpdateAction, UpdateDiagnostic, UpdatePlan, UpdateSelection,
+    UpstreamSkill,
+};
 pub use lock::{LockEntry, SkillsLock};
 pub use upstream::{SkillStatus, UpstreamFetcher};
 
@@ -196,6 +201,78 @@ pub fn parse_frontmatter(content: &str) -> Option<FrontmatterMetadata> {
         }
     }
     Some(meta)
+}
+
+/// Skill names follow the Agent Skills convention: lowercase, digits, '-'.
+pub fn validate_skill_name(name: &str) -> Result<String, MusterError> {
+    if lock::is_valid_name(name) {
+        Ok(name.to_string())
+    } else {
+        Err(MusterError::Usage(format!(
+            "invalid skill name '{name}': use lowercase letters, digits and '-'"
+        )))
+    }
+}
+
+fn io_error(path: &Path, e: std::io::Error) -> MusterError {
+    MusterError::Operational(format!("{}: {e}", path.display()))
+}
+
+/// `<skills_dir>/<name>[/<rel>]`, refusing any path that could leave
+/// `skills_dir`: `name` must be a valid skill name and `rel` (a file inside the
+/// skill, from an upstream checkout or the lock) must be relative and made only
+/// of plain components (no `..`, root, or drive prefix).
+pub fn contained(skills_dir: &Path, name: &str, rel: Option<&str>) -> Result<PathBuf, MusterError> {
+    let name = validate_skill_name(name)?;
+    let mut path = skills_dir.join(name);
+    if let Some(rel) = rel {
+        let rel_path = Path::new(rel);
+        let plain = !rel.is_empty()
+            && !rel.contains('\\')
+            && !rel.chars().any(char::is_control)
+            && rel_path
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)));
+        if !plain {
+            return Err(MusterError::Security(format!(
+                "skill '{}' file path {rel:?} escapes the skill directory",
+                path.file_name().unwrap_or_default().to_string_lossy()
+            )));
+        }
+        path = path.join(rel_path);
+    }
+    if !path.starts_with(skills_dir) {
+        return Err(MusterError::Security(format!(
+            "{} is outside the skills directory {}",
+            path.display(),
+            skills_dir.display()
+        )));
+    }
+    Ok(path)
+}
+
+/// Replace `<skills_dir>/<name>` with exactly `files`. Every path is checked to
+/// stay inside `skills_dir` before anything is removed or written.
+pub fn write_skill(
+    skills_dir: &Path,
+    name: &str,
+    files: &BTreeMap<String, String>,
+) -> Result<(), MusterError> {
+    let dir = contained(skills_dir, name, None)?;
+    let targets = files
+        .iter()
+        .map(|(rel, contents)| Ok((contained(skills_dir, name, Some(rel))?, contents)))
+        .collect::<Result<Vec<_>, MusterError>>()?;
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).map_err(|e| io_error(&dir, e))?;
+    }
+    for (path, contents) in targets {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| io_error(parent, e))?;
+        }
+        std::fs::write(&path, contents).map_err(|e| io_error(&path, e))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

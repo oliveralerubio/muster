@@ -24,14 +24,15 @@ use crate::manifest::{self, Manifest, SkillRemote};
 use crate::output::{Diagnostic, Severity};
 use crate::registry::{CommandSpec, ParamKind, ParamSpec, Params};
 use crate::skills::lifecycle::{
-    evaluate_update_action, read_upstream, Sources, UpdateAction, UpstreamSkill,
+    self, read_upstream, CheckFinding, CheckReport, CheckTarget, UpdateDiagnostic, UpdatePlan,
+    UpdateSelection, UpstreamSkill,
 };
 use crate::skills::lock::{self, LockEntry, SkillsLock};
 use crate::skills::upstream::{
-    classify, relative, CachedStatus, Checkout, GitFetcher, SkillStatus, StatusCache, Upstream,
-    UpstreamFetcher,
+    relative, Checkout, GitFetcher, SkillStatus, StatusCache, UpstreamFetcher,
 };
-use crate::skills::{content_hash, parse_frontmatter, read_skill_files};
+pub use crate::skills::validate_skill_name;
+use crate::skills::{contained, content_hash, parse_frontmatter, read_skill_files, write_skill};
 use crate::team;
 
 const DEFAULT_SOURCE: &str = "skills";
@@ -464,17 +465,6 @@ pub fn contained_skill_file(
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-/// Skill names follow the Agent Skills convention: lowercase, digits, '-'.
-pub fn validate_skill_name(name: &str) -> Result<String, MusterError> {
-    if lock::is_valid_name(name) {
-        Ok(name.to_string())
-    } else {
-        Err(MusterError::Usage(format!(
-            "invalid skill name '{name}': use lowercase letters, digits and '-'"
-        )))
-    }
-}
-
 fn required_name(params: &Params) -> Result<String, MusterError> {
     let name = params
         .get_string("name")
@@ -536,76 +526,6 @@ fn now() -> String {
 
 fn io_error(path: &Path, e: std::io::Error) -> MusterError {
     MusterError::Operational(format!("{}: {e}", path.display()))
-}
-
-/// `<skills_dir>/<name>[/<rel>]`, refusing any path that could leave
-/// `skills_dir`: `name` must be a valid skill name and `rel` (a file inside the
-/// skill, from an upstream checkout or the lock) must be relative and made only
-/// of plain components (no `..`, root, or drive prefix).
-fn contained(skills_dir: &Path, name: &str, rel: Option<&str>) -> Result<PathBuf, MusterError> {
-    let name = validate_skill_name(name)?;
-    let mut path = skills_dir.join(name);
-    if let Some(rel) = rel {
-        let rel_path = Path::new(rel);
-        let plain = !rel.is_empty()
-            && !rel.contains('\\')
-            && !rel.chars().any(char::is_control)
-            && rel_path
-                .components()
-                .all(|c| matches!(c, std::path::Component::Normal(_)));
-        if !plain {
-            return Err(MusterError::Security(format!(
-                "skill '{}' file path {rel:?} escapes the skill directory",
-                path.file_name().unwrap_or_default().to_string_lossy()
-            )));
-        }
-        path = path.join(rel_path);
-    }
-    if !path.starts_with(skills_dir) {
-        return Err(MusterError::Security(format!(
-            "{} is outside the skills directory {}",
-            path.display(),
-            skills_dir.display()
-        )));
-    }
-    Ok(path)
-}
-
-/// Replace `<skills_dir>/<name>` with exactly `files`. Every path is checked to
-/// stay inside `skills_dir` before anything is removed or written.
-fn write_skill(
-    skills_dir: &Path,
-    name: &str,
-    files: &BTreeMap<String, String>,
-) -> Result<(), MusterError> {
-    let dir = contained(skills_dir, name, None)?;
-    let targets = files
-        .iter()
-        .map(|(rel, contents)| Ok((contained(skills_dir, name, Some(rel))?, contents)))
-        .collect::<Result<Vec<_>, MusterError>>()?;
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).map_err(|e| io_error(&dir, e))?;
-    }
-    for (path, contents) in targets {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| io_error(parent, e))?;
-        }
-        std::fs::write(&path, contents).map_err(|e| io_error(&path, e))?;
-    }
-    Ok(())
-}
-
-/// Per-file change summary from `old` to `new`.
-fn diff_summary(old: &BTreeMap<String, String>, new: &BTreeMap<String, String>) -> Value {
-    let normalize = |s: &str| s.replace("\r\n", "\n");
-    let added: Vec<&String> = new.keys().filter(|k| !old.contains_key(*k)).collect();
-    let removed: Vec<&String> = old.keys().filter(|k| !new.contains_key(*k)).collect();
-    let changed: Vec<&String> = new
-        .iter()
-        .filter(|(k, v)| old.get(*k).is_some_and(|o| normalize(o) != normalize(v)))
-        .map(|(k, _)| k)
-        .collect();
-    json!({ "added": added, "changed": changed, "removed": removed })
 }
 
 fn diag_for(ctx: &mut Context, name: &str, status: SkillStatus, reason: Option<&str>) {
@@ -1566,15 +1486,14 @@ fn import(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
             version: v.skill.version.clone(),
             updated_at: updated_at.clone(),
         });
-        let status = classify(false, &v.skill.hash, &v.skill.upstream());
-        cache.skills.insert(
-            v.name.clone(),
-            CachedStatus {
-                status,
-                reason: v.skill.deprecated.clone(),
-                upstream_commit: Some(checkouts[v.plan].commit.clone()),
-                checked_at: updated_at.clone(),
-            },
+        let status = lifecycle::observe(
+            &mut cache,
+            &v.name,
+            &v.skill.hash,
+            &v.skill.upstream(),
+            v.skill.deprecated.clone(),
+            Some(checkouts[v.plan].commit.clone()),
+            &updated_at,
         );
         diag_for(ctx, &v.name, status, v.skill.deprecated.as_deref());
     }
@@ -1772,15 +1691,14 @@ fn add_remote(
             version: skill.version.clone(),
             updated_at: updated_at.clone(),
         });
-        let status = classify(false, &skill.hash, &skill.upstream());
-        cache.skills.insert(
-            name.clone(),
-            CachedStatus {
-                status,
-                reason: skill.deprecated.clone(),
-                upstream_commit: Some(checkout.commit.clone()),
-                checked_at: updated_at.clone(),
-            },
+        let status = lifecycle::observe(
+            &mut cache,
+            name,
+            &skill.hash,
+            &skill.upstream(),
+            skill.deprecated.clone(),
+            Some(checkout.commit.clone()),
+            &updated_at,
         );
         diag_for(ctx, name, status, skill.deprecated.as_deref());
     }
@@ -1821,82 +1739,53 @@ fn check_with(
 ) -> Result<Value, MusterError> {
     let manifest = Manifest::load(&ctx.config_dir)?;
     let lock = SkillsLock::load(&ctx.config_dir)?;
-    let only = match params.get_string("name") {
-        Some(name) => {
-            let name = validate_skill_name(name)?;
-            if lock.get(&name).is_none() {
-                return Err(MusterError::Usage(format!(
-                    "skill '{name}' is not in skills.lock"
-                )));
-            }
-            Some(name)
-        }
-        None => None,
+    let target = match params.get_string("name") {
+        Some(name) => CheckTarget::Named(validate_skill_name(name)?),
+        None => CheckTarget::All,
     };
-    let mut sources = Sources::new(&manifest, fetcher);
-    let mut cache = StatusCache::load(&ctx.state_dir);
-    let checked_at = now();
-    let mut reported_unreachable = BTreeSet::new();
-    let mut skills = Vec::new();
-    for entry in &lock.skills {
-        if only.as_ref().is_some_and(|n| n != &entry.name) {
-            continue;
+    let report = lifecycle::check(&target, &manifest, &lock, fetcher, &ctx.state_dir, &now())?;
+    emit_check_findings(ctx, &report);
+    Ok(check_json(&report))
+}
+
+fn emit_check_findings(ctx: &mut Context, report: &CheckReport) {
+    for finding in &report.findings {
+        match finding {
+            CheckFinding::SourceUnreachable { origin, why } => unreachable(ctx, origin, why),
+            CheckFinding::Status {
+                name,
+                status,
+                reason,
+            } => diag_for(ctx, name, *status, reason.as_deref()),
         }
-        if entry.is_local() {
-            skills.push(json!({ "name": entry.name, "origin": entry.origin, "status": "local" }));
-            continue;
-        }
-        let (upstream, skill, commit) = match sources.checkout(&entry.origin) {
-            Ok((remote, checkout)) => match read_upstream(&checkout, &remote, &entry.name) {
-                Ok(Some(skill)) => (skill.upstream(), Some(skill), Some(checkout.commit)),
-                Ok(None) => (Upstream::Missing, None, Some(checkout.commit)),
-                Err(e) => {
-                    if reported_unreachable.insert(entry.origin.clone()) {
-                        unreachable(ctx, &entry.origin, &e.to_string());
-                    }
-                    (Upstream::Unreachable, None, None)
-                }
-            },
-            Err(e) => {
-                if reported_unreachable.insert(entry.origin.clone()) {
-                    unreachable(ctx, &entry.origin, &e);
-                }
-                (Upstream::Unreachable, None, None)
-            }
-        };
-        let status = classify(false, &entry.content_hash, &upstream);
-        let reason = skill.as_ref().and_then(|s| s.deprecated.clone());
-        diag_for(ctx, &entry.name, status, reason.as_deref());
-        let last_known = cache.skills.get(&entry.name).map(|c| c.status.as_str());
-        let mut view = json!({
-            "name": entry.name,
-            "origin": entry.origin,
-            "status": status.as_str(),
-            "reason": reason,
-            "commit": entry.commit,
-            "upstream_commit": commit,
-            "upstream_version": skill.as_ref().and_then(|s| s.version.clone()),
-        });
-        if status == SkillStatus::Unknown {
-            // Keep the last known status in the cache; report it alongside.
-            view["last_known"] = json!(last_known);
-        } else {
-            cache.skills.insert(
-                entry.name.clone(),
-                CachedStatus {
-                    status,
-                    reason,
-                    upstream_commit: commit,
-                    checked_at: checked_at.clone(),
-                },
-            );
-        }
-        skills.push(view);
     }
-    cache.checked_at = Some(checked_at.clone());
-    cache.skills.retain(|name, _| lock.get(name).is_some());
-    cache.save(&ctx.state_dir)?;
-    Ok(json!({ "checked_at": checked_at, "skills": skills }))
+}
+
+fn check_json(report: &CheckReport) -> Value {
+    let skills: Vec<Value> = report
+        .skills
+        .iter()
+        .map(|s| {
+            if s.status == SkillStatus::Local {
+                return json!({ "name": s.name, "origin": s.origin, "status": "local" });
+            }
+            let mut view = json!({
+                "name": s.name,
+                "origin": s.origin,
+                "status": s.status.as_str(),
+                "reason": s.reason,
+                "commit": s.commit,
+                "upstream_commit": s.upstream_commit,
+                "upstream_version": s.upstream_version,
+            });
+            if s.status == SkillStatus::Unknown {
+                // The cache keeps the last known status; report it alongside.
+                view["last_known"] = json!(s.last_known);
+            }
+            view
+        })
+        .collect();
+    json!({ "checked_at": report.checked_at, "skills": skills })
 }
 
 fn unreachable(ctx: &mut Context, origin: &str, why: &str) {
@@ -1914,15 +1803,6 @@ fn unreachable(ctx: &mut Context, origin: &str, why: &str) {
 // update
 // ---------------------------------------------------------------------------
 
-struct Planned {
-    name: String,
-    origin: String,
-    commit: String,
-    skill: UpstreamSkill,
-    files: Value,
-    forced: bool,
-}
-
 fn update(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let fetcher = GitFetcher::from_env()?;
     update_with(ctx, params, &fetcher)
@@ -1932,17 +1812,6 @@ fn update_with(
     ctx: &mut Context,
     params: &Params,
     fetcher: &dyn UpstreamFetcher,
-) -> Result<Value, MusterError> {
-    update_inner(ctx, params, fetcher, false)
-}
-
-/// `unattended`: the caller (sync) already decided to apply, so no
-/// confirmation is asked. This is NOT the global `--yes`.
-fn update_inner(
-    ctx: &mut Context,
-    params: &Params,
-    fetcher: &dyn UpstreamFetcher,
-    unattended: bool,
 ) -> Result<Value, MusterError> {
     let manifest = Manifest::load(&ctx.config_dir)?;
     let actor = admin(ctx, &manifest)?;
@@ -1959,111 +1828,50 @@ fn update_inner(
     }
     let (dir, _) = skills_dir(ctx, &manifest)?;
     let mut lock = SkillsLock::load(&ctx.config_dir)?;
-    let targets: Vec<LockEntry> = match &named {
-        Some(name) => {
-            let entry = lock.get(name).ok_or_else(|| {
-                MusterError::Usage(format!("skill '{name}' is not in skills.lock"))
-            })?;
-            if entry.is_local() {
-                return Err(MusterError::Usage(format!(
-                    "skill '{name}' is an own skill; edit it in place"
-                )));
-            }
-            vec![entry.clone()]
-        }
-        None => lock
-            .skills
-            .iter()
-            .filter(|e| !e.is_local())
-            .cloned()
-            .collect(),
+    let selection = match named {
+        Some(name) => UpdateSelection::Named(name),
+        None => UpdateSelection::All,
     };
+    let plan = lifecycle::plan_update(&selection, force, &manifest, &dir, &lock, fetcher)?;
+    emit_update_diagnostics(ctx, &plan);
+    let result = update_json(ctx, &plan);
+    if plan.planned.is_empty() || ctx.dry_run {
+        return Ok(result);
+    }
+    let summary: Vec<String> = plan
+        .planned
+        .iter()
+        .map(|p| {
+            format!(
+                "{} (+{} ~{} -{} files)",
+                p.name,
+                p.diff.added.len(),
+                p.diff.changed.len(),
+                p.diff.removed.len()
+            )
+        })
+        .collect();
+    ctx.confirm(&format!("Update skill(s) {}?", summary.join(", ")))?;
+    apply_and_commit(ctx, &plan, &dir, &mut lock, actor.as_ref())?;
+    Ok(result)
+}
 
-    let mut sources = Sources::new(&manifest, fetcher);
-    let mut planned = Vec::new();
-    let mut skipped = Vec::new();
-    for entry in targets {
-        let skill_dir = contained(&dir, &entry.name, None)?;
-        let refuse = |ctx: &mut Context, code: &str, message: String| -> Result<(), MusterError> {
-            if named.is_some() {
-                return Err(MusterError::Usage(message));
-            }
-            ctx.diag(Diagnostic::new(Severity::Warning, code, message));
-            Ok(())
-        };
-        let (remote, checkout) = match sources.checkout(&entry.origin) {
-            Ok(found) => found,
-            Err(e) => {
-                if named.is_some() {
-                    return Err(MusterError::Operational(format!(
-                        "cannot update skill '{}': {e}",
-                        entry.name
-                    )));
-                }
-                unreachable(ctx, &entry.origin, &e);
-                skipped.push(json!({ "name": entry.name, "reason": "unreachable" }));
-                continue;
-            }
-        };
-        let upstream = read_upstream(&checkout, &remote, &entry.name)?;
-        let disk = if upstream.is_some() {
-            Some(read_skill_files(&skill_dir)?)
-        } else {
-            None
-        };
-        let disk_hash = disk.as_ref().map(content_hash).unwrap_or_default();
-        let action = evaluate_update_action(
-            &entry.content_hash,
-            &disk_hash,
-            upstream.as_ref().map(|s| s.hash.as_str()),
-            force,
-        );
-
-        match action {
-            UpdateAction::SkipUpstreamRemoved => {
-                refuse(
-                    ctx,
-                    "skill_upstream_removed",
-                    format!(
-                        "skill '{}' was removed from source '{}'; nothing to update to. Keep it with \
-                         `muster skill rm {} --detach --yes` or delete it with `muster skill rm {} --yes`",
-                        entry.name, entry.origin, entry.name, entry.name
-                    ),
-                )?;
-                skipped.push(json!({ "name": entry.name, "reason": "upstream_removed" }));
-                continue;
-            }
-            UpdateAction::UpToDate => continue,
-            UpdateAction::SkipModified => {
-                refuse(
-                    ctx,
-                    "skill_modified",
-                    format!(
-                        "skill '{}' has local modifications that the update would overwrite; \
-                         re-run with --force to discard them",
-                        entry.name
-                    ),
-                )?;
-                skipped.push(json!({ "name": entry.name, "reason": "modified" }));
-                continue;
-            }
-            UpdateAction::ApplyUpdate => {
-                let skill = upstream.expect("apply update requires upstream skill");
-                let disk = disk.expect("apply update requires disk files");
-                let modified = disk_hash != entry.content_hash;
-                planned.push(Planned {
-                    files: diff_summary(&disk, &skill.files),
-                    name: entry.name.clone(),
-                    origin: entry.origin.clone(),
-                    commit: checkout.commit.clone(),
-                    skill,
-                    forced: modified && force,
-                });
-            }
+fn emit_update_diagnostics(ctx: &mut Context, plan: &UpdatePlan) {
+    for d in &plan.diagnostics {
+        match d {
+            UpdateDiagnostic::SourceUnreachable { origin, why } => unreachable(ctx, origin, why),
+            other => ctx.diag(Diagnostic::new(
+                Severity::Warning,
+                other.code(),
+                other.message(),
+            )),
         }
     }
+}
 
-    let updated: Vec<Value> = planned
+fn update_json(ctx: &Context, plan: &UpdatePlan) -> Value {
+    let updated: Vec<Value> = plan
+        .planned
         .iter()
         .map(|p| {
             json!({
@@ -2072,73 +1880,51 @@ fn update_inner(
                 "commit": p.commit,
                 "version": p.skill.version,
                 "deprecated": p.skill.deprecated,
-                "files": p.files,
+                "files": {
+                    "added": p.diff.added,
+                    "changed": p.diff.changed,
+                    "removed": p.diff.removed,
+                },
                 "forced": p.forced,
             })
         })
         .collect();
-    let result = json!({ "updated": updated, "skipped": skipped, "dry_run": ctx.dry_run });
-    if planned.is_empty() || ctx.dry_run {
-        return Ok(result);
-    }
-    let summary: Vec<String> = planned
+    let skipped: Vec<Value> = plan
+        .skipped
         .iter()
-        .map(|p| {
-            let count = |k: &str| p.files[k].as_array().map_or(0, Vec::len);
-            format!(
-                "{} (+{} ~{} -{} files)",
-                p.name,
-                count("added"),
-                count("changed"),
-                count("removed")
-            )
-        })
+        .map(|s| json!({ "name": s.name, "reason": s.reason.as_str() }))
         .collect();
-    if !unattended {
-        ctx.confirm(&format!("Update skill(s) {}?", summary.join(", ")))?;
-    }
+    json!({ "updated": updated, "skipped": skipped, "dry_run": ctx.dry_run })
+}
 
-    let updated_at = now();
-    let mut cache = StatusCache::load(&ctx.state_dir);
-    for p in &planned {
-        let skill_dir = contained(&dir, &p.name, None)?;
-        if content_hash(&read_skill_files(&skill_dir)?) != p.skill.hash {
-            write_skill(&dir, &p.name, &p.skill.files)?;
-        }
-        lock.upsert(LockEntry {
-            name: p.name.clone(),
-            origin: p.origin.clone(),
-            commit: Some(p.commit.clone()),
-            content_hash: p.skill.hash.clone(),
-            version: p.skill.version.clone(),
-            updated_at: updated_at.clone(),
-        });
-        let status = classify(false, &p.skill.hash, &p.skill.upstream());
-        cache.skills.insert(
-            p.name.clone(),
-            CachedStatus {
-                status,
-                reason: p.skill.deprecated.clone(),
-                upstream_commit: Some(p.commit.clone()),
-                checked_at: updated_at.clone(),
-            },
-        );
-    }
-    lock.save(&ctx.config_dir)?;
-    if let Err(e) = cache.save(&ctx.state_dir) {
+/// Vendor the plan, then record it as one commit (team actor in team mode).
+fn apply_and_commit(
+    ctx: &mut Context,
+    plan: &UpdatePlan,
+    skills_dir: &Path,
+    lock: &mut SkillsLock,
+    actor: Option<&team::Actor>,
+) -> Result<(), MusterError> {
+    let applied = lifecycle::apply_update(
+        plan,
+        skills_dir,
+        &ctx.config_dir,
+        &ctx.state_dir,
+        lock,
+        &now(),
+    )?;
+    if let Some(e) = &applied.cache_error {
         ctx.diag(Diagnostic::new(
             Severity::Warning,
             "skill_status_cache",
             format!("cannot record skill status: {e}"),
         ));
     }
-    let names: Vec<&str> = planned.iter().map(|p| p.name.as_str()).collect();
     commit(
         ctx,
-        actor.as_ref(),
-        &format!("feat(skills): update {}", names.join(", ")),
-    )?;
-    Ok(result)
+        actor,
+        &format!("feat(skills): update {}", applied.names.join(", ")),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2267,7 +2053,7 @@ pub fn auto_update_in_sync(ctx: &mut Context) -> Vec<Value> {
         }
     };
     match auto_update_with(ctx, &fetcher) {
-        Ok(updated) => updated,
+        Ok(updated) => updated.into_iter().map(Value::String).collect(),
         Err(e) => {
             auto_update_warning(ctx, &e.to_string());
             Vec::new()
@@ -2286,7 +2072,7 @@ fn auto_update_warning(ctx: &mut Context, why: &str) {
 fn auto_update_with(
     ctx: &mut Context,
     fetcher: &dyn UpstreamFetcher,
-) -> Result<Vec<Value>, MusterError> {
+) -> Result<Vec<String>, MusterError> {
     let manifest = Manifest::load(&ctx.config_dir)?;
     let layers = crate::engine::layer::global_layers(
         &ctx.config_dir,
@@ -2297,29 +2083,47 @@ fn auto_update_with(
     if !merged.agents.skills.as_ref().is_some_and(|s| s.auto_update) {
         return Ok(Vec::new());
     }
-    if !SkillsLock::load(&ctx.config_dir)?
-        .skills
-        .iter()
-        .any(|e| !e.is_local())
-    {
+    let mut lock = SkillsLock::load(&ctx.config_dir)?;
+    if !lock.skills.iter().any(|e| !e.is_local()) {
         return Ok(Vec::new());
     }
-    if let Err(e) = admin(ctx, &manifest) {
-        ctx.diag(Diagnostic::new(
-            Severity::Warning,
-            "skill_auto_update_skipped",
-            format!("skill auto-update skipped: {e}"),
-        ));
-        return Ok(Vec::new());
+    let actor = match admin(ctx, &manifest) {
+        Ok(actor) => actor,
+        Err(e) => {
+            ctx.diag(Diagnostic::new(
+                Severity::Warning,
+                "skill_auto_update_skipped",
+                format!("skill auto-update skipped: {e}"),
+            ));
+            return Ok(Vec::new());
+        }
+    };
+    let report = lifecycle::check(
+        &CheckTarget::All,
+        &manifest,
+        &lock,
+        fetcher,
+        &ctx.state_dir,
+        &now(),
+    )?;
+    emit_check_findings(ctx, &report);
+    let (dir, _) = skills_dir(ctx, &manifest)?;
+    // Never forced: locally modified skills are skipped with a warning.
+    let plan = lifecycle::plan_update(
+        &UpdateSelection::All,
+        false,
+        &manifest,
+        &dir,
+        &lock,
+        fetcher,
+    )?;
+    emit_update_diagnostics(ctx, &plan);
+    let names: Vec<String> = plan.planned.iter().map(|p| p.name.clone()).collect();
+    if plan.planned.is_empty() || ctx.dry_run {
+        return Ok(names);
     }
-    check_with(ctx, &Params::default(), fetcher)?;
-    let mut params = Params::default();
-    params.set("all", Value::Bool(true));
-    let result = update_inner(ctx, &params, fetcher, true)?;
-    Ok(result["updated"]
-        .as_array()
-        .map(|items| items.iter().map(|u| u["name"].clone()).collect())
-        .unwrap_or_default())
+    apply_and_commit(ctx, &plan, &dir, &mut lock, actor.as_ref())?;
+    Ok(names)
 }
 
 // ---------------------------------------------------------------------------
@@ -2509,24 +2313,6 @@ mod tests {
         );
         assert_eq!(source_name_from_url("file:///tmp/.tmpAbC"), "tmpabc");
         assert_eq!(source_name_from_url(""), "upstream");
-    }
-
-    #[test]
-    fn diff_summary_lists_added_changed_removed() {
-        let old = BTreeMap::from([
-            ("SKILL.md".to_string(), "a\n".to_string()),
-            ("gone.md".to_string(), "x".to_string()),
-            ("same.md".to_string(), "s\r\n".to_string()),
-        ]);
-        let new = BTreeMap::from([
-            ("SKILL.md".to_string(), "b\n".to_string()),
-            ("new.md".to_string(), "n".to_string()),
-            ("same.md".to_string(), "s\n".to_string()),
-        ]);
-        assert_eq!(
-            diff_summary(&old, &new),
-            json!({ "added": ["new.md"], "changed": ["SKILL.md"], "removed": ["gone.md"] })
-        );
     }
 
     #[test]
