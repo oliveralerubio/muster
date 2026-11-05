@@ -58,6 +58,16 @@ pub fn run(
     check_keys: bool,
     offline: bool,
 ) -> Result<Value, MusterError> {
+    // Governance waiting for admin co-signatures is not accepted: doctor only
+    // reports, and never plans, renders or resolves secrets from it.
+    if fix && ctx.governance_pending {
+        return Err(MusterError::Security(
+            "`muster doctor --fix` refused: the repo holds a governance change that has not \
+             gathered enough admin signatures. Doctor only reports until an admin completes \
+             it with `muster trust cosign`"
+                .into(),
+        ));
+    }
     let mut checkup = examine(ctx);
     let mut fixes: Vec<Value> = checkup
         .repairs
@@ -84,9 +94,11 @@ pub fn run(
 
     // Run the optional network check once, even when repairs re-examine local state.
     checkup.checks.push(api_keys::check(check_keys, offline));
-    checkup
-        .checks
-        .push(api_keys::check_declared(ctx, check_keys, offline));
+    checkup.checks.push(if ctx.governance_pending {
+        Check::skipped("provider_api_keys")
+    } else {
+        api_keys::check_declared(ctx, check_keys, offline)
+    });
     let diagnostics = checkup.diagnostics();
     let count = |s: Severity| diagnostics.iter().filter(|d| d.severity == s).count();
     let errors = count(Severity::Error);
@@ -231,7 +243,9 @@ fn examine(ctx: &mut Context) -> Checkup {
         Check::skipped("vault")
     });
     let mut plan = None;
+    let held = ctx.governance_pending;
     checks.push(match &manifest {
+        _ if held => Check::skipped("adapters"),
         Some(_) => {
             let (check, planned) = check_adapters(ctx);
             if check
@@ -248,10 +262,12 @@ fn examine(ctx: &mut Context) -> Checkup {
         None => Check::skipped("adapters"),
     });
     checks.push(match &manifest {
+        _ if held => Check::skipped("keys"),
         Some(m) => check_keys(ctx, m),
         None => Check::skipped("keys"),
     });
     checks.push(match &manifest {
+        _ if held => Check::skipped("providers"),
         Some(m) => check_ai_providers(ctx, m),
         None => Check::skipped("providers"),
     });
