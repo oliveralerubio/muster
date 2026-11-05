@@ -24,7 +24,9 @@ At the root of the configuration repository, `fleet.state.json` contains:
 - `prev`: SHA-256 digest of the previous state payload (`null` at epoch 1).
 - `governance`: SHA-256 digest of canonical JSON serialization of security-critical fields (`machines`, `members`, `groups`, `secrets`, `required_approvals`, `revoked_recipients`, `recovery`).
 - `vault`: Map of group names to SHA-256 hashes of `<group>.age` ciphertext files.
+- `vault_meta`: Map of group names to SHA-256 hashes of `<group>.meta.json` sidecar files (plaintext metadata including recipient and secret lists). Tampered, missing, forged, or unexpected sidecars fail verification with security error code 5.
 - `signer`: Public key of the signing machine or recovery key.
+- Compatibility: `vault_meta` is omitted from the canonical bytes when empty, so states signed before sidecar coverage keep their exact hash and signature. Sidecars of such a state are not compared until the next change re-signs it with digests.
 - Detached Ed25519 signature over canonical JSON of the payload prefixed with domain separator `b"muster fleet state v1\n"`.
 
 ### 3. Canonical JSON Encoding
@@ -40,11 +42,14 @@ Stored with permissions 0600 strictly outside the Git repository:
 - **Anti-Rollback Verification:** Rejects states where `epoch < pin.epoch`, or `epoch == pin.epoch` with a mismatched payload hash (fork).
 - **Anti-Downgrade Verification:** Refuses operation if `fleet.state.json` is missing when a local trust pin exists.
 - **Automatic Rollback Restoration on Pull:** When `muster sync --pull` encounters an invalid state or rollback, it immediately reverts HEAD to the pre-pull commit so tainted or rolled-back state is never applied to the local machine.
+- **Pin check on every mutating command:** before committing, any mutating command (security-consuming or not, via `trust::guard` and `trust::commit`) refuses a repo whose `epoch < pin.epoch` ("cannot commit on top of a rolled-back fleet state"), so no command builds on a rolled-back checkout and pushes it.
+- **TOFU confirmation record:** `trust.json` records `tofu: true` when the pin was created by trust on first use without `--expect-signer`. `muster doctor` reports it as the info diagnostic `trust_pin_unconfirmed` with the signer fingerprint to verify out of band. A later run with a matching `--expect-signer` clears the flag; pins from before this field and pins a machine created by signing itself count as confirmed.
 - Advances pin atomically only after full signature, governance, and vault digest checks pass.
 
 ### 5. Automatic Re-Sealing vs. Operator Re-Signing (`muster trust resign`)
 - **Automated Operations:** Every mutating security command (`init`, `approve`, `reject`, `revoke`, `secret add/rotate/rm`, `group rekey`, etc.) automatically calculates canonical digests, re-seals with `epoch + 1`, updates the local trust pin, and commits `fleet.state.json` in the same atomic Git commit.
 - **Manual Governance Edits:** If an operator edits `muster.toml` by hand, commands consuming security state fail with code 5 (`error[security]`). The operator inspects the proposed state transition and runs `muster trust resign --yes`, which cryptographically seals the updated governance under an authorized admin or recovery key.
+- **Resign anti-rollback invariant:** a seal (including `muster trust resign`, migration and automatic re-sealing) must advance or preserve the local pin epoch, never launder an older state. If the repo's `fleet.state.json` epoch is below the pinned epoch, resign is refused with a security error (code 5: "cannot re-sign a rolled-back fleet state (epoch N < pinned M)"); restore the repo from a trusted copy instead. The check runs inside `fleet_state::seal` and at the top of `trust resign`, before the "already up to date" shortcut.
 - **Trust Inspection:** `muster trust show` renders current epoch, payload hash, signer fingerprints, governance status, and local pin health.
 
 ### 6. Signed Quorum Approvals
