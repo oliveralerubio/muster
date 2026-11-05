@@ -119,7 +119,35 @@ fn run_resign(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> 
         }
     };
 
-    // Show governance diff if any
+    // The signer must be an admin, both of this manifest and of the pinned
+    // fleet, before anything is sealed (a recovery key counts via the manifest).
+    let public = signer.public();
+    let (admins, _) = fleet_state::signer_sets(&manifest);
+    let pin = TrustAnchor::load(&ctx.state_dir)?;
+    let pinned_ok = pin
+        .as_ref()
+        .is_none_or(|p| p.admins.is_empty() || p.admins.contains(&public));
+    if !admins.contains(&public) || !pinned_ok {
+        return Err(MusterError::Security(format!(
+            "cannot re-sign: signer {} is not an admin of this fleet",
+            signing::fingerprint(&public)
+        )));
+    }
+
+    // Governance diff against what this machine last accepted.
+    let governance_diff = pin
+        .as_ref()
+        .and_then(|p| p.snapshot.as_ref())
+        .map(|old| {
+            let render = |v: &Value| serde_json::to_string_pretty(v).unwrap_or_default();
+            crate::engine::diff::unified(
+                &render(old),
+                &render(&governance_content(&manifest)),
+                "governance",
+                false,
+            )
+        })
+        .unwrap_or_default();
     let existing_state = FleetState::load(&ctx.config_dir)?;
     if let Some(existing) = &existing_state {
         if fleet_state::is_current(&ctx.config_dir, &manifest, existing)? {
@@ -133,6 +161,13 @@ fn run_resign(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> 
 
     if params.get_bool("yes") {
         ctx.yes = true;
+    }
+    if !ctx.yes {
+        if governance_diff.is_empty() {
+            eprintln!("Governance fields are unchanged; only vault hashes will be re-signed.");
+        } else {
+            eprintln!("Governance changes to be signed:\n{governance_diff}");
+        }
     }
     ctx.confirm("Re-sign fleet state with the current muster.toml security fields?")?;
 
@@ -151,5 +186,6 @@ fn run_resign(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> 
         "fingerprint": signing::fingerprint(&state.payload.signer),
         "governance": state.payload.governance,
         "governance_content": governance_content(&manifest),
+        "governance_diff": governance_diff,
     }))
 }

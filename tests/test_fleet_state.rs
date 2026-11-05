@@ -848,3 +848,36 @@ fn doctor_flags_unconfirmed_tofu_pin_until_confirmed_with_expect_signer() {
         "unexpected trust_pin_unconfirmed after confirmation: {diags_after:?}"
     );
 }
+
+#[test]
+fn resign_refuses_a_signer_that_is_not_an_admin() {
+    let env = MusterEnv::new();
+    ok(&env, &["init", "--yes", "--machine", "alpha"]);
+    let path = env.config_dir().join("muster.toml");
+    let mut text = manifest_text(&env);
+    text.push_str("\n# hand edit\n");
+    std::fs::write(&path, text).unwrap();
+    // A signing key the manifest has never heard of.
+    std::fs::write(state_dir(&env).join("signing.key"), "42".repeat(32)).unwrap();
+
+    let (code, raw) = fail(&env, &["trust", "resign", "--yes"]);
+    assert_eq!(code, 5, "{raw}");
+    assert!(raw.to_string().contains("not an admin"), "{raw}");
+}
+
+#[test]
+fn resign_reports_the_governance_diff() {
+    let env = MusterEnv::new();
+    ok(&env, &["init", "--yes", "--machine", "alpha"]);
+    let attacker = "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq";
+    let path = env.config_dir().join("muster.toml");
+    let mut text = manifest_text(&env);
+    text.push_str(&format!(
+        "\n[machines.evil]\nrecipient = \"{attacker}\"\nplatform = \"linux-x86_64\"\nmuster_version = \"0.1.0\"\n"
+    ));
+    std::fs::write(&path, text).unwrap();
+
+    let resigned = ok(&env, &["trust", "resign", "--yes"]);
+    let diff = resigned["result"]["governance_diff"].as_str().unwrap();
+    assert!(diff.contains("+") && diff.contains("evil"), "{diff}");
+}
