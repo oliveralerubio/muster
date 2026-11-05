@@ -164,19 +164,24 @@ fn leaf_command(name: &'static str, spec: &'static CommandSpec) -> Command {
 }
 
 fn with_params(cmd: Command, spec: &'static CommandSpec) -> Command {
-    spec.params.iter().fold(cmd, |cmd, p| {
-        let arg = Arg::new(p.name).help(p.about).required(p.required);
-        let arg = if p.positional { arg } else { arg.long(p.name) };
-        cmd.arg(match p.kind {
-            ParamKind::String => arg,
-            ParamKind::Bool => arg.action(ArgAction::SetTrue),
-            ParamKind::Int => arg.value_parser(clap::value_parser!(i64)),
-            // List values that look like flags themselves (MCP `--args -y`)
-            // need the `--args=-y` form: `allow_hyphen_values` would swallow
-            // following global flags (`--args --dry-run`, `--args --yes`).
-            ParamKind::List => arg.action(ArgAction::Append),
+    // Secret params get no flag: values never travel in argv (see `--value-stdin`).
+    spec.params
+        .iter()
+        .filter(|p| p.kind != ParamKind::Secret)
+        .fold(cmd, |cmd, p| {
+            let arg = Arg::new(p.name).help(p.about).required(p.required);
+            let arg = if p.positional { arg } else { arg.long(p.name) };
+            cmd.arg(match p.kind {
+                ParamKind::String => arg,
+                ParamKind::Bool => arg.action(ArgAction::SetTrue),
+                ParamKind::Int => arg.value_parser(clap::value_parser!(i64)),
+                // List values that look like flags themselves (MCP `--args -y`)
+                // need the `--args=-y` form: `allow_hyphen_values` would swallow
+                // following global flags (`--args --dry-run`, `--args --yes`).
+                ParamKind::List => arg.action(ArgAction::Append),
+                ParamKind::Secret => unreachable!("filtered above"),
+            })
         })
-    })
 }
 
 /// Walk to the innermost subcommand; returns its dotted name and matches.
@@ -208,6 +213,7 @@ fn params(spec: &CommandSpec, m: &ArgMatches) -> Params {
     for p in spec.params {
         let value = match p.kind {
             ParamKind::String => m.get_one::<String>(p.name).map(|s| Value::from(s.as_str())),
+            ParamKind::Secret => None,
             ParamKind::Bool => Some(Value::Bool(m.get_flag(p.name))),
             ParamKind::Int => m.get_one::<i64>(p.name).map(|i| Value::from(*i)),
             ParamKind::List => m

@@ -15,8 +15,10 @@
 //! - `POST /api/secret/reveal {"name", "confirm": true}` is the only path that
 //!   returns a secret value, and it is recorded in the local history first.
 //! - `POST /api/secret/add|rotate` accepts `path`, `value` and `confirm: true`.
-//!   Values go directly to the shared vault handlers, never command parameters,
-//!   responses or history; the CLI equivalent uses `--value-stdin`.
+//!   The value is moved into the registry's zeroizing secret slot (the CLI fills
+//!   the same slot from stdin via `--value-stdin`) and the normal `secret.add` /
+//!   `secret.rotate` handler runs; it never reaches ordinary parameters, the
+//!   `cli` footer, responses or history.
 
 use std::io::{IsTerminal, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -32,6 +34,7 @@ use crate::context::{Context, Globals};
 use crate::errors::MusterError;
 use crate::output::{Envelope, Format};
 use crate::registry::{self, CommandSpec, ParamKind, Params};
+use crate::secrets::SecretValue;
 
 const INDEX_HTML: &str = include_str!("assets/index.html");
 const STYLE_CSS: &str = include_str!("assets/style.css");
@@ -70,6 +73,9 @@ struct Route {
     /// Parameters this route does not accept (e.g. `doctor --fix` on GET, or
     /// `profile set --from-file`, which must never read local files).
     hidden: &'static [&'static str],
+    /// Footer shown instead of the command's own line, when a different
+    /// command is the useful next step (history points at `rollback`).
+    cli_hint: Option<&'static str>,
 }
 
 const fn get(path: &'static str, command: &'static str) -> Route {
@@ -78,6 +84,7 @@ const fn get(path: &'static str, command: &'static str) -> Route {
         command,
         post: false,
         hidden: &[],
+        cli_hint: None,
     }
 }
 
@@ -87,6 +94,7 @@ const fn post(path: &'static str, command: &'static str) -> Route {
         command,
         post: true,
         hidden: &[],
+        cli_hint: None,
     }
 }
 
@@ -112,6 +120,10 @@ const ROUTES: &[Route] = &[
     post("secret/approve", "secret.approve"),
     post("secret/deny", "secret.deny"),
     post("secret/revoke", "secret.revoke"),
+    Route {
+        cli_hint: Some("muster rollback <generation>"),
+        ..get("history", "history")
+    },
     get("plan", "plan"),
     get("proposals", "proposal.list"),
     get("mcp-servers", "mcp-server.list"),
@@ -147,6 +159,14 @@ const ROUTES: &[Route] = &[
     post("mcp-server/add", "mcp-server.add"),
     post("mcp-server/rm", "mcp-server.rm"),
     post("secret/rm", "secret.rm"),
+    Route {
+        hidden: &["value-stdin"],
+        ..post("secret/add", "secret.add")
+    },
+    Route {
+        hidden: &["value-stdin"],
+        ..post("secret/rotate", "secret.rotate")
+    },
     post("proposal/create", "proposal.create"),
     post("proposal/accept", "proposal.accept"),
     get("skills", "skill.list"),
@@ -484,26 +504,33 @@ impl Ui {
     }
 
     fn api(&mut self, name: &str, post: bool, body: Map<String, Value>) -> Reply {
-        match (name, post) {
-            ("history", false) => return self.history(),
-            ("secret/reveal", true) => return self.reveal(body),
-            ("secret/add" | "secret/rotate", true) => return self.write_secret(name, body),
-            _ => {}
+        if name == "secret/reveal" && post {
+            return self.reveal(body);
         }
         let Some(route) = ROUTES.iter().find(|r| r.path == name && r.post == post) else {
-            let other = ROUTES.iter().any(|r| r.path == name) || name == "history";
-            return if other || matches!(name, "secret/reveal" | "secret/add" | "secret/rotate") {
+            let other = ROUTES.iter().any(|r| r.path == name);
+            return if other || name == "secret/reveal" {
                 Reply::error(405, &format!("wrong method for /api/{name}"))
             } else {
                 Reply::error(404, &format!("unknown API route /api/{name}"))
             };
         };
         let spec = registry::find(route.command).expect("routes map to registered commands");
-        let (params, flags) = match parse_params(spec, route.hidden, body) {
+        let mut body = body;
+        let secret = match take_secret_input(spec, &mut body) {
+            Ok(secret) => secret,
+            Err(reply) => return reply,
+        };
+        let (mut params, flags) = match parse_params(spec, route.hidden, body) {
             Ok(parsed) => parsed,
             Err(e) => return self.failure(spec, &cli_line(spec, &[], Flags::default()), e),
         };
-        self.execute(spec, &params, flags)
+        if secret.is_some() {
+            // The footer shows the CLI equivalent, which reads the value on stdin.
+            params.push(("value-stdin".into(), Value::Bool(true)));
+        }
+        let hint = route.cli_hint;
+        self.execute_as(spec, &params, flags, secret, hint)
     }
 
     /// Run a command exactly like the CLI does (`cli::execute`, never prompting:
@@ -514,10 +541,24 @@ impl Ui {
         params: &[(String, Value)],
         flags: Flags,
     ) -> Reply {
-        let cli = cli_line(spec, params, flags);
+        self.execute_as(spec, params, flags, None, None)
+    }
+
+    fn execute_as(
+        &self,
+        spec: &'static CommandSpec,
+        params: &[(String, Value)],
+        flags: Flags,
+        secret: Option<SecretValue>,
+        cli_hint: Option<&str>,
+    ) -> Reply {
+        let cli = cli_hint.map_or_else(|| cli_line(spec, params, flags), str::to_owned);
         let mut typed = Params::default();
         for (k, v) in params {
             typed.set(k.clone(), v.clone());
+        }
+        if let Some(secret) = secret {
+            typed.set_secret(secret);
         }
         let globals = Globals {
             config: Some(self.config_dir.clone()),
@@ -548,68 +589,6 @@ impl Ui {
             vec![err.to_diagnostic()],
             cli,
             status,
-        )
-    }
-
-    fn write_secret(&self, route: &str, mut body: Map<String, Value>) -> Reply {
-        use crate::commands::secret;
-        use crate::secrets::SecretValue;
-        let spec = if route == "secret/add" {
-            &secret::ADD
-        } else {
-            &secret::ROTATE
-        };
-        // Move the value into zeroizing storage before validating anything else.
-        let value = match body.remove("value") {
-            Some(Value::String(value)) => SecretValue::new(value),
-            _ => return Reply::error(400, "value must be a string"),
-        };
-        if body.get(CONFIRM).and_then(Value::as_bool) != Some(true) {
-            return Reply::error(400, "secret writes require confirm: true");
-        }
-        if !body.contains_key("path") {
-            if let Some(name) = body.remove("name") {
-                let path = match (body.remove("group"), name) {
-                    (Some(Value::String(group)), Value::String(name)) => {
-                        Value::String(format!("{group}/{name}"))
-                    }
-                    (None, name) => name,
-                    _ => return Reply::error(400, "name and group must be strings"),
-                };
-                body.insert("path".into(), path);
-            }
-        }
-        let (mut params, flags) = match parse_params(spec, &[], body) {
-            Ok(parsed) => parsed,
-            Err(e) => return self.failure(spec, &cli_line(spec, &[], Flags::default()), e),
-        };
-        params.push(("value-stdin".into(), Value::Bool(true)));
-        let cli = cli_line(spec, &params, flags);
-        let mut typed = Params::default();
-        for (k, v) in params {
-            typed.set(k, v);
-        }
-        let globals = Globals {
-            config: Some(self.config_dir.clone()),
-            format: Some(Format::Json),
-            yes: true,
-            dry_run: flags.dry_run,
-            quiet: true,
-            verbose: false,
-            audit_actor: None,
-            web_approval: false,
-        };
-        let (envelope, code) = crate::cli::execute_with(spec, globals, false, |ctx| {
-            if route == "secret/add" {
-                secret::add_with_value(ctx, &typed, value)
-            } else {
-                secret::rotate_with_value(ctx, &typed, value)
-            }
-        });
-        reply(
-            &envelope,
-            &cli,
-            if code == 0 { 200 } else { http_status(code) },
         )
     }
 
@@ -649,30 +628,6 @@ impl Ui {
         }
         // `secret get --reveal` records the reveal in the local history.
         self.execute(spec, &params, flags)
-    }
-
-    fn history(&self) -> Reply {
-        let cli = "muster rollback <generation>";
-        let result = crate::engine::generations(&self.state_dir).and_then(|generations| {
-            Ok(json!({
-                "generations": generations,
-                "events": crate::audit::events(&self.state_dir)?,
-            }))
-        });
-        match result {
-            Ok(result) => envelope("history", true, result, Vec::new(), cli, 200),
-            Err(e) => {
-                let status = http_status(e.exit_code());
-                envelope(
-                    "history",
-                    false,
-                    Value::Null,
-                    vec![e.to_diagnostic()],
-                    cli,
-                    status,
-                )
-            }
-        }
     }
 
     /// Consume a login token: the one printed at startup, or the one a second
@@ -768,7 +723,11 @@ fn parse_params(
             DRY_RUN | "dry-run" => flags.dry_run = as_bool(&value, &key)?,
             _ => {
                 let canonical = key.replace('_', "-");
-                let known = spec.params.iter().any(|p| p.name == canonical);
+                // Secret params are filled out of band (`take_secret_input`), never here.
+                let known = spec
+                    .params
+                    .iter()
+                    .any(|p| p.name == canonical && p.kind != ParamKind::Secret);
                 // `*-stdin` would read the server's own stdin, never a request.
                 if !known || hidden.contains(&canonical.as_str()) || canonical.ends_with("-stdin") {
                     return Err(MusterError::Usage(format!(
@@ -781,7 +740,7 @@ fn parse_params(
         }
     }
     let mut params = Vec::new();
-    for p in spec.params {
+    for p in spec.params.iter().filter(|p| p.kind != ParamKind::Secret) {
         let Some(value) = given.remove(p.name) else {
             if p.required {
                 return Err(MusterError::Usage(format!(
@@ -807,6 +766,44 @@ fn parse_params(
         params.push((p.name.to_owned(), value));
     }
     Ok((params, flags))
+}
+
+/// Pull a spec's secret input out of the request body into zeroizing storage
+/// before anything else looks at the body. `Ok(None)` for specs without one.
+/// Errors are plain 400 replies that never echo the body.
+fn take_secret_input(
+    spec: &CommandSpec,
+    body: &mut Map<String, Value>,
+) -> Result<Option<SecretValue>, Reply> {
+    let Some(param) = spec.params.iter().find(|p| p.kind == ParamKind::Secret) else {
+        return Ok(None);
+    };
+    let value = match body.remove(param.name) {
+        Some(Value::String(value)) => SecretValue::new(value),
+        _ => {
+            return Err(Reply::error(
+                400,
+                &format!("{} must be a string", param.name),
+            ))
+        }
+    };
+    if body.get(CONFIRM).and_then(Value::as_bool) != Some(true) {
+        return Err(Reply::error(400, "secret writes require confirm: true"));
+    }
+    // The panel's form sends `group` + `name`; the command takes `group/name`.
+    if !body.contains_key("path") {
+        if let Some(name) = body.remove("name") {
+            let path = match (body.remove("group"), name) {
+                (Some(Value::String(group)), Value::String(name)) => {
+                    Value::String(format!("{group}/{name}"))
+                }
+                (None, name) => name,
+                _ => return Err(Reply::error(400, "name and group must be strings")),
+            };
+            body.insert("path".into(), path);
+        }
+    }
+    Ok(Some(value))
 }
 
 fn as_bool(value: &Value, key: &str) -> Result<bool, MusterError> {

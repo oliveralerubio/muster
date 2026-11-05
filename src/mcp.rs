@@ -211,6 +211,7 @@ fn json_type(kind: ParamKind) -> &'static str {
         ParamKind::Bool => "boolean",
         ParamKind::Int => "integer",
         ParamKind::List => "array",
+        ParamKind::Secret => "string",
     }
 }
 
@@ -219,6 +220,8 @@ fn type_matches(kind: ParamKind, value: &Value) -> bool {
         ParamKind::String => value.is_string(),
         ParamKind::Bool => value.is_boolean(),
         ParamKind::Int => value.is_i64(),
+        // Secrets never arrive as tool arguments.
+        ParamKind::Secret => false,
         ParamKind::List => value
             .as_array()
             .is_some_and(|items| items.iter().all(Value::is_string)),
