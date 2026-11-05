@@ -1067,3 +1067,79 @@ fn approving_a_machine_in_team_mode_needs_the_member_it_joins() {
     let manifest = std::fs::read_to_string(config.join("muster.toml")).unwrap();
     assert!(!manifest.contains("[machines.carol-box]"));
 }
+
+#[test]
+fn recovery_approvals_validated_by_same_rule_locally_and_by_peers() {
+    let owner = MusterEnv::new();
+    let second_admin = MusterEnv::new();
+    let joining = MusterEnv::new();
+    let recovery_key = init(&owner);
+    let config = owner.config_dir();
+
+    ok(
+        &owner,
+        &config,
+        &["member", "add", "admin-two", "--role", "admin"],
+    );
+    ok(
+        &owner,
+        &config,
+        &["member", "approve", "admin-two", "--yes"],
+    );
+    join(&owner, &second_admin, "admin-two-laptop", "admin-two");
+    add_member(&owner, "worker", "member");
+
+    // Raise required_approvals to 2
+    let mut manifest = std::fs::read_to_string(config.join("muster.toml")).unwrap();
+    manifest.push_str(
+        "
+[team]
+required_approvals = 2
+",
+    );
+    std::fs::write(config.join("muster.toml"), manifest).unwrap();
+    ok(&owner, &config, &["trust", "resign", "--yes"]);
+
+    // Enrolling machine requests to join worker
+    ok(&joining, &config, &["enroll", "--name", "worker-box"]);
+
+    // Owner approves with recovery key via stdin (break-glass, 1 signature satisfies k=2)
+    let out = owner
+        .run(&[
+            "--format",
+            "json",
+            "--config",
+            config.to_str().unwrap(),
+            "approve",
+            "worker-box",
+            "--member",
+            "worker",
+            "--recovery-key-stdin",
+            "--yes",
+        ])
+        .write_stdin(recovery_key.as_bytes())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The state was signed with the recovery key as primary signer!
+    let state_file = std::fs::read_to_string(config.join("fleet.state.json")).unwrap();
+    let state: Value = serde_json::from_str(&state_file).unwrap();
+    let manifest_parsed = std::fs::read_to_string(config.join("muster.toml")).unwrap();
+    let toml: toml::Table = manifest_parsed.parse().unwrap();
+    let recovery_pub = toml["recovery"]["signing_key"].as_str().unwrap();
+    assert_eq!(state["payload"]["signer"], recovery_pub);
+
+    // Publisher's pin advanced
+    let owner_pin =
+        std::fs::read_to_string(owner.path().join(".local/state/muster/trust.json")).unwrap();
+    assert!(owner_pin.contains("worker-box"));
+
+    // Peer (second_admin) verifies and accepts the exact same state without pending!
+    let trust = ok(&second_admin, &config, &["trust", "show"]);
+    assert_eq!(trust["status"], "verified", "{trust}");
+}

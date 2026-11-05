@@ -412,9 +412,11 @@ pub(crate) fn seal_in(
         &pin.admins
     };
     let local = Signer::load(&ctx.state_dir)?;
-    let signer = match (&local, &ctx.recovery_signer) {
-        (Some(s), _) if allowed.contains(&s.public()) => s,
-        (_, Some(r)) if allowed.contains(&r.public()) => r,
+    // When the command executes with recovery authority, prefer the recovery
+    // signer over the local admin machine key so peers recognize the break-glass.
+    let signer = match (&ctx.recovery_signer, &local) {
+        (Some(r), _) if allowed.contains(&r.public()) => r,
+        (_, Some(s)) if allowed.contains(&s.public()) => s,
         _ => {
             return Err(MusterError::Security(format!(
                 "this machine cannot sign the fleet state: its signing key is not {} under the \
@@ -449,6 +451,16 @@ pub(crate) fn seal_in(
         fleet_state::seal_unpinned(dir, &ctx.state_dir, &manifest, signer, enrollments)?
     };
     if let Some(state) = &sealed {
+        if let Some(why) = fleet_state::refused_by_peers(&ctx.state_dir, state, &manifest)? {
+            ctx.diag(Diagnostic::new(
+                Severity::Warning,
+                "state_refused_by_peers",
+                format!(
+                    "the signed state other machines would refuse ({why}); this machine did not \
+                     pin it and `muster sync --push` will not publish it"
+                ),
+            ));
+        }
         if let Some((received, required)) =
             fleet_state::pending_quorum(&ctx.state_dir, state, &manifest)?
         {

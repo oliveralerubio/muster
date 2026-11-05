@@ -796,10 +796,24 @@ fn seal_inner(
     };
     let state = FleetState::sign(payload, signer)?;
     state.save(config_dir)?;
-    // A governance change short of its admin quorum is proposed, not accepted:
-    // this machine does not move its own pin either.
-    if save_pin && pending_quorum(state_dir, &state, manifest)?.is_none() {
-        TrustAnchor::for_state(&state, manifest, false)?.save(state_dir)?;
+    // The local pin only moves to a state the exact rule peers apply accepts:
+    // a change short of its admin quorum is proposed, not accepted, and one
+    // peers would refuse outright (the push gate then refuses it too) never
+    // becomes this machine's own baseline.
+    if save_pin {
+        let accepted = match TrustAnchor::load(state_dir)? {
+            Some(pin) => {
+                state.payload.epoch == pin.epoch + 1
+                    && matches!(
+                        check_transition(&pin.as_prior(), &state, manifest),
+                        Ok(Transition::Accepted)
+                    )
+            }
+            None => true,
+        };
+        if accepted {
+            TrustAnchor::for_state(&state, manifest, false)?.save(state_dir)?;
+        }
     }
     Ok(Some(state))
 }
@@ -1400,6 +1414,25 @@ pub fn governance_diff(old: Option<&Value>, new: &Value) -> String {
         "governance",
         false,
     )
+}
+
+/// After sealing: why the rule peers apply refuses `state` outright (not
+/// merely pending), `None` when they would take or hold it.
+pub fn refused_by_peers(
+    state_dir: &Path,
+    state: &FleetState,
+    manifest: &Manifest,
+) -> Result<Option<String>, MusterError> {
+    let Some(pin) = TrustAnchor::load(state_dir)? else {
+        return Ok(None);
+    };
+    if state.payload.epoch != pin.epoch + 1 {
+        return Ok(None);
+    }
+    Ok(match check_transition(&pin.as_prior(), state, manifest) {
+        Err(MusterError::Security(why)) => Some(why),
+        _ => None,
+    })
 }
 
 /// After sealing: `(received, required)` when the new state lacks the admin
@@ -2565,6 +2598,16 @@ mod tests {
                 &["commit", "-q", "--allow-empty", "-m", "state"],
             );
         }
+        /// Seals as the fixture signer and makes the result the accepted
+        /// baseline of the peer (`self.state`), as if every admin had agreed.
+        fn seal_adopted(&self, evidence: Vec<EnrollmentEvidence>) {
+            self.seal_as(&self.signer, tempdir().unwrap().path(), evidence);
+            let state = FleetState::load(&self.config).unwrap().unwrap();
+            TrustAnchor::for_state(&state, &self.manifest, false)
+                .unwrap()
+                .save(&self.state)
+                .unwrap();
+        }
         /// Seals as `signer` with a scratch pin so `self.state` (the peer's
         /// pin) stays where it was.
         fn seal_as(&self, signer: &Signer, scratch: &Path, evidence: Vec<EnrollmentEvidence>) {
@@ -2606,22 +2649,21 @@ mod tests {
         let mut f = fixture();
         git_in(&f.config, &["init", "-q"]);
         let (_k2dir, k2) = new_signer();
-        let scratch = tempdir().unwrap();
         f.manifest
             .machines
             .insert("node2".into(), machine_for(&k2, "age1node2"));
-        f.seal_as(&f.signer, scratch.path(), vec![]);
+        f.seal_as(&f.signer, tempdir().unwrap().path(), vec![]);
         // The peer accepts epoch 1 (both machines are admins in single-person mode).
         f.verify().unwrap();
         // Epoch 2: the admin revokes node2.
         f.manifest.machines.remove("node2");
-        f.seal_as(&f.signer, scratch.path(), vec![]);
+        f.seal_as(&f.signer, tempdir().unwrap().path(), vec![]);
         // Epoch 3 adds a rogue machine, signed by the revoked key or the real admin.
         f.manifest
             .machines
             .insert("evil".into(), machine_for(&k2, "age1evil"));
         let forger = if forger_is_revoked { &k2 } else { &f.signer };
-        f.seal_as(forger, scratch.path(), vec![]);
+        f.seal_as(forger, tempdir().unwrap().path(), vec![]);
         f
     }
 
@@ -2702,7 +2744,7 @@ mod tests {
             fs::write(f.config.join(format!("vault/{group}.age")), b"v1").unwrap();
             fs::write(f.config.join(format!("vault/{group}.meta.json")), b"{}").unwrap();
         }
-        f.seal_as(&f.signer, &f.state, vec![]);
+        f.seal_adopted(vec![]);
         f.verify().unwrap();
         (f, k2dir, k2)
     }
@@ -2733,7 +2775,7 @@ mod tests {
         f.manifest.team = Some(TeamConfig {
             required_approvals: 2,
         });
-        f.seal_as(&f.signer, &f.state, vec![]);
+        f.seal_adopted(vec![]);
         f.verify().unwrap();
         drop(k2dir);
         let (_d, k3) = new_signer();
@@ -2824,7 +2866,7 @@ mod tests {
                 ..Member::default()
             },
         );
-        f.seal_as(&f.signer, &f.state, vec![]);
+        f.seal_adopted(vec![]);
         f.verify().unwrap();
         f.manifest
             .machines
@@ -3004,7 +3046,7 @@ mod tests {
         f.manifest.team = Some(TeamConfig {
             required_approvals: 2,
         });
-        f.seal_as(&f.signer, &f.state, vec![]);
+        f.seal_adopted(vec![]);
         f.verify().unwrap();
         drop(k2dir);
         (f, k2, k3)
@@ -3161,7 +3203,7 @@ mod tests {
                 ..Member::default()
             },
         );
-        f.seal_as(&f.signer, &f.state, vec![]);
+        f.seal_adopted(vec![]);
         f.verify().unwrap();
         f.manifest
             .machines
@@ -3173,7 +3215,7 @@ mod tests {
             .machines
             .push("node3".into());
         let ev = evidence_for(&f, &k2, &k3, &["alice", "bob"], "carol");
-        f.seal_as(&f.signer, &f.state, vec![ev.clone()]);
+        f.seal_adopted(vec![ev.clone()]);
         f.verify().unwrap();
 
         // 2. node3 is later revoked with quorum (recorded in revoked_recipients & revoked_signing_keys)
@@ -3277,7 +3319,7 @@ mod tests {
                 ..Member::default()
             },
         );
-        f.seal_as(&f.signer, &f.state, vec![]);
+        f.seal_adopted(vec![]);
         f.verify().unwrap();
 
         // Alice drops the pending invitation AND tampers vault/dev.age (which alice does not read)
@@ -3427,7 +3469,7 @@ mod tests {
                 ..Member::default()
             },
         );
-        f.seal_as(&f.signer, &f.state, vec![]);
+        f.seal_adopted(vec![]);
         f.verify().unwrap();
 
         // One admin finalizes enrollment of node3 with valid evidence naming carol,
@@ -3470,7 +3512,7 @@ mod tests {
                 ..Member::default()
             },
         );
-        f.seal_as(&f.signer, &f.state, vec![]);
+        f.seal_adopted(vec![]);
         f.verify().unwrap();
 
         f.manifest
@@ -3556,6 +3598,22 @@ mod tests {
         assert!(pending_proposal(&f.config, &f.state, &f.manifest).is_err());
     }
 
+    /// Sol R12 F2: the local machine never pins a state its peers would reject.
+    #[test]
+    fn local_machine_never_pins_a_state_peers_would_reject() {
+        let (mut f, _k2, k3) = quorum_fixture();
+        let pinned = TrustAnchor::load(&f.state).unwrap().unwrap();
+        // One admin seals an added machine that carries no approvals at all.
+        f.manifest
+            .machines
+            .insert("node3".into(), machine_for(&k3, "age1node3"));
+        f.manifest.save(&f.config).unwrap();
+        seal_with(&f.config, &f.state, &f.manifest, &f.signer, false, vec![]).unwrap();
+        assert_eq!(TrustAnchor::load(&f.state).unwrap().unwrap(), pinned);
+        // Peers refuse the very same state.
+        assert!(message(f.verify().unwrap_err()).contains("quorum"));
+    }
+
     mod forged_ciphertext_property {
         use super::*;
         use proptest::prelude::*;
@@ -3581,7 +3639,7 @@ mod tests {
                     ..Member::default()
                 },
             );
-            f.seal_as(&f.signer, &f.state, vec![]);
+            f.seal_adopted(vec![]);
             f.verify().unwrap();
             (f, k2, k3)
         }
