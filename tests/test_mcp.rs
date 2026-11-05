@@ -35,6 +35,10 @@ struct McpServer {
 impl McpServer {
     /// Spawn `muster mcp` with the same isolation `MusterEnv` uses for the CLI.
     fn spawn(env: &MusterEnv) -> Self {
+        Self::spawn_with(env, &[])
+    }
+
+    fn spawn_with(env: &MusterEnv, extra: &[&str]) -> Self {
         let path = format!(
             "{}:{}",
             env.bin.display(),
@@ -42,6 +46,7 @@ impl McpServer {
         );
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_muster"));
         cmd.arg("mcp")
+            .args(extra)
             .env("HOME", env.path())
             .env("XDG_CONFIG_HOME", env.path().join(".config"))
             .env("XDG_STATE_HOME", env.path().join(".local/state"))
@@ -356,6 +361,8 @@ fn every_read_only_tool_matches_its_cli_command() {
                 "secret",
                 "get",
                 "native://ci/deploy_token",
+                "--agent",
+                "claude",
                 "--reveal",
             ],
         ),
@@ -941,4 +948,62 @@ fn propose_toggle_change_requires_acceptance() {
     assert!(output.status.success(), "{}", accepted.raw);
     assert!(manifest_text(&env).contains("skill:demo@claude"));
     server.shutdown();
+}
+
+#[test]
+fn second_initialize_with_another_client_is_rejected_and_keeps_identity() {
+    let env = MusterEnv::new();
+    init_machine(&env);
+    seed_secret(&env, "ci/deploy_token", REVEAL_VALUE);
+    reveal_granted_to_claude(&env);
+
+    let mut server = McpServer::spawn(&env);
+    // An unknown client first; it must not be able to switch to claude.
+    server.initialize_as("some-other-client");
+    server.send(&json!({
+        "jsonrpc": "2.0", "id": 9, "method": "initialize",
+        "params": {"protocolVersion": PROTOCOL_VERSION, "capabilities": {},
+                   "clientInfo": {"name": "claude-code", "version": "0"}}
+    }));
+    let response = server.read_response();
+    assert!(response["error"].is_object(), "{response}");
+    let result = server.call_tool(
+        2,
+        "secret_reveal",
+        json!({"reference": "native://ci/deploy_token"}),
+    );
+    server.shutdown();
+    assert_eq!(result["isError"], json!(true));
+    assert!(!tool_text(&result).contains(REVEAL_VALUE));
+}
+
+#[test]
+fn pinned_agent_ignores_the_client_supplied_name() {
+    let env = MusterEnv::new();
+    init_machine(&env);
+    seed_secret(&env, "ci/deploy_token", REVEAL_VALUE);
+    reveal_granted_to_claude(&env);
+
+    // Pinned to codex (not allowed): claiming to be claude-code does not help.
+    let mut server = McpServer::spawn_with(&env, &["--agent", "codex"]);
+    server.initialize_as("claude-code");
+    let result = server.call_tool(
+        2,
+        "secret_reveal",
+        json!({"reference": "native://ci/deploy_token"}),
+    );
+    server.shutdown();
+    assert_eq!(result["isError"], json!(true));
+    assert!(!tool_text(&result).contains(REVEAL_VALUE));
+
+    // Pinned to claude: reveal works whatever the client calls itself.
+    let mut server = McpServer::spawn_with(&env, &["--agent", "claude"]);
+    server.initialize_as("whatever");
+    let result = server.call_tool(
+        2,
+        "secret_reveal",
+        json!({"reference": "native://ci/deploy_token"}),
+    );
+    server.shutdown();
+    assert_eq!(result["isError"], json!(false), "{}", tool_text(&result));
 }

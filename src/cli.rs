@@ -32,7 +32,9 @@ where
     let spec = registry::find(&name).expect("parser is built from the registry");
     let globals = globals(&matches);
     if spec.name == crate::mcp::SPEC.name {
-        return crate::mcp::serve(globals);
+        let p = params(spec, sub);
+        let pinned = p.get_string("agent").map(str::to_owned);
+        return crate::mcp::serve(globals, pinned);
     }
     let (format, quiet) = (globals.format.unwrap_or(Format::Text), globals.quiet);
     let (envelope, code) = execute(spec, globals, &params(spec, sub), true);
