@@ -1108,6 +1108,142 @@ fn resign_without_a_pin_on_a_single_machine_fleet_shows_the_full_diff() {
     assert!(!diff.contains("+    \"alpha\""), "{diff}");
 }
 
+/// Three admins (alice, bob, carol) at `required_approvals = 2`, all pinned.
+fn quorum_fleet(remote: &str, alice: &MusterEnv, bob: &MusterEnv, carol: &MusterEnv) -> String {
+    // 1. Setup: 3 admins in team mode, required_approvals = 2.
+    ok(alice, &["init", "--yes", "--machine", "alice-box"]);
+    ok(alice, &["sync", "--remote", remote]);
+    let signer_a = support::fleet_signer(&alice.config_dir());
+
+    ok(alice, &["member", "add", "bob", "--role", "admin"]);
+    ok(alice, &["member", "approve", "bob", "--yes"]);
+    ok(alice, &["member", "add", "carol", "--role", "admin"]);
+    ok(alice, &["member", "approve", "carol", "--yes"]);
+
+    // Enroll Bob and Carol
+    ok(
+        bob,
+        &[
+            "sync",
+            "--remote",
+            remote,
+            "--pull",
+            "--expect-signer",
+            &signer_a,
+        ],
+    );
+    ok(bob, &["enroll", "--name", "bob-box"]);
+    ok(alice, &["sync", "--pull"]);
+    ok(alice, &["approve", "bob-box", "--member", "bob", "--yes"]);
+
+    ok(
+        carol,
+        &[
+            "sync",
+            "--remote",
+            remote,
+            "--pull",
+            "--expect-signer",
+            &signer_a,
+        ],
+    );
+    ok(carol, &["enroll", "--name", "carol-box"]);
+    ok(alice, &["sync", "--pull"]);
+    ok(
+        alice,
+        &["approve", "carol-box", "--member", "carol", "--yes"],
+    );
+
+    // Raise required_approvals = 2.
+    let mut manifest = manifest_text(alice);
+    manifest.push_str("\n[team]\nrequired_approvals = 2\n");
+    std::fs::write(alice.config_dir().join("muster.toml"), manifest).unwrap();
+    ok(alice, &["trust", "resign", "--yes"]);
+    ok(alice, &["sync", "--push"]);
+
+    // Bob and Carol sync and accept this pin.
+    ok(bob, &["sync", "--pull"]);
+    ok(carol, &["sync", "--pull"]);
+    signer_a
+}
+
+#[test]
+fn fresh_machine_does_not_pin_a_pending_governance_change() {
+    let (_guard, remote) = bare_remote();
+    let remote = remote.to_str().unwrap();
+    let (alice, bob, carol) = (MusterEnv::new(), MusterEnv::new(), MusterEnv::new());
+    let signer_a = quorum_fleet(remote, &alice, &bob, &carol);
+
+    // Alice removes Bob alone: epoch N+1 lacks its second admin signature.
+    ok(&alice, &["member", "rm", "bob", "--yes"]);
+    ok(&alice, &["sync", "--push"]);
+
+    // Dave has no pin and joins while the change is pending.
+    let dave = MusterEnv::new();
+    let joined = ok(
+        &dave,
+        &[
+            "sync",
+            "--remote",
+            remote,
+            "--pull",
+            "--expect-signer",
+            &signer_a,
+        ],
+    );
+    assert_eq!(joined["result"]["applied"], false, "{joined}");
+    let bob_pk = muster::signing::Signer::load(&state_dir(&bob))
+        .unwrap()
+        .unwrap()
+        .public();
+    let pin = std::fs::read_to_string(state_dir(&dave).join("trust.json")).unwrap();
+    assert!(
+        pin.contains(&bob_pk),
+        "dave must pin the last quorate state, where bob is still an admin"
+    );
+
+    // Every consumer holds: the pending governance is not used.
+    let (code, raw) = fail(&dave, &["status"]);
+    assert_eq!(code, 5, "{raw}");
+    assert!(raw.to_string().contains("governance change"), "{raw}");
+    let again = ok(&dave, &["sync", "--pull"]);
+    assert_eq!(again["result"]["applied"], false, "{again}");
+    assert!(
+        again["diagnostics"]
+            .to_string()
+            .contains("governance_pending"),
+        "{again}"
+    );
+}
+
+#[test]
+fn doctor_reports_but_never_fixes_or_applies_pending_governance() {
+    let (_guard, remote) = bare_remote();
+    let remote = remote.to_str().unwrap();
+    let (alice, bob, carol) = (MusterEnv::new(), MusterEnv::new(), MusterEnv::new());
+    quorum_fleet(remote, &alice, &bob, &carol);
+    ok(&alice, &["member", "rm", "bob", "--yes"]);
+    ok(&alice, &["sync", "--push"]);
+    ok(&carol, &["sync", "--pull"]);
+
+    let (code, raw) = fail(&carol, &["doctor", "--fix", "--yes"]);
+    assert_eq!(code, 5, "{raw}");
+    assert!(raw.to_string().contains("doctor --fix"), "{raw}");
+
+    let report = ok(&carol, &["doctor", "--offline"]);
+    let checks = report["result"]["checks"].to_string();
+    for name in ["adapters", "keys", "providers"] {
+        let needle = format!("{{\"name\":\"{name}\",\"status\":\"skipped\"}}");
+        assert!(checks.contains(&needle), "{name} must be skipped: {checks}");
+    }
+    assert!(
+        report["diagnostics"]
+            .to_string()
+            .contains("governance_pending"),
+        "{report}"
+    );
+}
+
 #[test]
 fn quorum_two_admin_a_removing_admin_b_stays_pending_until_cosigned() {
     let (_guard, remote) = bare_remote();
@@ -1117,60 +1253,8 @@ fn quorum_two_admin_a_removing_admin_b_stays_pending_until_cosigned() {
     let bob = MusterEnv::new();
     let carol = MusterEnv::new();
 
-    // 1. Setup: 3 admins in team mode, required_approvals = 2.
-    ok(&alice, &["init", "--yes", "--machine", "alice-box"]);
-    ok(&alice, &["sync", "--remote", remote]);
-    let signer_a = support::fleet_signer(&alice.config_dir());
-
-    ok(&alice, &["member", "add", "bob", "--role", "admin"]);
-    ok(&alice, &["member", "approve", "bob", "--yes"]);
-    ok(&alice, &["member", "add", "carol", "--role", "admin"]);
-    ok(&alice, &["member", "approve", "carol", "--yes"]);
-
-    // Enroll Bob and Carol
-    ok(
-        &bob,
-        &[
-            "sync",
-            "--remote",
-            remote,
-            "--pull",
-            "--expect-signer",
-            &signer_a,
-        ],
-    );
-    ok(&bob, &["enroll", "--name", "bob-box"]);
-    ok(&alice, &["sync", "--pull"]);
-    ok(&alice, &["approve", "bob-box", "--member", "bob", "--yes"]);
-
-    ok(
-        &carol,
-        &[
-            "sync",
-            "--remote",
-            remote,
-            "--pull",
-            "--expect-signer",
-            &signer_a,
-        ],
-    );
-    ok(&carol, &["enroll", "--name", "carol-box"]);
-    ok(&alice, &["sync", "--pull"]);
-    ok(
-        &alice,
-        &["approve", "carol-box", "--member", "carol", "--yes"],
-    );
-
-    // Raise required_approvals = 2.
-    let mut manifest = manifest_text(&alice);
-    manifest.push_str("\n[team]\nrequired_approvals = 2\n");
-    std::fs::write(alice.config_dir().join("muster.toml"), manifest).unwrap();
-    ok(&alice, &["trust", "resign", "--yes"]);
-    ok(&alice, &["sync", "--push"]);
-
-    // Bob and Carol sync and accept this pin.
-    ok(&bob, &["sync", "--pull"]);
-    ok(&carol, &["sync", "--pull"]);
+    let signer_a = quorum_fleet(remote, &alice, &bob, &carol);
+    let _ = &signer_a;
     let pinned_bob = std::fs::read_to_string(state_dir(&bob).join("trust.json")).unwrap();
     assert!(pinned_bob.contains("bob-box"));
 
