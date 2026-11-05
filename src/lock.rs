@@ -2,54 +2,41 @@
 //!
 //! Every mutating command, and the revocation recovery that any command may
 //! run, holds it, so a concurrent command can never delete or republish a
-//! live revocation stage. The lock file is created with `create_new` and holds
-//! the owner's pid and process start time; a lock whose owner is gone (pid
-//! dead, or the pid now belongs to a younger process) is stale and is broken
-//! under a second advisory lock so two waiters cannot both break it and then
-//! both believe they own the new one.
+//! live revocation stage. The lock is a kernel advisory lock on an open file
+//! (the same mechanism as the sync and secret-lease locks), held for the whole
+//! mutation or recovery. The kernel releases it when the holder exits, so
+//! there is no owner bookkeeping, no age cap, and a leftover or planted file
+//! with nobody holding it is simply free. The file is never unlinked, so a
+//! guard can never remove somebody else's lock.
 
 use std::cell::Cell;
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::time::{Duration, Instant, SystemTime};
+use std::fs::{File, OpenOptions, TryLockError};
+use std::path::Path;
+use std::time::{Duration, Instant};
 
 use crate::errors::MusterError;
 
 pub const LOCK_FILE: &str = "mutation.lock";
-const BREAK_FILE: &str = "mutation.lock.break";
 /// How long a command waits for another one before giving up.
 const DEFAULT_WAIT: Duration = Duration::from_secs(5);
-/// A lock file that nobody has written yet is given this long before it counts as stale.
-const WRITE_GRACE: Duration = Duration::from_secs(2);
-
-/// A lock older than this is stale even if its recorded owner looks alive: no
-/// legitimate mutation runs this long, and a planted lock must never freeze
-/// mutations forever.
-const MAX_LOCK_AGE: Duration = Duration::from_secs(600);
 
 thread_local! {
     static HELD_BY_THIS_THREAD: Cell<bool> = const { Cell::new(false) };
 }
-/// Threads of this process that hold the lock (the web panel runs commands on threads).
-static IN_PROCESS_HOLDERS: Mutex<u32> = Mutex::new(0);
 
 /// The lock, released on drop. A re-entrant acquisition on the same thread
 /// holds nothing and releases nothing.
 #[derive(Debug)]
 pub struct MutationLock {
-    path: Option<PathBuf>,
+    file: Option<File>,
 }
 
 impl Drop for MutationLock {
     fn drop(&mut self) {
-        if let Some(path) = self.path.take() {
-            let _ = fs::remove_file(path);
+        if let Some(file) = self.file.take() {
             HELD_BY_THIS_THREAD.with(|h| h.set(false));
-            if let Ok(mut n) = IN_PROCESS_HOLDERS.lock() {
-                *n = n.saturating_sub(1);
-            }
+            // Closing the file releases the lock; unlocking first is explicit.
+            let _ = file.unlock();
         }
     }
 }
@@ -92,138 +79,23 @@ pub fn acquire_for(state_dir: &Path, wait: Duration) -> Result<MutationLock, Mus
 /// that already holds it, returns a guard that owns nothing.
 pub fn try_acquire(state_dir: &Path) -> Result<Option<MutationLock>, MusterError> {
     if held_by_this_thread() {
-        return Ok(Some(MutationLock { path: None }));
+        return Ok(Some(MutationLock { file: None }));
     }
-    create_dir_private(state_dir)?;
+    std::fs::create_dir_all(state_dir).map_err(|e| io_err(state_dir, e))?;
     let path = state_dir.join(LOCK_FILE);
-    for _ in 0..3 {
-        match create_lock(&path) {
-            Ok(()) => {
-                HELD_BY_THIS_THREAD.with(|h| h.set(true));
-                if let Ok(mut n) = IN_PROCESS_HOLDERS.lock() {
-                    *n += 1;
-                }
-                return Ok(Some(MutationLock { path: Some(path) }));
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                if !break_if_stale(state_dir, &path)? {
-                    return Ok(None);
-                }
-            }
-            Err(e) => return Err(io_err(&path, e)),
-        }
-    }
-    Ok(None)
-}
-
-fn create_lock(path: &Path) -> std::io::Result<()> {
     let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
+    options.create(true).truncate(false).read(true).write(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let mut file = options.open(path)?;
-    let pid = std::process::id();
-    let started = process_start(pid).unwrap_or(0);
-    file.write_all(format!("{pid} {started}\n").as_bytes())?;
-    file.sync_all()
-}
-
-/// Removes the lock when its owner is gone. Returns whether it did.
-fn break_if_stale(state_dir: &Path, path: &Path) -> Result<bool, MusterError> {
-    // Serialize breakers: re-read under the guard, so a lock another waiter
-    // just created is never removed on the strength of a stale view.
-    let guard_path = state_dir.join(BREAK_FILE);
-    let guard = File::options()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&guard_path)
-        .map_err(|e| io_err(&guard_path, e))?;
-    guard.lock().map_err(|e| io_err(&guard_path, e))?;
-    let stale = is_stale(path);
-    if stale {
-        let _ = fs::remove_file(path);
+    let file = options.open(&path).map_err(|e| io_err(&path, e))?;
+    match file.try_lock() {
+        Ok(()) => {
+            HELD_BY_THIS_THREAD.with(|h| h.set(true));
+            Ok(Some(MutationLock { file: Some(file) }))
+        }
+        Err(TryLockError::WouldBlock) => Ok(None),
+        Err(TryLockError::Error(e)) => Err(io_err(&path, e)),
     }
-    drop(guard);
-    Ok(stale)
-}
-
-fn is_stale(path: &Path) -> bool {
-    let Ok(text) = fs::read_to_string(path) else {
-        // Gone already (the owner just finished): the next create decides.
-        return !path.exists();
-    };
-    let mut parts = text.split_whitespace();
-    let (Some(pid), Some(started)) = (
-        parts.next().and_then(|p| p.parse::<u32>().ok()),
-        parts.next().and_then(|s| s.parse::<u64>().ok()),
-    ) else {
-        // Empty or partial: its creator may be mid-write.
-        return fs::metadata(path)
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| SystemTime::now().duration_since(t).ok())
-            .is_some_and(|age| age > WRITE_GRACE);
-    };
-    if pid == std::process::id() {
-        // Ours: live only while a thread of this process holds it.
-        return IN_PROCESS_HOLDERS.lock().map_or(true, |n| *n == 0);
-    }
-    if !process_alive(pid) {
-        return true;
-    }
-    // The pid is alive. Only a lock whose recorded start time matches the
-    // live process is credible; zero, unverifiable or different (pid reused)
-    // is stale, as is any lock past the age cap.
-    if started == 0 || process_start(pid) != Some(started) {
-        return true;
-    }
-    fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| SystemTime::now().duration_since(t).ok())
-        .is_some_and(|age| age > MAX_LOCK_AGE)
-}
-
-fn process_alive(pid: u32) -> bool {
-    if Path::new("/proc/self").exists() {
-        return Path::new(&format!("/proc/{pid}")).exists();
-    }
-    std::process::Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
-}
-
-/// Process start time in clock ticks since boot (Linux), a stand-in elsewhere
-/// where `/proc` is missing (`ps` start time hashed to a number).
-fn process_start(pid: u32) -> Option<u64> {
-    if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) {
-        // Field 22, counted after the command name's closing parenthesis.
-        let rest = stat.rsplit_once(')')?.1;
-        return rest.split_whitespace().nth(19)?.parse().ok();
-    }
-    let out = std::process::Command::new("ps")
-        .args(["-o", "lstart=", "-p", &pid.to_string()])
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let text = text.trim();
-    if text.is_empty() {
-        return None;
-    }
-    Some(
-        text.bytes().fold(1469598103934665603u64, |h, b| {
-            (h ^ u64::from(b)).wrapping_mul(1099511628211)
-        }) | 1,
-    )
-}
-
-fn create_dir_private(dir: &Path) -> Result<(), MusterError> {
-    fs::create_dir_all(dir).map_err(|e| io_err(dir, e))
 }
 
 fn io_err(path: &Path, e: std::io::Error) -> MusterError {
@@ -233,83 +105,105 @@ fn io_err(path: &Path, e: std::io::Error) -> MusterError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::SystemTime;
     use tempfile::tempdir;
 
     #[test]
-    fn second_acquire_from_another_holder_is_refused_until_release() {
+    fn a_second_holder_is_refused_until_release() {
         let dir = tempdir().unwrap();
-        // A lock owned by a live foreign process (our parent) is respected.
-        let parent = std::os::unix::process::parent_id();
-        let started = process_start(parent).unwrap_or(0);
-        fs::write(dir.path().join(LOCK_FILE), format!("{parent} {started}\n")).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let state = dir.path().to_path_buf();
+        let holder = std::thread::spawn(move || {
+            let lock = try_acquire(&state).unwrap().expect("free");
+            tx.send(()).unwrap();
+            done_rx.recv().unwrap();
+            drop(lock);
+        });
+        rx.recv().unwrap();
         assert!(try_acquire(dir.path()).unwrap().is_none());
-    }
-
-    #[test]
-    fn a_dead_owner_makes_the_lock_stale() {
-        let dir = tempdir().unwrap();
-        let mut child = std::process::Command::new("true").spawn().unwrap();
-        let pid = child.id();
-        child.wait().unwrap();
-        fs::write(dir.path().join(LOCK_FILE), format!("{pid} 1\n")).unwrap();
-        let lock = try_acquire(dir.path()).unwrap().expect("stale lock broken");
-        assert!(dir.path().join(LOCK_FILE).exists());
-        drop(lock);
-        assert!(!dir.path().join(LOCK_FILE).exists());
-    }
-
-    #[test]
-    fn a_reused_pid_with_another_start_time_is_stale() {
-        let dir = tempdir().unwrap();
-        let parent = std::os::unix::process::parent_id();
-        let Some(real) = process_start(parent) else {
-            return;
-        };
-        fs::write(
-            dir.path().join(LOCK_FILE),
-            format!("{parent} {}\n", real + 12345),
-        )
-        .unwrap();
+        done_tx.send(()).unwrap();
+        holder.join().unwrap();
         assert!(try_acquire(dir.path()).unwrap().is_some());
     }
 
     #[test]
-    fn a_planted_lock_with_zero_start_time_is_stale() {
+    fn a_planted_file_nobody_holds_is_free() {
         let dir = tempdir().unwrap();
         let parent = std::os::unix::process::parent_id();
-        fs::write(dir.path().join(LOCK_FILE), format!("{parent} 0\n")).unwrap();
+        // Whatever the content says (a live pid, a fresh mtime), no held lock
+        // means no owner.
+        std::fs::write(dir.path().join(LOCK_FILE), format!("{parent} 1\n")).unwrap();
+        assert!(try_acquire(dir.path()).unwrap().is_some());
+        std::fs::write(dir.path().join(LOCK_FILE), "garbage").unwrap();
         assert!(try_acquire(dir.path()).unwrap().is_some());
     }
 
     #[test]
-    fn an_old_lock_of_a_live_owner_is_stale() {
+    fn an_old_lock_that_is_still_held_stays_held() {
         let dir = tempdir().unwrap();
-        let parent = std::os::unix::process::parent_id();
-        let Some(real) = process_start(parent) else {
-            return;
-        };
-        let path = dir.path().join(LOCK_FILE);
-        fs::write(&path, format!("{parent} {real}\n")).unwrap();
-        // Fresh and credible: respected.
-        assert!(try_acquire(dir.path()).unwrap().is_none());
-        let old = SystemTime::now() - MAX_LOCK_AGE - Duration::from_secs(60);
+        let state = dir.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let lock = try_acquire(&state).unwrap().expect("free");
+            tx.send(()).unwrap();
+            done_rx.recv().unwrap();
+            drop(lock);
+        });
+        rx.recv().unwrap();
+        let old = SystemTime::now() - Duration::from_secs(24 * 3600);
         File::options()
             .write(true)
-            .open(&path)
+            .open(dir.path().join(LOCK_FILE))
             .unwrap()
             .set_modified(old)
             .unwrap();
-        assert!(try_acquire(dir.path()).unwrap().is_some());
+        assert!(try_acquire(dir.path()).unwrap().is_none());
+        done_tx.send(()).unwrap();
+        holder.join().unwrap();
     }
 
     #[test]
-    fn same_thread_reacquire_is_free_and_release_removes_the_file() {
+    fn dropping_a_guard_never_removes_the_file_or_another_lock() {
         let dir = tempdir().unwrap();
-        let outer = acquire(dir.path()).unwrap();
+        let first = acquire(dir.path()).unwrap();
+        drop(first);
+        assert!(dir.path().join(LOCK_FILE).exists());
+        let second = acquire(dir.path()).unwrap();
+        // A re-entrant guard dropping releases nothing.
         let inner = acquire(dir.path()).unwrap();
         drop(inner);
-        assert!(dir.path().join(LOCK_FILE).exists());
-        drop(outer);
-        assert!(!dir.path().join(LOCK_FILE).exists());
+        assert!(held_by_this_thread());
+        drop(second);
+        assert!(!held_by_this_thread());
+    }
+
+    #[test]
+    fn a_child_process_holding_the_lock_blocks_us_until_it_exits() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(LOCK_FILE);
+        std::fs::write(&path, "").unwrap();
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exec 9>>\"$1\"; flock -n 9 || exit 3; echo ready; sleep 30")
+            .arg("sh")
+            .arg(&path)
+            .stdout(std::process::Stdio::piped())
+            .spawn();
+        let Ok(child) = child.as_mut() else { return };
+        let mut line = String::new();
+        let mut out = std::io::BufReader::new(child.stdout.take().unwrap());
+        std::io::BufRead::read_line(&mut out, &mut line).unwrap();
+        if line.trim() != "ready" {
+            // No flock(1) on this machine; the in-process tests cover the rest.
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        }
+        assert!(try_acquire(dir.path()).unwrap().is_none());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(try_acquire(dir.path()).unwrap().is_some());
     }
 }
