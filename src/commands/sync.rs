@@ -17,6 +17,13 @@ pub const SPEC: CommandSpec = CommandSpec {
     about: "Pull/push the config repo, then apply the desired state (backup, generation)",
     params: &[
         ParamSpec {
+            name: "expect-state",
+            about: "Payload SHA-256 (from `muster trust show` on a trusted machine) of the one fleet state this machine may take as its origin when it pins a fleet for the first time",
+            kind: ParamKind::String,
+            required: false,
+            positional: false,
+        },
+        ParamSpec {
             name: "expect-signer",
             about: "Full public key (musterpk1...) or full 256-bit fingerprint (SHA256:<64 hex>) the fleet signer must have when this machine pins the fleet for the first time",
             kind: ParamKind::String,

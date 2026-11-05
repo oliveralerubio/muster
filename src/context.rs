@@ -41,6 +41,9 @@ pub struct Context {
     /// `--expect-signer`: full 256-bit fingerprint or full public key the fleet state's first
     /// signer must have when this machine pins it for the first time.
     pub expect_signer: Option<String>,
+    /// `--expect-state`: payload SHA-256 of the only state this machine may take as its
+    /// origin when it pins a fleet for the first time.
+    pub expect_state: Option<String>,
     /// Signed enrollment approvals the next fleet-state seal carries (set by
     /// `approve` when a quorum admitted a machine).
     pub enrollments: Vec<crate::fleet_state::EnrollmentEvidence>,
@@ -74,6 +77,7 @@ impl Context {
             is_tty: std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
             recovery_signer: None,
             expect_signer: None,
+            expect_state: None,
             enrollments: Vec::new(),
             governance_pending: false,
             fleet_state_invalid: false,
@@ -221,6 +225,7 @@ mod tests {
             is_tty: false,
             recovery_signer: None,
             expect_signer: None,
+            expect_state: None,
             enrollments: Vec::new(),
             governance_pending: false,
             fleet_state_invalid: false,

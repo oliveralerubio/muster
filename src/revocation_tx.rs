@@ -134,6 +134,7 @@ impl Txn {
             &manifest,
             &VerifyOptions {
                 expect_signer: None,
+                expect_state: None,
                 persist: false,
                 check_content: true,
             },

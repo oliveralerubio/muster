@@ -599,13 +599,14 @@ impl Ui {
             audit_actor: None,
             web_approval: false,
         };
-        let (envelope, code) = crate::cli::execute_with(spec, globals, false, None, |ctx| {
-            if route == "secret/add" {
-                secret::add_with_value(ctx, &typed, value)
-            } else {
-                secret::rotate_with_value(ctx, &typed, value)
-            }
-        });
+        let (envelope, code) =
+            crate::cli::execute_with(spec, globals, false, (None, None), |ctx| {
+                if route == "secret/add" {
+                    secret::add_with_value(ctx, &typed, value)
+                } else {
+                    secret::rotate_with_value(ctx, &typed, value)
+                }
+            });
         reply(
             &envelope,
             &cli,

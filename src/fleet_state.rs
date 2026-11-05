@@ -1042,7 +1042,7 @@ fn bootstrap_hold(
     config_dir: &Path,
     state: &FleetState,
     manifest: &Manifest,
-    allow_checkpoint: bool,
+    expect_state: Option<&str>,
 ) -> Result<Option<(Transition, FleetState, Manifest)>, MusterError> {
     let epoch = state.payload.epoch;
     let refuse = |why: String| {
@@ -1050,7 +1050,23 @@ fn bootstrap_hold(
             "cannot pin this fleet: {why}; ask an admin to confirm the state out of band"
         ))
     };
+    let pinned_origin = match expect_state {
+        Some(expected) => {
+            let expected = expected.trim().to_ascii_lowercase();
+            if state.payload_hash()? == expected {
+                // The operator named the current state itself as the origin.
+                return Ok(None);
+            }
+            Some(expected)
+        }
+        None => None,
+    };
     if epoch <= 1 {
+        if pinned_origin.is_some() {
+            return Err(refuse(
+                "it is not the state named with --expect-state".into(),
+            ));
+        }
         if state.payload.prev.is_some() {
             return Err(refuse("its first state names a predecessor".into()));
         }
@@ -1058,24 +1074,29 @@ fn bootstrap_hold(
     }
     if !crate::git::is_repo(config_dir) {
         return Err(refuse(format!(
-            "its state is at epoch {epoch} but there is no git history to check the admin signatures \
-             of its changes"
+            "its state is at epoch {epoch} but there is no git history to check the admin signatures              of its changes"
         )));
     }
     let chain = history_chain(config_dir, 1, state, manifest)?;
-    // With the signer named out of band, the forward chain may start at the
-    // newest valid checkpoint instead of genesis.
-    let origin = if allow_checkpoint {
-        newest_checkpoint(&chain, epoch)
-    } else {
-        None
+    // An origin named out of band is the only possible origin; otherwise the
+    // forward chain starts at genesis.
+    let origin = match &pinned_origin {
+        Some(expected) => {
+            let found = chain
+                .iter()
+                .find(|(_, (s, _))| s.payload_hash().ok().as_ref() == Some(expected))
+                .map(|(e, _)| *e);
+            Some(found.ok_or_else(|| {
+                refuse("no state of its history matches the one named with --expect-state".into())
+            })?)
+        }
+        None => None,
     };
     let first = origin.unwrap_or(1);
     for e in first..=epoch {
         if !chain.contains_key(&e) {
             return Err(refuse(format!(
-                "epoch {e} is missing from the repository history (or does not chain to the \
-                 current state)"
+                "epoch {e} is missing from the repository history (or does not chain to the                  current state)"
             )));
         }
     }
@@ -1093,65 +1114,84 @@ fn bootstrap_hold(
     }
     let mut prior = Prior::from_state(genesis, genesis_manifest)?;
     let mut accepted = (genesis.clone(), genesis_manifest.clone());
-    for e in first + 1..=epoch {
+    let mut e = first + 1;
+    while e <= epoch {
         let (step, step_manifest) = &chain[&e];
-        let outcome = check_transition(&prior, step, step_manifest).map_err(|err| match err {
-            MusterError::Security(m) if e < epoch => refuse(format!("epoch {e}: {m}")),
-            other => other,
-        })?;
-        if outcome != Transition::Accepted {
-            return Ok(Some((outcome, accepted.0, accepted.1)));
+        match check_transition(&prior, step, step_manifest) {
+            Ok(Transition::Accepted) => {}
+            Ok(outcome) => return Ok(Some((outcome, accepted.0, accepted.1))),
+            Err(err) => {
+                // A transition today's rules refuse (legacy history) may be
+                // bridged by a later checkpoint, but only one that the
+                // ACCEPTED state vouches for: never one that vouches for itself.
+                let bridge = (e + 1..=epoch).find(|c| {
+                    let (cs, _) = &chain[c];
+                    cs.payload.checkpoint
+                        && checkpoint_unchanged(&chain, *c)
+                        && checkpoint_vouched(&prior, cs)
+                });
+                match (bridge, err) {
+                    (Some(c), _) => {
+                        let (cs, cm) = &chain[&c];
+                        prior = Prior::from_state(cs, cm)?;
+                        accepted = (cs.clone(), cm.clone());
+                        e = c + 1;
+                        continue;
+                    }
+                    (None, MusterError::Security(m)) if e < epoch => {
+                        return Err(refuse(format!("epoch {e}: {m}")))
+                    }
+                    (None, other) => return Err(other),
+                }
+            }
         }
         prior = Prior::from_state(step, step_manifest)?;
         accepted = (step.clone(), step_manifest.clone());
+        e += 1;
     }
     Ok(None)
 }
 
-/// Epoch of the newest valid checkpoint in `chain` (contiguous down from the
-/// head), `None` without one.
-fn newest_checkpoint(chain: &BTreeMap<u64, (FleetState, Manifest)>, head: u64) -> Option<u64> {
-    for epoch in (1..=head).rev() {
-        let (state, manifest) = chain.get(&epoch)?;
-        if state.payload.checkpoint && checkpoint_valid(state, manifest) {
-            // A checkpoint never alters content: if its predecessor is recorded,
-            // its digests must equal the predecessor's.
-            if let Some(prev_hash) = &state.payload.prev {
-                if let Some((prev_state, _)) = chain.get(&(epoch - 1)) {
-                    if prev_state.payload_hash().ok().as_ref() != Some(prev_hash)
-                        || state.payload.governance != prev_state.payload.governance
-                        || state.payload.vault != prev_state.payload.vault
-                        || state.payload.vault_meta != prev_state.payload.vault_meta
-                        || !state.payload.enrollments.is_empty()
-                    {
-                        continue;
-                    }
-                }
-            }
-            return Some(epoch);
-        }
-    }
-    None
+/// A checkpoint never alters content and names a predecessor present in the
+/// chain: its digests must equal that predecessor's.
+fn checkpoint_unchanged(chain: &BTreeMap<u64, (FleetState, Manifest)>, epoch: u64) -> bool {
+    let Some((state, _)) = chain.get(&epoch) else {
+        return false;
+    };
+    let (Some(prev_hash), Some((prev_state, _))) =
+        (&state.payload.prev, chain.get(&(epoch.wrapping_sub(1))))
+    else {
+        return false;
+    };
+    prev_state.payload_hash().ok().as_ref() == Some(prev_hash)
+        && state.payload.governance == prev_state.payload.governance
+        && state.payload.vault == prev_state.payload.vault
+        && state.payload.vault_meta == prev_state.payload.vault_meta
+        && state.payload.enrollments.is_empty()
 }
 
-/// A checkpoint vouches for everything before it, so it must come from the
-/// recovery key of its own governance or from as many distinct admins of that
-/// governance as it requires (its signer plus verified co-signers).
-fn checkpoint_valid(state: &FleetState, manifest: &Manifest) -> bool {
-    let signer = &state.payload.signer;
-    if manifest
-        .recovery
-        .as_ref()
-        .and_then(|r| r.signing_key.as_deref())
-        == Some(signer.as_str())
+/// Whether the ACCEPTED state `prior` vouches for `checkpoint`: it is signed by
+/// the recovery key recorded in `prior`'s governance, or by as many distinct
+/// admins of `prior` (signer plus verified co-signers) as `prior` requires,
+/// at least two. The checkpoint's own governance never counts, and a fleet
+/// that needs only one admin cannot bridge anything this way (an operator
+/// names the origin with `--expect-state` instead).
+fn checkpoint_vouched(prior: &Prior, checkpoint: &FleetState) -> bool {
+    let Some(old) = prior.snapshot.as_ref() else {
+        return false;
+    };
+    let mut keys = vec![checkpoint.payload.signer.clone()];
+    keys.extend(checkpoint.valid_cosigners());
+    if keys
+        .iter()
+        .any(|k| old["recovery"]["signing_key"].as_str() == Some(k.as_str()))
     {
         return true;
     }
-    let Ok(prior) = Prior::from_state(state, manifest) else {
-        return false;
-    };
-    prior.admins.contains(signer)
-        && quorum_count(&prior, state).is_none_or(|(received, required)| received >= required)
+    match quorum_count(prior, checkpoint) {
+        Some((received, required)) => received >= required,
+        None => false,
+    }
 }
 
 /// One transition `prior` -> `state`: signer authorization (admin for
@@ -2071,6 +2111,7 @@ pub fn verify(
         manifest,
         &VerifyOptions {
             expect_signer,
+            expect_state: None,
             persist: true,
             check_content: true,
         },
@@ -2081,6 +2122,9 @@ pub fn verify(
 #[derive(Debug, Clone, Copy)]
 pub struct VerifyOptions<'a> {
     pub expect_signer: Option<&'a str>,
+    /// `--expect-state`: the payload SHA-256 of the one state a machine with
+    /// no pin may take as its origin (named out of band).
+    pub expect_state: Option<&'a str>,
     /// Advance (or create) the local pin on success.
     pub persist: bool,
     /// Compare `muster.toml` and the vault with the signed digests. Off only
@@ -2164,7 +2208,7 @@ pub fn verify_with(
                 ));
             }
             if let Some((held, step, step_manifest)) =
-                bootstrap_hold(config_dir, &state, manifest, expect_signer.is_some())?
+                bootstrap_hold(config_dir, &state, manifest, options.expect_state)?
             {
                 outcome = held;
                 bootstrap = Some((step, step_manifest));
@@ -2268,7 +2312,8 @@ pub fn verify_with(
     // machine with no pin gets the last quorate state, never the pending one).
     if let Some(held) = pending(outcome) {
         if let (true, Some((step, step_manifest))) = (options.persist, &bootstrap) {
-            let confirmed = expect_signer.is_some_and(|e| signing::signer_matches(e, &signer));
+            let confirmed = options.expect_state.is_some()
+                || expect_signer.is_some_and(|e| signing::signer_matches(e, &signer));
             let tofu = match &anchor {
                 Some(pin) => pin.tofu && !confirmed,
                 None => !confirmed,
@@ -2280,7 +2325,8 @@ pub fn verify_with(
     if options.persist {
         // A first-use pin stays unconfirmed until a run names the signer with
         // `--expect-signer`; a pin that was already confirmed stays so.
-        let confirmed = expect_signer.is_some_and(|e| signing::signer_matches(e, &signer));
+        let confirmed = options.expect_state.is_some()
+            || expect_signer.is_some_and(|e| signing::signer_matches(e, &signer));
         let tofu = match &anchor {
             Some(pin) => pin.tofu && !confirmed,
             None => !confirmed,
@@ -3792,17 +3838,64 @@ mod tests {
     }
 
     fn bootstrap(f: &Fixture, signer: Option<&str>) -> Result<Verification, MusterError> {
+        bootstrap_with(f, signer, None).map(|(v, _)| v)
+    }
+
+    /// A fresh machine's first verification; also returns its state dir so the
+    /// pin it took can be inspected.
+    fn bootstrap_with(
+        f: &Fixture,
+        signer: Option<&str>,
+        state: Option<&str>,
+    ) -> Result<(Verification, TempDir), MusterError> {
         let fresh = tempdir().unwrap();
-        verify_with(
+        let v = verify_with(
             &f.config,
             fresh.path(),
             &f.manifest,
             &VerifyOptions {
                 expect_signer: signer,
+                expect_state: state,
                 persist: true,
                 check_content: true,
             },
-        )
+        )?;
+        Ok((v, fresh))
+    }
+
+    fn head_hash(f: &Fixture) -> String {
+        FleetState::load(&f.config)
+            .unwrap()
+            .unwrap()
+            .payload_hash()
+            .unwrap()
+    }
+
+    /// Like `legacy_history` but the recovery key is recorded (and quorate)
+    /// BEFORE the legacy transition, so the accepted state vouches for it.
+    fn legacy_history_with_recovery() -> (Fixture, Signer, Signer) {
+        let (mut f, k2, _k3) = quorum_fixture();
+        let recovery = crate::identity::Identity::generate();
+        let recovery_signer = Signer::from_recovery(&recovery).unwrap();
+        f.manifest.recovery = Some(crate::manifest::Recovery {
+            recipient: recovery.recipient(),
+            signing_key: Some(recovery_signer.public()),
+        });
+        f.seal_as(&f.signer, tempdir().unwrap().path(), vec![]);
+        let mut st = FleetState::load(&f.config).unwrap().unwrap();
+        st.add_cosignature(&k2).unwrap();
+        st.save(&f.config).unwrap();
+        f.commit();
+        f.manifest.members.insert(
+            "carol".into(),
+            Member {
+                role: Role::Member,
+                status: MemberStatus::Active,
+                ..Member::default()
+            },
+        );
+        f.seal_adopted(vec![]);
+        (f, k2, recovery_signer)
     }
 
     /// Seals a checkpoint as `signer`, then lets `cosigners` co-sign it.
@@ -3834,8 +3927,8 @@ mod tests {
         let (f, k2) = legacy_history();
         checkpoint_as(&f, &f.signer, &[&k2]);
         let signer = f.signer.public();
-        // Only with the signer named out of band.
-        assert!(bootstrap(&f, None).is_err());
+        // Vouched by the accepted state's admins: no out-of-band help needed.
+        assert!(bootstrap(&f, None).is_ok());
         match bootstrap(&f, Some(&signer)).unwrap() {
             Verification::Verified {
                 first_use: true, ..
@@ -3867,18 +3960,9 @@ mod tests {
 
     #[test]
     fn a_recovery_signed_checkpoint_needs_no_cosigner() {
-        let (mut f, _k2) = legacy_history();
-        let recovery = crate::identity::Identity::generate();
-        let recovery_signer = Signer::from_recovery(&recovery).unwrap();
-        f.manifest.recovery = Some(crate::manifest::Recovery {
-            recipient: recovery.recipient(),
-            signing_key: Some(recovery_signer.public()),
-        });
-        f.seal_adopted(vec![]);
+        let (f, _k2, recovery_signer) = legacy_history_with_recovery();
         checkpoint_as(&f, &recovery_signer, &[]);
         let signer = f.signer.public();
-        // The recovery-signed checkpoint is the head; the signer named out of
-        // band is the one that signed it.
         let head_signer = recovery_signer.public();
         assert!(bootstrap(&f, Some(&signer)).is_err());
         match bootstrap(&f, Some(&head_signer)).unwrap() {
@@ -3887,6 +3971,128 @@ mod tests {
             } => {}
             other => panic!("recovery checkpoint must bootstrap: {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_recovery_checkpoint_the_accepted_state_never_recorded_is_refused() {
+        // The recovery key is introduced by the same unaccepted legacy step the
+        // checkpoint would bridge: the accepted state does not vouch for it.
+        let (mut f, _k2, _k3) = quorum_fixture();
+        let recovery = crate::identity::Identity::generate();
+        let recovery_signer = Signer::from_recovery(&recovery).unwrap();
+        f.manifest.members.insert(
+            "carol".into(),
+            Member {
+                role: Role::Member,
+                status: MemberStatus::Active,
+                ..Member::default()
+            },
+        );
+        f.manifest.recovery = Some(crate::manifest::Recovery {
+            recipient: recovery.recipient(),
+            signing_key: Some(recovery_signer.public()),
+        });
+        f.seal_adopted(vec![]);
+        checkpoint_as(&f, &recovery_signer, &[]);
+        let head_signer = recovery_signer.public();
+        assert!(bootstrap(&f, Some(&head_signer)).is_err());
+    }
+
+    // ---- attacker view: a checkpoint never validates itself --------------------
+
+    /// Alice (one stolen admin key of a k=2 fleet) appends `P` and a checkpoint
+    /// over it, signed by herself (and `extra`), to the real history.
+    fn forged_checkpoint(mutate: impl FnOnce(&mut Fixture), extra: Option<&Signer>) -> Fixture {
+        let (mut f, _k2, _k3) = quorum_fixture();
+        mutate(&mut f);
+        f.seal_as(&f.signer, tempdir().unwrap().path(), vec![]);
+        checkpoint_as(&f, &f.signer, extra.as_slice());
+        f
+    }
+
+    fn never_pinned_as_governance(f: &Fixture, marker: &str) {
+        let signer = f.signer.public();
+        for expect in [None, Some(signer.as_str())] {
+            match bootstrap_with(f, expect, None) {
+                Err(_) => {}
+                Ok((Verification::Pending { .. }, dir)) => {
+                    let pin = TrustAnchor::load(dir.path()).unwrap().unwrap();
+                    assert!(
+                        !pin.snapshot.unwrap().to_string().contains(marker),
+                        "the forged governance was pinned"
+                    );
+                }
+                Ok((other, _)) => panic!("a self-signed checkpoint bootstrapped: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn self_signed_checkpoint_cannot_lower_required_approvals() {
+        let f = forged_checkpoint(
+            |f| {
+                f.manifest.team = Some(TeamConfig {
+                    required_approvals: 1,
+                });
+            },
+            None,
+        );
+        never_pinned_as_governance(&f, "\"required_approvals\":1");
+    }
+
+    #[test]
+    fn self_signed_checkpoint_cannot_add_an_evidence_less_admin() {
+        let (_d, eve) = new_signer();
+        let f = forged_checkpoint(
+            |f| {
+                f.manifest.members.insert(
+                    "eve".into(),
+                    Member {
+                        role: Role::Admin,
+                        status: MemberStatus::Active,
+                        machines: vec!["eve-box".into()],
+                        ..Member::default()
+                    },
+                );
+                f.manifest
+                    .machines
+                    .insert("eve-box".into(), machine_for(&eve, "age1eve"));
+            },
+            Some(&eve),
+        );
+        never_pinned_as_governance(&f, "eve");
+    }
+
+    #[test]
+    fn expect_state_pins_an_exact_origin_against_a_forged_tail() {
+        let (mut f, _k2, _k3) = quorum_fixture();
+        let honest = head_hash(&f);
+        f.manifest.team = Some(TeamConfig {
+            required_approvals: 1,
+        });
+        f.seal_as(&f.signer, tempdir().unwrap().path(), vec![]);
+        checkpoint_as(&f, &f.signer, &[]);
+        let (v, dir) = bootstrap_with(&f, None, Some(&honest)).unwrap();
+        assert!(matches!(v, Verification::Pending { .. }), "{v:?}");
+        let pin = TrustAnchor::load(dir.path()).unwrap().unwrap();
+        assert_eq!(pin.payload_hash, honest);
+        // Naming the forged head itself is the operator's own explicit choice.
+        let head = head_hash(&f);
+        assert!(bootstrap_with(&f, None, Some(&head)).is_ok());
+        // A hash that is not in the history is refused.
+        assert!(bootstrap_with(&f, None, Some(&"0".repeat(64))).is_err());
+    }
+
+    #[test]
+    fn expect_state_bootstraps_past_legacy_history() {
+        let (f, k2) = legacy_history();
+        checkpoint_as(&f, &f.signer, &[&k2]);
+        let (v, dir) = bootstrap_with(&f, None, Some(&head_hash(&f))).unwrap();
+        assert!(matches!(v, Verification::Verified { .. }), "{v:?}");
+        assert_eq!(
+            TrustAnchor::load(dir.path()).unwrap().unwrap().payload_hash,
+            head_hash(&f)
+        );
     }
 
     #[test]

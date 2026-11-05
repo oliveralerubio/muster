@@ -39,6 +39,11 @@ where
     let (format, quiet) = (globals.format.unwrap_or(Format::Text), globals.quiet);
     let mut p = params(spec, sub);
     // `--expect-signer` / `MUSTER_EXPECT_SIGNER` apply to every command.
+    if p.get_string("expect-state").is_none() {
+        if let Some(state) = matches.get_one::<String>("expect-state") {
+            p.set("expect-state", Value::from(state.as_str()));
+        }
+    }
     if p.get_string("expect-signer").is_none() {
         if let Some(signer) = matches.get_one::<String>("expect-signer") {
             p.set("expect-signer", Value::from(signer.as_str()));
@@ -59,9 +64,14 @@ pub fn execute(
     interactive: bool,
 ) -> (Envelope, i32) {
     let expect_signer = params.get_string("expect-signer").map(str::to_owned);
-    execute_with(spec, globals, interactive, expect_signer, |ctx| {
-        (spec.handler)(ctx, params)
-    })
+    let expect_state = params.get_string("expect-state").map(str::to_owned);
+    execute_with(
+        spec,
+        globals,
+        interactive,
+        (expect_signer, expect_state),
+        |ctx| (spec.handler)(ctx, params),
+    )
 }
 
 /// Shared envelope handling for web-only input that must never enter Params.
@@ -69,13 +79,14 @@ pub(crate) fn execute_with(
     spec: &'static CommandSpec,
     globals: Globals,
     interactive: bool,
-    expect_signer: Option<String>,
+    (expect_signer, expect_state): (Option<String>, Option<String>),
     handler: impl FnOnce(&mut Context) -> Result<Value, MusterError>,
 ) -> (Envelope, i32) {
     let (result, mut diagnostics, failed) = match Context::new(globals) {
         Ok(mut ctx) => {
             ctx.is_tty &= interactive;
             ctx.expect_signer = expect_signer;
+            ctx.expect_state = expect_state;
             // One mutation at a time per machine, so a concurrent command can
             // never clobber a live revocation stage or a half-written commit.
             let lock = if spec.mutating && !ctx.dry_run {
@@ -156,6 +167,18 @@ pub fn command() -> Command {
                 .help(
                     "Full public key (musterpk1...) or full SHA256 fingerprint the fleet \
                      signer must have when this machine pins a fleet for the first time",
+                )
+                .global(true),
+        )
+        .arg(
+            Arg::new("expect-state")
+                .long("expect-state")
+                .value_name("SHA256")
+                .env("MUSTER_EXPECT_STATE")
+                .help(
+                    "Payload SHA-256 (from `muster trust show` on a trusted machine) of the \
+                     one fleet state this machine may take as its origin when it pins a fleet \
+                     for the first time",
                 )
                 .global(true),
         )

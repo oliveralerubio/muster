@@ -132,6 +132,7 @@ fn run_show(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
         &manifest,
         &fleet_state::VerifyOptions {
             expect_signer: None,
+            expect_state: None,
             persist: false,
             check_content: true,
         },
@@ -317,6 +318,7 @@ fn run_cosign(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> 
         &manifest,
         &fleet_state::VerifyOptions {
             expect_signer: None,
+            expect_state: None,
             persist: true,
             check_content: true,
         },
@@ -381,6 +383,7 @@ fn run_cosign(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> 
         &manifest,
         &fleet_state::VerifyOptions {
             expect_signer: None,
+            expect_state: None,
             persist: false,
             check_content: true,
         },
@@ -422,6 +425,7 @@ fn run_cosign(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> 
         &manifest,
         &fleet_state::VerifyOptions {
             expect_signer: None,
+            expect_state: None,
             persist: true,
             check_content: true,
         },
@@ -517,6 +521,7 @@ fn run_reject(
             &m,
             &fleet_state::VerifyOptions {
                 expect_signer: None,
+                expect_state: None,
                 persist: true,
                 check_content: true,
             },

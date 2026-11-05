@@ -176,7 +176,10 @@ fn confirm_typed(
 /// `--expect-signer`, a typed confirmation on a terminal, or be this
 /// machine's own key.
 fn confirm_first_use(ctx: &Context) -> Result<(), MusterError> {
-    if ctx.expect_signer.is_some() || TrustAnchor::load(&ctx.state_dir)?.is_some() {
+    if ctx.expect_signer.is_some()
+        || ctx.expect_state.is_some()
+        || TrustAnchor::load(&ctx.state_dir)?.is_some()
+    {
         return Ok(());
     }
     let Some(state) = FleetState::load(&ctx.config_dir)? else {
@@ -217,6 +220,7 @@ pub fn verify(
         manifest,
         &VerifyOptions {
             expect_signer: ctx.expect_signer.as_deref(),
+            expect_state: ctx.expect_state.as_deref(),
             persist,
             check_content: true,
         },
