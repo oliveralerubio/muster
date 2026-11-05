@@ -397,3 +397,41 @@ fn reencrypt_enforces_authorized_and_revoked_policy() {
         .unwrap_err();
     assert!(matches!(err, muster::errors::MusterError::Security(_)));
 }
+
+#[test]
+fn reencrypt_refuses_fleet_machine_outside_the_groups_readers() {
+    let d = tempdir().unwrap();
+    let a = Identity::generate();
+    let b = Identity::generate();
+    fs::write(
+        d.path().join("muster.toml"),
+        format!(
+            "version = 1\n\
+             [machines.a]\nrecipient = \"{}\"\nplatform = \"linux-x86_64\"\nmuster_version = \"0.1.0\"\n\
+             [machines.b]\nrecipient = \"{}\"\nplatform = \"linux-x86_64\"\nmuster_version = \"0.1.0\"\n\
+             [groups.prod.readers]\nmachines = [\"a\"]\n",
+            a.recipient(),
+            b.recipient()
+        ),
+    )
+    .unwrap();
+    let mut v = Vault::open(d.path()).unwrap();
+    v.add(
+        "prod",
+        "n",
+        SecretValue::new("x".into()),
+        &[a.recipient()],
+        &a,
+    )
+    .unwrap();
+    // b is authorized fleet-wide but is not a reader of `prod`.
+    let err = v
+        .reencrypt("prod", &[a.recipient(), b.recipient()], &a)
+        .unwrap_err();
+    assert!(
+        matches!(err, muster::errors::MusterError::Security(_)),
+        "{err:?}"
+    );
+    // Re-encrypting for its own readers still works.
+    v.reencrypt("prod", &[a.recipient()], &a).unwrap();
+}

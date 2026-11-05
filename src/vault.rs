@@ -289,6 +289,30 @@ impl Vault {
         Ok(())
     }
 
+    /// A reader may only re-encrypt `group` for the recipients the manifest
+    /// assigns to it (plus the recovery key), not for any fleet machine.
+    /// Without a manifest there is no governance to enforce.
+    fn verify_group_membership(
+        &self,
+        group: &str,
+        recipients: &[String],
+    ) -> Result<(), MusterError> {
+        let config_dir = self.dir.parent().unwrap_or(&self.dir);
+        if !config_dir.join(crate::manifest::FILE_NAME).exists() {
+            return Ok(());
+        }
+        let manifest = Manifest::load(config_dir)?;
+        let allowed = crate::team::group_recipients(&manifest, group);
+        for r in recipients {
+            if !allowed.contains(r) {
+                return Err(MusterError::Security(format!(
+                    "recipient '{r}' is not a reader of group '{group}' in muster.toml"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Metadata for every secret in `group`, sorted by name. Needs no identity.
     pub fn list(&self, group: &str) -> Result<Vec<SecretMeta>, MusterError> {
         let meta = self.read_meta(group)?;
@@ -344,6 +368,7 @@ impl Vault {
         id: &Identity,
     ) -> Result<(), MusterError> {
         self.verify_recipients(group, new_recipients)?;
+        self.verify_group_membership(group, new_recipients)?;
         let mut data = self.read_verified_readers(group, id)?;
         data.recipients = new_recipients.to_vec();
         self.write(group, &data)
