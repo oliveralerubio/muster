@@ -319,6 +319,13 @@ fn get(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         let manifest = match Manifest::load(&ctx.config_dir) {
             Ok(m) => Some(m),
             Err(MusterError::Operational(_)) if !ctx.config_dir.join("muster.toml").exists() => {
+                let pin_exists = crate::fleet_state::TrustAnchor::load(&ctx.state_dir)?.is_some();
+                let state_exists = ctx.config_dir.join(crate::fleet_state::STATE_FILE).exists();
+                if pin_exists || state_exists {
+                    return Err(MusterError::Security(
+                        "cannot reveal secret: muster.toml is missing but a trust pin or signed fleet state exists".into(),
+                    ));
+                }
                 None
             }
             Err(e) => return Err(e),
