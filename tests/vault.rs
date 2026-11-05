@@ -382,4 +382,18 @@ fn reencrypt_enforces_authorized_and_revoked_policy() {
     let mut v_revoked = Vault::open(d.path()).unwrap().with_revoked([b.recipient()]);
     let err = v_revoked.reencrypt("g", &[b.recipient()], &a).unwrap_err();
     assert!(matches!(err, muster::errors::MusterError::Security(_)));
+    // Unauthorized recipient is rejected when policy is defined
+    fs::write(
+        d.path().join("muster.toml"),
+        format!(
+            "version = 1\n[machines.me]\nrecipient = \"{}\"\nplatform = \"linux-x86_64\"\nmuster_version = \"0.1.0\"\n",
+            a.recipient()
+        ),
+    )
+    .unwrap();
+    let mut v_authorized = Vault::open(d.path()).unwrap();
+    let err = v_authorized
+        .reencrypt("g", &[b.recipient()], &a)
+        .unwrap_err();
+    assert!(matches!(err, muster::errors::MusterError::Security(_)));
 }
