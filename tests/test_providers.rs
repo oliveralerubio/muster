@@ -957,7 +957,8 @@ fn mcp_provider_mutations_follow_the_propose_change_policy() {
         "--format",
         "json",
     ]);
-    assert!(proposal.ok());
+    // Provider destinations are signed governance: a proposal cannot add one.
+    assert!(!proposal.ok());
     assert_eq!(
         std::fs::read_to_string(env.config_dir().join("muster.toml")).unwrap(),
         "version = 1\n"

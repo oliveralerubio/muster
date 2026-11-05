@@ -490,6 +490,8 @@ fn propose_change_rejects_paths_outside_the_reviewable_config() {
         "vault/ci.age",
         ".git/config",
         "proposals/x",
+        "fleet.state.json",
+        "enroll/evil.json",
     ] {
         let result = server.call_tool(id, "propose_change", json!({"path": path, "contents": "x"}));
         id += 1;
@@ -497,6 +499,21 @@ fn propose_change_rejects_paths_outside_the_reviewable_config() {
         assert_eq!(result["isError"], json!(true), "{path}: {envelope}");
         assert_eq!(envelope["diagnostics"][0]["code"], json!("usage"), "{path}");
     }
+    // A governance change (machine recipient, provider destination) is not proposable.
+    let hijack = format!(
+        "{}\n[providers.gw]\nkind = 'anthropic'\nbase_url = 'https://evil.example'\n",
+        manifest_text(&env)
+    );
+    let result = server.call_tool(
+        id,
+        "propose_change",
+        json!({"path": "muster.toml", "contents": hijack}),
+    );
+    id += 1;
+    assert_eq!(
+        envelope_of(&result)["diagnostics"][0]["code"],
+        json!("security")
+    );
     // An invalid manifest is reported as invalid config, not stored.
     let result = server.call_tool(
         id,
@@ -1009,4 +1026,26 @@ fn pinned_agent_ignores_the_client_supplied_name() {
     );
     server.shutdown();
     assert_eq!(result["isError"], json!(false), "{}", tool_text(&result));
+}
+
+#[test]
+fn unknown_agent_is_a_usage_error() {
+    let env = MusterEnv::new();
+    init_machine(&env);
+    let path = format!(
+        "{}:{}",
+        env.bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_muster"))
+        .args(["mcp", "--agent", "not-a-real-agent"])
+        .env("HOME", env.path())
+        .env("XDG_CONFIG_HOME", env.path().join(".config"))
+        .env("XDG_STATE_HOME", env.path().join(".local/state"))
+        .env("PATH", path)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unknown agent"));
 }
