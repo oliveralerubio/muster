@@ -1460,6 +1460,7 @@ fn quorum_two_admin_a_removing_admin_b_stays_pending_until_cosigned() {
     let cosigned = ok(&carol, &["trust", "cosign", "--yes"]);
     assert_eq!(cosigned["result"]["cosigned"], true, "{cosigned}");
     assert_eq!(cosigned["result"]["accepted"], true, "{cosigned}");
+    assert!(cosigned["result"]["pushed"].is_boolean(), "{cosigned}");
     ok(&carol, &["sync", "--push"]);
 
     // Now Carol's pin HAS advanced and Bob is removed.

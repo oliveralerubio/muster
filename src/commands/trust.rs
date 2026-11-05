@@ -133,6 +133,25 @@ fn run_show(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
     }))
 }
 
+/// Pushes the committed change. A failure is surfaced, never silent: peers do
+/// not see the change until it is pushed. False when nothing reached a remote.
+fn publish(ctx: &mut Context, what: &str) -> bool {
+    if !git::has_remote(&ctx.config_dir) {
+        return false;
+    }
+    match git::push(&ctx.config_dir) {
+        Ok(()) => true,
+        Err(e) => {
+            ctx.diag(Diagnostic::new(
+                Severity::Warning,
+                "push_failed",
+                format!("{what} committed but not pushed: {e}; run `muster sync --push`"),
+            ));
+            false
+        }
+    }
+}
+
 fn run_resign(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let manifest = Manifest::load(&ctx.config_dir)?;
     fleet_state::ensure_not_behind_pin(&ctx.config_dir, &ctx.state_dir, "re-sign")?;
@@ -218,12 +237,11 @@ fn run_resign(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> 
         .ok_or_else(|| MusterError::Operational("sealing failed".into()))?;
 
     git::commit_if_configured(&ctx.config_dir, "feat(security): re-sign fleet state")?;
-    if git::has_remote(&ctx.config_dir) {
-        let _ = git::push(&ctx.config_dir);
-    }
+    let pushed = publish(ctx, "re-signed state");
 
     Ok(json!({
         "resigned": true,
+        "pushed": pushed,
         "epoch": state.payload.epoch,
         "signer": state.payload.signer,
         "fingerprint": signing::fingerprint(&state.payload.signer),
@@ -370,11 +388,10 @@ fn run_cosign(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> 
     let accepted = matches!(verified, Verification::Verified { .. });
 
     git::commit_if_configured(&ctx.config_dir, "feat(security): co-sign governance change")?;
-    if git::has_remote(&ctx.config_dir) {
-        let _ = git::push(&ctx.config_dir);
-    }
+    let pushed = publish(ctx, "co-signature");
     Ok(json!({
         "cosigned": true,
+        "pushed": pushed,
         "epoch": state.payload.epoch,
         "accepted": accepted,
         "signer": public,

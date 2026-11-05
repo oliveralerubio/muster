@@ -462,3 +462,36 @@ fn quorum_fleet(remote: &str, alice: &MusterEnv, bob: &MusterEnv, carol: &Muster
     ok(carol, &["sync", "--pull"]);
     signer_a
 }
+
+#[test]
+fn resign_reports_push_failure_instead_of_hiding_it() {
+    let env = MusterEnv::new();
+    ok(&env, &["init", "--yes", "--machine", "alpha"]);
+    let dir = env.config_dir();
+    let git = |args: &[&str]| {
+        let st = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+        assert!(st.success(), "git {args:?}");
+    };
+    git(&["init", "-q"]);
+    git(&["remote", "add", "origin", "/nonexistent/unreachable.git"]);
+    let mut manifest = manifest_text(&env);
+    manifest.push_str(
+        "\n[machines.eve]\nrecipient = \"age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p\"\nplatform = \"linux-x86_64\"\nmuster_version = \"0.1.0\"\n",
+    );
+    std::fs::write(dir.join("muster.toml"), manifest).unwrap();
+    let out = ok(&env, &["trust", "resign", "--yes"]);
+    assert_eq!(out["result"]["resigned"], true, "{out}");
+    assert_eq!(out["result"]["pushed"], false, "{out}");
+    assert!(
+        out["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["code"] == "push_failed"),
+        "{out}"
+    );
+}
