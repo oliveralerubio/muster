@@ -1192,15 +1192,13 @@ impl Plan {
                 .unwrap_or_default()
         };
         let action = entry.action();
-        let mut diff = diff::unified(
-            &redact(&entry.before),
-            &redact(&entry.after),
-            &entry.path.display().to_string(),
-            entry.private,
-        );
-        if entry.private {
-            diff = mask_secret_lines(&diff, &self.secrets);
-        }
+        let path = entry.path.display().to_string();
+        // A private file never shows lines: not its context, not its additions.
+        let diff = if entry.private {
+            diff::private_placeholder(entry.before.as_deref(), entry.after.as_deref(), &path)
+        } else {
+            diff::unified(&redact(&entry.before), &redact(&entry.after), &path, false)
+        };
         json!({
             "path": entry.path,
             "action": action,
@@ -1688,26 +1686,6 @@ fn redact(text: &str, secrets: &BTreeMap<String, SecretValue>) -> String {
         }
     }
     out
-}
-
-/// Last line of defence for secret-bearing files: any diff line that still
-/// carries a secret form is hidden entirely.
-fn mask_secret_lines(diff: &str, secrets: &BTreeMap<String, SecretValue>) -> String {
-    let forms: Vec<String> = secrets
-        .values()
-        .flat_map(|s| secret_forms(s.expose()))
-        .collect();
-    diff.lines()
-        .map(|line| {
-            if forms.iter().any(|f| line.contains(f.as_str())) {
-                "<line hidden: file contains secrets>".to_owned()
-            } else {
-                line.to_owned()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-        + if diff.ends_with('\n') { "\n" } else { "" }
 }
 
 /// Resolve every secret reference in MCP `env`/`headers` through the provider

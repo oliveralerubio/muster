@@ -732,3 +732,80 @@ env = { KEY = "env://TRICKY" }
         assert_eq!(mode, 0o600, "{file} must stay private");
     }
 }
+
+fn assert_no_content_lines(diff: &str) {
+    for line in diff.lines().skip(2) {
+        assert!(
+            !line.starts_with(['+', '-', ' ']),
+            "private diff shows a content line: {line:?} in {diff}"
+        );
+    }
+}
+
+#[test]
+fn private_file_diff_suppression_never_reveals_secret_context_or_additions() {
+    let env = MusterEnv::new();
+    env.run(&["--format", "json", "--yes", "init"])
+        .assert()
+        .code(0);
+    std::fs::write(
+        env.config_dir().join("AGENTS.md"),
+        "# Rules
+",
+    )
+    .unwrap();
+    let mut text = std::fs::read_to_string(env.config_dir().join("muster.toml")).unwrap();
+    text.push_str(
+        r#"
+[agents]
+enabled = ["claude"]
+
+[agents.instructions]
+source = "AGENTS.md"
+
+[mcp.demo]
+command = "demo-server"
+env = { SECRET = "env://DEMO_SECRET" }
+"#,
+    );
+    std::fs::write(env.config_dir().join("muster.toml"), text).unwrap();
+    env.run(&["trust", "resign", "--yes"]).assert().success();
+
+    // 1. Plan for initial addition: private agent file (.claude.json / settings)
+    let (plan_out, plan_env) = all_json(&env, &["plan"]);
+    assert!(plan_out.status.success());
+    let raw = plan_env.raw;
+    let files = raw["result"]["agents"][0]["files"].as_array().unwrap();
+    let private_file = files
+        .iter()
+        .find(|f| f["private"] == true)
+        .expect("has private file");
+    let diff = private_file["diff"].as_str().unwrap();
+    assert!(diff.contains("<private file added>"), "diff: {diff}");
+    assert!(!diff.contains("DEMO_SECRET"), "diff: {diff}");
+    assert_no_content_lines(diff);
+
+    // Apply first
+    let (sync_out, _) = all_json(&env, &["sync", "--yes"]);
+    assert!(sync_out.status.success());
+
+    // 2. Modify private file: add another environment variable
+    let mut text2 = std::fs::read_to_string(env.config_dir().join("muster.toml")).unwrap();
+    text2 = text2.replace("demo-server", "sensitive-addition");
+    std::fs::write(env.config_dir().join("muster.toml"), text2).unwrap();
+    env.run(&["trust", "resign", "--yes"]).assert().success();
+
+    let (plan2_out, plan2_env) = all_json(&env, &["plan"]);
+    assert!(plan2_out.status.success());
+    let raw2 = plan2_env.raw;
+    let files2 = raw2["result"]["agents"][0]["files"].as_array().unwrap();
+    let private_file2 = files2
+        .iter()
+        .find(|f| f["private"] == true && f["changed"] == true)
+        .expect("has modified private file");
+    let diff2 = private_file2["diff"].as_str().unwrap();
+    assert!(diff2.contains("<private file modified>"), "diff: {diff2}");
+    assert!(!diff2.contains("sensitive-addition"), "diff: {diff2}");
+    assert!(!diff2.contains("demo-server"), "diff: {diff2}");
+    assert_no_content_lines(diff2);
+}

@@ -123,9 +123,35 @@ fn script<'a>(a: &[&'a str], b: &[&'a str]) -> Vec<(Op, &'a str)> {
     ops
 }
 
+/// Diff of a private (secret-bearing) file: names the change, never shows any
+/// line, so neither context nor additions can leak a value nobody can name.
+pub fn private_placeholder(old: Option<&str>, new: Option<&str>, path: &str) -> String {
+    if old == new {
+        return String::new();
+    }
+    let what = match (old, new) {
+        (None, _) => "added",
+        (_, None) => "removed",
+        _ => "modified",
+    };
+    format!("--- a{path}\n+++ b{path}\n<private file {what}>\n")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::unified;
+    use super::{private_placeholder, unified};
+
+    #[test]
+    fn private_files_never_show_lines() {
+        let added = private_placeholder(None, Some("token = \"hunter2\"\n"), "/f");
+        assert!(added.contains("<private file added>") && !added.contains("hunter2"));
+        let modified =
+            private_placeholder(Some("a=old-secret\n"), Some("a=new-secret\nb=1\n"), "/f");
+        assert!(modified.contains("<private file modified>"));
+        assert!(!modified.contains("secret") && !modified.contains("b=1"));
+        assert!(private_placeholder(Some("x"), None, "/f").contains("<private file removed>"));
+        assert_eq!(private_placeholder(Some("x"), Some("x"), "/f"), "");
+    }
 
     #[test]
     fn equal_texts_have_no_diff() {
