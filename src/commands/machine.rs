@@ -338,10 +338,18 @@ fn add(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     if has_config {
         steps.push(format!("{host} already has a config repo; kept as is"));
     } else {
+        // The new host has no pin yet: tell it which signer to trust so it does
+        // not take whatever the remote serves first (trust on first use).
+        let signer = match crate::fleet_state::FleetState::load(&ctx.config_dir)? {
+            Some(state) => state.payload.signer,
+            None => crate::signing::Signer::load_or_create(&ctx.state_dir)?.public(),
+        };
+        let fingerprint = crate::signing::fingerprint(&signer);
         remote.muster_ok(
             "joining the config repo",
             &format!(
-                "{bin} --format json sync --remote {} --pull",
+                "{bin} --format json sync --expect-signer {} --remote {} --pull",
+                shell_quote(&fingerprint),
                 shell_quote(&url)
             ),
             &format!("{host} needs its own git access to {url} (deploy key, ssh agent or credential helper); Muster does not copy credentials"),
@@ -370,7 +378,12 @@ fn add(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     ));
 
     // f. fetch the request, check it is the one the host reported, approve, push.
-    crate::git::pull(&ctx.config_dir)?;
+    // Verify what the pull brought in before trusting any of it (the remote
+    // can serve a forged request or fleet state).
+    let previous = crate::git::head_commit_opt(&ctx.config_dir);
+    let pulled = crate::git::pull(&ctx.config_dir)?;
+    let joined = matches!(pulled, crate::git::Pulled::Joined { .. });
+    crate::trust::verify_pulled(ctx, previous.as_deref(), joined, false)?;
     let request = EnrollmentRequest::load(&ctx.config_dir, &name)?;
     if request.recipient != recipient {
         return Err(MusterError::Security(format!(
