@@ -16,6 +16,7 @@
 
 pub(crate) mod diff;
 pub mod dotfiles;
+pub mod effective;
 pub mod layer;
 mod ownership;
 pub(crate) mod store;
