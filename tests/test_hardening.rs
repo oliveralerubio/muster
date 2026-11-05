@@ -170,7 +170,7 @@ machines = [\"alpha\"]
 
     let alpha_pub = id.to_public();
     let eve_pub: age::x25519::Recipient = eve_recipient.parse().unwrap();
-    let recipients = vec![alpha_pub, eve_pub];
+    let recipients = [alpha_pub, eve_pub];
     let encryptor =
         age::Encryptor::with_recipients(recipients.iter().map(|r| r as &dyn age::Recipient))
             .unwrap();
