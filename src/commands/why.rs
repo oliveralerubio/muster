@@ -116,7 +116,9 @@ fn why(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
                 .skip_instructions
                 .as_ref()
                 .is_some_and(|v| v.iter().any(|x| x == id)))
-            || (matches!(target, Target::Project(_)) && *id != "claude" && enabled_count > 1);
+            || (matches!(target, Target::Project(_))
+                && adapters::find(id).is_some_and(|a| a.shared_project_instructions)
+                && enabled_count > 1);
         if !skip {
             files.insert(
                 path.with_file_name(format!("AGENTS.{id}.md")),
@@ -146,53 +148,14 @@ fn why(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
                     .or_insert(("instructions", "native", vec![adapter.id], false));
             }
         }
-        // Native skills/subagents directories, matching what the adapters
-        // render (global and project scopes; hermes has no native
-        // subagent directory).
-        let (base, skills, subagents) = match (adapter.id, &target) {
-            ("claude", Target::Global) => (
-                roots.base(adapters::Base::Home),
-                ".claude/skills",
-                Some(".claude/agents"),
+        let context = &adapter.context_roots;
+        let (base, skills, subagents) = match &target {
+            Target::Global => (roots.base(context.base), context.skills, context.subagents),
+            Target::Project(dir) => (
+                dir.as_path(),
+                context.project_skills,
+                context.project_subagents,
             ),
-            ("codex", Target::Global) => (
-                roots.base(adapters::Base::Home),
-                ".agents/skills",
-                Some(".codex/agents"),
-            ),
-            ("antigravity", Target::Global) => (
-                roots.base(adapters::Base::Home),
-                ".gemini/antigravity-cli/skills",
-                Some(".gemini/antigravity-cli/agents"),
-            ),
-            ("opencode", Target::Global) => (
-                roots.base(adapters::Base::XdgConfig),
-                "opencode/skills",
-                Some("opencode/agents"),
-            ),
-            ("pi", Target::Global) => (
-                roots.base(adapters::Base::Home),
-                ".pi/agent/skills",
-                Some(".pi/agent/agents"),
-            ),
-            ("hermes", Target::Global) => {
-                (roots.base(adapters::Base::Home), ".hermes/skills", None)
-            }
-            ("claude", Target::Project(dir)) => {
-                (dir.as_path(), ".claude/skills", Some(".claude/agents"))
-            }
-            ("codex", Target::Project(dir)) => {
-                (dir.as_path(), ".agents/skills", Some(".codex/agents"))
-            }
-            ("antigravity", Target::Project(dir)) => {
-                (dir.as_path(), ".agents/skills", Some(".agents/agents"))
-            }
-            ("opencode", Target::Project(dir)) => {
-                (dir.as_path(), ".opencode/skills", Some(".opencode/agents"))
-            }
-            ("pi", Target::Project(dir)) => (dir.as_path(), ".pi/skills", Some(".pi/agents")),
-            ("hermes", Target::Project(dir)) => (dir.as_path(), ".hermes/skills", None),
-            _ => continue,
         };
         if let Ok(entries) = std::fs::read_dir(base.join(skills)) {
             for e in entries.flatten() {
