@@ -1,5 +1,6 @@
 mod support;
 
+use muster::manifest::{Group, Manifest, Readers};
 use serde_json::Value;
 use std::{fs, process::Command};
 use tempfile::TempDir;
@@ -19,8 +20,9 @@ fn assert_cli_success(env: &support::MusterEnv, args: &[&str]) -> Value {
     let (output, envelope) = env.run_json(args);
     assert!(
         output.status.success(),
-        "{args:?}: {}",
-        String::from_utf8_lossy(&output.stderr)
+        "{args:?}: {} {}",
+        String::from_utf8_lossy(&output.stderr),
+        envelope.raw
     );
     assert!(envelope.ok(), "{args:?}: {}", envelope.raw);
     envelope.raw["result"].clone()
@@ -76,7 +78,19 @@ fn enroll_approve_and_sync_between_two_machines() {
             "bob-first",
         ],
     );
-    assert_cli_success(&bob, &["--format", "json", "sync", "--remote", remote]);
+    let signer = support::fleet_signer(&alice.config_dir());
+    assert_cli_success(
+        &bob,
+        &[
+            "--format",
+            "json",
+            "sync",
+            "--remote",
+            remote,
+            "--expect-signer",
+            &signer,
+        ],
+    );
     assert_cli_success(&bob, &["--format", "json", "enroll", "--name", "bob"]);
     assert!(bob.config_dir().join("enroll/bob.toml").exists());
     assert_cli_success(&alice, &["--format", "json", "sync", "--pull"]);
@@ -155,7 +169,19 @@ fn reject_removes_the_request_without_revoking_and_allows_reenrollment() {
             "bob-first",
         ],
     );
-    assert_cli_success(&bob, &["--format", "json", "sync", "--remote", remote]);
+    let signer = support::fleet_signer(&alice.config_dir());
+    assert_cli_success(
+        &bob,
+        &[
+            "--format",
+            "json",
+            "sync",
+            "--remote",
+            remote,
+            "--expect-signer",
+            &signer,
+        ],
+    );
     assert_cli_success(&bob, &["--format", "json", "enroll", "--name", "bob"]);
     assert_cli_success(&alice, &["--format", "json", "sync", "--pull"]);
 
@@ -217,7 +243,19 @@ fn reject_dry_run_changes_nothing_and_errors_match_approve() {
             "bob-first",
         ],
     );
-    assert_cli_success(&bob, &["--format", "json", "sync", "--remote", remote]);
+    let signer = support::fleet_signer(&alice.config_dir());
+    assert_cli_success(
+        &bob,
+        &[
+            "--format",
+            "json",
+            "sync",
+            "--remote",
+            remote,
+            "--expect-signer",
+            &signer,
+        ],
+    );
     assert_cli_success(&bob, &["--format", "json", "enroll", "--name", "bob"]);
     assert_cli_success(&alice, &["--format", "json", "sync", "--pull"]);
     let request = alice.config_dir().join("enroll/bob.toml");
@@ -323,6 +361,12 @@ fn reject_discards_the_partial_approvals_of_a_machine_request() {
         &config,
         &["member", "approve", "admin-two", "--yes"],
     );
+    on(
+        &owner,
+        &config,
+        &["member", "add", "worker", "--role", "member"],
+    );
+    on(&owner, &config, &["member", "approve", "worker", "--yes"]);
     assert_cli_success(
         &second_admin,
         &[
@@ -353,6 +397,7 @@ fn reject_discards_the_partial_approvals_of_a_machine_request() {
         format!("{manifest}\n[team]\nrequired_approvals = 2\n"),
     )
     .unwrap();
+    on(&owner, &config, &["trust", "resign", "--yes"]);
 
     assert_cli_success(
         &joining,
@@ -366,7 +411,11 @@ fn reject_discards_the_partial_approvals_of_a_machine_request() {
             "quorum-machine",
         ],
     );
-    let first = on(&owner, &config, &["approve", "quorum-machine", "--yes"]);
+    let first = on(
+        &owner,
+        &config,
+        &["approve", "quorum-machine", "--member", "worker", "--yes"],
+    );
     assert_eq!(first["status"], "pending", "{first}");
     let request = std::fs::read_to_string(config.join("enroll/quorum-machine.toml")).unwrap();
     assert!(
@@ -392,7 +441,11 @@ fn reject_discards_the_partial_approvals_of_a_machine_request() {
             "quorum-machine",
         ],
     );
-    let again = on(&owner, &config, &["approve", "quorum-machine", "--yes"]);
+    let again = on(
+        &owner,
+        &config,
+        &["approve", "quorum-machine", "--member", "worker", "--yes"],
+    );
     assert_eq!(again["status"], "pending", "{again}");
     assert_eq!(again["approvals_received"], 1, "{again}");
 }
@@ -406,18 +459,17 @@ fn revoke_reencrypts_lists_exposed_secrets_and_machine_list_shows_roles() {
         .expect("init exposes recovery key once");
     assert_cli_success(&machine, &["--format", "json", "enroll", "--name", "bob"]);
     // Single simulated machine: self-approval is forbidden, so use the recovery key.
-    assert_cli_success(
-        &machine,
-        &[
-            "--format",
-            "json",
-            "approve",
-            "bob",
-            "--recovery-key",
-            recovery_key,
-            "--yes",
-        ],
-    );
+    let mut cmd = machine.run(&[
+        "--format",
+        "json",
+        "approve",
+        "bob",
+        "--recovery-key-stdin",
+        "--yes",
+    ]);
+    cmd.write_stdin(recovery_key.as_bytes());
+    let (output, envelope) = support::json(cmd);
+    assert!(output.status.success(), "{}", envelope.raw);
 
     let machines = assert_cli_success(&machine, &["--format", "json", "machine", "list"]);
     assert!(machines.to_string().contains("bob"), "{machines}");
@@ -465,7 +517,14 @@ fn rotated_secret_reaches_authorized_machine_on_next_sync_only() {
             machine,
             &["--format", "json", "init", "--yes", "--machine", name],
         );
-        assert_cli_success(machine, &["--format", "json", "sync", "--remote", remote]);
+        let mut args = vec!["--format", "json", "sync", "--remote", remote];
+        // Everyone after the first joins alice's fleet and names her signer.
+        let signer;
+        if !std::ptr::eq(machine, &alice) {
+            signer = support::fleet_signer(&alice.config_dir());
+            args.extend(["--expect-signer", &signer]);
+        }
+        assert_cli_success(machine, &args);
     }
     assert_cli_success(&bob, &["--format", "json", "enroll", "--name", "bob"]);
     assert_cli_success(&alice, &["--format", "json", "sync", "--pull"]);
@@ -545,4 +604,271 @@ fn rotated_secret_reaches_authorized_machine_on_next_sync_only() {
         let text = String::from_utf8_lossy(stream);
         assert!(!text.contains(old) && !text.contains(new), "secret leaked");
     }
+}
+
+/// Alice (admin, recovery key in `.1`) and an approved machine "bob".
+fn alice_and_bob() -> (support::MusterEnv, support::MusterEnv, String) {
+    let alice = support::MusterEnv::new();
+    let bob = support::MusterEnv::new();
+    for env in [&alice, &bob] {
+        env.link_system_exe("git");
+    }
+    let init = assert_cli_success(
+        &alice,
+        &["--format", "json", "init", "--yes", "--machine", "alice"],
+    );
+    let key = init["recovery_key"].as_str().unwrap().to_owned();
+    on(&bob, &alice.config_dir(), &["enroll", "--name", "bob"]);
+    let mut approve = alice.run_isolated(&[
+        "--format",
+        "json",
+        "approve",
+        "bob",
+        "--recovery-key-stdin",
+        "--yes",
+    ]);
+    approve.write_stdin(key.clone());
+    let (out, env) = support::json(approve);
+    assert!(out.status.success(), "{}", env.raw);
+    (alice, bob, key)
+}
+
+fn add_secret(env: &support::MusterEnv, path: &str, value: &str) {
+    let out = env
+        .run_isolated(&["--format", "json", "secret", "add", path, "--value-stdin"])
+        .write_stdin(value.to_owned())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+fn bob_reads(bob: &support::MusterEnv, alice: &support::MusterEnv, path: &str) -> bool {
+    bob.run_isolated(&[
+        "--format",
+        "json",
+        "--config",
+        alice.config_dir().to_str().unwrap(),
+        "--yes",
+        "secret",
+        "get",
+        path,
+        "--reveal",
+    ])
+    .output()
+    .unwrap()
+    .status
+    .success()
+}
+
+fn revoke(alice: &support::MusterEnv, name: &str) -> (std::process::Output, support::Envelope) {
+    alice.run_json(&["--format", "json", "revoke", name, "--yes"])
+}
+
+#[test]
+fn sidecar_edited_to_drop_target_before_revoke_still_rekeys() {
+    let (alice, bob, _key) = alice_and_bob();
+    add_secret(&alice, "grp/s", "secval");
+    assert!(bob_reads(&bob, &alice, "native://grp/s"));
+
+    // Tamper with the plaintext sidecar: drop bob (the first non-alice reader).
+    let meta_path = alice.config_dir().join("vault/grp.meta.json");
+    let mut meta: Value = serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+    let bob_rec = Manifest::load(&alice.config_dir()).unwrap().machines["bob"]
+        .recipient
+        .clone();
+    meta["recipients"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|r| r.as_str() != Some(bob_rec.as_str()));
+    fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+
+    let (out, env) = revoke(&alice, "bob");
+    // Either revoke repairs the group or it fails closed; bob must lose access.
+    let _ = (out, env);
+    assert!(!bob_reads(&bob, &alice, "native://grp/s"));
+}
+
+#[test]
+fn failed_preflight_leaves_manifest_unchanged_and_rerun_completes() {
+    let (alice, bob, _key) = alice_and_bob();
+    add_secret(&alice, "g1/s", "sec1");
+    add_secret(&alice, "g2/s", "sec2");
+    let digest = vault_digest(&alice.config_dir());
+    let g2_age = alice.config_dir().join("vault/g2.age");
+    let good = fs::read(&g2_age).unwrap();
+    fs::write(&g2_age, b"corrupt").unwrap();
+
+    let before = fs::read_to_string(alice.config_dir().join("muster.toml")).unwrap();
+    let (out, _env) = revoke(&alice, "bob");
+    assert!(!out.status.success());
+    assert_eq!(
+        fs::read_to_string(alice.config_dir().join("muster.toml")).unwrap(),
+        before,
+        "manifest must not change when the rekey cannot proceed"
+    );
+    // The healthy group was not touched either (preflight precedes mutation).
+    fs::write(&g2_age, &good).unwrap();
+    assert_eq!(vault_digest(&alice.config_dir()), digest);
+    assert!(bob_reads(&bob, &alice, "native://g1/s"));
+
+    let (out, env) = revoke(&alice, "bob");
+    assert!(out.status.success(), "{}", env.raw);
+    assert!(!bob_reads(&bob, &alice, "native://g1/s"));
+    assert!(!bob_reads(&bob, &alice, "native://g2/s"));
+}
+
+#[test]
+fn rerun_finishes_rekeying_when_machine_is_already_out_of_the_manifest() {
+    let (alice, bob, _key) = alice_and_bob();
+    add_secret(&alice, "grp/s", "secval");
+    // Simulate a partial revoke: manifest entry was removed and recorded in revoked_recipients,
+    // but vault groups were not yet re-encrypted.
+    let bob_rec = Manifest::load(&alice.config_dir()).unwrap().machines["bob"]
+        .recipient
+        .clone();
+    let mut manifest = Manifest::load(&alice.config_dir()).unwrap();
+    manifest.machines.remove("bob");
+    manifest.revoked_recipients.push(bob_rec);
+    manifest.save(&alice.config_dir()).unwrap();
+    on(&alice, &alice.config_dir(), &["trust", "resign", "--yes"]);
+    assert!(bob_reads(&bob, &alice, "native://grp/s"));
+
+    let (out, env) = revoke(&alice, "bob");
+    assert!(out.status.success(), "{}", env.raw);
+    assert!(!bob_reads(&bob, &alice, "native://grp/s"));
+}
+
+#[test]
+fn stale_group_reader_recipient_cannot_regrant_and_revoked_cannot_reenroll() {
+    let (alice, bob, _key) = alice_and_bob();
+    let bob_rec = Manifest::load(&alice.config_dir()).unwrap().machines["bob"]
+        .recipient
+        .clone();
+    let mut manifest = Manifest::load(&alice.config_dir()).unwrap();
+    manifest.groups.insert(
+        "special".into(),
+        Group {
+            readers: Readers {
+                recipients: vec![bob_rec.clone()],
+                ..Default::default()
+            },
+            profile: None,
+        },
+    );
+    manifest.save(&alice.config_dir()).unwrap();
+    on(&alice, &alice.config_dir(), &["trust", "resign", "--yes"]);
+
+    let (out, env) = revoke(&alice, "bob");
+    assert!(out.status.success(), "{}", env.raw);
+    let after = Manifest::load(&alice.config_dir()).unwrap();
+    assert!(!after.groups["special"]
+        .readers
+        .recipients
+        .contains(&bob_rec));
+    assert!(after.revoked_recipients.contains(&bob_rec));
+
+    // The same key cannot come back, nor be added by hand to a new group.
+    let (out, _env) = bob.run_json(&[
+        "--format",
+        "json",
+        "--config",
+        alice.config_dir().to_str().unwrap(),
+        "enroll",
+        "--name",
+        "bob-again",
+    ]);
+    assert!(!out.status.success(), "revoked key must not re-enroll");
+    let mut manifest = Manifest::load(&alice.config_dir()).unwrap();
+    manifest
+        .groups
+        .get_mut("special")
+        .unwrap()
+        .readers
+        .recipients
+        .push(bob_rec);
+    manifest.save(&alice.config_dir()).unwrap();
+    let out = alice
+        .run_isolated(&[
+            "--format",
+            "json",
+            "secret",
+            "add",
+            "special/x",
+            "--value-stdin",
+        ])
+        .write_stdin("v".to_owned())
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "vault must refuse a revoked recipient"
+    );
+}
+
+#[test]
+fn interrupted_revocation_publication_is_completed_by_the_next_run() {
+    let (alice, bob, _key) = alice_and_bob();
+    add_secret(&alice, "g1/s", "sec1");
+    add_secret(&alice, "g2/s", "sec2");
+    assert!(bob_reads(&bob, &alice, "native://g1/s"));
+    assert!(bob_reads(&bob, &alice, "native://g2/s"));
+
+    // Crash after the first file of the publication was written.
+    let out = alice
+        .run_isolated(&["--format", "json", "revoke", "bob", "--yes"])
+        .env("MUSTER_TEST_REVOCATION_FAIL_AFTER", "1")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "the injected failure must surface");
+    let state_dir = alice.path().join(".local/state/muster");
+    assert!(
+        state_dir.join("revocation-tx/journal.json").exists(),
+        "the journal survives the crash"
+    );
+
+    // Any later command finishes the job on its own.
+    let (out, env) = alice.run_json(&["--format", "json", "machine", "list"]);
+    assert!(out.status.success(), "{}", env.raw);
+    assert!(
+        env.raw.to_string().contains("revocation_recovered"),
+        "{}",
+        env.raw
+    );
+    assert!(!state_dir.join("revocation-tx").exists());
+    assert!(!bob_reads(&bob, &alice, "native://g1/s"));
+    assert!(!bob_reads(&bob, &alice, "native://g2/s"));
+    let manifest = Manifest::load(&alice.config_dir()).unwrap();
+    assert!(!manifest.machines.contains_key("bob"));
+    let (out, env) = alice.run_json(&["--format", "json", "trust", "show"]);
+    assert!(out.status.success());
+    assert_eq!(env.raw["result"]["status"], "verified", "{}", env.raw);
+}
+
+#[test]
+fn revocation_that_fails_before_the_journal_changes_nothing_and_rerun_completes() {
+    let (alice, bob, _key) = alice_and_bob();
+    add_secret(&alice, "g1/s", "sec1");
+    let before = fs::read_to_string(alice.config_dir().join("muster.toml")).unwrap();
+    let digest = vault_digest(&alice.config_dir());
+    // Not a valid failure point for the journaled phase (0 never matches), so
+    // break staging instead: a corrupt group fails the rekey before any publish.
+    let age = alice.config_dir().join("vault/g1.age");
+    let good = fs::read(&age).unwrap();
+    fs::write(&age, b"corrupt").unwrap();
+    let (out, _env) = revoke(&alice, "bob");
+    assert!(!out.status.success());
+    fs::write(&age, &good).unwrap();
+    assert_eq!(
+        fs::read_to_string(alice.config_dir().join("muster.toml")).unwrap(),
+        before
+    );
+    assert_eq!(vault_digest(&alice.config_dir()), digest);
+    assert!(bob_reads(&bob, &alice, "native://g1/s"));
+    let (out, env) = revoke(&alice, "bob");
+    assert!(out.status.success(), "{}", env.raw);
+    assert!(!bob_reads(&bob, &alice, "native://g1/s"));
 }

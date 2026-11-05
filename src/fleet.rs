@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::errors::MusterError;
+use crate::manifest::{Manifest, MemberStatus, Role};
+use crate::signing::{self, Signer};
 
 const ENROLL_DIR: &str = "enroll";
 
@@ -14,15 +16,22 @@ const ENROLL_DIR: &str = "enroll";
 pub struct EnrollmentRequest {
     pub name: String,
     pub recipient: String,
+    /// Ed25519 public key (`musterpk1...`) of the requesting machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing_key: Option<String>,
+    /// Random per-request nonce; bound into signed approvals (see `fleet_state`).
+    #[serde(default)]
+    pub nonce: String,
     pub platform: String,
     pub muster_version: String,
     #[serde(default)]
     pub agents: Vec<String>,
     pub created_at: String,
-    /// Admins (member names) who approved this request so far, while it
-    /// waits for the team quorum (`[team] required_approvals`).
+    /// Admin approvals so far, while the request waits for the team quorum
+    /// (`[team] required_approvals`). Each is an Ed25519 signature bound to
+    /// the request's content; see [`EnrollmentRequest::approval_message`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub approvals: Vec<String>,
+    pub approvals: Vec<ApprovalEntry>,
     /// Assignment proposed by the first approver; later approvals confirm it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
@@ -32,7 +41,134 @@ pub struct EnrollmentRequest {
     pub member: Option<String>,
 }
 
+/// One admin's signed approval of an enrollment request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SignedApproval {
+    pub member: String,
+    /// The approving admin's machine (whose signing key signed).
+    pub machine: String,
+    pub signing_key: String,
+    pub signature: String,
+}
+
+/// A recorded approval. `Legacy` is a bare member name from before signed
+/// approvals; it is kept readable so it can be reported, but never counts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum ApprovalEntry {
+    Signed(SignedApproval),
+    Legacy(String),
+}
+
+/// Approvals that count toward the quorum, and those that were ignored.
+#[derive(Debug, Default)]
+pub struct ApprovalCheck {
+    /// Distinct active admins with a verifying signature, sorted.
+    pub valid: Vec<SignedApproval>,
+    /// Bare-name approvals from before signed approvals.
+    pub legacy: usize,
+    /// Signed entries that failed verification (altered request, unknown or
+    /// non-admin signer, wrong key, bad signature, duplicate).
+    pub invalid: usize,
+}
+
+const APPROVAL_DOMAIN: &str = "muster enroll approval v1";
+
 impl EnrollmentRequest {
+    /// Canonical bytes an admin signs: every field that decides what the
+    /// approval grants, plus the random request nonce. Changing any of them
+    /// (for example swapping the recipient) invalidates earlier approvals.
+    ///
+    /// `state` is the payload hash of the fleet state the approver was looking
+    /// at; the verifier demands the state the new one is chained to, so an
+    /// approval is good for exactly one transition and cannot be replayed
+    /// later (for example to bring a revoked machine back).
+    pub fn approval_message(&self, state: Option<&str>) -> Result<Vec<u8>, MusterError> {
+        crate::fleet_state::canonical_bytes(&serde_json::json!({
+            "domain": APPROVAL_DOMAIN,
+            "state": state,
+            "name": self.name,
+            "recipient": self.recipient,
+            "signing_key": self.signing_key,
+            "member": self.member,
+            "role": self.role,
+            "profile": self.profile,
+            "created_at": self.created_at,
+            "nonce": self.nonce,
+        }))
+    }
+
+    /// Signs the request as `member`'s `machine` against the fleet state with
+    /// payload hash `state`, and records it.
+    pub fn sign_approval(
+        &mut self,
+        member: &str,
+        machine: &str,
+        signer: &Signer,
+        state: Option<&str>,
+    ) -> Result<(), MusterError> {
+        let signature = signer.sign(&self.approval_message(state)?);
+        self.approvals.push(ApprovalEntry::Signed(SignedApproval {
+            member: member.to_string(),
+            machine: machine.to_string(),
+            signing_key: signer.public(),
+            signature,
+        }));
+        Ok(())
+    }
+
+    /// Names of the members whose signed approvals are recorded (unverified;
+    /// use [`Self::check_approvals`] for what counts).
+    pub fn approval_members(&self) -> Vec<String> {
+        self.approvals
+            .iter()
+            .filter_map(|a| match a {
+                ApprovalEntry::Signed(s) => Some(s.member.clone()),
+                ApprovalEntry::Legacy(_) => None,
+            })
+            .collect()
+    }
+
+    /// Verifies recorded approvals against the (already verified) governance in
+    /// `manifest`: the signer must be a machine of an active admin that
+    /// publishes exactly that signing key, and each admin counts once. Only
+    /// approvals given against the fleet state `state` count.
+    pub fn check_approvals(&self, manifest: &Manifest, state: Option<&str>) -> ApprovalCheck {
+        let mut check = ApprovalCheck::default();
+        let Ok(message) = self.approval_message(state) else {
+            check.invalid = self.approvals.len();
+            return check;
+        };
+        for entry in &self.approvals {
+            let ApprovalEntry::Signed(approval) = entry else {
+                check.legacy += 1;
+                continue;
+            };
+            let admin = manifest.members.get(&approval.member).is_some_and(|m| {
+                m.role == Role::Admin
+                    && m.status == MemberStatus::Active
+                    && m.machines.contains(&approval.machine)
+            });
+            let key_matches = manifest
+                .machines
+                .get(&approval.machine)
+                .and_then(|m| m.signing_key.as_deref())
+                == Some(approval.signing_key.as_str());
+            let fresh = !check.valid.iter().any(|a| a.member == approval.member);
+            if admin
+                && key_matches
+                && fresh
+                && signing::verify(&approval.signing_key, &message, &approval.signature).is_ok()
+            {
+                check.valid.push(approval.clone());
+            } else {
+                check.invalid += 1;
+            }
+        }
+        check.valid.sort_by(|a, b| a.member.cmp(&b.member));
+        check
+    }
+
     pub fn file_path(config_dir: &Path, name: &str) -> PathBuf {
         config_dir.join(ENROLL_DIR).join(format!("{name}.toml"))
     }

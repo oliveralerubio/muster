@@ -226,6 +226,7 @@ fn member_reject_cleans_partial_quorum_approvals() {
         format!("{manifest}\n[team]\nrequired_approvals = 2\n"),
     )
     .unwrap();
+    ok(&owner, &config, &["trust", "resign", "--yes"]);
 
     ok(
         &owner,
@@ -351,29 +352,21 @@ fn revoking_member_revokes_all_associated_machines_and_lists_secrets_to_rotate()
     let get = ["secret", "get", "native://engineering/api-key"];
     ok(&desktop, &config, &get);
 
-    let (out, envelope) = on(
-        &owner,
-        &config,
-        &[
-            "member",
-            "rm",
-            "alice",
-            "--recovery-key",
-            &recovery_key,
-            "--yes",
-        ],
-    );
-    assert!(out.status.success());
+    let mut cmd = owner.run(&[
+        "--format",
+        "json",
+        "--config",
+        config.to_str().unwrap(),
+        "member",
+        "rm",
+        "alice",
+        "--recovery-key-stdin",
+        "--yes",
+    ]);
+    cmd.write_stdin(recovery_key.as_bytes());
+    let (out, envelope) = support::json(cmd);
+    assert!(out.status.success(), "{}", envelope.raw);
     assert!(envelope.ok());
-    assert!(
-        envelope.raw["diagnostics"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|d| d["code"] == "insecure_recovery_key_argument"),
-        "argv recovery key must warn: {}",
-        envelope.raw
-    );
     let revoked = envelope.result().clone();
     let mut machines: Vec<_> = revoked["revoked_machines"]
         .as_array()
@@ -402,6 +395,8 @@ fn revoking_member_revokes_all_associated_machines_and_lists_secrets_to_rotate()
     }
     let fleet = ok(&owner, &config, &["machine", "list"]);
     assert_eq!(names(&fleet["machines"]), ["owner-laptop"]);
+    let manifest_toml = std::fs::read_to_string(config.join("muster.toml")).unwrap();
+    assert!(manifest_toml.contains("revoked_recipients = ["));
 }
 
 #[test]
@@ -437,6 +432,7 @@ members = ["owner"]
 "#,
     );
     std::fs::write(config.join("muster.toml"), manifest).unwrap();
+    ok(&owner, &config, &["trust", "resign", "--yes"]);
 
     let explain = ok(&owner, &config, &["plan", "--explain"])["explain"].clone();
     assert_eq!(
@@ -622,6 +618,7 @@ fn team_status_reports_member_and_machine_profile_drift() {
     let mut manifest = std::fs::read_to_string(config.join("muster.toml")).unwrap();
     manifest.push_str("\n[agents.models]\nclaude = \"new-team-model\"\n");
     std::fs::write(config.join("muster.toml"), manifest).unwrap();
+    ok(&owner, &config, &["trust", "resign", "--yes"]);
     let now = drift(&owner);
     assert_eq!(
         names(&now["machines"]),
@@ -686,6 +683,7 @@ fn machine_status_tracks_convergence_and_apply_records_last_sync() {
     let mut manifest = std::fs::read_to_string(config.join("muster.toml")).unwrap();
     manifest.push_str("\n[agents.models]\nclaude = \"new-team-model\"\n");
     std::fs::write(config.join("muster.toml"), manifest).unwrap();
+    ok(&owner, &config, &["trust", "resign", "--yes"]);
     assert_eq!(alice_row(&owner)["status"], "drifted");
     assert_eq!(status_row(&owner)["status"], "drifted");
 
@@ -711,12 +709,14 @@ fn team_quorum_requires_multiple_admin_approvals() {
         &["member", "approve", "admin-two", "--yes"],
     );
     join(&owner, &second_admin, "admin-two-laptop", "admin-two");
+    add_member(&owner, "worker", "member");
 
     // Raise the quorum once a second admin can approve (a quorum of 2 with a
     // single admin could only be met with the recovery key).
     let mut manifest = std::fs::read_to_string(config.join("muster.toml")).unwrap();
     manifest.push_str("\n[team]\nrequired_approvals = 2\n");
     std::fs::write(config.join("muster.toml"), manifest).unwrap();
+    ok(&owner, &config, &["trust", "resign", "--yes"]);
 
     let enrollment = ok(
         &joining_machine,
@@ -725,12 +725,20 @@ fn team_quorum_requires_multiple_admin_approvals() {
     );
     assert_eq!(enrollment["status"], "pending", "{enrollment}");
     let request_id = "quorum-machine";
-    let first = ok(&owner, &config, &["approve", request_id, "--yes"]);
+    let first = ok(
+        &owner,
+        &config,
+        &["approve", request_id, "--member", "worker", "--yes"],
+    );
     assert_eq!(first["status"], "pending", "{first}");
     assert_eq!(first["approvals_received"], 1, "{first}");
     assert_eq!(first["approvals_required"], 2, "{first}");
 
-    let (out, duplicate) = on(&owner, &config, &["approve", request_id, "--yes"]);
+    let (out, duplicate) = on(
+        &owner,
+        &config,
+        &["approve", request_id, "--member", "worker", "--yes"],
+    );
     assert!(
         !out.status.success(),
         "duplicate approval must fail: {}",
@@ -745,7 +753,11 @@ fn team_quorum_requires_multiple_admin_approvals() {
         duplicate.raw
     );
 
-    let approved = ok(&second_admin, &config, &["approve", request_id, "--yes"]);
+    let approved = ok(
+        &second_admin,
+        &config,
+        &["approve", request_id, "--member", "worker", "--yes"],
+    );
     assert_eq!(approved["status"], "active", "{approved}");
     let machines = ok(&owner, &config, &["machine", "list"]);
     assert!(
@@ -805,6 +817,7 @@ fn member_quorum_requires_multiple_admin_approvals() {
     let mut manifest = std::fs::read_to_string(config.join("muster.toml")).unwrap();
     manifest.push_str("\n[team]\nrequired_approvals = 2\n");
     std::fs::write(config.join("muster.toml"), manifest).unwrap();
+    ok(&owner, &config, &["trust", "resign", "--yes"]);
 
     ok(
         &owner,
@@ -863,6 +876,7 @@ fn creating_a_group_preserves_unrelated_reader_drift() {
         .recipients
         .push(extra.clone());
     manifest.save(&config).unwrap();
+    ok(&owner, &config, &["trust", "resign", "--yes"]);
 
     let (out, envelope) = on(&owner, &config, &["group", "create", "unrelated"]);
     assert!(out.status.success(), "{}", envelope.raw);
@@ -922,6 +936,7 @@ fn explicit_group_rekey_previews_access_and_requires_confirmation() {
         .recipients
         .push(muster::identity::Identity::generate().recipient());
     manifest.save(&config).unwrap();
+    ok(&owner, &config, &["trust", "resign", "--yes"]);
     let config_before = std::fs::read(config.join("muster.toml")).unwrap();
 
     let preview = ok(&owner, &config, &["group", "rekey", "prod", "--dry-run"]);
@@ -952,4 +967,179 @@ fn explicit_group_rekey_previews_access_and_requires_confirmation() {
     let again = ok(&owner, &config, &["group", "rekey", "prod", "--yes"]);
     assert_eq!(again["reencrypted_groups"], serde_json::json!([]));
     assert!(std::fs::read(config.join("vault/prod.age")).unwrap() == applied);
+}
+
+#[test]
+fn member_rm_fails_closed_when_sidecar_disagrees_with_ciphertext() {
+    let owner = MusterEnv::new();
+    let laptop = MusterEnv::new();
+    let recovery_key = init(&owner);
+    let config = owner.config_dir();
+    add_member(&owner, "alice", "member");
+    join(&owner, &laptop, "alice-laptop", "alice");
+    ok(
+        &owner,
+        &config,
+        &["group", "create", "engineering", "--reader", "alice"],
+    );
+    add_secret(&owner, &config, "engineering/api-key", "TOP_SECRET");
+
+    // Attacker tampers engineering.meta.json to remove alice's recipient
+    let meta_path = config.join("vault/engineering.meta.json");
+    let mut meta: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+    meta["recipients"] = serde_json::json!([]);
+    std::fs::write(&meta_path, meta.to_string()).unwrap();
+
+    // Even if the tamperer re-signs the state, member rm reads the real
+    // recipients from the ciphertext: it never silently skips the group.
+    ok(&owner, &config, &["trust", "resign", "--yes"]);
+    let mut cmd = owner.run(&[
+        "--format",
+        "json",
+        "--config",
+        config.to_str().unwrap(),
+        "member",
+        "rm",
+        "alice",
+        "--recovery-key-stdin",
+        "--yes",
+    ]);
+    cmd.write_stdin(recovery_key.as_bytes());
+    let (out, envelope) = support::json(cmd);
+    assert_eq!(out.status.code(), Some(5), "{}", envelope.raw);
+    // Nothing was committed: alice is still a member.
+    let manifest = std::fs::read_to_string(config.join("muster.toml")).unwrap();
+    assert!(manifest.contains("[members.alice]"), "{manifest}");
+}
+
+#[test]
+fn removing_member_revokes_every_machine_it_requested() {
+    let owner = MusterEnv::new();
+    let carol_laptop = MusterEnv::new();
+    init(&owner);
+    let config = owner.config_dir();
+    add_member(&owner, "carol", "member");
+    join(&owner, &carol_laptop, "carol-box", "carol");
+
+    // Carol's machine is active and has recipient
+    let manifest_before = std::fs::read_to_string(config.join("muster.toml")).unwrap();
+    assert!(manifest_before.contains("carol-box"));
+
+    // Revoke member carol
+    ok(&owner, &config, &["member", "rm", "carol", "--yes"]);
+
+    // carol-box MUST be revoked and purged from machines
+    let manifest_after = std::fs::read_to_string(config.join("muster.toml")).unwrap();
+    assert!(!manifest_after.contains("[machines.carol-box]"));
+    assert!(manifest_after.contains("revoked_recipients"));
+    assert!(manifest_after.contains("revoked_signing_keys"));
+
+    let parsed: toml::Table = manifest_after.parse().unwrap();
+    let machines = parsed.get("machines").and_then(|m| m.as_table()).unwrap();
+    assert!(!machines.contains_key("carol-box"));
+}
+
+#[test]
+fn approving_a_machine_in_team_mode_needs_the_member_it_joins() {
+    let owner = MusterEnv::new();
+    let laptop = MusterEnv::new();
+    init(&owner);
+    let config = owner.config_dir();
+    add_member(&owner, "carol", "member");
+    ok(&laptop, &config, &["enroll", "--name", "carol-box"]);
+    let (output, envelope) = owner.run_json(&[
+        "--format",
+        "json",
+        "--config",
+        config.to_str().unwrap(),
+        "approve",
+        "carol-box",
+        "--yes",
+    ]);
+    assert!(!output.status.success(), "{}", envelope.raw);
+    assert!(
+        envelope.raw.to_string().contains("--member"),
+        "{}",
+        envelope.raw
+    );
+    // Nothing was enrolled.
+    let manifest = std::fs::read_to_string(config.join("muster.toml")).unwrap();
+    assert!(!manifest.contains("[machines.carol-box]"));
+}
+
+#[test]
+fn recovery_approvals_validated_by_same_rule_locally_and_by_peers() {
+    let owner = MusterEnv::new();
+    let second_admin = MusterEnv::new();
+    let joining = MusterEnv::new();
+    let recovery_key = init(&owner);
+    let config = owner.config_dir();
+
+    ok(
+        &owner,
+        &config,
+        &["member", "add", "admin-two", "--role", "admin"],
+    );
+    ok(
+        &owner,
+        &config,
+        &["member", "approve", "admin-two", "--yes"],
+    );
+    join(&owner, &second_admin, "admin-two-laptop", "admin-two");
+    add_member(&owner, "worker", "member");
+
+    // Raise required_approvals to 2
+    let mut manifest = std::fs::read_to_string(config.join("muster.toml")).unwrap();
+    manifest.push_str(
+        "
+[team]
+required_approvals = 2
+",
+    );
+    std::fs::write(config.join("muster.toml"), manifest).unwrap();
+    ok(&owner, &config, &["trust", "resign", "--yes"]);
+
+    // Enrolling machine requests to join worker
+    ok(&joining, &config, &["enroll", "--name", "worker-box"]);
+
+    // Owner approves with recovery key via stdin (break-glass, 1 signature satisfies k=2)
+    let out = owner
+        .run(&[
+            "--format",
+            "json",
+            "--config",
+            config.to_str().unwrap(),
+            "approve",
+            "worker-box",
+            "--member",
+            "worker",
+            "--recovery-key-stdin",
+            "--yes",
+        ])
+        .write_stdin(recovery_key.as_bytes())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The state was signed with the recovery key as primary signer!
+    let state_file = std::fs::read_to_string(config.join("fleet.state.json")).unwrap();
+    let state: Value = serde_json::from_str(&state_file).unwrap();
+    let manifest_parsed = std::fs::read_to_string(config.join("muster.toml")).unwrap();
+    let toml: toml::Table = manifest_parsed.parse().unwrap();
+    let recovery_pub = toml["recovery"]["signing_key"].as_str().unwrap();
+    assert_eq!(state["payload"]["signer"], recovery_pub);
+
+    // Publisher's pin advanced
+    let owner_pin =
+        std::fs::read_to_string(owner.path().join(".local/state/muster/trust.json")).unwrap();
+    assert!(owner_pin.contains("worker-box"));
+
+    // Peer (second_admin) verifies and accepts the exact same state without pending!
+    let trust = ok(&second_admin, &config, &["trust", "show"]);
+    assert_eq!(trust["status"], "verified", "{trust}");
 }

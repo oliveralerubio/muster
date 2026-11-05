@@ -514,7 +514,7 @@ fn commit(
 ) -> Result<(), MusterError> {
     match actor {
         Some(actor) => team::commit(ctx, actor, summary),
-        None => crate::git::commit_if_configured(&ctx.config_dir, summary).map(|_| ()),
+        None => crate::trust::commit(ctx, summary).map(|_| ()),
     }
 }
 

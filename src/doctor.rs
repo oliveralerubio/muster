@@ -58,6 +58,17 @@ pub fn run(
     check_keys: bool,
     offline: bool,
 ) -> Result<Value, MusterError> {
+    // Governance waiting for admin co-signatures, or a signed state that failed
+    // verification, is not accepted: doctor only reports, and never plans,
+    // renders, decrypts or resolves secrets from it.
+    if fix && (ctx.governance_pending || ctx.fleet_state_invalid) {
+        return Err(MusterError::Security(
+            "`muster doctor --fix` refused: the repo's signed fleet state is invalid or holds a \
+             governance change that has not gathered enough admin signatures. Doctor only \
+             reports until an admin completes it (`muster trust cosign`) or the repo is restored"
+                .into(),
+        ));
+    }
     let mut checkup = examine(ctx);
     let mut fixes: Vec<Value> = checkup
         .repairs
@@ -86,10 +97,19 @@ pub fn run(
     checkup.checks.push(api_keys::check(check_keys, offline));
     checkup
         .checks
-        .push(api_keys::check_declared(ctx, check_keys, offline));
+        .push(if ctx.governance_pending || ctx.fleet_state_invalid {
+            Check::skipped("provider_api_keys")
+        } else {
+            api_keys::check_declared(ctx, check_keys, offline)
+        });
+    let pre_errors = ctx
+        .diagnostics()
+        .iter()
+        .filter(|d| d.severity == Severity::Error)
+        .count();
     let diagnostics = checkup.diagnostics();
     let count = |s: Severity| diagnostics.iter().filter(|d| d.severity == s).count();
-    let errors = count(Severity::Error);
+    let errors = count(Severity::Error) + pre_errors;
     let result = json!({
         "healthy": errors == 0,
         "summary": {
@@ -206,6 +226,7 @@ impl Checkup {
 }
 
 fn examine(ctx: &mut Context) -> Checkup {
+    let held = ctx.governance_pending || ctx.fleet_state_invalid;
     let mut repairs = Vec::new();
     let git_ok = git::version().is_some();
     let initialized = ctx.config_dir.join(manifest::FILE_NAME).is_file();
@@ -232,6 +253,7 @@ fn examine(ctx: &mut Context) -> Checkup {
     });
     let mut plan = None;
     checks.push(match &manifest {
+        _ if held => Check::skipped("adapters"),
         Some(_) => {
             let (check, planned) = check_adapters(ctx);
             if check
@@ -248,10 +270,12 @@ fn examine(ctx: &mut Context) -> Checkup {
         None => Check::skipped("adapters"),
     });
     checks.push(match &manifest {
+        _ if held => Check::skipped("keys"),
         Some(m) => check_keys(ctx, m),
         None => Check::skipped("keys"),
     });
     checks.push(match &manifest {
+        _ if held => Check::skipped("providers"),
         Some(m) => check_ai_providers(ctx, m),
         None => Check::skipped("providers"),
     });
@@ -631,6 +655,29 @@ fn check_repo(ctx: &Context) -> Check {
         )),
         None => {}
     }
+    if let Ok(Some(pin)) = crate::fleet_state::TrustAnchor::load(&ctx.state_dir) {
+        if pin.tofu {
+            let fingerprint = crate::fleet_state::FleetState::load(&ctx.config_dir)
+                .ok()
+                .flatten()
+                .map(|s| crate::signing::fingerprint(&s.payload.signer))
+                .unwrap_or_else(|| "unknown".into());
+            diags.push(
+                Diagnostic::new(
+                    Severity::Info,
+                    "trust_pin_unconfirmed",
+                    format!(
+                        "trust_pin_unconfirmed: verify signer fingerprint out-of-band: \
+                         {fingerprint}"
+                    ),
+                )
+                .with_suggestion(
+                    "ask the admin who approved you for the fingerprint, then run \
+                     `muster sync --pull --expect-signer <fingerprint>` to confirm the pin",
+                ),
+            );
+        }
+    }
     Check::new("repo", diags)
 }
 
@@ -640,7 +687,11 @@ fn check_vault(ctx: &Context) -> Check {
     if !dir.is_dir() {
         return Check::new("vault", Vec::new());
     }
-    let identity = Identity::load(&ctx.state_dir).ok();
+    let identity = if ctx.fleet_state_invalid {
+        None
+    } else {
+        Identity::load(&ctx.state_dir).ok()
+    };
     let problems = Vault::open(&ctx.config_dir).and_then(|v| v.verify(identity.as_ref()));
     let diags = match problems {
         Ok(problems) => problems

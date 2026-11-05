@@ -27,6 +27,15 @@ const EXTENSION_PREFIX: &str = "x-";
 pub struct Manifest {
     /// Manifest format version.
     pub version: u32,
+    /// age recipients removed by `muster revoke`. Vault encryption and
+    /// enrollment refuse them, so a stale reader list cannot re-grant access.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub revoked_recipients: Vec<String>,
+    /// Signing keys of machines removed by `muster revoke` or `muster member
+    /// rm`. Signed governance: a machine with one of these keys can never be
+    /// enrolled again, and the list only shrinks with the full admin quorum.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub revoked_signing_keys: Vec<String>,
     /// Offline recovery key: its public recipient is added to every secret group.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery: Option<Recovery>,
@@ -95,6 +104,10 @@ fn default_required_approvals() -> u32 {
 pub struct Recovery {
     /// age x25519 recipient (`age1...`).
     pub recipient: String,
+    /// Ed25519 signing key (`musterpk1...`) derived from the recovery key, so
+    /// the break-glass path can sign fleet state and approvals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing_key: Option<String>,
 }
 
 /// A whole file Muster writes under `$HOME` (`muster sync`), with its
@@ -118,6 +131,10 @@ pub struct ManagedDotfile {
 pub struct Machine {
     /// age x25519 recipient (`age1...`) of the machine identity.
     pub recipient: String,
+    /// Ed25519 public key (`musterpk1...`) the machine signs fleet state and
+    /// approvals with. Absent in legacy manifests until the machine publishes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing_key: Option<String>,
     /// `<os>-<arch>`, e.g. `linux-x86_64`.
     pub platform: String,
     /// Muster version that last wrote this entry.
@@ -176,6 +193,15 @@ pub struct Member {
     /// Member who invited this member.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invited_by: Option<String>,
+    /// Random nonce minted when the member was invited. Signed approvals are
+    /// bound to it, so approvals of an earlier invitation never verify against
+    /// a re-invitation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invite_nonce: Option<String>,
+    /// Payload hash of the signed fleet state the invitation was created in;
+    /// also bound into every approval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invited_at_state: Option<String>,
     /// Admin who approved the invitation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approved_by: Option<String>,
@@ -258,8 +284,9 @@ pub struct SecretPolicy {
     /// Agents allowed to receive the secret: an adapter id (`claude`) grants
     /// it everywhere; `agent@project` only inside that project (the project
     /// directory's name). Empty = no agent (the human CLI always can).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub allow: Vec<String>,
+    /// `None` = no list declared; `Some([])` = explicit `allow = []` (deny all).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow: Option<Vec<String>>,
     #[serde(default)]
     pub approval: SecretApproval,
     pub approval_ttl: Option<String>,
@@ -274,13 +301,20 @@ pub enum SecretApproval {
 }
 
 impl SecretPolicy {
+    /// The declared allow entries (empty when absent or explicitly empty).
+    pub fn allow_list(&self) -> &[String] {
+        self.allow.as_deref().unwrap_or(&[])
+    }
+
     /// Whether `agent` may receive the secret when rendering for `project`
     /// (`None` = user scope).
     pub fn allows(&self, agent: &str, project: Option<&str>) -> bool {
-        self.allow.iter().any(|entry| match entry.split_once('@') {
-            None => entry == agent,
-            Some((a, p)) => a == agent && project == Some(p),
-        })
+        self.allow_list()
+            .iter()
+            .any(|entry| match entry.split_once('@') {
+                None => entry == agent,
+                Some((a, p)) => a == agent && project == Some(p),
+            })
     }
 }
 
@@ -314,10 +348,21 @@ pub struct McpServerConfig {
     pub reveal: Vec<String>,
 }
 
+/// Which age recipients the vault may encrypt to / expect on existing groups.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VaultPolicy {
+    /// Recipients revoked by `muster revoke`: never encrypted to.
+    pub revoked: std::collections::BTreeSet<String>,
+    /// Enrolled machines, group `readers.recipients` and the recovery key.
+    pub authorized: std::collections::BTreeSet<String>,
+}
+
 impl Manifest {
     pub fn new() -> Self {
         Self {
             version: 1,
+            revoked_recipients: Vec::new(),
+            revoked_signing_keys: Vec::new(),
             recovery: None,
             machines: BTreeMap::new(),
             members: BTreeMap::new(),
@@ -349,6 +394,62 @@ impl Manifest {
             Err(e) => return Err(MusterError::Operational(format!("{}: {e}", path.display()))),
         };
         Self::parse(&text, &path.display().to_string())
+    }
+
+    /// The recipient policy of `<config_dir>/muster.toml` for the vault, read
+    /// leniently so a manifest that is broken elsewhere does not hide the
+    /// vault. `None` when there is no manifest; an unparsable one fails closed.
+    pub fn vault_policy(config_dir: &Path) -> Result<Option<VaultPolicy>, MusterError> {
+        let path = config_dir.join(FILE_NAME);
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(MusterError::Operational(format!("{}: {e}", path.display()))),
+        };
+        let table: toml::Table = text.parse().map_err(|e| MusterError::InvalidConfig {
+            message: format!("cannot read recipient policy: {e}"),
+            path: Some(path.display().to_string()),
+        })?;
+        let strings = |value: Option<&toml::Value>| -> Vec<String> {
+            value
+                .and_then(toml::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        };
+        let mut policy = VaultPolicy::default();
+        policy
+            .revoked
+            .extend(strings(table.get("revoked_recipients")));
+        let recipient = |value: &toml::Value| {
+            value
+                .get("recipient")
+                .and_then(toml::Value::as_str)
+                .map(str::to_owned)
+        };
+        policy
+            .authorized
+            .extend(table.get("recovery").and_then(recipient));
+        for machine in table
+            .get("machines")
+            .and_then(toml::Value::as_table)
+            .into_iter()
+            .flat_map(|t| t.values())
+        {
+            policy.authorized.extend(recipient(machine));
+        }
+        for group in table
+            .get("groups")
+            .and_then(toml::Value::as_table)
+            .into_iter()
+            .flat_map(|t| t.values())
+        {
+            policy.authorized.extend(strings(
+                group.get("readers").and_then(|r| r.get("recipients")),
+            ));
+        }
+        Ok(Some(policy))
     }
 
     /// Write `<config_dir>/muster.toml`.
@@ -485,7 +586,7 @@ impl Manifest {
             }
             crate::secrets::SecretRef::parse(reference)
                 .map_err(|e| invalid(format!("secrets: {e}")))?;
-            for entry in &policy.allow {
+            for entry in policy.allow_list() {
                 validate_allow_entry(entry)
                     .map_err(|e| invalid(format!("secrets.\"{reference}\".allow: {e}")))?;
             }
@@ -622,11 +723,13 @@ mod tests {
         let mut m = Manifest::new();
         m.recovery = Some(Recovery {
             recipient: "age1recovery".into(),
+            signing_key: None,
         });
         m.machines.insert(
             "laptop".into(),
             Machine {
                 recipient: "age1laptop".into(),
+                signing_key: None,
                 platform: "linux-x86_64".into(),
                 muster_version: "0.1.0".into(),
                 agents: vec!["claude".into()],

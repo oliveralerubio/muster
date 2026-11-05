@@ -114,3 +114,324 @@ fn secret_never_leaks_to_format_metadata_or_files() {
         assert!(!String::from_utf8_lossy(&fs::read(p).unwrap()).contains(value));
     }
 }
+
+fn forge(dir: &std::path::Path, file: &str, payload: &serde_json::Value, to: &Identity) {
+    use std::io::Write;
+    let recipient: age::x25519::Recipient = to.recipient().parse().unwrap();
+    let encryptor =
+        age::Encryptor::with_recipients(std::iter::once(&recipient as &dyn age::Recipient))
+            .unwrap();
+    let mut out = Vec::new();
+    let armor =
+        age::armor::ArmoredWriter::wrap_output(&mut out, age::armor::Format::AsciiArmor).unwrap();
+    let mut w = encryptor.wrap_output(armor).unwrap();
+    w.write_all(payload.to_string().as_bytes()).unwrap();
+    w.finish().unwrap().finish().unwrap();
+    fs::write(dir.join("vault").join(file), out).unwrap();
+}
+
+fn is_security<T: std::fmt::Debug>(r: Result<T, muster::errors::MusterError>) -> bool {
+    matches!(r, Err(muster::errors::MusterError::Security(_)))
+}
+
+#[test]
+fn copying_one_group_over_another_is_rejected() {
+    let d = tempdir().unwrap();
+    let id = Identity::generate();
+    let mut v = Vault::open(d.path()).unwrap();
+    let rec = [id.recipient()];
+    v.add("low", "n", SecretValue::new("low-value".into()), &rec, &id)
+        .unwrap();
+    v.add(
+        "high",
+        "n",
+        SecretValue::new("high-value".into()),
+        &rec,
+        &id,
+    )
+    .unwrap();
+    fs::copy(
+        d.path().join("vault/low.age"),
+        d.path().join("vault/high.age"),
+    )
+    .unwrap();
+    assert!(is_security(v.get("high", "n", &id)));
+    assert!(is_security(v.rotate(
+        "high",
+        "n",
+        SecretValue::new("x".into()),
+        &id
+    )));
+    assert!(is_security(v.add(
+        "high",
+        "m",
+        SecretValue::new("x".into()),
+        &rec,
+        &id
+    )));
+}
+
+#[test]
+fn forged_payload_group_never_writes_outside_the_vault() {
+    let d = tempdir().unwrap();
+    let outer = d.path().join("cfg");
+    fs::create_dir_all(&outer).unwrap();
+    let id = Identity::generate();
+    let mut v = Vault::open(&outer).unwrap();
+    let rec = [id.recipient()];
+    v.add("g", "n", SecretValue::new("x".into()), &rec, &id)
+        .unwrap();
+    let payload = serde_json::json!({
+        "group": "../../x",
+        "recipients": rec,
+        "secrets": {"n": {"name": "n", "ciphertext_or_value": "y",
+            "created_at": "t", "updated_at": "t"}}
+    });
+    forge(&outer, "g.age", &payload, &id);
+    assert!(is_security(v.rotate(
+        "g",
+        "n",
+        SecretValue::new("z".into()),
+        &id
+    )));
+    assert!(!d.path().join("x.age").exists());
+    assert!(!d.path().join("x.meta.json").exists());
+}
+
+#[test]
+fn forged_secret_key_not_matching_entry_name_is_rejected() {
+    let d = tempdir().unwrap();
+    let id = Identity::generate();
+    let mut v = Vault::open(d.path()).unwrap();
+    let rec = [id.recipient()];
+    v.add("g", "n", SecretValue::new("x".into()), &rec, &id)
+        .unwrap();
+    let payload = serde_json::json!({
+        "group": "g",
+        "recipients": rec,
+        "secrets": {"../evil": {"name": "../evil", "ciphertext_or_value": "y",
+            "created_at": "t", "updated_at": "t"}}
+    });
+    forge(d.path(), "g.age", &payload, &id);
+    assert!(is_security(v.get("g", "n", &id)));
+}
+
+#[test]
+fn groups_enumerates_union_and_incomplete_pair_fails_closed() {
+    let d = tempdir().unwrap();
+    let id = Identity::generate();
+    let mut v = Vault::open(d.path()).unwrap();
+    let rec = [id.recipient()];
+    v.add("full", "s", SecretValue::new("1".into()), &rec, &id)
+        .unwrap();
+    v.add("orphan_age", "s", SecretValue::new("2".into()), &rec, &id)
+        .unwrap();
+    v.add("orphan_meta", "s", SecretValue::new("3".into()), &rec, &id)
+        .unwrap();
+    fs::remove_file(d.path().join("vault/orphan_age.meta.json")).unwrap();
+    fs::remove_file(d.path().join("vault/orphan_meta.age")).unwrap();
+
+    let all = v.groups().unwrap();
+    assert!(all.contains(&"full".into()));
+    assert!(all.contains(&"orphan_age".into()));
+    assert!(all.contains(&"orphan_meta".into()));
+
+    assert!(is_security(v.ensure_pair("orphan_age")));
+    assert!(is_security(v.ensure_pair("orphan_meta")));
+
+    assert!(is_security(v.rotate(
+        "orphan_age",
+        "s",
+        SecretValue::new("x".into()),
+        &id
+    )));
+    assert!(is_security(v.rotate(
+        "orphan_meta",
+        "s",
+        SecretValue::new("x".into()),
+        &id
+    )));
+    assert!(is_security(v.add(
+        "orphan_age",
+        "new_sec",
+        SecretValue::new("x".into()),
+        &rec,
+        &id
+    )));
+    assert!(is_security(v.add(
+        "orphan_meta",
+        "new_sec",
+        SecretValue::new("x".into()),
+        &rec,
+        &id
+    )));
+    assert!(is_security(v.remove("orphan_age", "s", &id)));
+    assert!(is_security(v.remove("orphan_meta", "s", &id)));
+    assert!(is_security(v.reencrypt("orphan_age", &rec, &id)));
+}
+
+#[test]
+fn mutating_ops_fail_if_sidecar_readers_differ_from_ciphertext() {
+    let d = tempdir().unwrap();
+    let id = Identity::generate();
+    let other = Identity::generate();
+    let mut v = Vault::open(d.path()).unwrap();
+    let rec = [id.recipient()];
+    v.add("g", "s", SecretValue::new("1".into()), &rec, &id)
+        .unwrap();
+
+    // Tamper with meta sidecar to inject `other` as a reader
+    let meta_path = d.path().join("vault/g.meta.json");
+    let mut meta: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+    meta["recipients"] = serde_json::json!([id.recipient(), other.recipient()]);
+    fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap()).unwrap();
+
+    assert!(is_security(v.rotate(
+        "g",
+        "s",
+        SecretValue::new("2".into()),
+        &id
+    )));
+    assert!(is_security(v.add(
+        "g",
+        "s2",
+        SecretValue::new("2".into()),
+        &rec,
+        &id
+    )));
+    assert!(is_security(v.remove("g", "s", &id)));
+    assert!(is_security(v.reencrypt("g", &rec, &id)));
+}
+
+#[test]
+fn rotate_and_add_refuse_a_group_with_an_unauthorized_recipient() {
+    let d = tempdir().unwrap();
+    let id = Identity::generate();
+    let attacker = Identity::generate();
+    fs::write(
+        d.path().join("muster.toml"),
+        format!(
+            "version = 1\n[machines.me]\nrecipient = \"{}\"\nplatform = \"linux-x86_64\"\nmuster_version = \"0.1.0\"\n",
+            id.recipient()
+        ),
+    )
+    .unwrap();
+    let mut v = Vault::open(d.path()).unwrap();
+    let rec = [id.recipient()];
+    v.add("g", "n", SecretValue::new("old".into()), &rec, &id)
+        .unwrap();
+
+    // A remote writer swaps in ciphertext (and sidecar) that also encrypts to them.
+    let both = [id.recipient(), attacker.recipient()];
+    let payload = serde_json::json!({
+        "group": "g",
+        "recipients": both,
+        "secrets": {"n": {"name": "n", "ciphertext_or_value": "old",
+            "created_at": "t", "updated_at": "t"}}
+    });
+    let recipients: Vec<age::x25519::Recipient> = both.iter().map(|r| r.parse().unwrap()).collect();
+    {
+        use std::io::Write;
+        let enc =
+            age::Encryptor::with_recipients(recipients.iter().map(|r| r as &dyn age::Recipient))
+                .unwrap();
+        let mut out = Vec::new();
+        let armor =
+            age::armor::ArmoredWriter::wrap_output(&mut out, age::armor::Format::AsciiArmor)
+                .unwrap();
+        let mut w = enc.wrap_output(armor).unwrap();
+        w.write_all(payload.to_string().as_bytes()).unwrap();
+        w.finish().unwrap().finish().unwrap();
+        fs::write(d.path().join("vault/g.age"), out).unwrap();
+    }
+    let meta_path = d.path().join("vault/g.meta.json");
+    let mut meta: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+    meta["recipients"] = serde_json::json!(both);
+    fs::write(&meta_path, meta.to_string()).unwrap();
+
+    let new_value = "brand-new-value";
+    assert!(is_security(v.rotate(
+        "g",
+        "n",
+        SecretValue::new(new_value.into()),
+        &id
+    )));
+    assert!(is_security(v.add(
+        "g",
+        "m",
+        SecretValue::new(new_value.into()),
+        &rec,
+        &id
+    )));
+    // The attacker never gains the new value: the ciphertext was not rewritten.
+    assert!(v.get("g", "n", &attacker).unwrap().expose() == "old");
+}
+
+#[test]
+fn reencrypt_enforces_authorized_and_revoked_policy() {
+    let d = tempdir().unwrap();
+    let a = Identity::generate();
+    let b = Identity::generate();
+    let mut v = Vault::open(d.path()).unwrap();
+    v.add("g", "n", SecretValue::new("x".into()), &[a.recipient()], &a)
+        .unwrap();
+
+    // Revoked recipient is rejected
+    let mut v_revoked = Vault::open(d.path()).unwrap().with_revoked([b.recipient()]);
+    let err = v_revoked.reencrypt("g", &[b.recipient()], &a).unwrap_err();
+    assert!(matches!(err, muster::errors::MusterError::Security(_)));
+    // Unauthorized recipient is rejected when policy is defined
+    fs::write(
+        d.path().join("muster.toml"),
+        format!(
+            "version = 1\n[machines.me]\nrecipient = \"{}\"\nplatform = \"linux-x86_64\"\nmuster_version = \"0.1.0\"\n",
+            a.recipient()
+        ),
+    )
+    .unwrap();
+    let mut v_authorized = Vault::open(d.path()).unwrap();
+    let err = v_authorized
+        .reencrypt("g", &[b.recipient()], &a)
+        .unwrap_err();
+    assert!(matches!(err, muster::errors::MusterError::Security(_)));
+}
+
+#[test]
+fn reencrypt_refuses_fleet_machine_outside_the_groups_readers() {
+    let d = tempdir().unwrap();
+    let a = Identity::generate();
+    let b = Identity::generate();
+    fs::write(
+        d.path().join("muster.toml"),
+        format!(
+            "version = 1\n\
+             [machines.a]\nrecipient = \"{}\"\nplatform = \"linux-x86_64\"\nmuster_version = \"0.1.0\"\n\
+             [machines.b]\nrecipient = \"{}\"\nplatform = \"linux-x86_64\"\nmuster_version = \"0.1.0\"\n\
+             [groups.prod.readers]\nmachines = [\"a\"]\n",
+            a.recipient(),
+            b.recipient()
+        ),
+    )
+    .unwrap();
+    let mut v = Vault::open(d.path()).unwrap();
+    v.add(
+        "prod",
+        "n",
+        SecretValue::new("x".into()),
+        &[a.recipient()],
+        &a,
+    )
+    .unwrap();
+    // b is authorized fleet-wide but is not a reader of `prod`.
+    let err = v
+        .reencrypt("prod", &[a.recipient(), b.recipient()], &a)
+        .unwrap_err();
+    assert!(
+        matches!(err, muster::errors::MusterError::Security(_)),
+        "{err:?}"
+    );
+    // Re-encrypting for its own readers still works.
+    v.reencrypt("prod", &[a.recipient()], &a).unwrap();
+}

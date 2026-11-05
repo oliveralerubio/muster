@@ -153,3 +153,33 @@ pub(super) fn plan(
     }
     Ok(())
 }
+
+/// Managed dotfiles land in `$HOME` (`.bashrc`, `.ssh/authorized_keys`), so a
+/// new or content-changed one is code the user must approve, like a hook.
+/// `approved.files` is rebuilt from the dotfiles planned now.
+pub(super) fn approvals(
+    entries: &BTreeMap<PathBuf, Entry>,
+    approved: &mut super::store::Approved,
+    approvals: &mut Vec<super::Approval>,
+) {
+    let previous = std::mem::take(&mut approved.files);
+    for (path, entry) in entries {
+        if !(entry.managed && entry.agents == [OWNER]) {
+            continue;
+        }
+        let Some(after) = entry.after.as_deref() else {
+            continue;
+        };
+        let key = path.display().to_string();
+        let hash = crate::hash::sha256_hex(after.as_bytes());
+        // Already on disk as declared: nothing new is being installed.
+        if previous.get(&key) != Some(&hash) && entry.before.as_deref() != Some(after) {
+            approvals.push(super::Approval {
+                kind: "dotfile",
+                name: key.clone(),
+                detail: format!("sha256 {hash}"),
+            });
+        }
+        approved.files.insert(key, hash);
+    }
+}

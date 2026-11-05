@@ -8,10 +8,9 @@ use serde_json::{json, Value};
 
 use crate::context::Context;
 use crate::errors::MusterError;
-use crate::git;
 use crate::identity::Identity;
 use crate::machine;
-use crate::manifest::{validate_allow_entry, Manifest, SecretPolicy};
+use crate::manifest::{validate_allow_entry, Manifest, SecretApproval, SecretPolicy};
 use crate::output::{Diagnostic, Severity};
 use crate::providers::Providers;
 use crate::registry::{CommandSpec, ParamKind, ParamSpec, Params};
@@ -195,17 +194,14 @@ pub(crate) fn add_with_value(
         manifest.secrets.insert(
             format!("native://{group}/{name}"),
             SecretPolicy {
-                allow: allow.clone(),
+                allow: Some(allow.clone()),
                 ..Default::default()
             },
         );
         manifest.save(&ctx.config_dir)?;
     }
 
-    git::commit_if_configured(
-        &ctx.config_dir,
-        &format!("feat(secret): add {group}/{name}"),
-    )?;
+    crate::trust::commit(ctx, &format!("feat(secret): add {group}/{name}"))?;
 
     Ok(json!({
         "group": group,
@@ -225,7 +221,7 @@ fn list(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
             let allow = manifest
                 .as_ref()
                 .and_then(|m| m.secrets.get(&reference))
-                .map(|p| p.allow.clone())
+                .map(|p| p.allow_list().to_vec())
                 .unwrap_or_default();
             secrets.push(json!({
                 "group": group,
@@ -276,10 +272,7 @@ pub(crate) fn rotate_with_value(
     crate::audit::record(&ctx.state_dir, "secret.rotate", &format!("{group}/{name}"))?;
     vault.rotate(&group, &name, value, &identity)?;
 
-    git::commit_if_configured(
-        &ctx.config_dir,
-        &format!("feat(secret): rotate {group}/{name}"),
-    )?;
+    crate::trust::commit(ctx, &format!("feat(secret): rotate {group}/{name}"))?;
 
     Ok(json!({
         "rotated": format!("{group}/{name}"),
@@ -321,10 +314,7 @@ fn rm(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         manifest.save(&ctx.config_dir)?;
     }
 
-    git::commit_if_configured(
-        &ctx.config_dir,
-        &format!("feat(secret): remove {group}/{name}"),
-    )?;
+    crate::trust::commit(ctx, &format!("feat(secret): remove {group}/{name}"))?;
 
     Ok(json!({ "removed": format!("{group}/{name}") }))
 }
@@ -336,6 +326,51 @@ fn get(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         .get_string("agent")
         .map(str::to_owned)
         .or_else(|| ctx.audit_actor.clone());
+    // A secret with an allow list or per-use approval is never revealed to an
+    // unnamed caller: `--yes` alone does not satisfy a policy.
+    if reveal && actor.is_none() {
+        // Fail closed: an unreadable manifest must never turn into "no policy".
+        let manifest = match Manifest::load(&ctx.config_dir) {
+            Ok(m) => Some(m),
+            Err(MusterError::Operational(_)) if !ctx.config_dir.join("muster.toml").exists() => {
+                let pin_exists = crate::fleet_state::TrustAnchor::load(&ctx.state_dir)?.is_some();
+                let state_exists = ctx.config_dir.join(crate::fleet_state::STATE_FILE).exists();
+                if pin_exists || state_exists {
+                    return Err(MusterError::Security(
+                        "cannot reveal secret: muster.toml is missing but a trust pin or signed fleet state exists".into(),
+                    ));
+                }
+                None
+            }
+            Err(e) => return Err(e),
+        };
+        let policy = manifest
+            .as_ref()
+            .and_then(|m| m.secrets.get(reference.as_str()));
+        if policy.is_some_and(|p| p.allow.as_ref().is_some_and(Vec::is_empty)) {
+            ctx.diag(Diagnostic::error(
+                "secret_allow_list_empty",
+                format!("{reference} has `allow = []`: no one may reveal it"),
+            ));
+            return Err(MusterError::Security(
+                "secret has an empty allow list; access denied".into(),
+            ));
+        }
+        let restricted = policy
+            .is_some_and(|p| !p.allow_list().is_empty() || p.approval == SecretApproval::Each);
+        if restricted {
+            ctx.diag(Diagnostic::error(
+                "secret_policy_requires_agent",
+                format!(
+                    "{reference} has an access policy; reveal it with --agent <id> so the \
+                     policy (and any approval lease) can be enforced"
+                ),
+            ));
+            return Err(MusterError::Security(
+                "secret policy requires an agent identity".into(),
+            ));
+        }
+    }
     // Check current policy before resolving any value, including MCP calls.
     let _lease_guard = if let Some(agent) = actor.as_deref().filter(|_| reveal) {
         crate::secret_leases::authorize(ctx, reference.as_str(), agent)?

@@ -196,6 +196,10 @@ pub static COMMANDS: &[CommandSpec] = &[
     crate::commands::toggle::DISABLE,
     crate::mcp::SPEC,
     crate::commands::usage::SPEC,
+    crate::commands::trust::SHOW,
+    crate::commands::trust::RESIGN,
+    crate::commands::trust::COSIGN,
+    crate::commands::trust::CHECKPOINT,
     crate::commands::history::SPEC,
 ];
 

@@ -1066,6 +1066,7 @@ fn secret_approval_requires_a_human_and_leases_expire_and_revoke() {
     let mut text = std::fs::read_to_string(&manifest).unwrap();
     text.push_str("\n[secrets.'native://app/key']\nallow = ['claude']\napproval = 'each'\napproval_ttl = '15m'\n");
     std::fs::write(&manifest, &text).unwrap();
+    env.run(&["trust", "resign", "--yes"]).assert().success();
     let state = env.path().join(".local/state/muster");
     let store_path = state.join("secret-leases.json");
     let reveal = [
@@ -1175,6 +1176,7 @@ fn secret_approval_requires_a_human_and_leases_expire_and_revoke() {
         }
         if cycle == 0 {
             std::fs::write(&manifest, text.replace("allow = ['claude']", "allow = []")).unwrap();
+            env.run(&["trust", "resign", "--yes"]).assert().success();
             let (out, envelope) = env.run_json(&reveal);
             assert_eq!(out.status.code(), Some(5));
             assert!(envelope
@@ -1184,6 +1186,7 @@ fn secret_approval_requires_a_human_and_leases_expire_and_revoke() {
                 .iter()
                 .any(|d| d["code"] == "secret_not_allowed_for_agent"));
             std::fs::write(&manifest, &text).unwrap();
+            env.run(&["trust", "resign", "--yes"]).assert().success();
             let mut data: Value = serde_json::from_str(&stored).unwrap();
             data["leases"][0]["expires_at"] = json!(1);
             std::fs::write(&store_path, data.to_string()).unwrap();
@@ -1210,10 +1213,14 @@ fn secret_approval_requires_a_human_and_leases_expire_and_revoke() {
     );
     let (_, requests) = env.run_json(&["secret", "requests", "--format", "json"]);
     assert_eq!(requests.result(), &json!([]));
-    // A person can still reveal with ordinary confirmation and no agent.
-    env.run(&["secret", "get", "native://app/key", "--reveal", "--yes"])
-        .assert()
-        .success();
+    // `--yes` alone never satisfies a per-use approval policy: an unnamed
+    // caller is refused instead of bypassing the lease.
+    let bare = env
+        .run(&["secret", "get", "native://app/key", "--reveal", "--yes"])
+        .output()
+        .unwrap();
+    assert_eq!(bare.status.code(), Some(5));
+    assert!(!String::from_utf8_lossy(&bare.stdout).contains(value));
     let events = muster::audit::events(&state).unwrap();
     for action in [
         "secret.request",
@@ -1726,6 +1733,48 @@ fn web_skill_import_all_and_auto_update_routes_match_cli() {
         &serde_json::json!({"state": "off", "path": "/etc", "confirm": true}),
     );
     assert_eq!(status, 400, "{reply}");
+}
+
+#[test]
+fn ui_sync_on_first_use_surfaces_the_security_error_and_accepts_expect_signer() {
+    let remote_dir = tempfile::TempDir::new().unwrap();
+    let remote = remote_dir.path().join("central.git");
+    let git_ok = |args: &[&str]| {
+        assert!(Command::new("git").args(args).status().unwrap().success());
+    };
+    git_ok(&["init", "--bare", "--quiet", remote.to_str().unwrap()]);
+    let alice = support::MusterEnv::new();
+    alice.run(&["--yes", "init"]).assert().success();
+    alice
+        .run(&["sync", "--remote", remote.to_str().unwrap()])
+        .assert()
+        .success();
+    let signer = support::fleet_signer(&alice.config_dir());
+
+    // A machine that cloned the repo by hand and has never pinned a fleet.
+    let bob = support::MusterEnv::new();
+    git_ok(&[
+        "clone",
+        "--quiet",
+        remote.to_str().unwrap(),
+        bob.config_dir().to_str().unwrap(),
+    ]);
+    let mut ui = Ui::start(&bob);
+    let cookie = ui.session();
+
+    let (status, _, body) = ui.request("POST", "/api/sync", Some(&cookie), Some("{}"));
+    assert_eq!(status, 403, "{body}");
+    assert!(body.contains("--expect-signer"), "{body}");
+    assert!(
+        body.contains("SHA256:"),
+        "the fingerprint is surfaced: {body}"
+    );
+    assert!(!bob.path().join(".local/state/muster/trust.json").exists());
+
+    let request = format!("{{\"expect_signer\": \"{signer}\"}}");
+    let (status, _, body) = ui.request("POST", "/api/sync", Some(&cookie), Some(&request));
+    assert_eq!(status, 200, "{body}");
+    assert!(bob.path().join(".local/state/muster/trust.json").exists());
 }
 
 fn web_json(

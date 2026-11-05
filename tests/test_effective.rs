@@ -2,6 +2,14 @@ mod support;
 
 use support::MusterEnv;
 
+/// `effective` verifies the signed fleet state, so a hand-written
+/// `muster.toml` must be re-signed first (as a user would).
+fn resign(env: &MusterEnv) {
+    env.run(&["--format", "json", "trust", "resign", "--yes"])
+        .assert()
+        .success();
+}
+
 #[test]
 fn effective_reports_layers_and_instruction_source() {
     let env = MusterEnv::new();
@@ -10,6 +18,7 @@ fn effective_reports_layers_and_instruction_source() {
         .success();
     let config = env.config_dir();
     std::fs::write(config.join("muster.toml"), "version = 1\n[agents]\nenabled = [\"claude\"]\n[agents.instructions]\nsource = \"AGENTS.md\"\n").unwrap();
+    resign(&env);
     std::fs::write(config.join("AGENTS.md"), "Be kind.\n").unwrap();
     let (output, envelope) = env.run_json(&["effective", "--format", "json"]);
     assert!(output.status.success());
@@ -33,7 +42,10 @@ fn effective_reports_instruction_disk_states() {
         .assert()
         .success();
     let config = env.config_dir();
-    std::fs::write(config.join("muster.toml"), "version = 1\n[agents]\nenabled = [\"claude\", \"codex\"]\nskip_instructions = [\"codex\"]\n[agents.instructions]\nsource = \"AGENTS.md\"\n").unwrap();
+    let mut manifest = std::fs::read_to_string(config.join("muster.toml")).unwrap();
+    manifest.push_str("\n[agents]\nenabled = [\"claude\", \"codex\"]\nskip_instructions = [\"codex\"]\n[agents.instructions]\nsource = \"AGENTS.md\"\n");
+    std::fs::write(config.join("muster.toml"), manifest).unwrap();
+    resign(&env);
     std::fs::write(config.join("AGENTS.md"), "Be kind.\n").unwrap();
     let (_, before) = env.run_json(&["effective", "--format", "json"]);
     assert_eq!(
@@ -72,6 +84,7 @@ fn effective_reports_skills_and_installation() {
         "version = 1\n[agents]\nenabled = [\"claude\"]\n[agents.skills]\nsource = \"skills\"\n",
     )
     .unwrap();
+    resign(&env);
     std::fs::create_dir_all(config.join("skills/demo")).unwrap();
     std::fs::write(
         config.join("skills/demo/SKILL.md"),
@@ -97,6 +110,7 @@ fn effective_reports_skill_disk_changes_and_extras() {
         "version = 1\n[agents]\nenabled = [\"claude\"]\n[agents.skills]\nsource = \"skills\"\n",
     )
     .unwrap();
+    resign(&env);
     std::fs::create_dir_all(config.join("skills/demo")).unwrap();
     let source = "---\nname: demo\ndescription: Helpful skill\n---\nHello\n";
     std::fs::write(config.join("skills/demo/SKILL.md"), source).unwrap();
@@ -126,6 +140,7 @@ fn effective_reports_mcp_without_secret_values() {
     let env = MusterEnv::new();
     env.run(&["--yes", "init"]).assert().success();
     std::fs::write(env.config_dir().join("muster.toml"), "version = 1\n[agents]\nenabled = [\"claude\"]\n[mcp.tool]\ncommand = \"tool\"\n[mcp.tool.env]\nTOKEN = \"native://app/token\"\n").unwrap();
+    resign(&env);
     let (output, result) = env.run_json(&["effective", "--format", "json"]);
     assert!(output.status.success());
     assert!(!String::from_utf8_lossy(&output.stdout).contains("super-secret-value"));
@@ -155,6 +170,7 @@ fn effective_reports_subagent_state() {
         "version = 1\n[agents]\nenabled = [\"claude\"]\n[agents.subagents]\nsource = \"agents\"\n",
     )
     .unwrap();
+    resign(&env);
     std::fs::create_dir_all(env.config_dir().join("agents")).unwrap();
     let source = "---\nname: reviewer\ndescription: Review changes\n---\nReview.\n";
     std::fs::write(env.config_dir().join("agents/reviewer.md"), source).unwrap();
@@ -202,6 +218,7 @@ fn effective_filters_adapters_and_rejects_unknown() {
     let env = MusterEnv::new();
     env.run(&["--yes", "init"]).assert().success();
     std::fs::write(env.config_dir().join("muster.toml"), "version = 1\n[agents]\nenabled = [\"claude\", \"codex\"]\n[agents.instructions]\nsource = \"AGENTS.md\"\n").unwrap();
+    resign(&env);
     std::fs::write(env.config_dir().join("AGENTS.md"), "Hello\n").unwrap();
     let (_, result) = env.run_json(&["effective", "--agent", "claude", "--format", "json"]);
     assert_eq!(
@@ -222,6 +239,7 @@ fn effective_totals_instruction_and_skill_description_tokens() {
     let env = MusterEnv::new();
     env.run(&["--yes", "init"]).assert().success();
     std::fs::write(env.config_dir().join("muster.toml"), "version = 1\n[agents]\nenabled = [\"claude\", \"codex\"]\nskip_instructions = [\"codex\"]\n[agents.instructions]\nsource = \"AGENTS.md\"\n[agents.skills]\nsource = \"skills\"\n").unwrap();
+    resign(&env);
     std::fs::write(env.config_dir().join("AGENTS.md"), "Be kind.\n").unwrap();
     std::fs::create_dir_all(env.config_dir().join("skills/demo")).unwrap();
     std::fs::write(
@@ -243,6 +261,7 @@ fn effective_text_shows_compact_sections() {
         "version = 1\n[agents]\nenabled = [\"claude\"]\n",
     )
     .unwrap();
+    resign(&env);
     let output = env
         .run(&["effective", "--format", "text"])
         .output()
@@ -259,6 +278,7 @@ fn effective_compares_mcp_without_disclosing_existing_secrets() {
     let env = MusterEnv::new();
     env.run(&["--yes", "init"]).assert().success();
     std::fs::write(env.config_dir().join("muster.toml"), "version = 1\n[agents]\nenabled = [\"claude\"]\n[mcp.tool]\ncommand = \"tool\"\n[mcp.tool.env]\nTOKEN = \"native://app/token\"\n").unwrap();
+    resign(&env);
     std::fs::write(
         env.path().join(".claude.json"),
         r#"{"mcpServers":{"tool":{"command":"tool","env":{"TOKEN":"super-secret-value"}}}}"#,
@@ -285,6 +305,7 @@ fn effective_project_reports_both_user_and_project_disk_states() {
         "version = 1\n[agents]\nenabled = [\"claude\"]\n[mcp.user]\ncommand = \"user-tool\"\n",
     )
     .unwrap();
+    resign(&env);
     std::fs::write(
         env.path().join(".claude.json"),
         r#"{"mcpServers":{"user":{"command":"user-tool"}}}"#,
@@ -326,6 +347,7 @@ fn effective_finds_extra_skills_without_managed_skills() {
         "version = 1\n[agents]\nenabled = [\"claude\"]\n",
     )
     .unwrap();
+    resign(&env);
     std::fs::create_dir_all(env.path().join(".claude/skills/personal")).unwrap();
     let (_, result) = env.run_json(&["effective", "--format", "json"]);
     assert_eq!(
@@ -343,6 +365,7 @@ fn effective_reflects_toggles_in_adapter_states_and_totals() {
         "version = 1\n[agents]\nenabled = [\"claude\", \"codex\"]\n[agents.skills]\nsource = \"skills\"\n[agents.subagents]\nsource = \"agents\"\n[agents.toggles]\ndisable = [\"skill:demo@claude\", \"mcp:tool@claude\", \"subagent:reviewer@claude\"]\n[mcp.tool]\ncommand = \"tool\"\n",
     )
     .unwrap();
+    resign(&env);
     std::fs::create_dir_all(env.config_dir().join("skills/demo")).unwrap();
     std::fs::write(
         env.config_dir().join("skills/demo/SKILL.md"),
@@ -376,6 +399,7 @@ fn effective_compares_toml_yaml_and_opencode_configs_without_secret_values() {
         "version = 1\n[agents]\nenabled = [\"codex\", \"hermes\", \"opencode\"]\n[mcp.tool]\ncommand = \"tool\"\n[mcp.tool.env]\nTOKEN = \"native://app/token\"\n",
     )
     .unwrap();
+    resign(&env);
     // On disk as sync leaves it: the resolved secret this read-only view
     // cannot reproduce. TOML (Codex), YAML (Hermes) and OpenCode's
     // `environment` field must not read as drift because of it.
@@ -414,6 +438,7 @@ fn effective_project_mcp_overrides_lower_layers_and_merges_extras() {
         "version = 1\n[agents]\nenabled = [\"claude\", \"opencode\"]\n[mcp.tool]\ncommand = \"team-tool\"\n",
     )
     .unwrap();
+    resign(&env);
     // User-scope unmanaged extra.
     std::fs::create_dir_all(env.path().join(".claude/skills/personal")).unwrap();
     let project = env.path().join("project");
@@ -457,6 +482,7 @@ fn effective_text_prints_layers_and_provenance() {
         "version = 1\n[agents]\nenabled = [\"claude\"]\n[agents.instructions]\nsource = \"AGENTS.md\"\n[agents.skills]\nsource = \"skills\"\n[mcp.tool]\ncommand = \"tool\"\n",
     )
     .unwrap();
+    resign(&env);
     std::fs::write(env.config_dir().join("AGENTS.md"), "Be kind.\n").unwrap();
     std::fs::create_dir_all(env.config_dir().join("skills/demo")).unwrap();
     std::fs::write(

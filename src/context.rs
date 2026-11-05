@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use crate::errors::MusterError;
 use crate::output::{Diagnostic, Format};
 use crate::secrets::SecretValue;
+use crate::signing::Signer;
 
 /// Global options after CLI/`MUSTER_*` precedence has been applied.
 #[derive(Debug, Clone, Default)]
@@ -34,6 +35,24 @@ pub struct Context {
     pub audit_actor: Option<String>,
     pub web_approval: bool,
     pub is_tty: bool,
+    /// Break-glass signing key derived from the recovery key, set when the
+    /// command received the recovery key (see `team::recovery_identity`).
+    pub recovery_signer: Option<Signer>,
+    /// `--expect-signer`: full 256-bit fingerprint or full public key the fleet state's first
+    /// signer must have when this machine pins it for the first time.
+    pub expect_signer: Option<String>,
+    /// `--expect-state`: payload SHA-256 of the only state this machine may take as its
+    /// origin when it pins a fleet for the first time.
+    pub expect_state: Option<String>,
+    /// Signed enrollment approvals the next fleet-state seal carries (set by
+    /// `approve` when a quorum admitted a machine).
+    pub enrollments: Vec<crate::fleet_state::EnrollmentEvidence>,
+    /// The repo holds a governance change that is short of its admin
+    /// co-signatures: this machine keeps using the last accepted state and
+    /// commands that would consume the new one refuse (see `trust::guard`).
+    pub governance_pending: bool,
+    /// Fleet state is invalid (bad signature, forged vault, tampered governance).
+    pub fleet_state_invalid: bool,
     diagnostics: Vec<Diagnostic>,
     failed: bool,
 }
@@ -56,6 +75,12 @@ impl Context {
             audit_actor: globals.audit_actor,
             web_approval: globals.web_approval,
             is_tty: std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
+            recovery_signer: None,
+            expect_signer: None,
+            expect_state: None,
+            enrollments: Vec::new(),
+            governance_pending: false,
+            fleet_state_invalid: false,
             diagnostics: Vec::new(),
             failed: false,
         })
@@ -63,6 +88,10 @@ impl Context {
 
     pub fn diag(&mut self, diagnostic: Diagnostic) {
         self.diagnostics.push(diagnostic);
+    }
+
+    pub fn diagnostics(&self) -> &[Diagnostic] {
+        &self.diagnostics
     }
 
     pub fn take_diagnostics(&mut self) -> Vec<Diagnostic> {
@@ -194,6 +223,12 @@ mod tests {
             audit_actor: None,
             web_approval: false,
             is_tty: false,
+            recovery_signer: None,
+            expect_signer: None,
+            expect_state: None,
+            enrollments: Vec::new(),
+            governance_pending: false,
+            fleet_state_invalid: false,
             diagnostics: Vec::new(),
             failed: false,
         }

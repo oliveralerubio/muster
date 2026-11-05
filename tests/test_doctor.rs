@@ -112,7 +112,10 @@ fn git(dir: &std::path::Path, args: &[&str]) {
 
 fn commit_all(env: &MusterEnv) {
     git(&env.config_dir(), &["add", "-A"]);
-    git(&env.config_dir(), &["commit", "--quiet", "-m", "baseline"]);
+    git(
+        &env.config_dir(),
+        &["commit", "--quiet", "--allow-empty", "-m", "baseline"],
+    );
 }
 
 // ---------------------------------------------------------------------------

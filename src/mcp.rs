@@ -34,7 +34,13 @@ const INVALID_PARAMS: i64 = -32602;
 pub const SPEC: CommandSpec = CommandSpec {
     name: "mcp",
     about: "Run the MCP server over stdio (tools: status, doctor, plan, effective, why, usage, provider_list, secret_list_meta, propose_change, secret_reveal)",
-    params: &[],
+    params: &[ParamSpec {
+        name: "agent",
+        about: "Pin client agent identity (e.g. claude, codex)",
+        kind: ParamKind::String,
+        required: false,
+        positional: false,
+    }],
     mutating: false,
     handler: not_a_handler,
 };
@@ -229,10 +235,24 @@ fn type_matches(kind: ParamKind, value: &Value) -> bool {
 }
 
 /// Serve until stdin reaches EOF (exit 0). SIGINT is handled in `main` (130).
-pub fn serve(globals: Globals) -> i32 {
+pub fn serve(globals: Globals, pinned: Option<String>) -> i32 {
+    let pinned_id = if let Some(ref a) = pinned {
+        match client_agent(a).or_else(|| crate::adapters::find(a).map(|ad| ad.id)) {
+            Some(id) => Some(id),
+            None => {
+                let err = MusterError::Usage(format!("unknown agent `{a}` for --agent"));
+                eprintln!("muster mcp: error[{}]: {err}", err.code());
+                return err.exit_code();
+            }
+        }
+    } else {
+        None
+    };
     let server = Server {
         globals,
-        agent: RefCell::new(None),
+        pinned_agent: pinned_id,
+        first_client_name: RefCell::new(None),
+        agent: RefCell::new(pinned_id),
     };
     let mut stdout = std::io::stdout().lock();
     for line in std::io::stdin().lock().lines() {
@@ -261,6 +281,8 @@ pub fn serve(globals: Globals) -> i32 {
 
 struct Server {
     globals: Globals,
+    pinned_agent: Option<&'static str>,
+    first_client_name: RefCell<Option<String>>,
     /// Adapter id of the connected client (from `initialize` `clientInfo`);
     /// `None` = unknown client, which no secret allow list grants.
     agent: RefCell<Option<&'static str>>,
@@ -307,8 +329,23 @@ impl Server {
                     .pointer("/clientInfo/name")
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                *self.agent.borrow_mut() = client_agent(client);
-                Ok(initialize(params))
+                let mut first = self.first_client_name.borrow_mut();
+                if let Some(existing) = first.as_deref() {
+                    if existing != client {
+                        Err((
+                            INVALID_REQUEST,
+                            format!("cannot re-initialize with a different client identity ('{client}' != '{existing}')"),
+                        ))
+                    } else {
+                        Ok(initialize(params))
+                    }
+                } else {
+                    *first = Some(client.to_owned());
+                    if self.pinned_agent.is_none() {
+                        *self.agent.borrow_mut() = client_agent(client);
+                    }
+                    Ok(initialize(params))
+                }
             }
             "ping" => Ok(json!({})),
             "tools/list" => {

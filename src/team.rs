@@ -24,6 +24,7 @@ use crate::manifest::{Manifest, Member, MemberStatus, Role};
 use crate::output::{Diagnostic, Severity};
 use crate::registry::{ParamKind, ParamSpec, Params};
 use crate::secrets::SecretValue;
+use crate::signing::Signer;
 use crate::vault::Vault;
 
 /// The single member of a manifest without `[members]`.
@@ -31,10 +32,10 @@ pub const IMPLICIT_MEMBER: &str = "owner";
 
 pub const RECOVERY_KEY_ENV: &str = "MUSTER_RECOVERY_KEY";
 
-/// `--recovery-key`, for re-encrypting groups the caller cannot read (deprecated: use stdin or env).
+/// `--recovery-key`: always rejected (argv leaks into history and `ps`); kept so the error can explain the safe options.
 pub const RECOVERY_KEY_PARAM: ParamSpec = ParamSpec {
     name: "recovery-key",
-    about: "Offline recovery key (deprecated: prefer --recovery-key-stdin or MUSTER_RECOVERY_KEY)",
+    about: "Rejected: use --recovery-key-stdin or MUSTER_RECOVERY_KEY instead",
     kind: ParamKind::String,
     required: false,
     positional: false,
@@ -65,6 +66,11 @@ impl Actor {
     /// Git commit trailer naming the actor.
     fn trailer(&self) -> String {
         format!("Muster-Actor: {} (machine {})", self.member, self.machine)
+    }
+
+    /// Commit message for `summary`, naming this actor.
+    pub fn message(&self, summary: &str) -> String {
+        format!("{summary}\n\n{}", self.trailer())
     }
 }
 
@@ -179,7 +185,7 @@ pub fn group_recipients(manifest: &Manifest, group: &str) -> Vec<String> {
         out.push(recovery.recipient.clone());
     }
     let mut seen = BTreeSet::new();
-    out.retain(|r| seen.insert(r.clone()));
+    out.retain(|r| seen.insert(r.clone()) && !manifest.revoked_recipients.contains(r));
     out
 }
 
@@ -272,29 +278,21 @@ pub fn check_self_grant(
     )))
 }
 
-/// The offline recovery key, if one was supplied: `--recovery-key-stdin`, the
-/// deprecated `--recovery-key` argument (warns: it lands in shell history and
-/// `ps`), or [`RECOVERY_KEY_ENV`]. Call once per command: stdin is consumed.
+/// The offline recovery key, if one was supplied: `--recovery-key-stdin` or
+/// [`RECOVERY_KEY_ENV`]. The `--recovery-key` argument is a Usage error. Call once per command: stdin is consumed.
 pub fn recovery_key(
     ctx: &mut Context,
     params: &Params,
 ) -> Result<Option<SecretValue>, MusterError> {
+    if params.get_string(RECOVERY_KEY_PARAM.name).is_some() {
+        return Err(MusterError::Usage(format!(
+            "passing the recovery key via --{} is insecure and forbidden (it appears in process listings and shell history); pipe it via --{} or set {RECOVERY_KEY_ENV}",
+            RECOVERY_KEY_PARAM.name,
+            RECOVERY_KEY_STDIN_PARAM.name,
+        )));
+    }
     if params.get_bool(RECOVERY_KEY_STDIN_PARAM.name) {
         return ctx.read_secret_stdin().map(Some);
-    }
-    if let Some(raw) = params.get_string(RECOVERY_KEY_PARAM.name) {
-        ctx.diag(
-            Diagnostic::new(
-                Severity::Warning,
-                "insecure_recovery_key_argument",
-                "the recovery key was passed as a command-line argument, where shell history and \
-                 process listings can record it",
-            )
-            .with_suggestion(format!(
-                "pipe it with --recovery-key-stdin or set {RECOVERY_KEY_ENV}"
-            )),
-        );
-        return Ok(Some(SecretValue::new(raw.to_string())));
     }
     Ok(std::env::var(RECOVERY_KEY_ENV)
         .ok()
@@ -309,12 +307,25 @@ pub fn recovery_identity(
     params: &Params,
     manifest: &Manifest,
 ) -> Result<Option<Identity>, MusterError> {
+    recovery_identity_against(ctx, params, manifest.recovery.as_ref())
+}
+
+/// Like [`recovery_identity`] but checked against an explicit recovery record
+/// (e.g. the one in the last ACCEPTED governance, not an unaccepted manifest).
+pub fn recovery_identity_against(
+    ctx: &mut Context,
+    params: &Params,
+    recovery: Option<&crate::manifest::Recovery>,
+) -> Result<Option<Identity>, MusterError> {
     let Some(key) = recovery_key(ctx, params)? else {
         return Ok(None);
     };
     let identity = Identity::from_secret(&key)?;
-    match &manifest.recovery {
-        Some(r) if r.recipient == identity.recipient() => Ok(Some(identity)),
+    match recovery {
+        Some(r) if r.recipient == identity.recipient() => {
+            ctx.recovery_signer = Some(Signer::from_recovery(&identity)?);
+            Ok(Some(identity))
+        }
         Some(_) => Err(MusterError::Security(
             "provided recovery key does not match manifest recovery recipient".into(),
         )),
@@ -445,6 +456,9 @@ pub fn rekey(
     identity: &Identity,
 ) -> Result<Vec<String>, MusterError> {
     check_can_rekey(vault, changes, identity)?;
+    // The manifest was saved after the vault was opened: authorize its
+    // current recipients (e.g. the machine being approved).
+    vault.reload_policy()?;
     for (group, recipients) in changes {
         vault.reencrypt(group, recipients, identity)?;
     }
@@ -494,7 +508,13 @@ pub fn exposed_secrets(vault: &Vault, recipients: &[String]) -> Result<Vec<Value
 /// Commit an administrative change, naming its actor, and push if a remote exists.
 pub fn commit(ctx: &mut Context, actor: &Actor, summary: &str) -> Result<(), MusterError> {
     let message = format!("{summary}\n\n{}", actor.trailer());
-    git::commit_if_configured(&ctx.config_dir, &message)?;
+    crate::trust::commit(ctx, &message)?;
+    publish(ctx);
+    Ok(())
+}
+
+/// Pushes the config repo when it has a remote (a failed push is a warning).
+pub fn publish(ctx: &mut Context) {
     if git::has_remote(&ctx.config_dir) {
         if let Err(e) = git::push(&ctx.config_dir) {
             ctx.diag(Diagnostic::new(
@@ -504,7 +524,6 @@ pub fn commit(ctx: &mut Context, actor: &Actor, summary: &str) -> Result<(), Mus
             ));
         }
     }
-    Ok(())
 }
 
 /// After a global apply (`result` from the engine) that wrote every adapter,
@@ -598,11 +617,18 @@ pub fn drift(config_dir: &Path, manifest: &Manifest) -> Value {
 
 /// Remove `machine` from every member and group reader list.
 pub fn forget_machine(manifest: &mut Manifest, machine: &str) {
+    let machine_recipient = manifest.machines.get(machine).map(|m| m.recipient.clone());
     for member in manifest.members.values_mut() {
         member.machines.retain(|m| m != machine);
     }
     for group in manifest.groups.values_mut() {
         group.readers.machines.retain(|m| m != machine);
+        if let Some(r) = &machine_recipient {
+            group.readers.recipients.retain(|rec| rec != r);
+        }
+        for r in &manifest.revoked_recipients {
+            group.readers.recipients.retain(|rec| rec != r);
+        }
     }
 }
 
@@ -618,42 +644,4 @@ impl Quorum {
     pub fn reached(self) -> bool {
         self.received >= self.required
     }
-}
-
-/// Record `approver` (an admin member) among the `approvals` already given to
-/// a pending change. The same admin never counts twice (Security, with an
-/// `already_approved_by_caller` diagnostic). Below quorum, emits an info
-/// diagnostic saying how many approvals are still missing.
-pub fn add_approval(
-    ctx: &mut Context,
-    manifest: &Manifest,
-    approvals: &mut Vec<String>,
-    approver: &str,
-) -> Result<Quorum, MusterError> {
-    if approvals.iter().any(|a| a == approver) {
-        ctx.diag(Diagnostic::new(
-            Severity::Error,
-            "already_approved_by_caller",
-            format!("'{approver}' already approved this request; another admin must approve it"),
-        ));
-        return Err(MusterError::Security(format!(
-            "'{approver}' already approved this request; the same admin cannot count twice"
-        )));
-    }
-    approvals.push(approver.to_string());
-    let quorum = Quorum {
-        received: approvals.len(),
-        required: manifest.required_approvals() as usize,
-    };
-    if !quorum.reached() {
-        ctx.diag(Diagnostic::new(
-            Severity::Info,
-            "approval_pending",
-            format!(
-                "{} of {} required approvals; waiting for another admin",
-                quorum.received, quorum.required
-            ),
-        ));
-    }
-    Ok(quorum)
 }

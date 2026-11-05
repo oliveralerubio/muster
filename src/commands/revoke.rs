@@ -12,7 +12,7 @@ use crate::machine;
 use crate::manifest::Manifest;
 use crate::output::{Diagnostic, Severity};
 use crate::registry::{CommandSpec, ParamKind, ParamSpec, Params};
-use crate::vault::Vault;
+use crate::vault::{self, Vault};
 
 pub const SPEC: CommandSpec = CommandSpec {
     name: "revoke",
@@ -39,9 +39,41 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     machine::validate_name(name)?;
 
     let mut manifest = Manifest::load(&ctx.config_dir)?;
-    let target = manifest.machines.get(name).cloned().ok_or_else(|| {
-        MusterError::Usage(format!("machine '{name}' is not enrolled in the fleet"))
-    })?;
+
+    // Safely re-runnable: if the machine is already gone from manifest, check
+    // an enrollment request or the revoked_recipients list.
+    let target_recipient = match manifest.machines.get(name) {
+        Some(m) => m.recipient.clone(),
+        None => {
+            if let Ok(req) = EnrollmentRequest::load(&ctx.config_dir, name) {
+                req.recipient
+            } else {
+                let vault = Vault::open(&ctx.config_dir)?;
+                let mut found = None;
+                for group in vault.groups()? {
+                    if let Ok(readers) = vault.readers(&group) {
+                        for r in &manifest.revoked_recipients {
+                            if readers.contains(r) {
+                                found = Some(r.clone());
+                                break;
+                            }
+                        }
+                    }
+                    if found.is_some() {
+                        break;
+                    }
+                }
+                match found {
+                    Some(r) => r,
+                    None => {
+                        return Err(MusterError::Usage(format!(
+                            "machine '{name}' is not enrolled in the fleet"
+                        )))
+                    }
+                }
+            }
+        }
+    };
 
     ctx.confirm(&format!(
         "Revoke machine '{name}'? Its access will be removed and exposed secrets must be rotated."
@@ -64,7 +96,7 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
                 .any(|m| m.recipient == caller_id.recipient());
             if !is_member {
                 return Err(MusterError::Security(
-                    "this machine is not an approved fleet member; revoke from an approved machine or with --recovery-key".into(),
+                    "this machine is not an approved fleet member; revoke from an approved machine or with --recovery-key-stdin".into(),
                 ));
             }
             caller_id
@@ -75,50 +107,61 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let shared_key = manifest
         .machines
         .iter()
-        .any(|(n, m)| n != name && m.recipient == target.recipient);
+        .any(|(n, m)| n != name && m.recipient == target_recipient);
 
-    let mut vault = Vault::open(&ctx.config_dir)?;
-    let authorizer = authorizer_identity.recipient();
+    let vault = Vault::open(&ctx.config_dir)?;
     let mut affected_groups = Vec::new();
     let mut exposed_secrets = Vec::new();
+
+    // Determine affected groups from authentic decrypted ciphertext. Preflight
+    // every group so any failure aborts before durable mutation.
     for group in vault.groups()? {
-        let readers = vault.readers(&group)?;
-        if !readers.contains(&target.recipient) {
-            continue;
+        vault.ensure_pair(&group)?;
+        let view = match vault.group_view(&group, &authorizer_identity) {
+            Ok(view) => view,
+            Err(ref err) if vault::is_not_a_recipient(err) => {
+                if shared_key {
+                    continue;
+                }
+                return Err(MusterError::Security(format!(
+                    "the authorizer is not a reader of secret group '{group}'; revoke with --recovery-key-stdin"
+                )));
+            }
+            Err(err) => return Err(err),
+        };
+        if view.readers.contains(&target_recipient) {
+            for secret_name in view.secrets {
+                exposed_secrets.push(json!({
+                    "group": group,
+                    "name": secret_name,
+                    "reference": format!("native://{group}/{secret_name}"),
+                }));
+            }
+            affected_groups.push(group);
         }
-        if !shared_key && !readers.contains(&authorizer) {
-            return Err(MusterError::Security(format!(
-                "the authorizer is not a reader of secret group '{group}'; revoke with --recovery-key"
-            )));
-        }
-        for secret in vault.list(&group)? {
-            exposed_secrets.push(json!({
-                "group": group,
-                "name": secret.name,
-                "reference": format!("native://{group}/{}", secret.name),
-            }));
-        }
-        affected_groups.push(group);
     }
-    let advice = "Rotate every exposed secret (e.g. `muster secret rotate <group>/<name>`). \
-        Revocation only protects future secrets: it cannot recover or erase values \
-        the machine already downloaded or decrypted.";
+
+    let advice = "Rotate every exposed secret (e.g. `muster secret rotate <group>/<name>`).         Revocation only protects future secrets: it cannot recover or erase values         the machine already downloaded or decrypted.";
 
     if ctx.dry_run {
         return Ok(json!({
             "dry_run": true,
             "revoked": name,
-            "recipient": target.recipient,
+            "recipient": target_recipient,
             "affected_groups": affected_groups,
             "exposed_secrets": exposed_secrets,
             "rotation_advice": advice,
         }));
     }
 
-    manifest.machines.remove(name);
-    crate::team::forget_machine(&mut manifest, name);
-    manifest.save(&ctx.config_dir)?;
-
+    // Rekey every affected group BEFORE modifying or saving the manifest.
+    // Everything below is staged in a shadow copy and published as one
+    // recoverable transaction (see `revocation_tx`).
+    crate::fleet_state::ensure_not_behind_pin(&ctx.config_dir, &ctx.state_dir, "commit on top of")?;
+    let txn = crate::revocation_tx::Txn::begin(ctx)?;
+    let shadow = txn.dir().to_path_buf();
+    drop(vault);
+    let mut vault = Vault::open(&shadow)?.with_revoked([target_recipient.clone()]);
     let mut reencrypted_groups = Vec::new();
     if shared_key {
         ctx.diag(Diagnostic::new(
@@ -130,10 +173,32 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         ));
     } else {
         for group in &affected_groups {
-            let mut readers: Vec<String> = vault
-                .readers(group)?
+            let view = vault.group_view(group, &authorizer_identity)?;
+            // If the sidecar was tampered to drop the target, restore it to the authentic
+            // ciphertext recipients so read_verified_readers validates the authentic state.
+            let meta_path = shadow.join("vault").join(format!("{group}.meta.json"));
+            if let Ok(text) = std::fs::read_to_string(&meta_path) {
+                if let Ok(mut meta) = serde_json::from_str::<serde_json::Value>(&text) {
+                    let sidecar_recs: std::collections::BTreeSet<_> = meta["recipients"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|v| v.as_str())
+                        .collect();
+                    let authentic_recs: std::collections::BTreeSet<_> =
+                        view.readers.iter().map(String::as_str).collect();
+                    if sidecar_recs != authentic_recs {
+                        meta["recipients"] = serde_json::json!(view.readers);
+                        if let Ok(fixed) = serde_json::to_string_pretty(&meta) {
+                            let _ = crate::vault::write_atomic(&meta_path, fixed.as_bytes());
+                        }
+                    }
+                }
+            }
+            let mut readers: Vec<String> = view
+                .readers
                 .into_iter()
-                .filter(|r| r != &target.recipient)
+                .filter(|r| r != &target_recipient && !manifest.revoked_recipients.contains(r))
                 .collect();
             if let Some(recovery) = &manifest.recovery {
                 if !readers.contains(&recovery.recipient) {
@@ -144,12 +209,22 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
             reencrypted_groups.push(group.clone());
         }
     }
-    EnrollmentRequest::remove(&ctx.config_dir, name)?;
 
-    git::commit_if_configured(
-        &ctx.config_dir,
-        &format!("feat(fleet): revoke machine {name}"),
-    )?;
+    // Rekeying succeeded: now update and persist the manifest.
+    if !manifest.revoked_recipients.contains(&target_recipient) {
+        manifest.revoked_recipients.push(target_recipient.clone());
+    }
+    if let Some(key) = manifest.machines.remove(name).and_then(|m| m.signing_key) {
+        if !manifest.revoked_signing_keys.contains(&key) {
+            manifest.revoked_signing_keys.push(key);
+        }
+    }
+    crate::team::forget_machine(&mut manifest, name);
+    manifest.save(&shadow)?;
+
+    let _ = EnrollmentRequest::remove(&shadow, name);
+
+    txn.commit(ctx, &format!("feat(fleet): revoke machine {name}"))?;
     if git::has_remote(&ctx.config_dir) {
         if let Err(e) = git::push(&ctx.config_dir) {
             ctx.diag(Diagnostic::new(
@@ -172,7 +247,7 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
 
     Ok(json!({
         "revoked": name,
-        "recipient": target.recipient,
+        "recipient": target_recipient,
         "reencrypted_groups": reencrypted_groups,
         "exposed_secrets": exposed_secrets,
         "rotation_advice": advice,

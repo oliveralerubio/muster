@@ -102,6 +102,8 @@ pub(super) fn approve_with_identity(
         )));
     }
     let mut req = EnrollmentRequest::load(&ctx.config_dir, name)?;
+    // Approvals are given against, and only count for, the current fleet state.
+    let state_hash = crate::fleet_state::current_hash(&ctx.config_dir)?;
 
     // Authorization: either via caller machine identity or via recovery key.
     let by_recovery = recovery.is_some();
@@ -133,11 +135,24 @@ pub(super) fn approve_with_identity(
     };
 
     // Team mode: only admins approve machines, and nobody for themselves.
+    if manifest.revoked_recipients.contains(&req.recipient) {
+        return Err(MusterError::Security(format!(
+            "recipient '{}' has been revoked and cannot be approved",
+            req.recipient
+        )));
+    }
     let before = manifest;
     let role = proposal(params, "role", &mut req.role)?;
     let profile = proposal(params, "profile", &mut req.profile)?;
     let member = proposal(params, "member", &mut req.member)?;
     let team_mode = !before.members.is_empty() || member.is_some();
+    if team_mode && member.is_none() {
+        return Err(MusterError::Usage(
+            "in team mode a machine is approved for a member: pass --member <name> (an \
+             approved machine enrolled under no member would outlive that member's removal)"
+                .into(),
+        ));
+    }
     let actor = if team_mode && !by_recovery {
         Some(team::admin(&before, &ctx.state_dir)?)
     } else {
@@ -148,6 +163,7 @@ pub(super) fn approve_with_identity(
         name.to_string(),
         Machine {
             recipient: req.recipient.clone(),
+            signing_key: req.signing_key.clone(),
             platform: req.platform.clone(),
             muster_version: req.muster_version.clone(),
             agents: req.agents.clone(),
@@ -174,18 +190,95 @@ pub(super) fn approve_with_identity(
     // The recovery key is break-glass and counts as a full approval.
     let quorum = match &actor {
         Some(actor) => {
-            let admins: std::collections::BTreeSet<_> = team::members(&before)
-                .into_iter()
-                .filter(|(_, member)| {
-                    member.role == crate::manifest::Role::Admin
-                        && member.status == crate::manifest::MemberStatus::Active
+            let check = req.check_approvals(&before, state_hash.as_deref());
+            if check.legacy > 0 {
+                ctx.diag(crate::output::Diagnostic::new(
+                    crate::output::Severity::Warning,
+                    "legacy_approval_ignored",
+                    format!(
+                        "ignoring {} unsigned legacy approval(s); approvals must be signed by an admin key",
+                        check.legacy
+                    ),
+                ));
+            }
+            if check.invalid > 0 {
+                ctx.diag(crate::output::Diagnostic::new(
+                    crate::output::Severity::Warning,
+                    "invalid_approval_ignored",
+                    format!(
+                        "ignoring {} invalid approval(s) (altered request, unknown signer, wrong key, duplicate, or given against an older fleet state)",
+                        check.invalid
+                    ),
+                ));
+            }
+            if check.valid.iter().any(|a| a.member == actor.member) {
+                ctx.diag(crate::output::Diagnostic::new(
+                    crate::output::Severity::Error,
+                    "already_approved_by_caller",
+                    format!(
+                        "'{}' already approved this request; another admin must approve it",
+                        actor.member
+                    ),
+                ));
+                return Err(MusterError::Security(format!(
+                    "'{}' already approved this request; the same admin cannot count twice",
+                    actor.member
+                )));
+            }
+
+            let caller_machine = crate::machine::load_name(&ctx.state_dir)
+                .or_else(|| {
+                    let caller_id = Identity::load(&ctx.state_dir).ok()?;
+                    before
+                        .machines
+                        .iter()
+                        .find(|(_, m)| m.recipient == caller_id.recipient())
+                        .map(|(n, _)| n.clone())
                 })
-                .map(|(name, _)| name)
+                .ok_or_else(|| {
+                    MusterError::Security(
+                        "cannot identify local machine name to sign approval".into(),
+                    )
+                })?;
+            let signer = crate::signing::Signer::load_or_create(&ctx.state_dir)?;
+            let published = before
+                .machines
+                .get(&caller_machine)
+                .and_then(|m| m.signing_key.as_deref());
+            if published != Some(signer.public().as_str()) {
+                return Err(MusterError::Security(format!(
+                    "machine '{caller_machine}' does not publish this signing key in the fleet \
+                     manifest, so its approval cannot be verified; run a mutating muster command \
+                     on it as an admin to publish it"
+                )));
+            }
+            req.sign_approval(
+                &actor.member,
+                &caller_machine,
+                &signer,
+                state_hash.as_deref(),
+            )?;
+
+            let final_check = req.check_approvals(&before, state_hash.as_deref());
+            req.approvals = final_check
+                .valid
+                .into_iter()
+                .map(crate::fleet::ApprovalEntry::Signed)
                 .collect();
-            validate_recorded_approvals(&admins, &req.approvals)?;
-            let mut approvals = req.approvals.clone();
-            let quorum = team::add_approval(ctx, &before, &mut approvals, &actor.member)?;
-            req.approvals = approvals;
+            let quorum = team::Quorum {
+                received: req.approvals.len(),
+                required: before.required_approvals() as usize,
+            };
+            if !quorum.reached() {
+                ctx.diag(crate::output::Diagnostic::new(
+                    crate::output::Severity::Info,
+                    "approval_pending",
+                    format!(
+                        "{} of {} required approvals; waiting for another admin",
+                        quorum.received, quorum.required
+                    ),
+                ));
+            }
             quorum
         }
         None => team::Quorum {
@@ -197,7 +290,7 @@ pub(super) fn approve_with_identity(
         let result = json!({
             "machine": name,
             "status": "pending",
-            "approvals": req.approvals,
+            "approvals": req.approval_members(),
             "approvals_received": quorum.received,
             "approvals_required": quorum.required,
         });
@@ -246,6 +339,25 @@ pub(super) fn approve_with_identity(
     manifest.save(&ctx.config_dir)?;
     let reencrypted_groups = team::rekey(&mut vault, &changes, &approver_identity)?;
 
+    ctx.enrollments
+        .push(crate::fleet_state::EnrollmentEvidence {
+            name: name.to_string(),
+            recipient: req.recipient.clone(),
+            signing_key: req.signing_key.clone(),
+            member: req.member.clone(),
+            role: req.role.clone(),
+            profile: req.profile.clone(),
+            created_at: req.created_at.clone(),
+            nonce: req.nonce.clone(),
+            approvals: req
+                .approvals
+                .iter()
+                .filter_map(|a| match a {
+                    crate::fleet::ApprovalEntry::Signed(s) => Some(s.clone()),
+                    crate::fleet::ApprovalEntry::Legacy(_) => None,
+                })
+                .collect(),
+        });
     EnrollmentRequest::remove(&ctx.config_dir, name)?;
 
     let summary = format!("feat(fleet): approve machine {name}");
@@ -258,12 +370,12 @@ pub(super) fn approve_with_identity(
                 "recipient": req.recipient,
                 "member": member,
                 "reencrypted_groups": reencrypted_groups,
-                "approvals": req.approvals,
+                "approvals": req.approval_members(),
                 "approvals_received": quorum.received,
                 "approvals_required": quorum.required,
             }));
         }
-        None => git::commit_if_configured(&ctx.config_dir, &summary)?,
+        None => crate::trust::commit(ctx, &summary)?,
     };
 
     if git::has_remote(&ctx.config_dir) {

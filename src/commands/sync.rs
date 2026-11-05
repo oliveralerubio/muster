@@ -17,6 +17,20 @@ pub const SPEC: CommandSpec = CommandSpec {
     about: "Pull/push the config repo, then apply the desired state (backup, generation)",
     params: &[
         ParamSpec {
+            name: "expect-state",
+            about: "Payload SHA-256 (from `muster trust show` on a trusted machine) of the one fleet state this machine may take as its origin when it pins a fleet for the first time",
+            kind: ParamKind::String,
+            required: false,
+            positional: false,
+        },
+        ParamSpec {
+            name: "expect-signer",
+            about: "Full public key (musterpk1...) or full 256-bit fingerprint (SHA256:<64 hex>) the fleet signer must have when this machine pins the fleet for the first time",
+            kind: ParamKind::String,
+            required: false,
+            positional: false,
+        },
+        ParamSpec {
             name: "remote",
             about: "Set the git remote URL of the config repo (joins an existing fleet)",
             kind: ParamKind::String,
@@ -131,6 +145,16 @@ fn sync(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     } else {
         transport(ctx, params, true)?
     };
+    // A governance change is waiting for admin co-signatures: the pull above
+    // may bring them, but nothing is applied from the unaccepted state.
+    if ctx.governance_pending {
+        return Ok(json!({
+            "applied": false,
+            "governance_pending": true,
+            "transport": transport,
+            "skills_updated": skills_updated,
+        }));
+    }
     let global = target == engine::Target::Global;
     let plan = engine::plan(
         ctx,
@@ -179,7 +203,18 @@ fn transport(
     let mut pulled = Value::Null;
     if do_pull {
         ctx.progress("Pulling config repo…");
-        pulled = match git::pull(&ctx.config_dir)? {
+        let previous = git::head_commit_opt(&ctx.config_dir);
+        let pull_result = git::pull(&ctx.config_dir)?;
+        // Refuse (and undo) a pull that rolls the fleet back, forges its vault or
+        // changes its governance without a valid signature from an authorized signer.
+        let joined = matches!(pull_result, Pulled::Joined { .. });
+        crate::trust::verify_pulled(
+            ctx,
+            previous.as_deref(),
+            joined,
+            params.get_string("remote").is_some(),
+        )?;
+        pulled = match pull_result {
             Pulled::Empty => json!("remote_empty"),
             Pulled::Updated => json!("updated"),
             Pulled::Joined { backup } => {

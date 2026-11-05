@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::errors::MusterError;
 use crate::identity::Identity;
+use crate::manifest::{Manifest, VaultPolicy};
 use crate::secrets::SecretValue;
 
 const VAULT_DIR: &str = "vault";
@@ -90,6 +91,23 @@ pub struct Problem {
 pub struct Vault {
     dir: PathBuf,
     actor: Option<String>,
+    policy: Option<VaultPolicy>,
+}
+
+/// What `muster revoke` needs to know about a group, from its decrypted
+/// payload only (the plaintext sidecar is untrusted).
+pub struct GroupView {
+    /// Recipients the ciphertext is really encrypted for.
+    pub readers: Vec<String>,
+    /// Secret names held in the group.
+    pub secrets: Vec<String>,
+}
+
+const NOT_A_RECIPIENT: &str = "this machine is not a recipient of the secret group";
+
+/// Whether `err` means the identity is simply not a reader of the group.
+pub fn is_not_a_recipient(err: &MusterError) -> bool {
+    matches!(err, MusterError::Security(m) if m == NOT_A_RECIPIENT)
 }
 
 impl Vault {
@@ -97,7 +115,35 @@ impl Vault {
     pub fn open(config_dir: &Path) -> Result<Self, MusterError> {
         let dir = config_dir.join(VAULT_DIR);
         fs::create_dir_all(&dir).map_err(|e| io_err(&dir, e))?;
-        Ok(Self { dir, actor: None })
+        let policy = Manifest::vault_policy(config_dir)?;
+        Ok(Self {
+            dir,
+            actor: None,
+            policy,
+        })
+    }
+
+    /// Also refuse to encrypt to `recipients` (revoked in this operation but
+    /// not yet persisted in the manifest).
+    pub fn with_revoked(mut self, recipients: impl IntoIterator<Item = String>) -> Self {
+        self.policy
+            .get_or_insert_with(VaultPolicy::default)
+            .revoked
+            .extend(recipients);
+        self
+    }
+
+    /// Re-reads the recipient policy from the saved `muster.toml`, keeping any
+    /// revocations added with [`Vault::with_revoked`]. Call it after the
+    /// manifest changed on disk (a newly approved machine becomes authorized).
+    pub fn reload_policy(&mut self) -> Result<(), MusterError> {
+        let config_dir = self.dir.parent().unwrap_or(&self.dir).to_path_buf();
+        let extra = self.policy.take().map(|p| p.revoked).unwrap_or_default();
+        self.policy = Manifest::vault_policy(&config_dir)?;
+        if let Some(policy) = &mut self.policy {
+            policy.revoked.extend(extra);
+        }
+        Ok(())
     }
 
     /// Records `actor` (a machine name) as author of later adds and rotations.
@@ -118,9 +164,15 @@ impl Vault {
     ) -> Result<(), MusterError> {
         validate_segment("group", group)?;
         validate_segment("secret name", name)?;
-        let mut data = if self.age_path(group).exists() {
-            self.read(group, id)?
+        let mut data = if self.age_path(group).exists() || self.meta_path(group).exists() {
+            self.ensure_pair(group)?;
+            let data = self.read_verified_readers(group, id)?;
+            self.verify_recipients(group, &data.recipients)?;
+            self.verify_group_exact(group, &data.recipients)?;
+            data
         } else {
+            self.verify_recipients(group, recipients)?;
+            self.verify_group_membership(group, recipients)?;
             GroupData {
                 group: group.to_owned(),
                 recipients: recipients.to_vec(),
@@ -144,7 +196,7 @@ impl Vault {
                 updated_by: self.actor.clone(),
             },
         );
-        self.write(&data)
+        self.write(group, &data)
     }
 
     pub fn get(&self, group: &str, name: &str, id: &Identity) -> Result<SecretValue, MusterError> {
@@ -163,7 +215,9 @@ impl Vault {
         value: SecretValue,
         id: &Identity,
     ) -> Result<(), MusterError> {
-        let mut data = self.read(group, id)?;
+        let mut data = self.read_verified_readers(group, id)?;
+        self.verify_recipients(group, &data.recipients)?;
+        self.verify_group_exact(group, &data.recipients)?;
         let entry = data
             .secrets
             .get_mut(name)
@@ -172,15 +226,119 @@ impl Vault {
         entry.ciphertext_or_value = value.expose().to_owned();
         entry.updated_at = now();
         entry.updated_by = self.actor.clone();
-        self.write(&data)
+        self.write(group, &data)
     }
 
     pub fn remove(&mut self, group: &str, name: &str, id: &Identity) -> Result<(), MusterError> {
-        let mut data = self.read(group, id)?;
+        let mut data = self.read_verified_readers(group, id)?;
+        self.verify_recipients(group, &data.recipients)?;
+        self.verify_group_exact(group, &data.recipients)?;
         data.secrets
             .remove(name)
             .ok_or_else(|| not_found(group, name))?;
-        self.write(&data)
+        self.write(group, &data)
+    }
+
+    /// Verifies that both `<group>.age` and `<group>.meta.json` exist. Fails
+    /// closed with a Security error if either is missing, or an Operational
+    /// error if neither exists.
+    pub fn ensure_pair(&self, group: &str) -> Result<(), MusterError> {
+        validate_segment("group", group)?;
+        let age = self.age_path(group);
+        let meta = self.meta_path(group);
+        match (age.exists(), meta.exists()) {
+            (true, true) => Ok(()),
+            (false, false) => Err(MusterError::Operational(format!(
+                "secret group '{group}' does not exist"
+            ))),
+            (true, false) => Err(MusterError::Security(format!(
+                "vault group '{group}' is incomplete: missing metadata sidecar '{group}.meta.json'"
+            ))),
+            (false, true) => Err(MusterError::Security(format!(
+                "vault group '{group}' is incomplete: missing ciphertext '{group}.age'"
+            ))),
+        }
+    }
+
+    /// Authentic readers and secret names of `group` decrypted with `id`.
+    /// The plaintext sidecar is verified to exist but not trusted for readers.
+    pub fn group_view(&self, group: &str, id: &Identity) -> Result<GroupView, MusterError> {
+        self.ensure_pair(group)?;
+        let data = self.read(group, id)?;
+        let mut secrets: Vec<String> = data.secrets.keys().cloned().collect();
+        secrets.sort();
+        Ok(GroupView {
+            readers: data.recipients,
+            secrets,
+        })
+    }
+
+    /// Verifies that `recipients` contains no revoked key, and, when the
+    /// manifest defines fleet recipients, only known authorized keys.
+    fn verify_recipients(&self, group: &str, recipients: &[String]) -> Result<(), MusterError> {
+        let Some(policy) = &self.policy else {
+            return Ok(());
+        };
+        for r in recipients {
+            if policy.revoked.contains(r) {
+                return Err(MusterError::Security(format!(
+                    "recipient '{r}' has been revoked"
+                )));
+            }
+            if !policy.authorized.is_empty() && !policy.authorized.contains(r) {
+                return Err(MusterError::Security(format!(
+                    "recipient '{r}' is not authorized for group '{group}'"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// A reader may only re-encrypt `group` for the recipients the manifest
+    /// assigns to it (plus the recovery key), not for any fleet machine.
+    /// Without a manifest there is no governance to enforce.
+    fn verify_group_membership(
+        &self,
+        group: &str,
+        recipients: &[String],
+    ) -> Result<(), MusterError> {
+        let config_dir = self.dir.parent().unwrap_or(&self.dir);
+        if !config_dir.join(crate::manifest::FILE_NAME).exists() {
+            return Ok(());
+        }
+        let manifest = Manifest::load(config_dir)?;
+        let allowed = crate::team::group_recipients(&manifest, group);
+        for r in recipients {
+            if !allowed.contains(r) {
+                return Err(MusterError::Security(format!(
+                    "recipient '{r}' is not a reader of group '{group}' in muster.toml"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The recipients carried by a decrypted payload must be exactly what the
+    /// signed manifest assigns to `group` (plus the recovery key): a write
+    /// re-encrypts to that set, never to a set the payload brought along.
+    fn verify_group_exact(&self, group: &str, carried: &[String]) -> Result<(), MusterError> {
+        let config_dir = self.dir.parent().unwrap_or(&self.dir);
+        if !config_dir.join(crate::manifest::FILE_NAME).exists() {
+            return Ok(());
+        }
+        let manifest = Manifest::load(config_dir)?;
+        let expected: BTreeSet<String> = crate::team::group_recipients(&manifest, group)
+            .into_iter()
+            .collect();
+        let carried: BTreeSet<String> = carried.iter().cloned().collect();
+        if expected != carried {
+            return Err(MusterError::Security(format!(
+                "the recipients of secret group '{group}' differ from the readers muster.toml \
+                 assigns to it; nothing was written. Run `muster group rekey {group}` to \
+                 re-encrypt it for exactly the signed readers"
+            )));
+        }
+        Ok(())
     }
 
     /// Metadata for every secret in `group`, sorted by name. Needs no identity.
@@ -202,19 +360,27 @@ impl Vault {
         Ok(list)
     }
 
-    /// Names of every group in the vault, sorted. Needs no identity.
+    /// Names of every group in the vault, sorted. Enumerates the union of
+    /// `<group>.age` and `<group>.meta.json` so incomplete pairs are visible.
     pub fn groups(&self) -> Result<Vec<String>, MusterError> {
-        let entries = fs::read_dir(&self.dir).map_err(|e| io_err(&self.dir, e))?;
-        let mut groups = Vec::new();
+        let entries = match fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(io_err(&self.dir, e)),
+        };
+        let mut groups = BTreeSet::new();
         for entry in entries {
             let entry = entry.map_err(|e| io_err(&self.dir, e))?;
             let file = entry.file_name();
-            if let Some(group) = file.to_str().and_then(|f| f.strip_suffix(".meta.json")) {
-                groups.push(group.to_owned());
+            let file = file.to_string_lossy();
+            if let Some(group) = file
+                .strip_suffix(".meta.json")
+                .or_else(|| file.strip_suffix(".age"))
+            {
+                groups.insert(group.to_owned());
             }
         }
-        groups.sort();
-        Ok(groups)
+        Ok(groups.into_iter().collect())
     }
 
     /// Current recipients (readers) of `group`, from metadata. Needs no identity.
@@ -229,12 +395,15 @@ impl Vault {
         new_recipients: &[String],
         id: &Identity,
     ) -> Result<(), MusterError> {
+        self.verify_recipients(group, new_recipients)?;
+        self.verify_group_membership(group, new_recipients)?;
         let mut data = self.read_verified_readers(group, id)?;
         data.recipients = new_recipients.to_vec();
-        self.write(&data)
+        self.write(group, &data)
     }
 
     fn read_verified_readers(&self, group: &str, id: &Identity) -> Result<GroupData, MusterError> {
+        self.ensure_pair(group)?;
         let data = self.read(group, id)?;
         let meta = self.read_meta(group)?;
         if meta.group != group
@@ -370,19 +539,52 @@ impl Vault {
         }
         let armored = fs::read(&path).map_err(|e| io_err(&path, e))?;
         let plaintext = decrypt(&armored, id)?;
-        serde_json::from_slice(&plaintext).map_err(|e| MusterError::InvalidConfig {
-            message: format!("corrupt vault group: {e}"),
-            path: Some(path.display().to_string()),
-        })
+        let data: GroupData =
+            serde_json::from_slice(&plaintext).map_err(|e| MusterError::InvalidConfig {
+                message: format!("corrupt vault group: {e}"),
+                path: Some(path.display().to_string()),
+            })?;
+        // The ciphertext is untrusted input: bind it to the file it came from.
+        if data.group != group {
+            return Err(MusterError::Security(format!(
+                "vault group binding mismatch: '{group}.age' holds another group's data"
+            )));
+        }
+        for (key, entry) in &data.secrets {
+            if *key != entry.name || validate_segment("secret name", key).is_err() {
+                return Err(MusterError::Security(format!(
+                    "vault group '{group}' holds a secret whose name does not match its key"
+                )));
+            }
+        }
+        Ok(data)
     }
 
-    fn write(&self, data: &GroupData) -> Result<(), MusterError> {
+    /// Paths always derive from the caller's validated `group`, never from
+    /// the decrypted payload.
+    fn write(&self, group: &str, data: &GroupData) -> Result<(), MusterError> {
+        validate_segment("group", group)?;
+        if data.group != group {
+            return Err(MusterError::Security(format!(
+                "refusing to write group data for '{}' into '{group}'",
+                data.group
+            )));
+        }
+        if let Some(policy) = &self.policy {
+            for r in &data.recipients {
+                if policy.revoked.contains(r) {
+                    return Err(MusterError::Security(format!(
+                        "refusing to encrypt group '{group}' to revoked recipient '{r}'"
+                    )));
+                }
+            }
+        }
         let plaintext = Zeroizing::new(
             serde_json::to_vec(data)
                 .map_err(|e| MusterError::Operational(format!("cannot serialize group: {e}")))?,
         );
         write_atomic(
-            &self.age_path(&data.group),
+            &self.age_path(group),
             &encrypt(&plaintext, &data.recipients)?,
         )?;
         let meta = GroupMeta {
@@ -402,7 +604,7 @@ impl Vault {
         };
         let json = serde_json::to_vec_pretty(&meta)
             .map_err(|e| MusterError::Operational(format!("cannot serialize metadata: {e}")))?;
-        write_atomic(&self.meta_path(&data.group), &json)
+        write_atomic(&self.meta_path(group), &json)
     }
 }
 
@@ -441,9 +643,7 @@ fn decrypt(armored: &[u8], id: &Identity) -> Result<Zeroizing<Vec<u8>>, MusterEr
     let mut reader = decryptor
         .decrypt(std::iter::once(id.as_age() as &dyn age::Identity))
         .map_err(|e| match e {
-            age::DecryptError::NoMatchingKeys => {
-                MusterError::Security("this machine is not a recipient of the secret group".into())
-            }
+            age::DecryptError::NoMatchingKeys => MusterError::Security(NOT_A_RECIPIENT.into()),
             other => crypto_err(other),
         })?;
     let mut plaintext = Zeroizing::new(Vec::new());

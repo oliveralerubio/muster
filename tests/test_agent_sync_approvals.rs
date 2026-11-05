@@ -165,9 +165,9 @@ fn approval_detail_identifies_old_and_new_versions_source_and_checksum() {
 fn unattended_agent_approval_does_not_block_config_secrets_or_verified_skills() {
     let env = MusterEnv::new();
     init(&env);
-    write(
-        &env.config_dir().join("muster.toml"),
-        r#"version = 1
+    let mut manifest = std::fs::read_to_string(env.config_dir().join("muster.toml")).unwrap();
+    manifest.push_str(
+        r#"
 [agents]
 enabled = ["claude"]
 [agents.instructions]
@@ -182,6 +182,8 @@ TOKEN = "native://app/token"
 allow = ["claude"]
 "#,
     );
+    write(&env.config_dir().join("muster.toml"), &manifest);
+    ok(&env, &["trust", "resign", "--yes"]);
     env.run(&["secret", "add", "app/token", "--value-stdin", "--yes"])
         .write_stdin("test-token")
         .assert()

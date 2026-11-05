@@ -133,6 +133,18 @@ fn adds_a_remote_machine_end_to_end_with_muster_already_installed() {
     assert!(result["steps"].as_array().unwrap().len() >= 5, "{result}");
     assert!(result["applied"].is_boolean());
     assert!(!fleet.calls().contains("scp "), "{}", fleet.calls());
+    // The new host must be told which signer to trust (no blind TOFU).
+    let fingerprint = ok(&fleet.alice, &["trust", "show"])["fleet_state"]["signer"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        fleet
+            .calls()
+            .contains(&format!("--expect-signer '{fingerprint}'")),
+        "{}",
+        fleet.calls()
+    );
 
     // Alice's manifest lists bob (with the role) and the request is gone.
     let machines = ok(&fleet.alice, &["machine", "list"]).to_string();
@@ -256,4 +268,48 @@ fn a_remote_that_cannot_reach_the_repo_gets_a_credentials_hint() {
     let (out, envelope) = support::json(fleet.add_cmd(&["fakehost", "--name", "bob", "--yes"]));
     assert_eq!(out.status.code(), Some(1), "{}", envelope.raw);
     assert!(envelope.raw.to_string().contains("git access"));
+}
+
+#[test]
+fn machine_add_refuses_and_restores_when_pulled_remote_corrupts_fleet_state() {
+    let fleet = Fleet::new(true);
+    fleet.install_muster_on_bob();
+
+    // Custom ssh script: after enroll succeeds, injects a forged commit onto origin central.git
+    // that breaks fleet state verification.
+    let inject_script = script(
+        fleet._tools.path(),
+        "ssh_inject",
+        &format!(
+            r#"#!/bin/sh
+cmd="$5"
+case "$cmd" in
+  *"enroll"*)
+    env -i HOME="$R_HOME" XDG_CONFIG_HOME="$R_HOME/.config"        XDG_STATE_HOME="$R_HOME/.local/state" XDG_DATA_HOME="$R_HOME/.local/share"        XDG_CACHE_HOME="$R_HOME/.cache" PATH="$R_BIN:/usr/bin:/bin" sh -c "$cmd"
+    rc=$?
+    # Corrupt fleet.state.json directly on central.git
+    TMPGIT="$(mktemp -d)"
+    git clone --quiet "{central}" "$TMPGIT"
+    echo '{{"payload":{{"epoch":999}},"signature":"bad"}}' > "$TMPGIT/fleet.state.json"
+    (cd "$TMPGIT" && git add fleet.state.json && git -c user.name=x -c user.email=x@x commit -qm "poison" && git push --quiet)
+    rm -rf "$TMPGIT"
+    exit $rc
+    ;;
+  *) exec "{orig_ssh}" "$@" ;;
+esac
+"#,
+            central = fleet.remote.to_str().unwrap(),
+            orig_ssh = fleet.ssh.to_str().unwrap()
+        ),
+    );
+
+    let mut cmd = fleet.add_cmd(&["fakehost", "--name", "bob", "--role", "dev", "--yes"]);
+    cmd.env("MUSTER_SSH", &inject_script);
+    let (out, envelope) = support::json(cmd);
+    assert!(!out.status.success(), "{}", envelope.raw);
+    assert!(envelope.raw.to_string().contains("discarded"));
+
+    // Alice never approved bob
+    let machines = ok(&fleet.alice, &["machine", "list"]).to_string();
+    assert!(!machines.contains("bob"), "{machines}");
 }

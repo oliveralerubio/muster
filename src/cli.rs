@@ -32,10 +32,24 @@ where
     let spec = registry::find(&name).expect("parser is built from the registry");
     let globals = globals(&matches);
     if spec.name == crate::mcp::SPEC.name {
-        return crate::mcp::serve(globals);
+        let p = params(spec, sub);
+        let pinned = p.get_string("agent").map(str::to_owned);
+        return crate::mcp::serve(globals, pinned);
     }
     let (format, quiet) = (globals.format.unwrap_or(Format::Text), globals.quiet);
-    let (envelope, code) = execute(spec, globals, &params(spec, sub), true);
+    let mut p = params(spec, sub);
+    // `--expect-signer` / `MUSTER_EXPECT_SIGNER` apply to every command.
+    if p.get_string("expect-state").is_none() {
+        if let Some(state) = matches.get_one::<String>("expect-state") {
+            p.set("expect-state", Value::from(state.as_str()));
+        }
+    }
+    if p.get_string("expect-signer").is_none() {
+        if let Some(signer) = matches.get_one::<String>("expect-signer") {
+            p.set("expect-signer", Value::from(signer.as_str()));
+        }
+    }
+    let (envelope, code) = execute(spec, globals, &p, true);
     output::render(&envelope, format, quiet);
     code
 }
@@ -49,9 +63,15 @@ pub fn execute(
     params: &Params,
     interactive: bool,
 ) -> (Envelope, i32) {
-    execute_with(spec, globals, interactive, |ctx| {
-        (spec.handler)(ctx, params)
-    })
+    let expect_signer = params.get_string("expect-signer").map(str::to_owned);
+    let expect_state = params.get_string("expect-state").map(str::to_owned);
+    execute_with(
+        spec,
+        globals,
+        interactive,
+        (expect_signer, expect_state),
+        |ctx| (spec.handler)(ctx, params),
+    )
 }
 
 /// Shared envelope handling for web-only input that must never enter Params.
@@ -59,12 +79,40 @@ pub(crate) fn execute_with(
     spec: &'static CommandSpec,
     globals: Globals,
     interactive: bool,
+    (expect_signer, expect_state): (Option<String>, Option<String>),
     handler: impl FnOnce(&mut Context) -> Result<Value, MusterError>,
 ) -> (Envelope, i32) {
     let (result, mut diagnostics, failed) = match Context::new(globals) {
         Ok(mut ctx) => {
             ctx.is_tty &= interactive;
-            let result = handler(&mut ctx);
+            ctx.expect_signer = expect_signer;
+            ctx.expect_state = expect_state;
+            // One mutation at a time per machine, so a concurrent command can
+            // never clobber a live revocation stage or a half-written commit.
+            let lock = if spec.mutating && !ctx.dry_run {
+                let wait = if spec.name == "sync" {
+                    std::time::Duration::ZERO
+                } else {
+                    crate::lock::wait_budget()
+                };
+                crate::lock::acquire_for(&ctx.state_dir, wait).map(Some)
+            } else {
+                Ok(None)
+            };
+            let result = match lock {
+                // A scheduled sync yields to a running command instead of failing.
+                Err(MusterError::Operational(_)) if spec.name == "sync" => {
+                    ctx.diag(crate::output::Diagnostic::new(
+                        crate::output::Severity::Info,
+                        "sync_skipped_locked",
+                        "another muster command is running",
+                    ));
+                    Ok(serde_json::json!({"skipped": "locked", "applied": false}))
+                }
+                Err(e) => Err(e),
+                Ok(_held) => crate::trust::guard(&mut ctx, spec.name, spec.mutating)
+                    .and_then(|()| handler(&mut ctx)),
+            };
             (result, ctx.take_diagnostics(), ctx.failed())
         }
         Err(err) => (Err(err), Vec::new(), false),
@@ -109,6 +157,29 @@ pub fn command() -> Command {
                 .value_parser(["text", "json"])
                 .default_value("text")
                 .help("Output format")
+                .global(true),
+        )
+        .arg(
+            Arg::new("expect-signer")
+                .long("expect-signer")
+                .value_name("KEY")
+                .env("MUSTER_EXPECT_SIGNER")
+                .help(
+                    "Full public key (musterpk1...) or full SHA256 fingerprint the fleet \
+                     signer must have when this machine pins a fleet for the first time",
+                )
+                .global(true),
+        )
+        .arg(
+            Arg::new("expect-state")
+                .long("expect-state")
+                .value_name("SHA256")
+                .env("MUSTER_EXPECT_STATE")
+                .help(
+                    "Payload SHA-256 (from `muster trust show` on a trusted machine) of the \
+                     one fleet state this machine may take as its origin when it pins a fleet \
+                     for the first time",
+                )
                 .global(true),
         )
         .arg(flag(

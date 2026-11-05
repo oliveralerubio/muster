@@ -83,7 +83,12 @@ pub fn validate_proposal_path(path: &str) -> Result<PathBuf, MusterError> {
         match comp {
             std::path::Component::Normal(s) => {
                 let name = s.to_string_lossy();
-                if name.starts_with(".git") || name == "vault" || name == "proposals" {
+                if name.starts_with(".git")
+                    || name == "vault"
+                    || name == "proposals"
+                    || name == "enroll"
+                    || name == "fleet.state.json"
+                {
                     return Err(MusterError::Usage(format!(
                         "path '{path}' modifies protected area '{name}'"
                     )));
@@ -194,6 +199,25 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), MusterError> {
     Ok(())
 }
 
+/// A proposal (often written by an agent) may tune configuration, but never
+/// the security fields a signature protects: machines, members, groups,
+/// secret policies, provider destinations, MCP reveal grants. Those change
+/// through admin commands or `muster trust resign`, not through a proposal.
+fn ensure_no_governance_change(ctx: &Context, proposed: &Manifest) -> Result<(), MusterError> {
+    let current = Manifest::load(&ctx.config_dir)?;
+    if crate::fleet_state::governance_digest(&current)?
+        != crate::fleet_state::governance_digest(proposed)?
+    {
+        return Err(MusterError::Security(
+            "a proposal may not change governance fields of muster.toml (machines, members, \
+             groups, secret policies, providers, MCP reveal, recovery); edit them with an admin \
+             command or `muster trust resign`"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 fn create(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let rel_path = params
         .get_string("path")
@@ -209,7 +233,8 @@ fn create(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
 
     // If proposing muster.toml, validate that it parses.
     if clean_path == Path::new("muster.toml") {
-        Manifest::parse(contents, "muster.toml")?;
+        let proposed = Manifest::parse(contents, "muster.toml")?;
+        ensure_no_governance_change(ctx, &proposed)?;
     }
 
     let plan = plan_with_overrides(ctx, &[(&clean_path, contents)])?;
@@ -289,7 +314,8 @@ fn accept(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
             if rel == Path::new(crate::manifest::FILE_NAME) {
                 let text = fs::read_to_string(&entry)
                     .map_err(|e| MusterError::Operational(format!("{}: {e}", entry.display())))?;
-                Manifest::parse(&text, crate::manifest::FILE_NAME)?;
+                let proposed = Manifest::parse(&text, crate::manifest::FILE_NAME)?;
+                ensure_no_governance_change(ctx, &proposed)?;
             }
             let dest = ctx.config_dir.join(&rel);
             if let Some(parent) = dest.parent() {

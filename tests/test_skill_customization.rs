@@ -71,6 +71,8 @@ fn subscribed(extra_manifest: &str) -> (MusterEnv, tempfile::TempDir) {
         let mut text = std::fs::read_to_string(&path).unwrap();
         text.push_str(extra_manifest);
         std::fs::write(&path, text).unwrap();
+        // `agents apply` verifies the signed fleet state: sign the hand edit.
+        env.run(&["trust", "resign", "--yes"]).assert().success();
     }
     (env, up)
 }

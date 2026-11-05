@@ -295,6 +295,7 @@ fn adapter_apply_resolves_native_mcp_environment_without_persisting_plaintext_or
          [mcp.api]\ncommand = \"api-mcp\"\nenv = { API_KEY = \"native://app/api\", PLAIN = \"visible\" }\n",
     );
     std::fs::write(&manifest_path, manifest).unwrap();
+    env.run(&["trust", "resign", "--yes"]).assert().success();
 
     let (output, envelope) = env.run_json(&["--format", "json", "agents", "apply", "--yes"]);
     assert!(output.status.success(), "{}", envelope.raw);
@@ -370,6 +371,7 @@ fn unresolvable_mcp_secret_reports_typed_provider_code_and_is_not_written() {
          [mcp.api]\ncommand = \"api-mcp\"\nenv = { API_KEY = \"native://app/missing\" }\n",
     );
     std::fs::write(&manifest_path, manifest).unwrap();
+    env.run(&["trust", "resign", "--yes"]).assert().success();
     let (output, envelope) = env.run_json(&["--format", "json", "agents", "apply", "--yes"]);
     assert!(output.status.success(), "{}", envelope.raw);
     let text = envelope.raw.to_string();
@@ -517,6 +519,7 @@ fn secret_isolation_denies_by_default_to_agents() {
          [mcp.leaky]\ncommand = \"leaky-mcp\"\nenv = { TOKEN = \"env://GLOBAL_SECRET\" }\n",
     );
     std::fs::write(&manifest_path, manifest).unwrap();
+    env.run(&["trust", "resign", "--yes"]).assert().success();
 
     let (output, envelope) = apply_for(&env, "claude", &[("GLOBAL_SECRET", DENY_BY_DEFAULT_VALUE)]);
     assert!(output.status.success(), "{}", envelope.raw);
@@ -545,6 +548,7 @@ fn secret_isolation_injects_only_allowed_secrets_per_agent() {
          [mcp.github]\ncommand = \"api-mcp\"\nenv = { KEY = \"env://ANTHROPIC_API_KEY\" }\n",
     );
     std::fs::write(&manifest_path, manifest).unwrap();
+    env.run(&["trust", "resign", "--yes"]).assert().success();
 
     // Claude is in the allow list: the resolved secret lands in its config.
     let (claude_out, claude_env) =
@@ -588,6 +592,7 @@ fn secret_isolation_allows_human_cli_access() {
     // A policy entry with no `allow`: no agent may receive it.
     manifest.push_str("\n[secrets.\"native://app/api\"]\n");
     std::fs::write(&manifest_path, manifest).unwrap();
+    env.run(&["trust", "resign", "--yes"]).assert().success();
 
     let added = add(&env, "app/api", SEED);
     assert!(
@@ -621,6 +626,7 @@ fn secret_isolation_agent_at_project_grants_only_in_that_project() {
          [mcp.github]\ncommand = \"api-mcp\"\nenv = { TOKEN = \"env://REPO_TOKEN\" }\n",
     );
     std::fs::write(&manifest_path, manifest).unwrap();
+    env.run(&["trust", "resign", "--yes"]).assert().success();
 
     // In user/global scope, `claude@my-repo` does NOT grant to claude.
     let (global_out, global_env) =
@@ -746,6 +752,7 @@ fn concurrent_secret_requests_are_deduplicated_without_losing_state() {
         "\n[secrets.'env://MUSTER_CONCURRENT_KEY']\nallow = ['claude']\napproval = 'each'\n",
     );
     std::fs::write(path, text).unwrap();
+    env.run(&["trust", "resign", "--yes"]).assert().success();
     std::thread::scope(|scope| {
         let jobs: Vec<_> =
             (0..8)
@@ -786,4 +793,169 @@ fn concurrent_secret_requests_are_deduplicated_without_losing_state() {
             .count(),
         1
     );
+}
+
+#[test]
+fn secret_get_reveal_without_agent_enforces_policy_and_refuses_yes_alone() {
+    let env = initialized();
+    let path = env.config_dir().join("muster.toml");
+    let mut text = std::fs::read_to_string(&path).unwrap();
+    text.push_str("\n[secrets.'env://POLICY_KEY']\nallow = ['claude']\napproval = 'each'\n");
+    std::fs::write(&path, text).unwrap();
+    env.run(&["trust", "resign", "--yes"]).assert().success();
+
+    // Human runs `secret get --reveal --yes` without --agent: must fail
+    let out = env
+        .run(&[
+            "--format",
+            "json",
+            "secret",
+            "get",
+            "env://POLICY_KEY",
+            "--reveal",
+            "--yes",
+        ])
+        .env("POLICY_KEY", "super-secret-value-must-not-leak")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        out.status.code(),
+        Some(5),
+        "reveal without --agent must fail code 5 when policy set: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("super-secret-value-must-not-leak"));
+
+    // Also test with allow list only (approval = none)
+    let mut manifest: muster::manifest::Manifest =
+        muster::manifest::Manifest::load(&env.config_dir()).unwrap();
+    manifest
+        .secrets
+        .get_mut("env://POLICY_KEY")
+        .unwrap()
+        .approval = muster::manifest::SecretApproval::None;
+    manifest.save(&env.config_dir()).unwrap();
+
+    let out2 = env
+        .run(&[
+            "--format",
+            "json",
+            "secret",
+            "get",
+            "env://POLICY_KEY",
+            "--reveal",
+            "--yes",
+        ])
+        .env("POLICY_KEY", "super-secret-value-must-not-leak")
+        .output()
+        .unwrap();
+    assert_eq!(
+        out2.status.code(),
+        Some(5),
+        "reveal without --agent must fail code 5 when allow list set: {}",
+        String::from_utf8_lossy(&out2.stdout)
+    );
+    assert!(!String::from_utf8_lossy(&out2.stdout).contains("super-secret-value-must-not-leak"));
+}
+
+#[test]
+fn bitwarden_json_output_yields_only_the_named_field() {
+    let env = initialized();
+    env.fake_exe(
+        "bws",
+        r#"echo '{"key":"K-NAME","value":"V-SECRET-1","note":"N-NOTE-2","other":"O-3"}'"#,
+    );
+    let get = |reference: &str| {
+        env.run_json(&[
+            "--format", "json", "secret", "get", reference, "--reveal", "--yes",
+        ])
+    };
+    let (out, envelope) = get("bws://item/value");
+    assert!(out.status.success(), "{}", envelope.raw);
+    assert_eq!(envelope.result().as_str(), Some("V-SECRET-1"));
+    let (_, envelope) = get("bws://item/note");
+    assert_eq!(envelope.result().as_str(), Some("N-NOTE-2"));
+    let (out, envelope) = get("bws://item/missing");
+    assert!(!out.status.success());
+    let text = envelope.raw.to_string();
+    assert!(
+        !text.contains("V-SECRET-1") && !text.contains("N-NOTE-2"),
+        "{text}"
+    );
+}
+
+#[test]
+fn secret_get_reveal_refuses_when_allow_list_is_empty_or_manifest_is_corrupt() {
+    let env = initialized();
+    let path = env.config_dir().join("muster.toml");
+    let mut text = std::fs::read_to_string(&path).unwrap();
+    text.push_str(
+        "
+[secrets.'env://DENIED_KEY']
+allow = []
+",
+    );
+    std::fs::write(&path, text).unwrap();
+    env.run(&["trust", "resign", "--yes"]).assert().success();
+
+    // 1. allow = [] without --agent: must fail
+    let out = env
+        .run(&[
+            "--format",
+            "json",
+            "secret",
+            "get",
+            "env://DENIED_KEY",
+            "--reveal",
+            "--yes",
+        ])
+        .env("DENIED_KEY", "denied-secret-value")
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(5),
+        "reveal must fail: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("denied-secret-value"));
+
+    // 2. allow = [] with --agent: must fail
+    let out_agent = env
+        .run(&[
+            "--format",
+            "json",
+            "secret",
+            "get",
+            "env://DENIED_KEY",
+            "--agent",
+            "claude",
+            "--reveal",
+            "--yes",
+        ])
+        .env("DENIED_KEY", "denied-secret-value")
+        .output()
+        .unwrap();
+    assert_eq!(out_agent.status.code(), Some(5));
+    assert!(!String::from_utf8_lossy(&out_agent.stdout).contains("denied-secret-value"));
+
+    // 3. muster.toml has syntax error: must fail hard, not leak
+    std::fs::write(&path, "this is not valid toml = [[[").unwrap();
+    let out_corrupt = env
+        .run(&[
+            "--format",
+            "json",
+            "secret",
+            "get",
+            "env://DENIED_KEY",
+            "--reveal",
+            "--yes",
+        ])
+        .env("DENIED_KEY", "denied-secret-value")
+        .output()
+        .unwrap();
+    assert!(!out_corrupt.status.success());
+    assert!(!String::from_utf8_lossy(&out_corrupt.stdout).contains("denied-secret-value"));
 }

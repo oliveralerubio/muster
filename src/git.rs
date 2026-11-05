@@ -315,3 +315,114 @@ fn check(dir: &Path, args: &[&str]) -> Result<(), MusterError> {
         )))
     }
 }
+
+/// Undoes a pull that produced a state this machine refuses: back to `previous`,
+/// or, when the repo had no commits before the pull, back to an empty repo
+/// (the files the pull checked out are removed).
+pub fn restore_after_pull(dir: &Path, previous: Option<&str>) -> Result<(), MusterError> {
+    match previous {
+        Some(commit) => check(dir, &["reset", "--quiet", "--hard", commit]),
+        None => {
+            let listed = run(dir, &["ls-files", "-z"])?;
+            for rel in String::from_utf8_lossy(&listed.stdout).split('\0') {
+                if !rel.is_empty() {
+                    let _ = std::fs::remove_file(dir.join(rel));
+                }
+            }
+            check(dir, &["update-ref", "-d", "HEAD"])?;
+            check(
+                dir,
+                &["rm", "-r", "--cached", "--quiet", "--ignore-unmatch", "."],
+            )
+        }
+    }
+}
+
+/// The commit `HEAD` points at, or `None` for a repo without commits.
+pub fn head_commit_opt(dir: &Path) -> Option<String> {
+    if has_commits(dir) {
+        head_commit(dir).ok()
+    } else {
+        None
+    }
+}
+
+/// `path` as of `commit` (`git show <commit>:<path>`), if it existed.
+pub fn file_at(dir: &Path, commit: &str, path: &str) -> Option<String> {
+    let out = run(dir, &["show", &format!("{commit}:{path}")]).ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Every commit touching `path`, oldest first.
+pub fn commits_touching_oldest_first(dir: &Path, path: &str) -> Result<Vec<String>, MusterError> {
+    let out = run(dir, &["log", "--reverse", "--format=%H", "--", path])?;
+    if !out.status.success() {
+        return Err(MusterError::Security(format!(
+            "cannot read the history of {path}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect())
+}
+
+/// Up to `limit` newest commits touching `path`.
+pub fn commits_touching(dir: &Path, path: &str, limit: usize) -> Vec<String> {
+    let limit = format!("-n{limit}");
+    run(dir, &["log", "--format=%H", &limit, "--", path])
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The commit whose `fleet.state.json` has payload hash `payload_hash`
+/// (newest first among the last 100 commits touching it).
+pub fn commit_with_state(dir: &Path, payload_hash: &str) -> Option<String> {
+    commits_touching(dir, crate::fleet_state::STATE_FILE, 100)
+        .into_iter()
+        .find(|commit| {
+            file_at(dir, commit, crate::fleet_state::STATE_FILE)
+                .and_then(|text| serde_json::from_str::<crate::fleet_state::FleetState>(&text).ok())
+                .and_then(|state| state.payload_hash().ok())
+                .as_deref()
+                == Some(payload_hash)
+        })
+}
+
+/// Makes `paths` (index and working tree) match `commit` exactly, deleting
+/// tracked files that `commit` does not have. Non-existent paths in `commit`
+/// are cleanly removed from the index and working tree.
+pub fn restore_paths(dir: &Path, commit: &str, paths: &[&str]) -> Result<(), MusterError> {
+    let source = format!("--source={commit}");
+    for path in paths {
+        // If path exists in the commit, restore it. Otherwise remove it if present.
+        let has_path = run(dir, &["cat-file", "-e", &format!("{commit}:{path}")])
+            .is_ok_and(|o| o.status.success());
+        if has_path {
+            check(
+                dir,
+                &[
+                    "restore",
+                    source.as_str(),
+                    "--staged",
+                    "--worktree",
+                    "--",
+                    path,
+                ],
+            )?;
+        } else if dir.join(path).exists() {
+            let _ = check(dir, &["rm", "-rf", "--quiet", "--ignore-unmatch", path]);
+        }
+    }
+    Ok(())
+}

@@ -338,10 +338,17 @@ fn add(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     if has_config {
         steps.push(format!("{host} already has a config repo; kept as is"));
     } else {
+        // The new host has no pin yet: tell it which signer to trust so it does
+        // not take whatever the remote serves first (trust on first use).
+        let signer = match crate::fleet_state::FleetState::load(&ctx.config_dir)? {
+            Some(state) => state.payload.signer,
+            None => crate::signing::Signer::load_or_create(&ctx.state_dir)?.public(),
+        };
         remote.muster_ok(
             "joining the config repo",
             &format!(
-                "{bin} --format json sync --remote {} --pull",
+                "{bin} --format json sync --expect-signer {} --remote {} --pull",
+                shell_quote(&signer),
                 shell_quote(&url)
             ),
             &format!("{host} needs its own git access to {url} (deploy key, ssh agent or credential helper); Muster does not copy credentials"),
@@ -370,7 +377,12 @@ fn add(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     ));
 
     // f. fetch the request, check it is the one the host reported, approve, push.
-    crate::git::pull(&ctx.config_dir)?;
+    // Verify what the pull brought in before trusting any of it (the remote
+    // can serve a forged request or fleet state).
+    let previous = crate::git::head_commit_opt(&ctx.config_dir);
+    let pulled = crate::git::pull(&ctx.config_dir)?;
+    let joined = matches!(pulled, crate::git::Pulled::Joined { .. });
+    crate::trust::verify_pulled(ctx, previous.as_deref(), joined, false)?;
     let request = EnrollmentRequest::load(&ctx.config_dir, &name)?;
     if request.recipient != recipient {
         return Err(MusterError::Security(format!(
@@ -557,9 +569,11 @@ fn list(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
 
     // Pending enrollment requests waiting for approval (or rejection).
     let approvals_required = manifest.required_approvals() as usize;
+    let state_hash = crate::fleet_state::current_hash(&ctx.config_dir)?;
     let pending: Vec<Value> = EnrollmentRequest::pending(&ctx.config_dir)?
         .into_iter()
         .map(|req| {
+            let check = req.check_approvals(&manifest, state_hash.as_deref());
             json!({
                 "name": req.name,
                 "recipient": req.recipient,
@@ -567,8 +581,8 @@ fn list(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
                 "version": req.muster_version,
                 "agents": req.agents,
                 "created_at": req.created_at,
-                "approvals": req.approvals,
-                "approvals_received": req.approvals.len(),
+                "approvals": check.valid.iter().map(|a| a.member.clone()).collect::<Vec<_>>(),
+                "approvals_received": check.valid.len(),
                 "approvals_required": approvals_required,
                 "role": req.role,
                 "profile": req.profile,
@@ -602,10 +616,7 @@ fn rm(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
             return Ok(json!({ "dry_run": true, "removed": name, "pending_request": pending }));
         }
         let _ = EnrollmentRequest::remove(&ctx.config_dir, name);
-        crate::git::commit_if_configured(
-            &ctx.config_dir,
-            &format!("chore(fleet): remove machine record {name}"),
-        )?;
+        crate::trust::commit(ctx, &format!("chore(fleet): remove machine record {name}"))?;
         Ok(json!({
             "removed": name,
             "pending_request": pending,
@@ -696,7 +707,7 @@ fn assign(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     match &actor {
         Some(actor) => team::commit(ctx, actor, &summary)?,
         None => {
-            crate::git::commit_if_configured(&ctx.config_dir, &summary)?;
+            crate::trust::commit(ctx, &summary)?;
         }
     }
     Ok(result)
