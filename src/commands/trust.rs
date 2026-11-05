@@ -119,15 +119,16 @@ fn run_resign(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> 
         }
     };
 
-    // The signer must be an admin, both of this manifest and of the pinned
-    // fleet, before anything is sealed (a recovery key counts via the manifest).
+    // The signer must be an admin under the last state this machine accepted
+    // (the pin decides who may change governance); with no pin, under the
+    // manifest. Checked before anything is sealed.
     let public = signer.public();
-    let (admins, _) = fleet_state::signer_sets(&manifest);
     let pin = TrustAnchor::load(&ctx.state_dir)?;
-    let pinned_ok = pin
-        .as_ref()
-        .is_none_or(|p| p.admins.is_empty() || p.admins.contains(&public));
-    if !admins.contains(&public) || !pinned_ok {
+    let is_admin = match &pin {
+        Some(p) => p.admins.contains(&public),
+        None => fleet_state::signer_sets(&manifest).0.contains(&public),
+    };
+    if !is_admin {
         return Err(MusterError::Security(format!(
             "cannot re-sign: signer {} is not an admin of this fleet",
             signing::fingerprint(&public)
