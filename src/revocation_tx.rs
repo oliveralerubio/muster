@@ -422,6 +422,7 @@ mod tests {
             muster_version: "0.1.0".into(),
             agents: Vec::new(),
             last_sync: None,
+            host: None,
             role: None,
             profile: None,
             applied_profile: None,

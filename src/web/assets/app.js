@@ -224,15 +224,23 @@ function diagnostics(data) {
   return list.length ? diagnosticsTable(list) : null;
 }
 
-function table(headers, rows, empty, cls) {
+function table(headers, rows, empty, cls, widths) {
   if (!rows.length) return empty instanceof Node ? empty : el("p", { class: "empty" }, empty || "Nothing to show.");
   const isActions = (cell) => cell instanceof Node
     && (cell.tagName === "BUTTON" || (cell.getAttribute("class") || "").includes("actions"));
   const label = headers.filter(Boolean).join(", ");
-  return el("div", { class: "table-wrap" + (cls ? " " + cls : ""), role: "region", "aria-label": label },
+  // Column widths travel as wN classes on the header cells (the panel's CSP
+  // blocks inline styles, so style="" and <col style> are silently dropped),
+  // switching the table to fixed layout like .fleet-table: auto layout gave
+  // every column its one-line content width, overflowed the container and
+  // crushed the Actions column to a sliver on wide fleets.
+  const fixed = Array.isArray(widths) && widths.length === headers.length;
+  return el("div", { class: "table-wrap" + (cls ? " " + cls : "") + (fixed ? " fixed-cols" : ""), role: "region", "aria-label": label },
     el("table", {},
-      el("thead", {}, el("tr", {}, headers.map((h) =>
-        el("th", { scope: "col" }, h || el("span", { class: "sr-only" }, "Actions"))))),
+      el("thead", {}, el("tr", {}, headers.map((h, i) => {
+        const attrs = fixed ? { scope: "col", class: "w" + widths[i] } : { scope: "col" };
+        return el("th", attrs, h || el("span", { class: "sr-only" }, "Actions"));
+      }))),
       el("tbody", {}, rows.map((row) => el("tr", {}, row.map((cell) =>
         el("td", isActions(cell) ? { class: "cell-actions" } : {}, cell)))))));
 }
@@ -468,11 +476,12 @@ function sectionHead(title, id, badge) {
 }
 
 function machineIdentity(m, current) {
+  const sub = [m.platform || "unknown platform", m.host ? `ssh ${m.host}` : null].filter(Boolean).join(" · ");
   return el("div", { class: "name-cell" },
     el("div", { class: "name-line" },
       el("span", { class: "board-name" }, m.name),
       current ? el("span", { class: "badge info" }, "this machine") : null),
-    el("code", { class: "data muted" }, m.platform || "unknown platform"));
+    el("code", { class: "data muted" }, sub));
 }
 
 const views = {
@@ -555,17 +564,20 @@ const views = {
         flagged ? `${flagged} ${flagged === 1 ? "diagnostic" : "diagnostics"}` : null].filter(Boolean).join(", ")
       : "Fleet converged";
 
+    const hasRemote = machines.some((m) => !m.is_current);
     const fleet = machines.length
-      ? table(["Machine", "Version", "Status", "Last sync"],
+      ? table(["Machine", "Version", "Status", "Last sync", hasRemote ? "Actions" : null].filter((h) => h !== null),
         machines.map((m) => [
           machineIdentity(m, m.is_current),
           el("code", { class: "data" }, m.version || "—"),
           machineState(m.status),
-          lastSyncCell(m.last_sync, m.status)]))
+          lastSyncCell(m.last_sync, m.status),
+          hasRemote ? (m.is_current ? "" : button("Sync", () => act(`Sync machine ${m.name} over SSH now?`, "machine/sync", { name: m.name }))) : null,
+        ].filter((c) => c !== null)))
       : el("div", { class: "empty-state" },
         el("p", {}, "No machines in fleet. Run ", el("code", {}, "muster machine add"), " to enroll one, or open the Machines tab."),
         button("Open Machines", () => show("machines")));
-    if (machines.length) fleet.setAttribute("class", "table-wrap board fleet-table");
+    if (machines.length) fleet.setAttribute("class", "table-wrap board fleet-table" + (hasRemote ? " actions-end" : ""));
 
     const statusPill = state(s.enabled ? "live" : "idle", s.enabled ? "On" : "Off");
     if (s.enabled && s.backend) statusPill.setAttribute("title", `Runs in the background using ${s.backend}`);
@@ -598,6 +610,12 @@ const views = {
         attentionBlocks.length
           ? attentionBlocks
           : el("p", { class: "quiet", role: "status" }, "Nothing needs attention: no pending approvals, no drift and no diagnostics."));
+    const manualDesc = hasRemote
+      ? "Get the latest shared setup, apply it to this machine and sync reachable fleet machines over SSH."
+      : "Get the latest shared setup and apply it to this machine now.";
+    const manualPrompt = hasRemote
+      ? "Sync this machine and reachable fleet machines now? Muster will apply the latest shared setup here and over SSH."
+      : "Sync this machine now? Muster will get the latest shared setup and apply it.";
     render("Dashboard", [],
       el("dl", { class: "plates", "aria-label": "Fleet status" },
         plate("Machines", String(machines.length), fleetSub),
@@ -611,8 +629,8 @@ const views = {
       el("section", { class: "ops", "aria-labelledby": "ops-title" },
         el("div", { class: "ops-row ops-manual" },
           el("div", { class: "ops-info" },
-            el("span", { class: "ops-desc" }, "Get the latest shared setup and apply it to this machine now.")),
-          button("Sync now", () => act("Sync this machine now? Muster will get the latest shared setup and apply it.", "sync"), "primary")),
+            el("span", { class: "ops-desc" }, manualDesc)),
+          button("Sync now", () => act(manualPrompt, "sync"), "primary")),
         el("div", { class: "ops-row ops-periodic" },
           el("div", { class: "ops-info" },
             el("div", { class: "ops-heading" }, statusPill, el("span", { class: "ops-title" }, statusText))),
@@ -730,20 +748,26 @@ const views = {
     const assignMachine = selectInput("Machine", machines.map((m) => m.name));
     const assignRole = textInput("Role", { placeholder: "role (optional)" });
     const assignProfile = textInput("Profile", { placeholder: "profile (optional)" });
+    const assignHost = textInput("SSH host", { placeholder: "user@host or alias (optional)" });
     const assignForm = machines.length
       ? el("div", { class: "skill-form" },
-        labelled("Machine", assignMachine), labelled("Role", assignRole), labelled("Profile", assignProfile),
+        labelled("Machine", assignMachine), labelled("Role", assignRole), labelled("Profile", assignProfile), labelled("SSH host", assignHost),
         button("Assign", () => {
           const body = { name: assignMachine.value };
           if (assignRole.value.trim()) body.role = assignRole.value.trim();
           if (assignProfile.value.trim()) body.profile = assignProfile.value.trim();
-          if (!body.role && !body.profile) return toast("Enter a role or a profile to assign.");
-          return act(`Assign ${[body.role && "role " + body.role, body.profile && "profile " + body.profile].filter(Boolean).join(" and ")} to ${body.name}?`, "machine/assign", body);
+          if (assignHost.value.trim()) body.host = assignHost.value.trim();
+          if (!body.role && !body.profile && !body.host) return toast("Enter a role, profile or SSH host to assign.");
+          return act(`Assign ${[body.role && "role " + body.role, body.profile && "profile " + body.profile, body.host && "SSH host " + body.host].filter(Boolean).join(" and ")} to ${body.name}?`, "machine/assign", body);
         }, "primary"))
       : null;
+    const headers = ["Machine", "Version", hasRole ? "Role" : null, hasProfile ? "Profile" : null, "Agents", "Status", "Last sync", hasActions ? "Actions" : null].filter((h) => h !== null);
+    // Percentages for the fixed column layout; Actions fits Sync + Remove side by side.
+    const colPct = { Machine: 20, Version: 8, Role: 10, Profile: 12, Agents: 30, Status: 12, "Last sync": 14, Actions: 16 };
+    const widths = headers.map((h) => colPct[h]);
     render("Machines", [enroll],
       sectionHead("Enrolled"),
-      table(["Machine", "Version", hasRole ? "Role" : null, hasProfile ? "Profile" : null, "Agents", "Status", "Last sync", hasActions ? "Actions" : null].filter((h) => h !== null),
+      table(headers,
         machines.map((m) => [nameCell(m, m.is_current),
           el("code", { class: "data" }, m.version || "—"),
           hasRole ? (m.role || el("span", { class: "muted" }, "—")) : null,
@@ -751,9 +775,12 @@ const views = {
           tags(m.agents),
           statusCell(m),
           lastSyncCell(m.last_sync, m.status),
-          hasActions ? (m.is_current ? "" : button("Remove", () => act(`Remove machine ${m.name}?`, "machine/rm", { name: m.name }), "danger")) : null].filter((c) => c !== null)),
+          hasActions ? (m.is_current ? "" : el("span", { class: "actions" },
+            button("Sync", () => act(`Sync machine ${m.name} over SSH now?`, "machine/sync", { name: m.name })),
+            button("Remove", () => act(`Remove machine ${m.name}?`, "machine/rm", { name: m.name }), "danger"))) : null].filter((c) => c !== null)),
         emptyCard("No machines enrolled yet", "Run ", el("code", {}, "muster init"), " on this machine, then ", el("code", {}, "muster machine add"), " to enroll more."),
-        "machines-table" + (!hasRole && !hasProfile ? " machines-basic" : "") + (hasActions ? " actions-end" : "")),
+        "machines-table" + (hasActions ? " actions-end" : ""),
+        widths),
       assignForm ? [sectionHead("Assign role or profile"), assignForm] : null,
       sectionHead("Pending enrollment requests"),
       el("p", { class: "section-desc" }, "Machines waiting for approval before they can join."),

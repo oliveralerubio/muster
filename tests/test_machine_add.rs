@@ -313,3 +313,108 @@ esac
     let machines = ok(&fleet.alice, &["machine", "list"]).to_string();
     assert!(!machines.contains("bob"), "{machines}");
 }
+
+#[test]
+fn sync_propagates_to_remote_fleet_machines_and_updates_convergence() {
+    let fleet = Fleet::new(true);
+    fleet.install_muster_on_bob();
+    let (out, envelope) =
+        support::json(fleet.add_cmd(&["fakehost", "--name", "bob", "--role", "dev", "--yes"]));
+    assert!(out.status.success(), "{}", envelope.raw);
+
+    // Immediately after `machine add`, bob's first sync pushed its applied_profile
+    // and last_sync back to origin and alice pulled it, so bob is already `active`.
+    let listed = ok(&fleet.alice, &["machine", "list"]);
+    let bob_row = listed["machines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["name"] == "bob")
+        .expect("bob is listed");
+    assert_eq!(bob_row["status"], "active", "{bob_row}");
+    assert_eq!(bob_row["host"], "fakehost", "{bob_row}");
+    assert!(bob_row["last_sync"].is_string(), "{bob_row}");
+
+    // Alice changes the shared instructions: before syncing, bob is drifted.
+    std::fs::write(
+        fleet.alice.config_dir().join("AGENTS.md"),
+        "Updated fleet instructions.\n",
+    )
+    .unwrap();
+    let mut manifest =
+        std::fs::read_to_string(fleet.alice.config_dir().join("muster.toml")).unwrap();
+    manifest.push_str(
+        "\n[agents]\nenabled = [\"claude\"]\n[agents.instructions]\nsource = \"AGENTS.md\"\n",
+    );
+    std::fs::write(fleet.alice.config_dir().join("muster.toml"), manifest).unwrap();
+
+    let before = ok(&fleet.alice, &["status"]);
+    let bob_before = before["machines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["name"] == "bob")
+        .unwrap();
+    assert_eq!(bob_before["status"], "drifted", "{bob_before}");
+
+    // Running `muster sync` on alice pushes the change, SSHes into bob to run
+    // `muster sync`, and pulls bob's updated applied_profile back.
+    let mut sync_cmd = fleet.alice.run(&["--format", "json", "sync", "--yes"]);
+    sync_cmd
+        .env("MUSTER_SSH", &fleet.ssh)
+        .env("MUSTER_SCP", &fleet.scp)
+        .env("FAKE_LOG", &fleet.log)
+        .env("R_HOME", fleet.bob.path())
+        .env("R_BIN", &fleet.bob.bin);
+    let (sync_out, sync_env) = support::json(sync_cmd);
+    assert!(sync_out.status.success(), "{}", sync_env.raw);
+    assert_eq!(sync_env.result()["fleet"][0]["machine"], "bob");
+    assert_eq!(sync_env.result()["fleet"][0]["ok"], true);
+
+    let after = ok(&fleet.alice, &["status"]);
+    let bob_after = after["machines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["name"] == "bob")
+        .unwrap();
+    assert_eq!(bob_after["status"], "active", "{bob_after}");
+    assert!(
+        after["drift"]["machines"].as_array().unwrap().is_empty(),
+        "no machine drift should remain: {after}"
+    );
+}
+
+#[test]
+fn machine_sync_command_syncs_named_remote_machine_over_ssh() {
+    let fleet = Fleet::new(true);
+    fleet.install_muster_on_bob();
+    let (out, envelope) = support::json(fleet.add_cmd(&["fakehost", "--name", "bob", "--yes"]));
+    assert!(out.status.success(), "{}", envelope.raw);
+
+    let mut manifest =
+        std::fs::read_to_string(fleet.alice.config_dir().join("muster.toml")).unwrap();
+    manifest.push_str("\n[agents.models]\nclaude = \"sonnet\"\n");
+    std::fs::write(fleet.alice.config_dir().join("muster.toml"), manifest).unwrap();
+
+    let mut cmd = fleet
+        .alice
+        .run(&["--format", "json", "machine", "sync", "bob", "--yes"]);
+    cmd.env("MUSTER_SSH", &fleet.ssh)
+        .env("MUSTER_SCP", &fleet.scp)
+        .env("FAKE_LOG", &fleet.log)
+        .env("R_HOME", fleet.bob.path())
+        .env("R_BIN", &fleet.bob.bin);
+    let (sync_out, sync_env) = support::json(cmd);
+    assert!(sync_out.status.success(), "{}", sync_env.raw);
+    assert_eq!(sync_env.result()["synced"], 1, "{}", sync_env.raw);
+
+    let after = ok(&fleet.alice, &["status"]);
+    let bob_after = after["machines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["name"] == "bob")
+        .unwrap();
+    assert_eq!(bob_after["status"], "active", "{bob_after}");
+}

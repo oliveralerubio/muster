@@ -62,8 +62,6 @@ pub fn load_name(state_dir: &Path) -> Option<String> {
 }
 
 /// Timestamp of this machine's last sync, from `<state_dir>/sync-status.json`.
-/// The manifest's per-machine `last_sync` is never written, so this is the
-/// only record of a sync on the current machine.
 pub fn local_last_sync(state_dir: &Path) -> Option<String> {
     let bytes = fs::read(state_dir.join("sync-status.json")).ok()?;
     let status: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
@@ -71,6 +69,21 @@ pub fn local_last_sync(state_dir: &Path) -> Option<String> {
         .as_str()
         .filter(|ts| !ts.is_empty())
         .map(str::to_owned)
+}
+
+/// Newest sync timestamp known for a machine: for the current machine, the
+/// newer of the manifest record and local `<state_dir>/sync-status.json`.
+pub fn effective_last_sync(
+    manifest_sync: Option<&str>,
+    local_sync: Option<&str>,
+    is_current: bool,
+) -> Option<String> {
+    match (manifest_sync, is_current.then_some(local_sync).flatten()) {
+        (Some(a), Some(b)) => Some(std::cmp::max(a, b).to_owned()),
+        (Some(a), None) => Some(a.to_owned()),
+        (None, Some(b)) => Some(b.to_owned()),
+        (None, None) => None,
+    }
 }
 
 pub fn save_name(state_dir: &Path, name: &str) -> Result<(), MusterError> {

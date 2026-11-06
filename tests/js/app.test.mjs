@@ -246,6 +246,32 @@ async function testDashboardSyncOperationsRedesign() {
   assert.ok(turnOnBtn, "Must show a 'Turn on' button when schedule is disabled");
   const syncNowBtn = liveButton("Sync now");
   assert.ok(syncNowBtn, "Must show a 'Sync now' button");
+
+  setResponder((call) => {
+    if (call.path === "schedule") {
+      return { ok: true, diagnostics: [], result: { enabled: true, backend: "systemd", files: [], pull: false, interval_minutes: 30 } };
+    }
+    if (call.path === "status") {
+      return {
+        ok: true,
+        diagnostics: [],
+        result: {
+          machines: [
+            { name: "omarchy", platform: "linux-x86_64", version: "0.1.0", status: "current", is_current: true, last_sync: "2026-11-06T18:57:00Z" },
+            { name: "onesafe", host: "root@onesafe", platform: "linux-x86_64", version: "0.1.0", status: "drifted", is_current: false, last_sync: null },
+          ],
+          sync: { ts: "2026-11-06T18:57:00Z", result: "ok" },
+        },
+      };
+    }
+    return { ok: true, diagnostics: [], result: {} };
+  });
+  await sandbox.show("dashboard");
+  await flush();
+  const fleetRendered = text(view);
+  assert.match(fleetRendered, /sync reachable fleet machines over SSH/, "Fleet dashboard must explain fleet SSH sync");
+  assert.match(fleetRendered, /ssh root@onesafe/, "Fleet table must display machine SSH host");
+  assert.ok(liveButton("Sync"), "Remote machine row must provide a Sync button");
   setResponder();
 }
 

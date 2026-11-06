@@ -142,6 +142,9 @@ pub struct Machine {
     /// Agent CLIs detected on the machine (`claude`, `codex`, `opencode`).
     #[serde(default)]
     pub agents: Vec<String>,
+    /// SSH host alias or `user@host` used to reach this machine, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
     /// RFC 3339 timestamp of the last successful sync, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_sync: Option<String>,
@@ -733,6 +736,7 @@ mod tests {
                 platform: "linux-x86_64".into(),
                 muster_version: "0.1.0".into(),
                 agents: vec!["claude".into()],
+                host: Some("laptop.local".into()),
                 last_sync: None,
                 role: Some("workstation".into()),
                 profile: None,

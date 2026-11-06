@@ -830,6 +830,11 @@ input[type="checkbox"], input[type="radio"] {
 .table-wrap.fleet-table th:nth-child(2) { width: 18%; }
 .table-wrap.fleet-table th:nth-child(3) { width: 22%; }
 .table-wrap.fleet-table th:nth-child(4) { width: 28%; }
+.table-wrap.fleet-table.actions-end th:nth-child(1) { width: 30%; }
+.table-wrap.fleet-table.actions-end th:nth-child(2) { width: 14%; }
+.table-wrap.fleet-table.actions-end th:nth-child(3) { width: 18%; }
+.table-wrap.fleet-table.actions-end th:nth-child(4) { width: 24%; }
+.table-wrap.fleet-table.actions-end th:nth-child(5) { width: 14%; }
 
 .sync-time, .muted.data {
   font-family: var(--font-mono);
@@ -839,6 +844,29 @@ input[type="checkbox"], input[type="radio"] {
   color: var(--text-secondary);
 }
 .muted.data { color: var(--muted); }
+
+/* Fixed-column tables size their columns from wN classes on the header cells
+   (CSP blocks inline styles, so widths cannot travel as style attributes).
+   Long content wraps instead of overflowing: dates and identity sub-lines
+   (platform · ssh host) break when the column runs narrow. */
+.table-wrap.fixed-cols table { table-layout: fixed; width: 100%; }
+.table-wrap.fixed-cols .sync-time { white-space: normal; overflow-wrap: normal; }
+.table-wrap.fixed-cols .name-cell .data { white-space: normal; overflow-wrap: anywhere; }
+.table-wrap th.w8 { width: 8%; }
+.table-wrap th.w9 { width: 9%; }
+.table-wrap th.w10 { width: 10%; }
+.table-wrap th.w12 { width: 12%; }
+.table-wrap th.w14 { width: 14%; }
+.table-wrap th.w16 { width: 16%; }
+.table-wrap th.w20 { width: 20%; }
+.table-wrap th.w30 { width: 30%; }
+
+/* Fleet table with a per-machine Sync column: same fixed shares, adjusted for five columns. */
+.table-wrap.fleet-table.actions-end th:nth-child(1) { width: 30%; }
+.table-wrap.fleet-table.actions-end th:nth-child(2) { width: 15%; }
+.table-wrap.fleet-table.actions-end th:nth-child(3) { width: 20%; }
+.table-wrap.fleet-table.actions-end th:nth-child(4) { width: 23%; }
+.table-wrap.fleet-table.actions-end th:nth-child(5) { width: 12%; }
 
 .table-wrap, pre {
   scrollbar-width: thin;
@@ -1614,16 +1642,13 @@ pre {
 .btn.link:hover { background: transparent; border-color: transparent; text-decoration-thickness: 2px; }
 .plate-sub .btn.link { margin-left: 2px; }
 
-/* Right-aligned action column */
+/* Right-aligned action column; the 1% squeeze only applies to auto-layout
+   tables — fixed-cols and fleet tables get their widths from column rules. */
 .table-wrap.actions-end th:last-child,
-.table-wrap.actions-end td:last-child { text-align: right; width: 1%; white-space: nowrap; }
+.table-wrap.actions-end td:last-child { text-align: right; white-space: nowrap; }
+.table-wrap.actions-end:not(.fixed-cols):not(.fleet-table) th:last-child,
+.table-wrap.actions-end:not(.fixed-cols):not(.fleet-table) td:last-child { width: 1%; }
 .table-wrap.actions-end td:last-child { padding-right: 16px; }
-.table-wrap.machines-basic table { table-layout: fixed; width: 100%; }
-.table-wrap.machines-basic th:nth-child(1) { width: 22%; }
-.table-wrap.machines-basic th:nth-child(2) { width: 9%; }
-.table-wrap.machines-basic th:nth-child(3) { width: 43%; }
-.table-wrap.machines-basic th:nth-child(4) { width: 12%; }
-.table-wrap.machines-basic th:nth-child(5) { width: 14%; }
 .table-wrap.machines-table .btn.danger { min-height: 28px; padding: 0 10px; font-size: var(--text-xs); }
 
 /* Small captions stay crisp in dark mode */
