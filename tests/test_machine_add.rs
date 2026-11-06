@@ -341,8 +341,11 @@ fn sync_propagates_to_remote_fleet_machines_and_updates_convergence() {
         "Updated fleet instructions.\n",
     )
     .unwrap();
-    let mut manifest = std::fs::read_to_string(fleet.alice.config_dir().join("muster.toml")).unwrap();
-    manifest.push_str("\n[agents]\nenabled = [\"claude\"]\n[agents.instructions]\nsource = \"AGENTS.md\"\n");
+    let mut manifest =
+        std::fs::read_to_string(fleet.alice.config_dir().join("muster.toml")).unwrap();
+    manifest.push_str(
+        "\n[agents]\nenabled = [\"claude\"]\n[agents.instructions]\nsource = \"AGENTS.md\"\n",
+    );
     std::fs::write(fleet.alice.config_dir().join("muster.toml"), manifest).unwrap();
 
     let before = ok(&fleet.alice, &["status"]);
@@ -389,7 +392,8 @@ fn machine_sync_command_syncs_named_remote_machine_over_ssh() {
     let (out, envelope) = support::json(fleet.add_cmd(&["fakehost", "--name", "bob", "--yes"]));
     assert!(out.status.success(), "{}", envelope.raw);
 
-    let mut manifest = std::fs::read_to_string(fleet.alice.config_dir().join("muster.toml")).unwrap();
+    let mut manifest =
+        std::fs::read_to_string(fleet.alice.config_dir().join("muster.toml")).unwrap();
     manifest.push_str("\n[agents.models]\nclaude = \"sonnet\"\n");
     std::fs::write(fleet.alice.config_dir().join("muster.toml"), manifest).unwrap();
 

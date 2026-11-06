@@ -742,7 +742,11 @@ fn assign(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     if let Some(h) = host {
         entry.host = (!h.is_empty()).then(|| h.to_string());
     }
-    let (role, profile, host_val) = (entry.role.clone(), entry.profile.clone(), entry.host.clone());
+    let (role, profile, host_val) = (
+        entry.role.clone(),
+        entry.profile.clone(),
+        entry.host.clone(),
+    );
 
     let mut vault = Vault::open(&ctx.config_dir)?;
     let changes = team::pending_rekeys(ctx, &vault, &before, &manifest)?;
@@ -947,9 +951,10 @@ fn sync_machines(ctx: &mut Context, params: &Params) -> Result<Value, MusterErro
         .transpose()?;
     let targets: Vec<(String, String)> = match &requested {
         Some(name) => {
-            let m = manifest.machines.get(name).ok_or_else(|| {
-                MusterError::Usage(format!("machine '{name}' is not enrolled"))
-            })?;
+            let m = manifest
+                .machines
+                .get(name)
+                .ok_or_else(|| MusterError::Usage(format!("machine '{name}' is not enrolled")))?;
             if is_current_machine(
                 name,
                 &m.recipient,
@@ -998,7 +1003,10 @@ fn sync_machines(ctx: &mut Context, params: &Params) -> Result<Value, MusterErro
 
     let prompt = match &requested {
         Some(name) => format!("Sync remote machine '{name}' over SSH now?"),
-        None => format!("Sync {} remote fleet machine(s) over SSH now?", targets.len()),
+        None => format!(
+            "Sync {} remote fleet machine(s) over SSH now?",
+            targets.len()
+        ),
     };
     ctx.confirm(&prompt)?;
 
