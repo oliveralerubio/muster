@@ -100,6 +100,7 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
             platform: machine::platform(),
             muster_version: env!("CARGO_PKG_VERSION").into(),
             agents: agents.clone(),
+            host: None,
             last_sync: None,
             role: None,
             profile: None,

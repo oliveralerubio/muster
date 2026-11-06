@@ -529,24 +529,24 @@ pub fn publish(ctx: &mut Context) {
 /// After a global apply (`result` from the engine) that wrote every adapter,
 /// record in the manifest that this machine applied the current
 /// team-approved layers (read by `status` on every machine). Commits only
-/// when it changed.
-pub fn record_applied(ctx: &Context, result: &Value) -> Result<(), MusterError> {
+/// when it changed and returns whether a commit was created.
+pub fn record_applied(ctx: &Context, result: &Value) -> Result<bool, MusterError> {
     let failed = result["agents"]
         .as_array()
         .is_some_and(|a| a.iter().any(|a| a["status"] == "failed"));
     if ctx.dry_run || failed {
-        return Ok(());
+        return Ok(false);
     }
     let Some(name) = machine::load_name(&ctx.state_dir) else {
-        return Ok(());
+        return Ok(false);
     };
     let mut manifest = Manifest::load(&ctx.config_dir)?;
     let digest = layer::digest(&ctx.config_dir, &manifest, &name);
     let Some(entry) = manifest.machines.get_mut(&name) else {
-        return Ok(());
+        return Ok(false);
     };
-    if entry.applied_profile.as_deref() == Some(digest.as_str()) {
-        return Ok(());
+    if entry.applied_profile.as_deref() == Some(digest.as_str()) && entry.last_sync.is_some() {
+        return Ok(false);
     }
     entry.applied_profile = Some(digest);
     entry.last_sync = Some(
@@ -558,8 +558,7 @@ pub fn record_applied(ctx: &Context, result: &Value) -> Result<(), MusterError> 
     git::commit_if_configured(
         &ctx.config_dir,
         &format!("chore(fleet): {name} applied the approved profile"),
-    )?;
-    Ok(())
+    )
 }
 
 /// Machines and members out of line with the approved team profile, and

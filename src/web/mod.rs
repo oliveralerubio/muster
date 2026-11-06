@@ -139,6 +139,7 @@ const ROUTES: &[Route] = &[
     post("reject", "reject"),
     post("revoke", "revoke"),
     post("machine/assign", "machine.assign"),
+    post("machine/sync", "machine.sync"),
     post("machine/rm", "machine.rm"),
     post("member/add", "member.add"),
     post("member/approve", "member.approve"),

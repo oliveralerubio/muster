@@ -165,7 +165,16 @@ fn sync(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     )?;
     let mut result = engine::apply(ctx, plan)?;
     if global {
-        crate::team::record_applied(ctx, &result)?;
+        let recorded = crate::team::record_applied(ctx, &result)?;
+        if recorded && transport["pushed"] == true {
+            git::push(&ctx.config_dir)?;
+        }
+        if !ctx.dry_run && !params.get_bool("pull") && !params.get_bool("push") {
+            let fleet = crate::commands::machine::sync_fleet_after_local_sync(ctx)?;
+            if !fleet.is_null() {
+                result["fleet"] = fleet;
+            }
+        }
     }
     result["transport"] = transport;
     result["skills_updated"] = Value::Array(skills_updated);

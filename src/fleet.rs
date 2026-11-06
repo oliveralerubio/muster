@@ -34,6 +34,8 @@ pub struct EnrollmentRequest {
     pub approvals: Vec<ApprovalEntry>,
     /// Assignment proposed by the first approver; later approvals confirm it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,

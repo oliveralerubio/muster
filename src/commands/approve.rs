@@ -49,6 +49,13 @@ pub const SPEC: CommandSpec = CommandSpec {
             required: false,
             positional: false,
         },
+        ParamSpec {
+            name: "host",
+            about: "SSH host alias or user@host of the approved machine",
+            kind: ParamKind::String,
+            required: false,
+            positional: false,
+        },
     ],
     mutating: true,
     handler: run,
@@ -142,6 +149,10 @@ pub(super) fn approve_with_identity(
         )));
     }
     let before = manifest;
+    let host = proposal(params, "host", &mut req.host)?;
+    if let Some(h) = &host {
+        crate::commands::machine::validate_host(h)?;
+    }
     let role = proposal(params, "role", &mut req.role)?;
     let profile = proposal(params, "profile", &mut req.profile)?;
     let member = proposal(params, "member", &mut req.member)?;
@@ -167,6 +178,7 @@ pub(super) fn approve_with_identity(
             platform: req.platform.clone(),
             muster_version: req.muster_version.clone(),
             agents: req.agents.clone(),
+            host: host.clone(),
             last_sync: None,
             role: role.clone(),
             profile: profile.clone(),

@@ -33,10 +33,8 @@ fn run(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
             (_, Some(lr)) if lr == &m.recipient => true,
             _ => false,
         };
-        let last_sync = m
-            .last_sync
-            .clone()
-            .or_else(|| is_current.then(|| local_sync.clone()).flatten());
+        let last_sync =
+            machine::effective_last_sync(m.last_sync.as_deref(), local_sync.as_deref(), is_current);
         let status = if is_current {
             "current"
         } else if m.applied_profile.is_none() {
@@ -51,6 +49,7 @@ fn run(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
         };
         machines.push(json!({
             "name": name,
+            "host": m.host,
             "recipient": m.recipient,
             "platform": m.platform,
             "version": m.muster_version,

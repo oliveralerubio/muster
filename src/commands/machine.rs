@@ -164,6 +164,16 @@ fn valid_host(host: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || "-_.@".contains(c))
 }
 
+pub fn validate_host(host: &str) -> Result<String, MusterError> {
+    if valid_host(host) {
+        Ok(host.to_string())
+    } else {
+        Err(MusterError::Usage(format!(
+            "invalid SSH host '{host}': use an ssh alias or user@host (letters, digits, - _ . @)"
+        )))
+    }
+}
+
 /// `<os>-<arch>` in the form `machine::platform()` uses, from `uname -s` / `-m`.
 fn remote_platform(os: &str, arch: &str) -> String {
     let os = match os {
@@ -191,11 +201,7 @@ fn add(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let host = params
         .get_string("host")
         .ok_or_else(|| MusterError::Usage("SSH host is required".into()))?;
-    if !valid_host(host) {
-        return Err(MusterError::Usage(format!(
-            "invalid SSH host '{host}': use an ssh alias or user@host (letters, digits, - _ . @)"
-        )));
-    }
+    validate_host(host)?;
     let manifest = Manifest::load(&ctx.config_dir)?;
     let explicit_name = params
         .get_string("name")
@@ -253,7 +259,7 @@ fn add(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         format!("enroll '{name_label}' on the host (muster enroll)"),
         "pull the request here and approve it (re-encrypts vault groups)".to_string(),
         "push the approval".to_string(),
-        "sync the host (muster sync --pull; no --yes, hooks/MCP stay pending)".to_string(),
+        "sync the host and enable automatic sync".to_string(),
     ];
     if ctx.dry_run {
         return Ok(json!({
@@ -391,6 +397,7 @@ fn add(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     }
     let mut approval_params = params.clone();
     approval_params.set("name", json!(name));
+    approval_params.set("host", json!(host));
     let approval =
         crate::commands::approve::approve_with_identity(ctx, &approval_params, recovery)?;
     if approval["status"] == "pending" {
@@ -403,10 +410,13 @@ fn add(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     crate::git::push(&ctx.config_dir)?;
     steps.push("approved and pushed".into());
 
-    // g. apply on the host. No --yes: without a terminal, sync leaves agent
-    // installs pending and refuses new hooks/MCP servers (exit 2); both are
-    // reported, never auto-approved.
-    let (code, synced) = remote.muster("syncing", &format!("{bin} --format json sync --pull"))?;
+    // g. apply on the host and push its applied_profile record back to origin.
+    // Without a terminal, sync leaves agent installs pending and refuses new
+    // hooks/MCP servers (exit 2); both are reported, never auto-approved.
+    let (code, synced) = remote.muster(
+        "syncing",
+        &format!("MUSTER_FLEET_HOP=1; export MUSTER_FLEET_HOP; {bin} --format json sync"),
+    )?;
     let sync_ok = code == 0 && synced["ok"] == true;
     let pending = if sync_ok {
         synced["result"]["approvals"].clone()
@@ -419,12 +429,26 @@ fn add(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
             "'{name}' is approved but its first sync failed; run `muster sync` on {host}"
         )));
     }
+    if sync_ok {
+        let _ = crate::git::pull(&ctx.config_dir);
+    }
     let applied = sync_ok && synced["result"]["applied"] == true;
     steps.push(if needs_approval {
         format!("{host} synced; approvals pending: run `muster sync` there in a terminal")
     } else {
         format!("{host} synced")
     });
+
+    // h. enable periodic sync on the remote machine when a scheduler is available.
+    if let Ok((0, sched)) = remote.muster(
+        "enabling automatic sync",
+        &format!("{bin} --format json schedule enable --yes"),
+    ) {
+        if sched["result"]["enabled"] == true {
+            steps.push(format!("enabled automatic sync on {host}"));
+        }
+    }
+
     Ok(json!({
         "machine": name,
         "host": host,
@@ -485,7 +509,7 @@ pub const RM: CommandSpec = CommandSpec {
 
 pub const ASSIGN: CommandSpec = CommandSpec {
     name: "machine.assign",
-    about: "Assign a role or profile to an enrolled machine",
+    about: "Assign a role, profile or SSH host to an enrolled machine",
     params: &[
         ParamSpec {
             name: "name",
@@ -515,12 +539,46 @@ pub const ASSIGN: CommandSpec = CommandSpec {
             required: false,
             positional: false,
         },
+        ParamSpec {
+            name: "host",
+            about: "SSH host alias or user@host of the machine (empty to clear)",
+            kind: ParamKind::String,
+            required: false,
+            positional: false,
+        },
         crate::team::RECOVERY_KEY_PARAM,
         crate::team::RECOVERY_KEY_STDIN_PARAM,
     ],
     mutating: true,
     handler: assign,
 };
+
+pub const SYNC: CommandSpec = CommandSpec {
+    name: "machine.sync",
+    about: "Sync one or all remote fleet machines over SSH",
+    params: &[ParamSpec {
+        name: "name",
+        about: "Fleet name of the remote machine to sync [default: all remote machines]",
+        kind: ParamKind::String,
+        required: false,
+        positional: true,
+    }],
+    mutating: true,
+    handler: sync_machines,
+};
+
+fn is_current_machine(
+    name: &str,
+    recipient: &str,
+    local_name: Option<&str>,
+    local_recipient: Option<&str>,
+) -> bool {
+    match (local_name, local_recipient) {
+        (Some(ln), _) if ln == name => true,
+        (_, Some(lr)) if lr == recipient => true,
+        _ => false,
+    }
+}
 
 fn list(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
     let manifest = Manifest::load(&ctx.config_dir)?;
@@ -531,15 +589,14 @@ fn list(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
 
     let mut machines = Vec::new();
     for (name, m) in &manifest.machines {
-        let is_current = match (&local_name, &local_recipient) {
-            (Some(ln), _) if ln == name => true,
-            (_, Some(lr)) if lr == &m.recipient => true,
-            _ => false,
-        };
-        let last_sync = m
-            .last_sync
-            .clone()
-            .or_else(|| is_current.then(|| local_sync.clone()).flatten());
+        let is_current = is_current_machine(
+            name,
+            &m.recipient,
+            local_name.as_deref(),
+            local_recipient.as_deref(),
+        );
+        let last_sync =
+            machine::effective_last_sync(m.last_sync.as_deref(), local_sync.as_deref(), is_current);
         let status = if is_current {
             "current"
         } else if m.applied_profile.is_none() {
@@ -554,6 +611,7 @@ fn list(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
         };
         machines.push(json!({
             "name": name,
+            "host": m.host,
             "status": status,
             "applied_profile": m.applied_profile.clone(),
             "recipient": m.recipient,
@@ -576,6 +634,7 @@ fn list(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
             let check = req.check_approvals(&manifest, state_hash.as_deref());
             json!({
                 "name": req.name,
+                "host": req.host,
                 "recipient": req.recipient,
                 "platform": req.platform,
                 "version": req.muster_version,
@@ -633,11 +692,17 @@ fn assign(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let role = params.get_string("role");
     let profile = params.get_string("profile");
     let member = params.get_string("member");
+    let host = params.get_string("host");
 
-    if role.is_none() && profile.is_none() && member.is_none() {
+    if role.is_none() && profile.is_none() && member.is_none() && host.is_none() {
         return Err(MusterError::Usage(
-            "specify at least one of --role, --profile or --member".into(),
+            "specify at least one of --role, --profile, --member or --host".into(),
         ));
+    }
+    if let Some(h) = host {
+        if !h.is_empty() {
+            validate_host(h)?;
+        }
     }
 
     let mut manifest = Manifest::load(&ctx.config_dir)?;
@@ -674,7 +739,10 @@ fn assign(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     if let Some(p) = profile {
         entry.profile = Some(p.to_string());
     }
-    let (role, profile) = (entry.role.clone(), entry.profile.clone());
+    if let Some(h) = host {
+        entry.host = (!h.is_empty()).then(|| h.to_string());
+    }
+    let (role, profile, host_val) = (entry.role.clone(), entry.profile.clone(), entry.host.clone());
 
     let mut vault = Vault::open(&ctx.config_dir)?;
     let changes = team::pending_rekeys(ctx, &vault, &before, &manifest)?;
@@ -690,6 +758,7 @@ fn assign(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     }
     let result = json!({
         "machine": name,
+        "host": host_val,
         "role": role,
         "profile": profile,
         "member": team::owner_of(&manifest, name),
@@ -711,4 +780,244 @@ fn assign(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         }
     }
     Ok(result)
+}
+
+fn remote_sync_shell(yes: bool) -> String {
+    let yes_flag = if yes { " --yes" } else { "" };
+    format!(
+        "MUSTER_FLEET_HOP=1; export MUSTER_FLEET_HOP; \
+         bin=$(command -v muster \
+           || {{ [ -x \"$HOME/.local/bin/muster\" ] && echo \"$HOME/.local/bin/muster\"; }} \
+           || {{ [ -x /usr/local/bin/muster ] && echo /usr/local/bin/muster; }}) \
+         && [ -n \"$bin\" ] \
+         && \"$bin\" --format json sync{yes_flag}"
+    )
+}
+
+/// Sync one remote machine over SSH. When `strict` is false (fleet fan-out
+/// during `muster sync`), SSH or remote errors become warning diagnostics so
+/// an offline machine never breaks the local sync.
+fn sync_one_remote(
+    ctx: &mut Context,
+    name: &str,
+    host: &str,
+    strict: bool,
+) -> Result<(bool, Value), MusterError> {
+    ctx.progress(&format!("Syncing {name} ({host})…"));
+    let remote = Remote { host };
+    let cmd = remote_sync_shell(ctx.yes);
+    match remote.muster(&format!("syncing '{name}'"), &cmd) {
+        Ok((0, envelope)) if envelope["ok"] == true => {
+            let applied = envelope["result"]["applied"].as_bool().unwrap_or(false);
+            Ok((
+                true,
+                json!({
+                    "machine": name,
+                    "host": host,
+                    "ok": true,
+                    "applied": applied,
+                }),
+            ))
+        }
+        Ok((2, envelope)) => {
+            let msg = format!(
+                "'{name}' ({host}) has pending approvals; run `muster machine sync {name} --yes` or `muster sync` on {host}"
+            );
+            ctx.diag(crate::output::Diagnostic::new(
+                crate::output::Severity::Warning,
+                "remote_sync_approval_needed",
+                &msg,
+            ));
+            Ok((
+                false,
+                json!({
+                    "machine": name,
+                    "host": host,
+                    "ok": false,
+                    "approval_needed": true,
+                    "diagnostics": envelope["diagnostics"],
+                }),
+            ))
+        }
+        Ok((_, envelope)) => {
+            let detail = envelope["diagnostics"]
+                .as_array()
+                .and_then(|d| d.iter().find(|d| d["severity"] == "error"))
+                .and_then(|d| d["message"].as_str())
+                .unwrap_or("remote sync failed");
+            let msg = format!("syncing '{name}' on '{host}' failed: {detail}");
+            if strict {
+                return Err(MusterError::Operational(msg));
+            }
+            ctx.diag(crate::output::Diagnostic::new(
+                crate::output::Severity::Warning,
+                "remote_sync_failed",
+                &msg,
+            ));
+            Ok((
+                false,
+                json!({
+                    "machine": name,
+                    "host": host,
+                    "ok": false,
+                    "error": detail,
+                }),
+            ))
+        }
+        Err(err) => {
+            if strict {
+                return Err(err);
+            }
+            ctx.diag(crate::output::Diagnostic::new(
+                crate::output::Severity::Warning,
+                "remote_sync_failed",
+                format!("could not sync '{name}' ({err})"),
+            ));
+            Ok((
+                false,
+                json!({
+                    "machine": name,
+                    "host": host,
+                    "ok": false,
+                    "error": err.to_string(),
+                }),
+            ))
+        }
+    }
+}
+
+/// Propagate `muster sync` over SSH to every other fleet machine that has an
+/// explicit `host` recorded in `muster.toml`. Skipped on dry-run, without a git
+/// remote, or inside a remote hop (`MUSTER_FLEET_HOP=1`).
+pub fn sync_fleet_after_local_sync(ctx: &mut Context) -> Result<Value, MusterError> {
+    if ctx.dry_run
+        || std::env::var_os("MUSTER_FLEET_HOP").is_some()
+        || !crate::git::has_remote(&ctx.config_dir)
+    {
+        return Ok(Value::Null);
+    }
+    let manifest = Manifest::load(&ctx.config_dir)?;
+    let local_identity = Identity::load(&ctx.state_dir).ok();
+    let local_recipient = local_identity.as_ref().map(|id| id.recipient());
+    let local_name = machine::load_name(&ctx.state_dir);
+
+    let targets: Vec<(String, String)> = manifest
+        .machines
+        .iter()
+        .filter(|(name, m)| {
+            !is_current_machine(
+                name,
+                &m.recipient,
+                local_name.as_deref(),
+                local_recipient.as_deref(),
+            )
+        })
+        .filter_map(|(name, m)| {
+            let host = m.host.as_deref()?.trim();
+            valid_host(host).then(|| (name.clone(), host.to_string()))
+        })
+        .collect();
+
+    if targets.is_empty() {
+        return Ok(Value::Null);
+    }
+
+    let mut results = Vec::with_capacity(targets.len());
+    let mut any_ok = false;
+    for (name, host) in targets {
+        let (ok, report) = sync_one_remote(ctx, &name, &host, false)?;
+        any_ok |= ok;
+        results.push(report);
+    }
+    if any_ok {
+        let _ = crate::git::pull(&ctx.config_dir);
+    }
+    Ok(Value::Array(results))
+}
+
+fn sync_machines(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
+    let manifest = Manifest::load(&ctx.config_dir)?;
+    let local_identity = Identity::load(&ctx.state_dir).ok();
+    let local_recipient = local_identity.as_ref().map(|id| id.recipient());
+    let local_name = machine::load_name(&ctx.state_dir);
+
+    let requested = params
+        .get_string("name")
+        .map(machine::validate_name)
+        .transpose()?;
+    let targets: Vec<(String, String)> = match &requested {
+        Some(name) => {
+            let m = manifest.machines.get(name).ok_or_else(|| {
+                MusterError::Usage(format!("machine '{name}' is not enrolled"))
+            })?;
+            if is_current_machine(
+                name,
+                &m.recipient,
+                local_name.as_deref(),
+                local_recipient.as_deref(),
+            ) {
+                return Err(MusterError::Usage(format!(
+                    "'{name}' is this machine; run `muster sync` instead"
+                )));
+            }
+            let host = m.host.as_deref().unwrap_or(name.as_str());
+            validate_host(host)?;
+            vec![(name.clone(), host.to_string())]
+        }
+        None => manifest
+            .machines
+            .iter()
+            .filter(|(name, m)| {
+                !is_current_machine(
+                    name,
+                    &m.recipient,
+                    local_name.as_deref(),
+                    local_recipient.as_deref(),
+                )
+            })
+            .map(|(name, m)| {
+                let host = m.host.as_deref().unwrap_or(name.as_str());
+                validate_host(host).map(|h| (name.clone(), h))
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+
+    if ctx.dry_run {
+        return Ok(json!({
+            "dry_run": true,
+            "machines": targets.iter().map(|(n, h)| json!({"machine": n, "host": h})).collect::<Vec<_>>(),
+            "applied": false,
+        }));
+    }
+
+    if !crate::git::has_remote(&ctx.config_dir) {
+        return Err(MusterError::Usage(
+            "the config repo has no git remote; run `muster sync --remote <url>` first".into(),
+        ));
+    }
+
+    let prompt = match &requested {
+        Some(name) => format!("Sync remote machine '{name}' over SSH now?"),
+        None => format!("Sync {} remote fleet machine(s) over SSH now?", targets.len()),
+    };
+    ctx.confirm(&prompt)?;
+
+    let _ = crate::git::commit_if_configured(&ctx.config_dir, "chore(muster): sync");
+    let _ = crate::git::push(&ctx.config_dir);
+
+    let strict = requested.is_some();
+    let mut results = Vec::with_capacity(targets.len());
+    let mut any_ok = false;
+    for (name, host) in targets {
+        let (ok, report) = sync_one_remote(ctx, &name, &host, strict)?;
+        any_ok |= ok;
+        results.push(report);
+    }
+    if any_ok {
+        let _ = crate::git::pull(&ctx.config_dir);
+    }
+    Ok(json!({
+        "machines": results,
+        "synced": results.iter().filter(|r| r["ok"] == true).count(),
+    }))
 }

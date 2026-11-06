@@ -100,6 +100,7 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         agents,
         created_at: now,
         approvals: Vec::new(),
+        host: None,
         role: None,
         profile: None,
         member: None,
