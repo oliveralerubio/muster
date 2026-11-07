@@ -107,15 +107,63 @@ pub fn run(
         .iter()
         .filter(|d| d.severity == Severity::Error)
         .count();
-    let diagnostics = checkup.diagnostics();
-    let count = |s: Severity| diagnostics.iter().filter(|d| d.severity == s).count();
-    let errors = count(Severity::Error) + pre_errors;
+    let mut diagnostics = checkup.diagnostics();
+    let count = |list: &[Diagnostic], s: Severity| list.iter().filter(|d| d.severity == s).count();
+    let errors = count(&diagnostics, Severity::Error) + pre_errors;
+    let warnings = count(&diagnostics, Severity::Warning);
+    if fix && !ctx.dry_run {
+        let applied_actions: Vec<String> = fixes
+            .iter()
+            .filter(|f| f["applied"] == true)
+            .filter_map(|f| {
+                let action = f["action"].as_str()?;
+                let consequence = f["consequence"].as_str().unwrap_or("");
+                if consequence.is_empty() {
+                    Some(action.to_string())
+                } else {
+                    Some(format!("{action} ({consequence})"))
+                }
+            })
+            .collect();
+        if !applied_actions.is_empty() {
+            diagnostics.push(
+                Diagnostic::new(
+                    Severity::Info,
+                    "fixes_applied",
+                    format!(
+                        "applied {} repair(s): {}",
+                        applied_actions.len(),
+                        applied_actions.join("; ")
+                    ),
+                )
+                .with_suggestion("run `muster doctor` to verify remaining checks"),
+            );
+        } else if errors > 0 || warnings > 0 {
+            diagnostics.push(
+                Diagnostic::new(
+                    Severity::Info,
+                    "no_automatic_fixes",
+                    "no automatic repairs available for the remaining issues (only `insecure_permissions` and `drift` can be auto-repaired by `doctor --fix`)",
+                )
+                .with_suggestion("follow the hint on each diagnostic above to resolve the remaining issues"),
+            );
+        }
+    }
+    let info = count(&diagnostics, Severity::Info);
+    let status = if errors > 0 {
+        "error"
+    } else if warnings > 0 {
+        "warning"
+    } else {
+        "ok"
+    };
     let result = json!({
         "healthy": errors == 0,
+        "status": status,
         "summary": {
             "errors": errors,
-            "warnings": count(Severity::Warning),
-            "info": count(Severity::Info),
+            "warnings": warnings,
+            "info": info,
         },
         "checks": checkup
             .checks
@@ -192,11 +240,13 @@ impl Repair {
                 "code": "insecure_permissions",
                 "path": path,
                 "action": format!("chmod {mode:04o} {}", path.display()),
+                "consequence": "restricts file access to the current OS user only (non-destructive)",
             }),
             Self::Resync => json!({
                 "code": "drift",
                 "path": null,
                 "action": "re-apply the managed configuration (muster sync)",
+                "consequence": "overwrites manual edits to managed keys in agent config files; unmanaged keys are preserved (destructive)",
             }),
         };
         value["destructive"] = json!(self.destructive());
@@ -344,7 +394,7 @@ fn check_config(ctx: &Context, initialized: bool) -> (Check, Option<Manifest>) {
             format!("no Muster configuration at {}", path.display()),
         )
         .with_path(path.display().to_string())
-        .with_suggestion("run `muster init` (new fleet) or `muster enroll` (join an existing one)");
+        .with_suggestion("run `muster init` (new fleet) or `muster sync --remote <url> --pull` then `muster enroll` (join an existing fleet)");
         return (Check::new("config", vec![diag]), None);
     }
     match Manifest::load(&ctx.config_dir) {
@@ -378,7 +428,7 @@ fn check_permissions(ctx: &Context, repairs: &mut Vec<Repair>) -> Check {
             Diagnostic::error("identity_missing", "this machine has no identity")
                 .with_path(identity.display().to_string())
                 .with_suggestion(
-                    "run `muster init` (new fleet) or `muster enroll` (join an existing one)",
+                    "run `muster init` (new fleet) or `muster sync --remote <url> --pull` then `muster enroll` (join an existing fleet)",
                 ),
         );
     }

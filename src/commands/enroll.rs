@@ -39,14 +39,18 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
             "machine '{name}' is already a member of the fleet"
         )));
     }
-    if let Ok(existing) = EnrollmentRequest::load(&ctx.config_dir, &name) {
-        let local = Identity::load(&ctx.state_dir).ok().map(|id| id.recipient());
-        if local.as_deref() != Some(existing.recipient.as_str()) {
-            return Err(MusterError::Usage(format!(
-                "another machine already requested enrollment as '{name}'"
-            )));
+    let existing = match EnrollmentRequest::load(&ctx.config_dir, &name) {
+        Ok(existing) => {
+            let local = Identity::load(&ctx.state_dir).ok().map(|id| id.recipient());
+            if local.as_deref() != Some(existing.recipient.as_str()) {
+                return Err(MusterError::Usage(format!(
+                    "another machine already requested enrollment as '{name}'"
+                )));
+            }
+            Some(existing)
         }
-    }
+        Err(_) => None,
+    };
 
     let agents = machine::detect_agents();
 
@@ -83,30 +87,59 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     }
 
     let signer = Signer::load_or_create(&ctx.state_dir)?;
-    let mut nonce = [0u8; 16];
-    getrandom::getrandom(&mut nonce)
-        .map_err(|e| MusterError::Operational(format!("no randomness available: {e}")))?;
-    let now = time::OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
-        .expect("RFC 3339 formatting of current UTC time cannot fail");
+    let (req, path) = match existing.filter(|e| {
+        e.recipient == identity.recipient()
+            && e.signing_key.as_deref() == Some(&signer.public())
+            && !e.nonce.is_empty()
+    }) {
+        Some(mut prev) => {
+            let path = if prev.approvals.is_empty() {
+                prev.platform = machine::platform();
+                prev.muster_version = env!("CARGO_PKG_VERSION").into();
+                prev.agents = agents;
+                prev.save(&ctx.config_dir)?
+            } else {
+                EnrollmentRequest::file_path(&ctx.config_dir, &name)
+            };
+            ctx.diag(Diagnostic::new(
+                Severity::Info,
+                "request_preserved",
+                format!(
+                    "existing enrollment request for '{name}' preserved ({} approval(s) kept); \
+                     run `muster sync --push` to publish it without recreating the request",
+                    prev.approvals.len()
+                ),
+            ));
+            (prev, path)
+        }
+        None => {
+            let mut nonce = [0u8; 16];
+            getrandom::getrandom(&mut nonce)
+                .map_err(|e| MusterError::Operational(format!("no randomness available: {e}")))?;
+            let now = time::OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .expect("RFC 3339 formatting of current UTC time cannot fail");
 
-    let req = EnrollmentRequest {
-        name: name.clone(),
-        recipient: identity.recipient(),
-        signing_key: Some(signer.public()),
-        nonce: signing::to_hex(&nonce),
-        platform: machine::platform(),
-        muster_version: env!("CARGO_PKG_VERSION").into(),
-        agents,
-        created_at: now,
-        approvals: Vec::new(),
-        host: None,
-        role: None,
-        profile: None,
-        member: None,
+            let req = EnrollmentRequest {
+                name: name.clone(),
+                recipient: identity.recipient(),
+                signing_key: Some(signer.public()),
+                nonce: signing::to_hex(&nonce),
+                platform: machine::platform(),
+                muster_version: env!("CARGO_PKG_VERSION").into(),
+                agents,
+                created_at: now,
+                approvals: Vec::new(),
+                host: None,
+                role: None,
+                profile: None,
+                member: None,
+            };
+
+            let path = req.save(&ctx.config_dir)?;
+            (req, path)
+        }
     };
-
-    let path = req.save(&ctx.config_dir)?;
 
     git::commit_if_configured(
         &ctx.config_dir,
@@ -117,11 +150,24 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         match git::push(&ctx.config_dir) {
             Ok(()) => true,
             Err(e) => {
-                ctx.diag(Diagnostic::new(
-                    Severity::Warning,
-                    "push_failed",
-                    format!("enrollment request committed but not pushed: {e}; run `muster sync --push`"),
-                ));
+                ctx.mark_failed();
+                ctx.diag(
+                    Diagnostic::new(
+                        Severity::Error,
+                        "push_failed",
+                        format!(
+                            "enrollment request committed locally at {} but push failed: {e}; \
+                             your request and any approvals are preserved — run `muster sync --push` \
+                             to publish it without recreating the request",
+                            path.display()
+                        ),
+                    )
+                    .with_path(path.display().to_string())
+                    .with_suggestion(
+                        "Run `muster sync --push` once the remote is reachable to publish the \
+                         existing enrollment request without recreating it.",
+                    ),
+                );
                 false
             }
         }
@@ -136,5 +182,6 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         "status": "pending",
         "request_path": path,
         "pushed": pushed,
+        "approvals_preserved": req.approvals.len(),
     }))
 }

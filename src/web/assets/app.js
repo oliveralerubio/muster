@@ -93,7 +93,7 @@ function scheduleNextProbe(delayMs) {
       scheduleNextProbe(reconnectDelay);
       return;
     }
-    if (status === 401 || status === 403) {
+    if (status === 401) {
       reconnecting = false;
       setConnBanner("Session expired. Reopen the panel with `muster ui`.");
       return;
@@ -129,7 +129,7 @@ async function api(path, body, quiet) {
   // Any answer means the server is back: stop reconnecting and drop the banner.
   stopReconnect();
   const data = await response.json().catch(() => ({ ok: false, diagnostics: [] }));
-  if (response.status === 401 || response.status === 403) {
+  if (response.status === 401) {
     attempt.failure = "Session expired. Reopen the panel with `muster ui`.";
     setConnBanner(attempt.failure);
     return { ok: false, error: attempt.failure, diagnostics: [] };
@@ -251,7 +251,9 @@ function diffPre(diff) {
 }
 
 function failMessage(data) {
-  return (data.diagnostics || []).map((d) => d.message).join("\n") || data.error || "failed";
+  return (data.diagnostics || [])
+    .map((d) => (d.suggestion ? `${d.message} (${d.suggestion})` : d.message))
+    .join("\n") || data.error || "failed";
 }
 
 // Every panel button is disabled while its handler is in flight, so a double
@@ -492,12 +494,24 @@ const views = {
     showCli("muster status");
     const r = data.result || {};
     const machines = r.machines || [];
-    const pending = (r.pending && r.pending.members) || [];
+    const pendingMembers = (r.pending && r.pending.members) || [];
+    const pendingMachines = (r.pending && r.pending.machines) || [];
+    const pendingRows = [
+      ...pendingMembers.map((p) => ["Member", el("code", {}, typeof p === "string" ? p : p.name)]),
+      ...pendingMachines.map((p) => [
+        "Machine",
+        typeof p === "string"
+          ? el("code", {}, p)
+          : el("span", {},
+            el("code", {}, p.name),
+            p.approvals_required ? ` (${(p.approvals || []).length}/${p.approvals_required} approvals)` : ""),
+      ]),
+    ];
     const drift = r.drift || {};
     const driftCount = (drift.members || []).length + (drift.machines || []).length;
     const diags = [...collectDiagnostics(data), ...collectDiagnostics(schedule)];
     const flagged = diags.filter((d) => d.severity === "warning" || d.severity === "error").length;
-    const attentionCount = pending.length + driftCount + flagged;
+    const attentionCount = pendingRows.length + driftCount + flagged;
     const s = schedule.result || {};
     const defaultInterval = s.interval_minutes || 60;
     const interval = el("input", { type: "number", min: "1", value: String(defaultInterval), "aria-label": "Minutes between syncs" });
@@ -559,7 +573,7 @@ const views = {
       ? Object.entries(byStatus).map(([status, count]) => `${count} ${status}`).join(", ")
       : "None enrolled";
     const attentionSub = attentionCount
-      ? [pending.length ? `${pending.length} pending` : null,
+      ? [pendingRows.length ? `${pendingRows.length} pending` : null,
         driftCount ? "Drift detected" : null,
         flagged ? `${flagged} ${flagged === 1 ? "diagnostic" : "diagnostics"}` : null].filter(Boolean).join(", ")
       : "Fleet converged";
@@ -575,7 +589,16 @@ const views = {
           hasRemote ? (m.is_current ? "" : button("Sync", () => act(`Sync machine ${m.name} over SSH now?`, "machine/sync", { name: m.name }))) : null,
         ].filter((c) => c !== null)))
       : el("div", { class: "empty-state" },
-        el("p", {}, "No machines in fleet. Run ", el("code", {}, "muster machine add"), " to enroll one, or open the Machines tab."),
+        el("p", {},
+          "No machines in fleet. To start a new fleet here, run ",
+          el("code", {}, "muster init"),
+          ". To join an existing fleet, pull its config repo with ",
+          el("code", {}, "muster sync --remote <url> --pull"),
+          " and run ",
+          el("code", {}, "muster enroll"),
+          ", or run ",
+          el("code", {}, "muster machine add <host>"),
+          " from an admin machine."),
         button("Open Machines", () => show("machines")));
     if (machines.length) fleet.setAttribute("class", "table-wrap board fleet-table" + (hasRemote ? " actions-end" : ""));
 
@@ -591,9 +614,10 @@ const views = {
       ...(drift.machines || []).map((d) => [sentenceCase("machine"), el("code", {}, d.name), el("span", { class: "reason" }, driftReasonLabel(d.reason))]),
     ];
     const attentionBlocks = [
-      pending.length
-        ? [el("h3", {}, `Pending approvals (${pending.length})`),
-          table(["Name"], pending.map((p) => [el("code", {}, typeof p === "string" ? p : p.name)]), null, "narrow")]
+      pendingRows.length
+        ? [el("h3", {}, `Pending approvals (${pendingRows.length})`),
+          table(["Kind", "Name"], pendingRows, null, "narrow"),
+          pendingMachines.length ? el("p", {}, button("Review machines", () => show("machines"))) : null]
         : null,
       driftCount
         ? table(["Kind", "Name", "Reason"], driftRows, null, "narrow drift-table")
@@ -621,7 +645,7 @@ const views = {
         plate("Machines", String(machines.length), fleetSub),
         plate("Needs attention", String(attentionCount), attentionSub, attentionCount > 0),
         plate("Last sync", syncFigure, syncSub, false, !r.sync)),
-      driftCount > 0 ? attentionSection : null,
+      attentionCount > 0 ? attentionSection : null,
       sectionHead("Fleet"),
       fleet,
       sectionHead("Automatic sync", "ops-title"),
@@ -641,7 +665,7 @@ const views = {
             el("div", { class: "ops-controls" },
               enableBtn,
               s.enabled ? button("Turn off", () => act("Turn off automatic sync? This machine will only sync when you click Sync now.", "schedule/disable")) : "")))),
-      driftCount > 0 ? null : attentionSection);
+      attentionCount > 0 ? null : attentionSection);
     setCount(`${machines.length} ${machines.length === 1 ? "machine" : "machines"}`);
   },
 
@@ -742,9 +766,9 @@ const views = {
         await navigator.clipboard.writeText(enrollCommand);
         copied = true;
       } catch (err) { /* clipboard unavailable: the command is still shown in the toast */ }
-      toast((copied ? "Copied: " : "Run on the new machine: ") + enrollCommand, "info", true);
+      toast((copied ? "Copied (run on an enrolled admin machine over SSH): " : "Run on an enrolled admin machine over SSH: ") + enrollCommand, "info", true);
     }, "primary");
-    enroll.title = "Copies " + enrollCommand;
+    enroll.title = "Copies " + enrollCommand + " (run from an enrolled admin machine over SSH)";
     const assignMachine = selectInput("Machine", machines.map((m) => m.name));
     const assignRole = textInput("Role", { placeholder: "role (optional)" });
     const assignProfile = textInput("Profile", { placeholder: "profile (optional)" });
@@ -778,7 +802,7 @@ const views = {
           hasActions ? (m.is_current ? "" : el("span", { class: "actions" },
             button("Sync", () => act(`Sync machine ${m.name} over SSH now?`, "machine/sync", { name: m.name })),
             button("Remove", () => act(`Remove machine ${m.name}?`, "machine/rm", { name: m.name }), "danger"))) : null].filter((c) => c !== null)),
-        emptyCard("No machines enrolled yet", "Run ", el("code", {}, "muster init"), " on this machine, then ", el("code", {}, "muster machine add"), " to enroll more."),
+        emptyCard("No machines enrolled yet", "Run ", el("code", {}, "muster init"), " on this machine to start a fleet, or ", el("code", {}, "muster machine add <host>"), " to enroll another machine over SSH."),
         "machines-table" + (hasActions ? " actions-end" : ""),
         widths),
       assignForm ? [sectionHead("Assign role or profile"), assignForm] : null,
@@ -790,7 +814,7 @@ const views = {
           el("span", { class: "actions" },
             button("Approve", () => act(`Approve enrollment of machine ${p.name}?`, "approve", { name: p.name })),
             button("Reject", () => act(`Reject the enrollment request of machine ${p.name}? Its recorded approvals are discarded.`, "reject", { name: p.name }), "danger"))]),
-        emptyCard("No pending requests", "New machines run ", el("code", {}, "muster init"), " to request enrollment.")),
+        emptyCard("No pending requests", "On the new machine, run ", el("code", {}, "muster sync --remote <url> --pull"), " then ", el("code", {}, "muster enroll"), ", or run ", el("code", {}, "muster machine add <host>"), " from an enrolled admin machine over SSH.")),
       diagnostics(data));
     setCount(`${machines.length} ${machines.length === 1 ? "machine" : "machines"}`
       + (pending.length ? `, ${pending.length} pending` : ""));
@@ -1020,7 +1044,9 @@ const views = {
       local: "own", up_to_date: "up to date", update_available: "update available",
       deprecated: "deprecated", upstream_removed: "removed upstream", unknown: "unknown",
     };
+    const hasModifiedSubscribed = skills.some((s) => s.origin !== "local" && (s.modified || s.status === "modified"));
     const rows = skills.map((s) => {
+      const isModified = Boolean(s.modified || s.status === "modified");
       const status = el("span", { class: "badge " + (badgeClass[s.status] || "") }, statusLabel[s.status] || s.status);
       if (s.reason) status.setAttribute("title", s.reason);
       // `enabled` is absent from older payloads: treat that as enabled.
@@ -1032,13 +1058,16 @@ const views = {
         button("Edit", () => openSkillEdit(s.name)),
         button(s.customized ? "Clear customization" : "Customize", () => customizeSkill(s)),
       ];
-      if (s.origin === "local" && (!s.locked || s.modified)) {
+      if (s.origin === "local" && (!s.locked || isModified)) {
         actions.push(button("Pin", () => act(`Approve the current contents of ${s.name} (pin in skills.lock)?`, "skills/pin", { name: s.name })));
       }
       if (s.status === "upstream_removed") {
         actions.push(button("Keep as own", () => act(`Keep ${s.name} as an own skill and stop following ${s.origin}?`, "skills/rm", { name: s.name, detach: true })));
         actions.push(button("Delete", () => act(`Delete skill ${s.name} and its files?`, "skills/rm", { name: s.name }), "danger"));
       } else {
+        if (s.origin !== "local" && isModified) {
+          actions.push(button("Keep as own", () => act(`Keep ${s.name} as an own skill and stop following ${s.origin}? Your local changes will be preserved.`, "skills/rm", { name: s.name, detach: true })));
+        }
         if (s.origin !== "local") actions.push(button("Update", () => updateSkill(s)));
         actions.push(button("Remove", () => act(`Delete skill ${s.name} and its files?`, "skills/rm", { name: s.name }), "danger"));
       }
@@ -1053,7 +1082,7 @@ const views = {
         el("span", { class: "state state-" + (enabled ? "live" : "idle") },
           el("span", { class: "state-dot", "aria-hidden": "true" }), enabled ? "Enabled" : "Disabled"),
         status,
-        s.modified ? el("span", { class: "badge warning", title: "Edited locally since it was vendored" }, "modified") : "",
+        isModified ? el("span", { class: "badge warning", title: "Edited locally since it was vendored. Use Keep as own (muster skill rm --detach) to keep your edits as an own skill, or Customize (muster skill customize) so upstream updates don't overwrite them." }, "modified") : "",
         el("span", { class: "actions" }, actions),
       ];
     });
@@ -1092,6 +1121,16 @@ const views = {
         "skills/auto-update", { state: r.auto_update ? "off" : "on" })),
     ],
       el("p", {}, r.checked_at ? `Last upstream check: ${formatTime(r.checked_at)}.` : "Upstream sources not checked yet on this machine."),
+      hasModifiedSubscribed
+        ? el("p", { class: "section-desc" },
+          "Locally modified subscribed skills are protected from overwrite. Click \"Keep as own\" (or run ",
+          el("code", {}, "muster skill rm <name> --detach"),
+          ") to keep your edits as an own skill, or move your additions into \"Customize\" (",
+          el("code", {}, "muster skill customize <name> --append <text>"),
+          ", followed by ",
+          el("code", {}, "muster sync"),
+          " to apply to agent files) and then update with --force.")
+        : null,
       table(["Name", "Origin", "Version", "Updated", "State", "Status", "", ""], rows, "No skills yet. Add one below."),
       el("h2", {}, "On disk, not managed by Muster"),
       el("p", {}, "Skills installed directly in an agent's skills folder. Skills installed from a known repository are subscribed, so they keep receiving updates; the rest are copied into your config repo as own skills. The original files stay untouched."),
@@ -1201,6 +1240,7 @@ const views = {
     if (token !== undefined && token !== navToken) return;
     const r = data.result || {};
     const generations = (r.generations || []).slice().reverse();
+    const commits = r.commits || [];
     render("History & generations", [],
       el("h2", {}, "Generations"),
       table(["#", "Created", "Kind", "Files", ""], generations.map((g) => [
@@ -1209,6 +1249,15 @@ const views = {
       ]), "No generations yet."),
       el("h2", {}, "Events"),
       table(["When", "Action", "Subject"], (r.events || []).slice().reverse().map((e) => [timeCell(e.at), e.action, e.subject]), "No events recorded."),
+      el("h2", {}, "Config repository commits (unverified Git metadata)"),
+      el("p", { class: "section-desc" }, "Git commit authors and Muster-Actor trailers are unverified Git metadata for audit visibility only. Cryptographically verified fleet authority lives in fleet.state.json (`muster trust show`)."),
+      table(["Commit", "When", "Summary", "Claimed actor (trailer)", "Git author (unverified)"], commits.map((c) => [
+        el("code", { class: "data", title: c.commit || "" }, c.short_commit || c.commit || ""),
+        timeCell(c.committed_at),
+        c.subject || "",
+        c.muster_actor ? el("code", { class: "data" }, c.muster_actor) : el("span", { class: "muted" }, "—"),
+        c.git_author || `${c.git_author_name || ""}${c.git_author_email ? ` <${c.git_author_email}>` : ""}`,
+      ]), "No Git commits recorded."),
       diagnostics(data));
   },
 
@@ -1271,9 +1320,64 @@ const views = {
     const data = await api("doctor");
     if (token !== undefined && token !== navToken) return;
     const r = data.result || {};
-    render("Doctor", [button("Apply safe fixes", () => act("Run doctor --fix?", "doctor", { fix: true }), "primary")],
-      el("p", {}, r.healthy ? "Healthy." : "Problems found."),
-      table(["Check", "Status"], (r.checks || []).map((c) => [c.name, c.status]), "No checks reported."),
+    const diags = collectDiagnostics(data);
+    const errors = diags.filter((d) => d.severity === "error").length;
+    const warnings = diags.filter((d) => d.severity === "warning").length;
+    const summaryText = errors > 0
+      ? `Problems found (${errors} ${errors === 1 ? "error" : "errors"}${warnings ? `, ${warnings} ${warnings === 1 ? "warning" : "warnings"}` : ""}).`
+      : warnings > 0
+        ? `Healthy with ${warnings} ${warnings === 1 ? "warning" : "warnings"}.`
+        : (r.healthy === false ? "Problems found." : "Healthy.");
+    const checkTone = { ok: "success", warning: "warning", error: "danger" };
+    const fixes = r.fixes || [];
+    const runFixes = async () => {
+      const res = await act(
+        "Run `muster doctor --fix`? Safe repairs (such as tightening key permissions and re-applying drifted agent configs) will be applied; manual edits to Muster-managed config keys will be overwritten.",
+        "doctor",
+        { fix: true }
+      );
+      if (res && res.ok) {
+        const applied = ((res.result && res.result.fixes) || []).filter((f) => f.applied);
+        if (applied.length) {
+          toast(
+            `Applied ${applied.length} ${applied.length === 1 ? "fix" : "fixes"}: `
+              + applied.map((f) => `${f.action}${f.consequence ? ` (${f.consequence})` : ""}`).join("; "),
+            "info",
+            true
+          );
+        } else {
+          const infoDiag = (res.diagnostics || []).find((d) => d.code === "no_automatic_fixes" || d.code === "fixes_applied");
+          toast(
+            infoDiag
+              ? (infoDiag.suggestion ? `${infoDiag.message} ${infoDiag.suggestion}` : infoDiag.message)
+              : "No automatic repairs applied. Review any remaining warnings or errors below.",
+            "info",
+            true
+          );
+        }
+      }
+    };
+    render("Doctor", [button("Apply safe fixes", runFixes, "primary")],
+      el("p", {}, summaryText),
+      table(["Check", "Status"], (r.checks || []).map((c) => [
+        c.name,
+        el("span", { class: "badge " + (checkTone[c.status] || "") }, c.status),
+      ]), "No checks reported."),
+      fixes.length
+        ? [
+          el("h2", {}, "Available repairs"),
+          table(["Code", "Repair", "Consequence", "Status"], fixes.map((f) => [
+            el("code", { class: "diag-code" }, f.code || ""),
+            f.action || "",
+            f.consequence || "",
+            f.applied
+              ? el("span", { class: "badge success" }, "applied")
+              : (f.destructive
+                ? el("span", { class: "badge warning" }, "overwrites manual edits to managed keys")
+                : el("span", { class: "badge info" }, "safe repair")),
+          ])),
+        ]
+        : null,
       diagnostics(data));
   },
 };
@@ -1306,7 +1410,7 @@ async function confirmUpdate(body) {
 }
 
 async function updateSkill(skill) {
-  if (skill.modified && !(await askConfirm(`${skill.name} was edited locally. Overwrite the local changes?`))) return;
+  if (skill.modified && !(await askConfirm(`${skill.name} was edited locally. Updating with --force will overwrite your local changes (to keep them instead, cancel and click "Keep as own" or move edits into "Customize"). Overwrite local changes?`))) return;
   return confirmUpdate(skill.modified ? { name: skill.name, force: true } : { name: skill.name });
 }
 
@@ -1862,12 +1966,14 @@ function skillEditsDiscardable() {
 
 async function customizeSkill(s) {
   if (s.customized) {
-    await act(`Remove the customization of ${s.name}?`, "skills/customize", { name: s.name, clear: true });
+    const res = await act(`Remove the customization of ${s.name}? Run Sync now (muster sync) afterwards to update agent skill files.`, "skills/customize", { name: s.name, clear: true });
+    if (res && res.ok) toast(`Customization removed from ${s.name}. Run Sync now (muster sync) to update agent skill files.`, "info", true);
     return;
   }
   const text = prompt(`Markdown to append to ${s.name}'s SKILL.md:`);
   if (!text) return;
-  await act(`Append this to ${s.name}?\n\n${text}`, "skills/customize", { name: s.name, append: text });
+  const res = await act(`Append this to ${s.name}?\n\n${text}`, "skills/customize", { name: s.name, append: text });
+  if (res && res.ok) toast(`Saved customization for ${s.name}. Run Sync now (muster sync) to render it into agent skill files.`, "info", true);
 }
 
 async function openSkillEdit(name) {

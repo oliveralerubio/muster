@@ -547,8 +547,11 @@ fn uninstall_removes_state_and_units_leaving_agent_files_in_place() {
 
     let cfg = env.config_dir();
     write(&cfg.join("AGENTS.md"), "# Canonical Instructions\n");
-    let manifest = "version = 1\n\n[agents]\nenabled = [\"claude\"]\n\n[agents.instructions]\nsource = \"AGENTS.md\"\n";
-    write(&cfg.join("muster.toml"), manifest);
+    let mut manifest = std::fs::read_to_string(cfg.join("muster.toml")).unwrap();
+    manifest.push_str(
+        "\n[agents]\nenabled = [\"claude\"]\n\n[agents.instructions]\nsource = \"AGENTS.md\"\n",
+    );
+    write(&cfg.join("muster.toml"), &manifest);
     // `agents apply` verifies the signed fleet state first.
     ok(&env, &["trust", "resign", "--yes"]);
 

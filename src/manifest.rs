@@ -390,7 +390,7 @@ impl Manifest {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(MusterError::Operational(format!(
-                    "not initialized: {} does not exist; run `muster init` first",
+                    "not initialized: {} does not exist; run `muster init` (new fleet) or `muster sync --remote <url> --pull` then `muster enroll` (join an existing fleet)",
                     path.display()
                 )))
             }

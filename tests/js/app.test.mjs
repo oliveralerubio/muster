@@ -190,7 +190,9 @@ const sandbox = {
     const body = options && options.body ? JSON.parse(options.body) : undefined;
     const call = { path: path.replace(/^\/api\//, ""), method: (options && options.method) || "GET", body };
     calls.push(call);
-    return { ok: true, json: async () => respond(call) };
+    const payload = await respond(call);
+    const status = payload && typeof payload.__status === "number" ? payload.__status : 200;
+    return { status, ok: status >= 200 && status < 300, json: async () => payload };
   },
   document: {
     activeElement: null,
@@ -744,6 +746,221 @@ async function testSkillsViewRendersUnmanagedSectionAndEscapesNames() {
   setResponder();
 }
 
+async function testApiDistinguishes401From403AndPreservesSession() {
+  setResponder((call) => {
+    if (call.path === "status") {
+      return {
+        __status: 403,
+        ok: false,
+        error: "fleet state governance digest does not match muster.toml",
+        diagnostics: [
+          {
+            severity: "error",
+            code: "fleet_state_invalid",
+            message: "fleet state governance digest does not match muster.toml",
+            suggestion: "run `muster trust resign`",
+          },
+        ],
+      };
+    }
+    return { ok: true, diagnostics: [], result: {} };
+  });
+  await sandbox.show("dashboard");
+  await flush();
+  const text = (node) => (typeof node === "string" ? node : [node.textContent || "", ...(node.children || []).map(text)].join(" "));
+  const rendered403 = text(view);
+  assert.doesNotMatch(rendered403, /Session expired/i, "403 must not claim session expired");
+  assert.match(rendered403, /fleet_state_invalid/, "403 must surface security diagnostic code");
+  assert.match(rendered403, /fleet state governance digest does not match muster\.toml/, "403 must show diagnostic message");
+  assert.match(rendered403, /muster trust resign/, "403 must include suggestion");
+
+  setResponder((call) => {
+    if (call.path === "status") {
+      return { __status: 401, ok: false, error: "unauthorized" };
+    }
+    return { ok: true, diagnostics: [], result: {} };
+  });
+  await sandbox.show("dashboard");
+  await flush();
+  const rendered401 = text(view);
+  assert.match(rendered401, /Session expired\. Reopen the panel with `muster ui`\./, "401 must report session expired");
+  setResponder();
+}
+
+async function testDashboardShowsOnboardingAndPendingMachines() {
+  setResponder((call) => {
+    if (call.path === "status") {
+      return { ok: true, diagnostics: [], result: { machines: [], sync: null } };
+    }
+    return { ok: true, diagnostics: [], result: {} };
+  });
+  await sandbox.show("dashboard");
+  await flush();
+  const text = (node) => (typeof node === "string" ? node : [node.textContent || "", ...(node.children || []).map(text)].join(" "));
+  const emptyDash = text(view);
+  assert.match(emptyDash, /muster init/, "Empty dashboard explains muster init for a new fleet");
+  assert.match(emptyDash, /muster sync --remote <url> --pull/, "Empty dashboard explains pulling existing fleet");
+  assert.match(emptyDash, /muster enroll/, "Empty dashboard explains muster enroll for joining a fleet");
+
+  setResponder((call) => {
+    if (call.path === "status") {
+      return {
+        ok: true,
+        diagnostics: [],
+        result: {
+          machines: [
+            { name: "alpha", platform: "linux-x86_64", version: "0.1.0", status: "current", is_current: true },
+          ],
+          pending: {
+            machines: [
+              { name: "beta-laptop", member: "bob", role: "member", approvals: ["alice"], approvals_required: 2 },
+            ],
+            members: [],
+          },
+          sync: { ts: "2026-11-07T00:00:00Z", result: "ok" },
+        },
+      };
+    }
+    return { ok: true, diagnostics: [], result: {} };
+  });
+  await sandbox.show("dashboard");
+  await flush();
+  const pendingDash = text(view);
+  assert.match(pendingDash, /Pending approvals/, "Dashboard renders pending approvals card");
+  assert.match(pendingDash, /beta-laptop/, "Dashboard lists pending machine enrollment request");
+  assert.match(pendingDash, /1\/2 approvals/, "Dashboard shows approval progress for pending machine");
+  assert.ok(liveButton("Review machines"), "Dashboard includes Review machines action button");
+  setResponder();
+}
+
+async function testDoctorDistinguishesWarningsFromErrorsAndShowsFixConsequences() {
+  setResponder((call) => {
+    if (call.path === "doctor") {
+      if (call.body && call.body.fix) {
+        return {
+          ok: true,
+          diagnostics: [
+            {
+              severity: "info",
+              code: "fixes_applied",
+              message: "applied 1 automatic repair(s): chmod 0600 on /tmp/identity.txt (restricts file access to the current OS user (mode 0600))",
+            },
+          ],
+          result: {
+            healthy: true,
+            status: "ok",
+            checks: [{ name: "permissions", status: "ok" }],
+            fixes: [
+              {
+                code: "loose_permissions",
+                action: "chmod 0600 /tmp/identity.txt",
+                consequence: "restricts file access to the current OS user (mode 0600)",
+                applied: true,
+              },
+            ],
+          },
+        };
+      }
+      return {
+        ok: true,
+        diagnostics: [
+          {
+            severity: "warning",
+            code: "skill_modified",
+            message: "subscribed skill 'demo' has local edits",
+            suggestion: "run `muster skill rm demo --detach` to keep local edits",
+          },
+        ],
+        result: {
+          healthy: true,
+          status: "warning",
+          checks: [
+            { name: "permissions", status: "ok" },
+            { name: "skills", status: "warning" },
+          ],
+          fixes: [
+            {
+              code: "loose_permissions",
+              action: "chmod 0600 /tmp/identity.txt",
+              consequence: "restricts file access to the current OS user (mode 0600)",
+              applied: false,
+            },
+          ],
+        },
+      };
+    }
+    return { ok: true, diagnostics: [], result: {} };
+  });
+  await sandbox.show("doctor");
+  await flush();
+  const text = (node) => (typeof node === "string" ? node : [node.textContent || "", ...(node.children || []).map(text)].join(" "));
+  const rendered = text(view);
+  assert.match(rendered, /Healthy with 1 warning\./, "Doctor distinguishes warning status from clean pass");
+  assert.doesNotMatch(rendered, /^Healthy\.$/, "Doctor with warnings must not say bare Healthy.");
+  assert.match(rendered, /run `muster skill rm demo --detach`/, "Doctor renders diagnostic suggestion");
+  assert.match(rendered, /restricts file access to the current OS user/, "Doctor renders repair consequence");
+  assert.ok(liveButton("Apply safe fixes"), "Doctor renders Apply safe fixes button");
+  setResponder();
+}
+
+async function testModifiedSkillShowsResolutionAndHistoryLabelsUnverifiedGitCommits() {
+  setResponder((call) => {
+    if (call.path === "skills") {
+      return {
+        ok: true,
+        diagnostics: [],
+        result: {
+          skills: [
+            { name: "demo", origin: "upstream", status: "modified", modified: true, enabled: true },
+          ],
+          unmanaged: [],
+        },
+      };
+    }
+    return { ok: true, diagnostics: [], result: {} };
+  });
+  await sandbox.show("skills");
+  await flush();
+  const text = (node) => (typeof node === "string" ? node : [node.textContent || "", ...(node.children || []).map(text)].join(" "));
+  const skillsRendered = text(view);
+  assert.match(skillsRendered, /muster skill rm <name> --detach/, "Modified skill explains --detach to keep local edits");
+  assert.match(skillsRendered, /muster sync/, "Modified skill explains running muster sync after customize");
+  assert.ok(liveButton("Keep as own"), "Modified skill provides Keep as own button");
+
+  setResponder((call) => {
+    if (call.path === "history") {
+      return {
+        ok: true,
+        diagnostics: [],
+        result: {
+          generations: [],
+          commits: [
+            {
+              commit: "1234567890abcdef1234567890abcdef12345678",
+              short_commit: "1234567",
+              committed_at: "2026-11-07T00:00:00Z",
+              git_author_name: "Alice",
+              git_author_email: "alice@example.com",
+              subject: "feat(team): invite bob",
+              muster_actor: "alice (machine alpha)",
+              verified: false,
+            },
+          ],
+        },
+      };
+    }
+    return { ok: true, diagnostics: [], result: {} };
+  });
+  await sandbox.show("history");
+  await flush();
+  const historyRendered = text(view);
+  assert.match(historyRendered, /Config repository commits \(unverified Git metadata\)/, "History renders Git commit audit card");
+  assert.match(historyRendered, /unverified Git metadata/, "History explicitly marks Git commits as unverified");
+  assert.match(historyRendered, /muster trust show/, "History points to muster trust show for verified state");
+  assert.match(historyRendered, /alice \(machine alpha\)/, "History displays Muster-Actor trailer");
+  setResponder();
+}
+
 const tests = {
   testSkillsViewRendersUnmanagedSectionAndEscapesNames,
   testEffectiveViewShowsStatesAndEscapesNames,
@@ -760,6 +977,10 @@ const tests = {
   testMcpFormUsesJsonArrayValues,
   testMcpPreviewIgnoresStaleResponse,
   testMcpEditClearsPreviewAndGuardsSave,
+  testApiDistinguishes401From403AndPreservesSession,
+  testDashboardShowsOnboardingAndPendingMachines,
+  testDoctorDistinguishesWarningsFromErrorsAndShowsFixConsequences,
+  testModifiedSkillShowsResolutionAndHistoryLabelsUnverifiedGitCommits,
 };
 
 let failed = 0;

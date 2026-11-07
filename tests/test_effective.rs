@@ -5,6 +5,24 @@ use support::MusterEnv;
 /// `effective` verifies the signed fleet state, so a hand-written
 /// `muster.toml` must be re-signed first (as a user would).
 fn resign(env: &MusterEnv) {
+    let manifest_path = env.config_dir().join("muster.toml");
+    let current = std::fs::read_to_string(&manifest_path).unwrap_or_default();
+    if !current.contains("[machines.") {
+        let base_out = std::process::Command::new("git")
+            .args([
+                "-C",
+                env.config_dir().to_str().unwrap(),
+                "show",
+                "HEAD:muster.toml",
+            ])
+            .output()
+            .expect("git show HEAD:muster.toml");
+        if base_out.status.success() {
+            let base = String::from_utf8_lossy(&base_out.stdout);
+            let stripped = current.strip_prefix("version = 1\n").unwrap_or(&current);
+            std::fs::write(&manifest_path, format!("{base}\n{stripped}")).unwrap();
+        }
+    }
     env.run(&["--format", "json", "trust", "resign", "--yes"])
         .assert()
         .success();

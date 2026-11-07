@@ -182,6 +182,7 @@ fn run_resign(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> 
     let manifest = Manifest::load(&ctx.config_dir)?;
     fleet_state::ensure_not_behind_pin(&ctx.config_dir, &ctx.state_dir, "re-sign")?;
     let recovery = team::recovery_identity(ctx, params, &manifest)?;
+    let used_recovery = recovery.is_some();
     let signer = match recovery {
         Some(rec_id) => Signer::from_recovery(&rec_id)?,
         None => {
@@ -209,6 +210,7 @@ fn run_resign(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> 
             signing::fingerprint(&public)
         )));
     }
+    ensure_resign_preserves_admin(&manifest, &public, used_recovery)?;
 
     // With no pin there is nothing to hold the manifest against, so the
     // manifest being signed could be exactly what an attacker wrote. Only a
@@ -275,6 +277,83 @@ fn run_resign(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> 
         "governance_content": governance_content(&manifest),
         "governance_diff": governance_diff,
     }))
+}
+
+/// Refuse to seal a manifest that leaves the fleet without admin signing
+/// authority or strips admin signing authority from the current signer.
+fn ensure_resign_preserves_admin(
+    manifest: &Manifest,
+    signer_public: &str,
+    used_recovery: bool,
+) -> Result<(), MusterError> {
+    let (new_admins, _) = fleet_state::signer_sets(manifest);
+    if used_recovery {
+        if !new_admins
+            .iter()
+            .any(|k| k == signer_public && signing::parse_public(k).is_ok())
+        {
+            return Err(MusterError::Security(
+                "cannot re-sign: muster.toml removes or changes [recovery].signing_key, \
+                 which would lock out the recovery key"
+                    .into(),
+            ));
+        }
+        return Ok(());
+    }
+
+    let valid_machine_key = |m: &crate::manifest::Machine| {
+        m.signing_key
+            .as_deref()
+            .is_some_and(|k| signing::parse_public(k).is_ok())
+    };
+    if manifest.members.is_empty() {
+        if !manifest.machines.values().any(valid_machine_key) {
+            return Err(MusterError::Security(
+                "cannot re-sign: muster.toml has no machine with a valid signing_key \
+                 (at least one admin machine must remain able to sign fleet state)"
+                    .into(),
+            ));
+        }
+    } else {
+        let active_admins: Vec<_> = manifest
+            .members
+            .values()
+            .filter(|m| {
+                m.status == crate::manifest::MemberStatus::Active
+                    && m.role == crate::manifest::Role::Admin
+            })
+            .collect();
+        if active_admins.is_empty() {
+            return Err(MusterError::Security(
+                "cannot re-sign: muster.toml has no active admin member \
+                 (at least one active admin must remain in the fleet)"
+                    .into(),
+            ));
+        }
+        let has_admin_machine_signer = active_admins
+            .iter()
+            .flat_map(|m| m.machines.iter())
+            .filter_map(|name| manifest.machines.get(name))
+            .any(valid_machine_key);
+        if !has_admin_machine_signer {
+            return Err(MusterError::Security(
+                "cannot re-sign: no active admin member in muster.toml owns a machine \
+                 with a valid signing_key"
+                    .into(),
+            ));
+        }
+    }
+    if !new_admins
+        .iter()
+        .any(|k| k == signer_public && signing::parse_public(k).is_ok())
+    {
+        return Err(MusterError::Security(format!(
+            "cannot re-sign: muster.toml removes admin signing authority from this machine ({}), \
+             which would lock out future `muster trust resign`",
+            signing::fingerprint(signer_public)
+        )));
+    }
+    Ok(())
 }
 
 /// Whether `manifest` lists exactly one machine and it is this one.

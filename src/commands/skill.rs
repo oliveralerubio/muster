@@ -389,6 +389,23 @@ fn file_set(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
                 entry.updated_at = now();
             }
             lock.save(&ctx.config_dir)?;
+        } else if lock.get(&name).is_some() {
+            ctx.diag(
+                Diagnostic::new(
+                    Severity::Info,
+                    "subscribed_skill_modified",
+                    format!(
+                        "skill '{name}' is subscribed; direct edits mark it as modified and block \
+                         upstream updates. To keep your changes without losing them on update, \
+                         detach it as an own skill (`muster skill rm {name} --detach --yes`) or \
+                         move additions to `muster skill customize {name} --append <text>` \
+                         (then run `muster sync`)"
+                    ),
+                )
+                .with_suggestion(format!(
+                    "muster skill rm {name} --detach --yes  # or: muster skill customize {name} --append <text>"
+                )),
+            );
         }
         commit(
             ctx,
@@ -807,7 +824,10 @@ fn pin(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let previous = lock.get(&name);
     if previous.is_some_and(|entry| !entry.is_local()) {
         return Err(MusterError::Usage(format!(
-            "skill '{name}' is subscribed; use `skill update` instead"
+            "skill '{name}' is subscribed; to keep local edits as an own skill run \
+             `muster skill rm {name} --detach --yes` (then `muster skill pin {name}`), \
+             or use `muster skill customize {name} --append <text>` (then `muster sync`), \
+             or use `muster skill update {name}` to pull upstream"
         )));
     }
     let files = read_skill_files(&dir.join(&name))?;
@@ -1860,6 +1880,13 @@ fn emit_update_diagnostics(ctx: &mut Context, plan: &UpdatePlan) {
     for d in &plan.diagnostics {
         match d {
             UpdateDiagnostic::SourceUnreachable { origin, why } => unreachable(ctx, origin, why),
+            UpdateDiagnostic::SkillModified { name } => ctx.diag(
+                Diagnostic::new(Severity::Warning, d.code(), d.message()).with_suggestion(format!(
+                    "detach with `muster skill rm {name} --detach --yes`, move additions to \
+                     `muster skill customize {name} --append <text>`, or discard edits with \
+                     `muster skill update {name} --force`"
+                )),
+            ),
             other => ctx.diag(Diagnostic::new(
                 Severity::Warning,
                 other.code(),
@@ -1948,8 +1975,13 @@ fn customize_cmd(ctx: &mut Context, params: &Params) -> Result<Value, MusterErro
     }
     let manifest = Manifest::load(&ctx.config_dir)?;
     let actor = admin(ctx, &manifest)?;
-    let result =
-        json!({ "name": name, "cleared": clear, "append": append, "dry_run": ctx.dry_run });
+    let result = json!({
+        "name": name,
+        "cleared": clear,
+        "append": append,
+        "dry_run": ctx.dry_run,
+        "sync_required": !ctx.dry_run,
+    });
     if ctx.dry_run {
         return Ok(result);
     }
@@ -1990,6 +2022,17 @@ fn customize_cmd(ctx: &mut Context, params: &Params) -> Result<Value, MusterErro
             if clear { "clear" } else { "set" }
         ),
     )?;
+    ctx.diag(
+        Diagnostic::new(
+            Severity::Info,
+            "sync_required",
+            format!(
+                "customization for skill '{name}' saved in muster.toml; run `muster sync` \
+                 (or `muster agents apply`) to render it into agent skill files"
+            ),
+        )
+        .with_suggestion("muster sync"),
+    );
     Ok(result)
 }
 

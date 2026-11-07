@@ -440,7 +440,10 @@ fn upstream_removed_message(name: &str, origin: &str) -> String {
 fn modified_message(name: &str) -> String {
     format!(
         "skill '{name}' has local modifications that the update would overwrite; \
-         re-run with --force to discard them"
+         to preserve your changes, detach it as an own skill with \
+         `muster skill rm {name} --detach --yes` or move additions into \
+         `muster skill customize {name} --append <text>` (then run `muster sync`), \
+         or re-run with `--force` to discard local edits"
     )
 }
 
