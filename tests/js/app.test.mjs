@@ -11,6 +11,7 @@
 
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import vm from "node:vm";
 
 const appJsPath = process.env.APP_JS;
@@ -273,6 +274,27 @@ async function testDashboardSyncOperationsRedesign() {
   assert.match(fleetRendered, /ssh root@onesafe/, "Fleet table must display machine SSH host");
   assert.ok(liveButton("Sync"), "Remote machine row must provide a Sync button");
   setResponder();
+}
+
+// #84 shipped two conflicting `.fleet-table.actions-end` width blocks: the
+// later one silently won, so the earlier percentages were dead code that could
+// bite the next editor. Column rules for a given table must be declared once.
+async function testFleetTableColumnWidthsDeclaredOnce() {
+  const css = readFileSync(join(dirname(appJsPath), "style.css"), "utf8");
+  const count = (selector) => css.split(selector).length - 1;
+  for (const child of [1, 2, 3, 4, 5]) {
+    const selector = `.table-wrap.fleet-table.actions-end th:nth-child(${child})`;
+    assert.equal(count(selector), 1, `${selector} must be declared exactly once`);
+  }
+  // The surviving five-column shares must partition the table width.
+  const widths = [...css.matchAll(/\.table-wrap\.fleet-table\.actions-end th:nth-child\(\d\) \{ width: (\d+)%; \}/g)]
+    .map((m) => Number(m[1]));
+  assert.equal(widths.length, 5, "five-column fleet table needs five width rules");
+  assert.equal(widths.reduce((a, b) => a + b, 0), 100, "fleet column widths must sum to 100%");
+  const fourCol = [...css.matchAll(/\.table-wrap\.fleet-table th:nth-child\(\d\) \{ width: (\d+)%; \}/g)]
+    .map((m) => Number(m[1]));
+  assert.equal(fourCol.length, 4, "four-column fleet table needs four width rules");
+  assert.equal(fourCol.reduce((a, b) => a + b, 0), 100, "four-column widths must sum to 100%");
 }
 
 
@@ -748,6 +770,7 @@ const tests = {
   testSkillsViewRendersUnmanagedSectionAndEscapesNames,
   testEffectiveViewShowsStatesAndEscapesNames,
   testDashboardSyncOperationsRedesign,
+  testFleetTableColumnWidthsDeclaredOnce,
   testSkillToggleControls,
   testMcpToggleShowsOnlyValidAction,
   testCliFooterNotOverwrittenByBackgroundFetch,
