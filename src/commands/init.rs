@@ -164,8 +164,8 @@ fn ensure_clean_for_init(config_dir: &Path, state_dir: &Path) -> Result<(), Must
         return Err(MusterError::Operational(format!(
             "cannot initialize a new fleet: local Muster state in {} already belongs to an \
              existing fleet (found {}); to join or restore that fleet run \
-             `muster sync --remote <url> --pull`, or run `muster uninstall --yes` before \
-             initializing a new fleet",
+             `muster sync --remote <url> --pull`; to initialize a separate fleet, set \
+             XDG_STATE_HOME to a separate directory",
             state_dir.display(),
             found.join(", ")
         )));
