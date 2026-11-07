@@ -608,8 +608,32 @@ pub fn drift(config_dir: &Path, manifest: &Manifest) -> Value {
             }));
         }
     }
+    let approvals_required = manifest.required_approvals() as usize;
+    let state_hash = crate::fleet_state::current_hash(config_dir).ok().flatten();
+    let pending_machines: Vec<Value> = crate::fleet::EnrollmentRequest::pending(config_dir)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|req| {
+            let check = req.check_approvals(manifest, state_hash.as_deref());
+            json!({
+                "name": req.name,
+                "host": req.host,
+                "recipient": req.recipient,
+                "platform": req.platform,
+                "version": req.muster_version,
+                "agents": req.agents,
+                "created_at": req.created_at,
+                "approvals": check.valid.iter().map(|a| a.member.clone()).collect::<Vec<_>>(),
+                "approvals_received": check.valid.len(),
+                "approvals_required": approvals_required,
+                "role": req.role,
+                "profile": req.profile,
+                "member": req.member,
+            })
+        })
+        .collect();
     json!({
-        "pending": { "members": pending },
+        "pending": { "members": pending, "machines": pending_machines },
         "drift": { "members": drifted_members, "machines": machines },
     })
 }

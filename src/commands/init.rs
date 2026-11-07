@@ -38,12 +38,9 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         ));
     }
     let config_dir = ctx.config_dir.clone();
-    if config_dir.join(manifest::FILE_NAME).exists() {
-        return Err(MusterError::Operational(format!(
-            "already initialized: {} exists",
-            config_dir.join(manifest::FILE_NAME).display()
-        )));
-    }
+    let state_dir = ctx.state_dir.clone();
+    ensure_clean_for_init(&config_dir, &state_dir)?;
+
     let name = match params.get_string("machine") {
         Some(name) => machine::validate_name(name)?,
         None => machine::default_name(),
@@ -58,12 +55,7 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         }));
     }
 
-    // Reuse an existing local identity rather than destroying it.
-    let state_dir = ctx.state_dir.clone();
-    let (identity, new_identity) = match Identity::load(&state_dir) {
-        Ok(identity) => (identity, false),
-        Err(_) => (Identity::generate(), true),
-    };
+    let identity = Identity::generate();
     let recovery = Identity::generate();
 
     // Interactive: show the key once on the terminal and require confirmation
@@ -77,9 +69,10 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         ctx.confirm("Have you stored the recovery key somewhere safe?")?;
     }
 
-    if new_identity {
-        identity.save(&state_dir)?;
-    }
+    let _lock = crate::lock::acquire_for(&state_dir, crate::lock::wait_budget())?;
+    ensure_clean_for_init(&config_dir, &state_dir)?;
+
+    identity.save(&state_dir)?;
     machine::save_name(&state_dir, &name)?;
 
     create_dir(&config_dir)?;
@@ -138,6 +131,46 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         "recovery_recipient": recovery.recipient(),
         "detected_agents": agents,
     }))
+}
+
+const STATE_ARTIFACTS: &[&str] = &[
+    crate::fleet_state::TRUST_FILE,
+    "machine-name",
+    "identity.txt",
+    "signing.key",
+    "generations",
+    "secret-leases.json",
+];
+
+fn ensure_clean_for_init(config_dir: &Path, state_dir: &Path) -> Result<(), MusterError> {
+    if config_dir.join(manifest::FILE_NAME).exists() {
+        return Err(MusterError::Operational(format!(
+            "already initialized: {} exists",
+            config_dir.join(manifest::FILE_NAME).display()
+        )));
+    }
+    if config_dir.join(crate::fleet_state::STATE_FILE).exists() {
+        return Err(MusterError::Operational(format!(
+            "already initialized: {} exists",
+            config_dir.join(crate::fleet_state::STATE_FILE).display()
+        )));
+    }
+    let found: Vec<&str> = STATE_ARTIFACTS
+        .iter()
+        .copied()
+        .filter(|name| state_dir.join(name).exists())
+        .collect();
+    if !found.is_empty() {
+        return Err(MusterError::Operational(format!(
+            "cannot initialize a new fleet: local Muster state in {} already belongs to an \
+             existing fleet (found {}); to join or restore that fleet run \
+             `muster sync --remote <url> --pull`, or run `muster uninstall --yes` before \
+             initializing a new fleet",
+            state_dir.display(),
+            found.join(", ")
+        )));
+    }
+    Ok(())
 }
 
 fn create_dir(path: &Path) -> Result<(), MusterError> {

@@ -89,7 +89,9 @@ pub(crate) fn execute_with(
             ctx.expect_state = expect_state;
             // One mutation at a time per machine, so a concurrent command can
             // never clobber a live revocation stage or a half-written commit.
-            let lock = if spec.mutating && !ctx.dry_run {
+            // `init` acquires the lock after its preflight checks so a refused
+            // init never creates `state_dir` or `mutation.lock`.
+            let lock = if spec.mutating && !ctx.dry_run && spec.name != "init" {
                 let wait = if spec.name == "sync" {
                     std::time::Duration::ZERO
                 } else {

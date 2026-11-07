@@ -426,3 +426,58 @@ pub fn restore_paths(dir: &Path, commit: &str, paths: &[&str]) -> Result<(), Mus
     }
     Ok(())
 }
+
+/// Up to `limit` newest commits in the config repository as JSON values for
+/// audit history inspection. Git author and `Muster-Actor` trailers are
+/// explicitly marked `verified: false` so they are never confused with
+/// cryptographically verified fleet state signatures (`muster trust show`).
+pub fn recent_commits(dir: &Path, limit: usize) -> Vec<serde_json::Value> {
+    if !is_repo(dir) || !has_commits(dir) {
+        return Vec::new();
+    }
+    let limit_arg = format!("-n{limit}");
+    let format_arg =
+        "--format=%H%x1f%cI%x1f%an <%ae>%x1f%s%x1f%(trailers:key=Muster-Actor,valueonly,separator=; )%x1e";
+    let Ok(out) = run(dir, &["log", "--no-show-signature", &limit_arg, format_arg]) else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .split('\x1e')
+        .filter_map(|record| {
+            let record = record.trim();
+            if record.is_empty() {
+                return None;
+            }
+            let mut parts = record.splitn(5, '\x1f');
+            let hash = parts.next()?.trim();
+            if hash.is_empty() {
+                return None;
+            }
+            let timestamp = parts.next().unwrap_or("").trim();
+            let git_author = parts.next().unwrap_or("").trim();
+            let subject = parts.next().unwrap_or("").trim();
+            let claimed_actor = parts
+                .next()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let short_hash: String = hash.chars().take(7).collect();
+            Some(serde_json::json!({
+                "commit": hash,
+                "short_commit": short_hash,
+                "hash": hash,
+                "short_hash": short_hash,
+                "committed_at": timestamp,
+                "timestamp": timestamp,
+                "subject": subject,
+                "git_author": git_author,
+                "muster_actor": claimed_actor,
+                "claimed_actor": claimed_actor,
+                "verified": false,
+            }))
+        })
+        .collect()
+}
