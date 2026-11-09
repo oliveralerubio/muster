@@ -151,7 +151,16 @@ fn status_machine_list_secret_list_and_agents_render_text_not_json() {
 #[test]
 fn text_output_covers_empty_and_incomplete_data() {
     let env = MusterEnv::new();
-    ok(&env, &["init", "--yes", "--machine", "solo"]);
+    env.link_system_exe("git");
+    let (out, envelope) = support::json(env.run_isolated(&[
+        "--format",
+        "json",
+        "init",
+        "--yes",
+        "--machine",
+        "solo",
+    ]));
+    assert!(out.status.success(), "{}", envelope.raw);
 
     // Empty vault: a sentence, not `[]`.
     let (stdout, _) = text(&env, &["secret", "list"]);
