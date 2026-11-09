@@ -63,7 +63,15 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let interactive = !ctx.yes;
     if interactive {
         eprintln!(
-            "Recovery key (shown only once; store it offline, it is never saved):\n\n  {}\n",
+            "Recovery key (shown only once; it is never saved anywhere by muster):\n\n  {}\n\n\
+             What it is: the one offline key that can still administer this fleet when\n\
+             every machine is lost or locked out — it can approve machines and members,\n\
+             read vault groups and re-sign the fleet state.\n\
+             How to store it: a password manager or printed offline, wherever this fleet's\n\
+             break-glass credentials belong.\n\
+             How to use it later: pipe the saved key to a command that needs it, e.g.\n\
+             `cat recovery.key | muster approve <machine> --member <you> --recovery-key-stdin`\n\
+             This exact value is never printed again; losing it removes the break-glass path.\n",
             recovery.secret_key().expose()
         );
         ctx.confirm("Have you stored the recovery key somewhere safe?")?;
@@ -114,6 +122,15 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
             ),
         ));
     }
+    // The key itself is never repeated here (interactive showed it once,
+    // --yes returned it in the result); this is only how to use it later.
+    ctx.diag(Diagnostic::new(
+        Severity::Info,
+        "recovery_key_guide",
+        "keep the recovery key offline; to use it, pipe the saved key to a command with \
+         --recovery-key-stdin (e.g. `cat recovery.key | muster approve <machine> --member \
+         <you> --recovery-key-stdin`); it cannot be printed again",
+    ));
 
     let recovery_key = if interactive {
         Value::Null

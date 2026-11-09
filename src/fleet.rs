@@ -175,6 +175,12 @@ impl EnrollmentRequest {
         config_dir.join(ENROLL_DIR).join(format!("{name}.toml"))
     }
 
+    /// The request file's path relative to the config repo root
+    /// (`enroll/<name>.toml`), for git queries about its publication.
+    pub fn rel_path(name: &str) -> String {
+        format!("{ENROLL_DIR}/{name}.toml")
+    }
+
     pub fn save(&self, config_dir: &Path) -> Result<PathBuf, MusterError> {
         let dir = config_dir.join(ENROLL_DIR);
         fs::create_dir_all(&dir)

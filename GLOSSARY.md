@@ -47,7 +47,7 @@ The number of distinct admins required to approve an enrollment or an invitation
 _Avoid_: threshold
 
 **Secret access (`allow`)**:
-The deny-by-default rule that decides which agents may receive a secret: `[secrets."<reference>"] allow` in `muster.toml`, with `agent` for everywhere or `agent@project` for one project. Without an entry, no agent receives it.
+The deny-by-default rule that decides which agents may receive a secret: `[secrets."<reference>"] allow` in `muster.toml`, with `agent` for everywhere or `agent@project` for one project. Four distinct states, never flattened: no policy declared (agents never receive it; the human CLI still can), approval policy only (no allow list, but a per-use approval requirement survives removing the list), an explicit empty list `allow = []` (deny everyone), and a list of allowed agents. `secret allow --remove` takes only the allow list; the approval policy (`approval`, `approval_ttl`) is preserved.
 _Avoid_: whitelist
 
 **Secret request**:

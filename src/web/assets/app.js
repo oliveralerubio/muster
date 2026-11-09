@@ -488,7 +488,7 @@ function machineIdentity(m, current) {
 
 const views = {
   async dashboard(token) {
-    const [data, schedule] = await Promise.all([api("status"), api("schedule")]);
+    const [data, schedule, agentsData] = await Promise.all([api("status"), api("schedule"), api("agents")]);
     if (token !== undefined && token !== navToken) return;
     // Both fetches race to set the footer hint; the dashboard's own command wins.
     showCli("muster status");
@@ -496,6 +496,7 @@ const views = {
     const machines = r.machines || [];
     const pendingMembers = (r.pending && r.pending.members) || [];
     const pendingMachines = (r.pending && r.pending.machines) || [];
+    const pendingSecrets = r.pending_secret_approvals || [];
     const pendingRows = [
       ...pendingMembers.map((p) => ["Member", el("code", {}, typeof p === "string" ? p : p.name)]),
       ...pendingMachines.map((p) => [
@@ -505,6 +506,12 @@ const views = {
           : el("span", {},
             el("code", {}, p.name),
             p.approvals_required ? ` (${(p.approvals || []).length}/${p.approvals_required} approvals)` : ""),
+      ]),
+      ...pendingSecrets.map((p) => [
+        "Secret",
+        el("span", {},
+          el("code", {}, p.reference),
+          ` for ${p.agent}`),
       ]),
     ];
     const drift = r.drift || {};
@@ -602,6 +609,30 @@ const views = {
         button("Open Machines", () => show("machines")));
     if (machines.length) fleet.setAttribute("class", "table-wrap board fleet-table" + (hasRemote ? " actions-end" : ""));
 
+    // Honest agent summary: enabled/detected/available are three different
+    // facts; none of them promises connectivity or authentication.
+    const agentsList = (agentsData.result && agentsData.result.agents) || [];
+    const agentRow = (a) => {
+      const cell = (on, label) => el("span", { class: "state state-" + (on === "yes" ? "live" : "idle"), title: label },
+        el("span", { class: "state-dot", "aria-hidden": "true" }), on === "yes" ? "Yes" : on === "no" ? "No" : "?");
+      // `available` is the adapter's own platform support computation.
+      const platformOk = a.available === true ? "yes" : a.available === false ? "no" : "unknown";
+      return [
+        el("span", {},
+          el("span", { class: "board-name" }, a.id),
+          a.experimental ? el("span", { class: "badge info" }, "experimental") : null),
+        cell(a.enabled === true ? "yes" : "no", "Enabled in the shared config"),
+        cell(a.detected === true ? "yes" : "no", "This agent's files were found on this machine"),
+        cell(platformOk, "Supported on this platform"),
+      ];
+    };
+    const agentsSection = el("section", { class: "board agents-board", "aria-labelledby": "agents-title" },
+      sectionHead("Agents on this machine", "agents-title"),
+      el("p", { class: "section-desc" },
+        "Enabled comes from the shared config, detection only means the agent's files exist here, and availability is about the platform. None of these say the agent is signed in or reachable."),
+      table(["Agent", "Enabled", "Detected", "This platform"],
+        agentsList.map(agentRow), "No agents known."));
+
     const statusPill = state(s.enabled ? "live" : "idle", s.enabled ? "On" : "Off");
     if (s.enabled && s.backend) statusPill.setAttribute("title", `Runs in the background using ${s.backend}`);
     const statusText = !s.enabled ? "This machine only syncs when you click Sync now."
@@ -617,7 +648,8 @@ const views = {
       pendingRows.length
         ? [el("h3", {}, `Pending approvals (${pendingRows.length})`),
           table(["Kind", "Name"], pendingRows, null, "narrow"),
-          pendingMachines.length ? el("p", {}, button("Review machines", () => show("machines"))) : null]
+          pendingMachines.length ? el("p", {}, button("Review machines", () => show("machines"))) : null,
+          pendingSecrets.length ? el("p", {}, button("Review secret approvals", () => show("secrets"))) : null]
         : null,
       driftCount
         ? table(["Kind", "Name", "Reason"], driftRows, null, "narrow drift-table")
@@ -648,6 +680,7 @@ const views = {
       attentionCount > 0 ? attentionSection : null,
       sectionHead("Fleet"),
       fleet,
+      agentsSection,
       sectionHead("Automatic sync", "ops-title"),
       el("p", { class: "ops-intro" }, "Keeps this machine's AI agent setup (instructions, skills, MCP servers and secrets) matching your shared Muster setup."),
       el("section", { class: "ops", "aria-labelledby": "ops-title" },
@@ -946,6 +979,28 @@ const views = {
     if (token !== undefined && token !== navToken) return;
     showCli("muster secret list");
     const secrets = Array.isArray(data.result) ? data.result : [];
+    const policyCell = (s) => {
+      // The four states are distinct on purpose: "no policy" (deny by
+      // default, human CLI can still reveal), "approval only" (no allow
+      // list, but a per-use approval requirement), "deny all" (explicit
+      // empty allow) and a list of allowed agents.
+      const entries = s.allow || [];
+      const approvalNote = s.approval === "each"
+        ? ` · per-use approval (${s.approval_ttl || "15m"})` : "";
+      const badge = (cls, label, title) => el("span", { class: "badge " + cls, title: title || "" }, label);
+      if (s.policy_state === "deny_all") {
+        return el("span", {}, badge("warning", "deny all", "Explicit allow = []: no agent may receive it"), approvalNote ? el("span", { class: "muted" }, approvalNote) : null);
+      }
+      if (s.policy_state === "approval_only") {
+        return el("span", {}, badge("", "no allow list", "No allow list is declared: agents never receive it; the per-use approval policy still applies"),
+          approvalNote ? el("span", { class: "muted" }, approvalNote) : null);
+      }
+      if (s.policy_state === "allows" && entries.length) {
+        return el("span", {}, badge("success", `allowed: ${entries.join(", ")}`, "These agents may receive the secret; agent@project only in that project"),
+          approvalNote ? el("span", { class: "muted" }, approvalNote) : null);
+      }
+      return el("span", {}, badge("", "no policy", "No policy declared: agents never receive it; the human CLI still can"));
+    };
     render("Secrets", [
       button("New secret", () => openSecretEdit(), "primary"),
       button("Check providers", async () => {
@@ -964,10 +1019,11 @@ const views = {
       }),
     ],
       el("p", {}, "Metadata only. Revealing a value needs explicit confirmation and is recorded."),
-      table(["Reference", "Updated", "By", "Readers", ""],
-        secrets.map((s) => [s.reference, timeCell(s.updated_at), s.updated_by || "",
+      table(["Reference", "Access policy", "Updated", "By", "Readers", ""],
+        secrets.map((s) => [s.reference, policyCell(s), timeCell(s.updated_at), s.updated_by || "",
           (s.readers || []).map((r) => r.machine || r.recipient).join(", "),
           el("div", { class: "actions" },
+            button("Edit policy", () => openPolicyEdit(s)),
             button("Reveal…", () => openReveal(s.reference)),
             button("Change value", () => openSecretEdit(s.reference)),
             button("Delete", () => act(`Delete secret ${s.reference}?`, "secret/rm", { path: s.reference }), "danger"))]),
@@ -1000,11 +1056,17 @@ const views = {
     const skills = Array.isArray(r.skills) ? r.skills : [];
     const mcp = Array.isArray(r.mcp) ? r.mcp : [];
     const subagents = Array.isArray(r.subagents) ? r.subagents : [];
+    const providers = Array.isArray(r.providers) ? r.providers : [];
     const entries = [
       ...instructions.map((i) => ["Instructions", i.source, i.layer, i]),
       ...skills.map((s) => ["Skill", s.name, s.origin, s]),
       ...mcp.map((s) => ["MCP", s.name, s.layer, s]),
       ...subagents.map((s) => ["Subagent", s.name, s.layer, s]),
+      ...providers.map((p) => {
+        // Metadata and origin, no secret values: `key` is a reference.
+        const meta = [p.kind, p.default_model, p.key].filter(Boolean).join(" · ");
+        return ["Provider", p.id, [p.layer, meta].filter(Boolean).join(" · "), p];
+      }),
     ];
     const extras = r.extra_on_disk || {};
     const totals = r.totals || {};
@@ -1081,8 +1143,9 @@ const views = {
         timeCell(s.updated_at),
         el("span", { class: "state state-" + (enabled ? "live" : "idle") },
           el("span", { class: "state-dot", "aria-hidden": "true" }), enabled ? "Enabled" : "Disabled"),
-        status,
-        isModified ? el("span", { class: "badge warning", title: "Edited locally since it was vendored. Use Keep as own (muster skill rm --detach) to keep your edits as an own skill, or Customize (muster skill customize) so upstream updates don't overwrite them." }, "modified") : "",
+        el("span", { class: "skill-status" },
+          status,
+          isModified ? el("span", { class: "badge warning", title: "Edited locally since it was vendored. Use Keep as own (muster skill rm --detach) to keep your edits as an own skill, or Customize (muster skill customize) so upstream updates don't overwrite them." }, "modified") : ""),
         el("span", { class: "actions" }, actions),
       ];
     });
@@ -1131,7 +1194,10 @@ const views = {
           el("code", {}, "muster sync"),
           " to apply to agent files) and then update with --force.")
         : null,
-      table(["Name", "Origin", "Version", "Updated", "State", "Status", "", ""], rows, "No skills yet. Add one below."),
+      // Fixed column widths keep the Name column readable at ~1280px and let
+      // the action buttons wrap instead of crushing every other column.
+      table(["Name", "Origin", "Version", "Updated", "State", "Status", ""], rows,
+        "No skills yet. Add one below.", "skills-table", [20, 10, 10, 14, 10, 12]),
       el("h2", {}, "On disk, not managed by Muster"),
       el("p", {}, "Skills installed directly in an agent's skills folder. Skills installed from a known repository are subscribed, so they keep receiving updates; the rest are copied into your config repo as own skills. The original files stay untouched."),
       (r.unmanaged || []).some((u) => u.valid) ? el("p", {}, button("Import all", () => importAll())) : null,
@@ -1248,7 +1314,9 @@ const views = {
         button("Roll back", () => act(`Restore generation ${g.number}?`, "rollback", { generation: g.number })),
       ]), "No generations yet."),
       el("h2", {}, "Events"),
-      table(["When", "Action", "Subject"], (r.events || []).slice().reverse().map((e) => [timeCell(e.at), e.action, e.subject]), "No events recorded."),
+      el("p", { class: "section-desc" }, "Local audit trail of sensitive actions on this machine. The actor is what the local process recorded, not a cryptographically verified identity."),
+      table(["When", "Action", "Subject", "Actor"], (r.events || []).slice().reverse().map((e) => [timeCell(e.at), e.action, e.subject,
+        e.actor ? el("code", { class: "data" }, e.actor) : el("span", { class: "muted" }, "unknown")]), "No events recorded."),
       el("h2", {}, "Config repository commits (unverified Git metadata)"),
       el("p", { class: "section-desc" }, "Git commit authors and Muster-Actor trailers are unverified Git metadata for audit visibility only. Cryptographically verified fleet authority lives in fleet.state.json (`muster trust show`)."),
       table(["Commit", "When", "Summary", "Claimed actor (trailer)", "Git author (unverified)"], commits.map((c) => [
@@ -1645,6 +1713,97 @@ $("#secret-form").addEventListener("submit", async (event) => {
     input.value = "";
     $("#secret-save").disabled = false;
   }
+});
+
+// Access-policy editing: the allow side of a secret's policy (no allow
+// list, deny everyone, or a list of agents), saved through `secret/allow` —
+// the same signed-publication circuit as the CLI. An approval policy
+// (approval/approval_ttl) is never editable here and survives every choice;
+// the confirmation teaches the exact change; secret values are never read.
+const policyDialog = $("#secret-policy");
+let policySecret = null;
+// The three editable allow states, resolved from per-radio ids (the fake DOM
+// used by the Node suite does not support attribute selectors).
+const POLICY_STATE_INPUTS = ["none", "deny_all", "allows"].map((state) => [state, `secret-policy-state-${state === "deny_all" ? "deny-all" : state}`]);
+function policyRadio(dialog, state) {
+  return dialog.querySelector(`#${POLICY_STATE_INPUTS.find(([s]) => s === state)[1]}`);
+}
+function policyStateOf(s) {
+  // "approval_only" (no allow list, approval policy kept) edits like "none":
+  // both mean "no allow list".
+  if (s.policy_state === "deny_all") return "deny_all";
+  if (s.policy_state === "allows" && (s.allow || []).length) return "allows";
+  return "none";
+}
+// What each choice means for THIS secret: picking "no allow list" on a
+// secret with an approval policy removes only the allow list — the
+// confirmation must say the approval policy is kept, not claim "no policy".
+function policyText(state, entries, s) {
+  if (state === "deny_all") return "no agent may receive it (allow = [])";
+  if (state === "allows") return `allow = [${entries.join(", ")}]`;
+  if (s && s.approval === "each") {
+    return `no allow list (the approval policy is kept: per-use approval, ttl ${s.approval_ttl || "15m"})`;
+  }
+  return "no access policy";
+}
+function openPolicyEdit(s) {
+  policySecret = s;
+  const state = policyStateOf(s);
+  $("#secret-policy-ref").textContent = s.reference;
+  const approvalNote = s.approval === "each"
+    ? ` Approval "each" (ttl ${s.approval_ttl || "15m"}) is never edited here and is preserved by every choice.` : "";
+  $("#secret-policy-current").textContent =
+    `Current: ${policyText(state, s.allow || [], s)}.${approvalNote}`;
+  const radio = policyRadio(policyDialog, state);
+  if (radio) radio.checked = true;
+  $("#secret-policy-entries").value = state === "allows" ? (s.allow || []).join(", ") : "";
+  $("#secret-policy-error").textContent = "";
+  policyDialog.showModal();
+  (radio || $("#secret-policy-save")).focus();
+}
+$("#secret-policy-cancel").addEventListener("click", () => policyDialog.close());
+$("#secret-policy-save").addEventListener("click", async () => {
+  const save = $("#secret-policy-save");
+  if (save.disabled || !policySecret) return;
+  const state = POLICY_STATE_INPUTS
+    .map(([s, id]) => [s, policyDialog.querySelector(`#${id}`)])
+    .filter(([, input]) => input && input.checked)
+    .map(([s]) => s)[0];
+  const entries = $("#secret-policy-entries").value.split(",").map((x) => x.trim()).filter(Boolean);
+  const error = $("#secret-policy-error");
+  error.textContent = "";
+  if (!state) return void (error.textContent = "Choose one of the three policy states.");
+  if (state === "allows" && !entries.length) {
+    error.textContent = "Name at least one agent, or choose \"Deny everyone\".";
+    return;
+  }
+  const current = policyText(policyStateOf(policySecret), policySecret.allow || [], policySecret);
+  const next = policyText(state, entries, policySecret);
+  const confirmed = await askConfirm(
+    `Change the access policy for ${policySecret.reference}? From: ${current}. To: ${next}.`,
+    "Edit access policy", "Change policy");
+  if (!confirmed) return;
+  const body = { reference: policySecret.reference, confirm: true };
+  if (state === "allows") body.entry = entries;
+  else if (state === "deny_all") body.deny_all = true;
+  else body.remove = true;
+  await busy(save, async () => {
+    try {
+      const data = await api("secret/allow", body);
+      if (data.ok) {
+        const quorum = data.result && data.result.quorum;
+        policyDialog.close();
+        if (quorum && quorum.pending) {
+          toast(`Change saved as a proposal: ${quorum.received} of ${quorum.required} admin signatures. Other machines keep the last accepted state until the rest co-sign.`, "info");
+        }
+        await show("secrets");
+      } else {
+        error.textContent = failMessage(data);
+      }
+    } catch (err) {
+      error.textContent = "Failed to save: " + err.message;
+    }
+  });
 });
 
 // Profile editing: a dialog with the profile TOML, a dry-run diff preview and

@@ -102,6 +102,7 @@ const ROUTES: &[Route] = &[
     get("status", "status"),
     get("why", "why"),
     get("effective", "effective"),
+    get("agents", "agents"),
     get("machines", "machine.list"),
     get("members", "member.list"),
     get("groups", "group.list"),
@@ -115,6 +116,10 @@ const ROUTES: &[Route] = &[
     post("provider/use", "provider.use"),
     get("profile", "profile.show"),
     get("secrets", "secret.list"),
+    // Edits an allow policy through the same signed-publication circuit as
+    // the CLI (`secret.allow` → `trust::commit`); the panel never writes
+    // muster.toml directly.
+    post("secret/allow", "secret.allow"),
     get("secret/requests", "secret.requests"),
     get("secret/leases", "secret.leases"),
     post("secret/approve", "secret.approve"),

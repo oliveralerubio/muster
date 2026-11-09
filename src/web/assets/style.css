@@ -1657,6 +1657,16 @@ pre {
   :root:not([data-theme="light"]) .state-idle,
   :root:not([data-theme="light"]) .count-chip { color: oklch(86% 0.01 250); font-weight: 500; }
 }
+
+/* Skills table: status badges wrap beside each other, action buttons wrap to
+   a second line instead of squeezing the Name column into three-line names. */
+.skills-table td .actions { flex-wrap: wrap; row-gap: 4px; }
+.skill-status { display: inline-flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+
+/* Access-policy dialog: the three states read as a list of choices. */
+.policy-choice { border: 1px solid var(--border); border-radius: 8px; padding: var(--space-sm) var(--space-md); margin: 0 0 var(--space-sm); }
+.policy-choice legend { font-size: var(--text-sm); color: var(--muted); padding: 0 4px; }
+.policy-choice .check { display: flex; gap: 8px; align-items: baseline; padding: 4px 0; }
 :root[data-theme="dark"] .plate-sub,
 :root[data-theme="dark"] .state-idle,
 :root[data-theme="dark"] .count-chip { color: oklch(86% 0.01 250); font-weight: 500; }

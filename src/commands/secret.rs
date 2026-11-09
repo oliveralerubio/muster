@@ -254,6 +254,329 @@ pub const CHECK: CommandSpec = CommandSpec {
     handler: check,
 };
 
+pub const ALLOW: CommandSpec = CommandSpec {
+    name: "secret.allow",
+    about: "Edit which agents may receive a secret (its allow policy)",
+    params: &[
+        ParamSpec {
+            name: "reference",
+            about: "Secret reference (e.g. native://app/api)",
+            kind: ParamKind::String,
+            required: true,
+            positional: true,
+        },
+        ParamSpec {
+            name: "entry",
+            about: "Agent allowed to receive the secret (repeatable): <agent> everywhere or \
+                    <agent>@<project> only in that project. The entries replace the current list",
+            kind: ParamKind::List,
+            required: false,
+            positional: false,
+        },
+        ParamSpec {
+            name: "deny-all",
+            about: "Set an explicit empty allow list: no agent (and no reveal) without a named, \
+                    allowed agent",
+            kind: ParamKind::Bool,
+            required: false,
+            positional: false,
+        },
+        ParamSpec {
+            name: "remove",
+            about: "Remove only the allow list; the approval policy (approval, approval_ttl) \
+                    is preserved",
+            kind: ParamKind::Bool,
+            required: false,
+            positional: false,
+        },
+    ],
+    mutating: true,
+    handler: allow,
+};
+
+/// The four distinguishable states of a secret's access policy. They are not
+/// flattened: "no policy" (deny by default, human CLI can still reveal) is a
+/// different state from an approval-only policy (no allow list, but a
+/// per-use approval requirement), from an explicit `allow = []` (deny
+/// everyone) and from a list of allowed agents.
+fn policy_state(policy: Option<&SecretPolicy>) -> &'static str {
+    match policy {
+        None => "none",
+        Some(p) => match p.allow.as_ref() {
+            None if approval_fields(p).is_some() => "approval_only",
+            None => "none",
+            Some(entries) if entries.is_empty() => "deny_all",
+            Some(_) => "allows",
+        },
+    }
+}
+
+/// The approval policy a `SecretPolicy` carries besides its allow list, as
+/// `approval=each, ttl=30m` (either half alone is reported too). `None` when
+/// the policy declares no approval fields — the case where nothing would
+/// survive removing the allow list.
+fn approval_fields(policy: &SecretPolicy) -> Option<String> {
+    let mut parts = Vec::new();
+    if policy.approval == SecretApproval::Each {
+        parts.push("approval=each".to_owned());
+    }
+    if let Some(ttl) = &policy.approval_ttl {
+        parts.push(format!("ttl={ttl}"));
+    }
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+fn describe_policy(policy: Option<&SecretPolicy>) -> String {
+    match policy_state(policy) {
+        "none" => "no access policy".to_owned(),
+        "approval_only" => "no allow list (approval policy only)".to_owned(),
+        "deny_all" => "allow = [] (no agent may receive it)".to_owned(),
+        _ => {
+            let entries = policy
+                .and_then(|p| p.allow.as_deref())
+                .map(|entries| entries.join(", "))
+                .unwrap_or_default();
+            format!("allow = [{entries}]")
+        }
+    }
+}
+
+fn allow(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
+    let raw = required(params, "reference")?;
+    let reference = SecretRef::parse(raw)?;
+    let entries = params.get_list("entry");
+    let deny_all = params.get_bool("deny-all");
+    let remove = params.get_bool("remove");
+    // Exactly one mode: a list of entries (possibly several), an explicit
+    // deny-all, or removal. Several entries are still one mode.
+    let modes = usize::from(!entries.is_empty()) + usize::from(deny_all) + usize::from(remove);
+    if modes != 1 {
+        return Err(MusterError::Usage(
+            "choose exactly one: --entry <agent>[...] to allow agents, --deny-all for an \
+             explicit empty allow list, or --remove to drop the policy"
+                .into(),
+        ));
+    }
+    for entry in &entries {
+        validate_allow_entry(entry).map_err(MusterError::Usage)?;
+    }
+
+    let mut manifest = Manifest::load(&ctx.config_dir)?;
+    let reference = reference.as_str().to_owned();
+    let current = manifest.secrets.get(&reference).cloned();
+    if remove {
+        match &current {
+            None => {
+                return Err(MusterError::Usage(format!(
+                    "no access policy declared for {reference}; nothing to remove"
+                )));
+            }
+            // A policy without an allow list is not "no policy": distinguish
+            // an approval-only policy (which `--remove` must keep whole) from
+            // an entry that carries nothing at all.
+            Some(p) if p.allow.is_none() => {
+                return Err(MusterError::Usage(match approval_fields(p) {
+                    Some(fields) => format!(
+                        "the policy for {reference} declares no allow list; only its approval \
+                         policy ({fields}) exists, and --remove never touches it — nothing to \
+                         remove"
+                    ),
+                    None => format!(
+                        "the policy entry for {reference} is empty (no allow list, no approval \
+                         policy); nothing to remove"
+                    ),
+                }));
+            }
+            Some(_) => {}
+        }
+    }
+
+    // The exact change, taught before anything is written. `--remove` takes
+    // only the allow list: the approval policy survives it when one exists,
+    // and the question must say so.
+    let approval = current.as_ref().and_then(approval_fields);
+    let kept = approval
+        .as_ref()
+        .map(|fields| format!(" ({fields} preserved)"))
+        .unwrap_or_default();
+    let question = if remove {
+        match &approval {
+            Some(fields) => format!(
+                "Remove only the allow list for {reference} (was: {})? The approval policy \
+                 ({fields}) is preserved.",
+                describe_policy(current.as_ref())
+            ),
+            None => format!(
+                "Remove the access policy for {reference} (was: {})?",
+                describe_policy(current.as_ref())
+            ),
+        }
+    } else if deny_all {
+        format!("Set an explicit empty allow list for {reference} (no agent may receive it){kept}?")
+    } else {
+        format!("Allow {} to receive {reference}{kept}?", entries.join(", "))
+    };
+    ctx.confirm(&question)?;
+
+    if ctx.dry_run {
+        let predicted = if remove {
+            if current
+                .as_ref()
+                .is_some_and(|p| approval_fields(p).is_some())
+            {
+                "approval_only"
+            } else {
+                "none"
+            }
+        } else if deny_all {
+            "deny_all"
+        } else {
+            "allows"
+        };
+        return Ok(json!({
+            "dry_run": true,
+            "reference": reference,
+            "policy_state": predicted,
+            "allow": entries,
+        }));
+    }
+
+    // Mutate only the allow field. `--remove` takes the whole entry down
+    // solely when no approval policy lives in it; otherwise the entry stays
+    // with `allow` unset and approval/approval_ttl exactly as they were.
+    if remove {
+        let policy = manifest
+            .secrets
+            .get_mut(&reference)
+            .expect("current policy checked above");
+        if approval_fields(policy).is_some() {
+            policy.allow = None;
+        } else {
+            manifest.secrets.remove(&reference);
+        }
+    } else {
+        let policy = manifest.secrets.entry(reference.clone()).or_default();
+        policy.allow = Some(entries.clone());
+    }
+
+    // The whole policy is compared, not just `allow`: "no policy entry" and
+    // "an entry without an allow list" are different states, and absent →
+    // deny-all must still be seen as a change.
+    let after = manifest.secrets.get(&reference).cloned();
+    let changed = current != after;
+    let original_text =
+        std::fs::read_to_string(ctx.config_dir.join(crate::manifest::FILE_NAME)).ok();
+    let result_policy = if changed {
+        crate::audit::record(&ctx.state_dir, "secret.allow", &reference)?;
+        manifest.save(&ctx.config_dir)?;
+        // If this machine cannot sign the change, nothing lands: the working
+        // tree goes back to byte-identical so no unsigned policy is left
+        // behind for the next command to trip over.
+        match crate::trust::commit(ctx, &format!("feat(secret): access policy for {reference}")) {
+            Ok(committed) => committed,
+            Err(e) => {
+                if let Some(text) = original_text {
+                    let _ = std::fs::write(ctx.config_dir.join(crate::manifest::FILE_NAME), text);
+                }
+                return Err(e);
+            }
+        }
+    } else {
+        false
+    };
+
+    // Applied now, or a proposal waiting for the remaining admin co-signatures?
+    // `trust::commit` never advances the local pin to a state the fleet would
+    // refuse; `pending_quorum` reports exactly that case.
+    let quorum = match crate::fleet_state::FleetState::load(&ctx.config_dir)? {
+        Some(state) => crate::fleet_state::pending_quorum(&ctx.state_dir, &state, &manifest)?
+            .map(|(received, required)| {
+                json!({ "received": received, "required": required, "pending": true })
+            }),
+        None => None,
+    };
+    let policy = after.as_ref();
+    let mut result = json!({
+        "reference": reference,
+        "policy_state": policy_state(policy),
+        "allow": policy.and_then(|p| p.allow.clone()).unwrap_or_default(),
+        "approval": match policy.map(|p| p.approval) {
+            Some(SecretApproval::Each) => "each",
+            _ => "none",
+        },
+        "approval_ttl": policy.and_then(|p| p.approval_ttl.clone()),
+        "changed": changed,
+        "committed": result_policy,
+        "quorum": quorum,
+    });
+    if !changed {
+        result["changed"] = Value::Bool(false);
+        ctx.diag(Diagnostic::new(
+            Severity::Info,
+            "secret_allow_unchanged",
+            format!(
+                "the access policy for {reference} already was {}",
+                describe_policy(policy)
+            ),
+        ));
+    } else if result["quorum"]["pending"] == Value::Bool(true) {
+        ctx.diag(Diagnostic::new(
+            Severity::Warning,
+            "governance_pending",
+            format!(
+                "the policy change is a proposal pending co-signatures ({} of {} admin \
+                 signatures); other machines keep the last accepted state until the remaining \
+                 admin(s) run `muster trust cosign`",
+                result["quorum"]["received"], result["quorum"]["required"]
+            ),
+        ));
+    }
+    if ctx.format == crate::output::Format::Text {
+        return Ok(Value::String(format_allow_text(&result)));
+    }
+    Ok(result)
+}
+
+fn format_allow_text(result: &Value) -> String {
+    let reference = result["reference"].as_str().unwrap_or_default();
+    let state = result["policy_state"].as_str().unwrap_or("none");
+    let described = match state {
+        "deny_all" => "allow = [] (no agent may receive it)".to_owned(),
+        "approval_only" => "no allow list (approval policy only)".to_owned(),
+        "allows" => format!(
+            "allow = [{}]",
+            result["allow"]
+                .as_array()
+                .map(|entries| entries
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", "))
+                .unwrap_or_default()
+        ),
+        _ => "no access policy".to_owned(),
+    };
+    let approval = match result["approval"].as_str() {
+        Some("each") => format!(
+            " (approval=each, ttl={})",
+            result["approval_ttl"].as_str().unwrap_or("15m")
+        ),
+        _ => String::new(),
+    };
+    let tail = if result["quorum"]["pending"] == Value::Bool(true) {
+        format!(
+            "\nProposal pending co-signatures: {} of {} admin signatures; other machines keep \
+             the last accepted state until an admin runs `muster trust cosign`.",
+            result["quorum"]["received"], result["quorum"]["required"]
+        )
+    } else if result["committed"] == Value::Bool(true) {
+        "\nApplied and committed.".to_owned()
+    } else {
+        String::new()
+    };
+    format!("Access policy for {reference}: {described}{approval}.{tail}")
+}
+
 fn add(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let (group, name) = parse_path(params)?;
     let allow = params.get_list("allow");
@@ -356,16 +679,23 @@ fn list(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
     for group in vault.groups()? {
         for meta in vault.list(&group)? {
             let reference = format!("native://{group}/{}", meta.name);
-            let allow = manifest
-                .as_ref()
-                .and_then(|m| m.secrets.get(&reference))
-                .map(|p| p.allow_list().to_vec())
-                .unwrap_or_default();
+            let policy = manifest.as_ref().and_then(|m| m.secrets.get(&reference));
+            let allow = policy.map(|p| p.allow_list().to_vec()).unwrap_or_default();
             secrets.push(json!({
                 "group": group,
                 "name": meta.name,
                 "reference": reference,
                 "allow": allow,
+                // The four distinguishable policy states (not flattened):
+                // "none" (no policy declared), "approval_only" (no allow
+                // list, but a per-use approval requirement), "deny_all"
+                // (explicit `allow = []`), "allows" (a non-empty allow list).
+                "policy_state": policy_state(policy),
+                "approval": match policy.map(|p| p.approval) {
+                    Some(SecretApproval::Each) => "each",
+                    _ => "none",
+                },
+                "approval_ttl": policy.and_then(|p| p.approval_ttl.clone()),
                 "created_at": meta.created_at,
                 "updated_at": meta.updated_at,
                 "created_by": meta.created_by,
@@ -374,7 +704,58 @@ fn list(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
             }));
         }
     }
+    if ctx.format == crate::output::Format::Text {
+        return Ok(Value::String(format_list_text(&secrets)));
+    }
     Ok(Value::Array(secrets))
+}
+
+fn format_list_text(secrets: &[Value]) -> String {
+    if secrets.is_empty() {
+        return "No secrets in the native vault.".to_owned();
+    }
+    let mut text = String::new();
+    for s in secrets {
+        let access = match s["policy_state"].as_str() {
+            Some("deny_all") => "no agent may receive it (allow = [])".to_owned(),
+            Some("approval_only") => "no allow list (agents never receive it)".to_owned(),
+            Some("allows") => format!(
+                "allowed: {}",
+                s["allow"]
+                    .as_array()
+                    .map(|entries| entries
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", "))
+                    .unwrap_or_default()
+            ),
+            _ => "no access policy (agents never receive it)".to_owned(),
+        };
+        let approval = if s["approval"].as_str() == Some("each") {
+            format!(
+                " [per-use approval, ttl {}]",
+                s["approval_ttl"].as_str().unwrap_or("15m")
+            )
+        } else {
+            String::new()
+        };
+        text.push_str(&format!(
+            "{}  {}  (updated {} by {})\n  {access}{approval}\n",
+            s["reference"].as_str().unwrap_or_default(),
+            s["readers"]
+                .as_array()
+                .map(|readers| readers
+                    .iter()
+                    .map(|r| r["machine"].as_str().unwrap_or("unknown"))
+                    .collect::<Vec<_>>()
+                    .join(", "))
+                .unwrap_or_default(),
+            s["updated_at"].as_str().unwrap_or("unknown time"),
+            s["updated_by"].as_str().unwrap_or("unknown"),
+        ));
+    }
+    text
 }
 
 fn rotate(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
@@ -1874,18 +2255,73 @@ pub const REVOKE: CommandSpec = CommandSpec {
 };
 
 fn requests(ctx: &mut Context, _: &Params) -> Result<Value, MusterError> {
-    Ok(json!(
-        crate::secret_leases::Store::open(&ctx.state_dir)?
-            .data
-            .requests
-    ))
+    let requests = crate::secret_leases::Store::open(&ctx.state_dir)?
+        .data
+        .requests;
+    if ctx.format == crate::output::Format::Text {
+        let serialized = serde_json::to_value(&requests).unwrap_or(Value::Array(Vec::new()));
+        let empty = Vec::new();
+        let items = serialized.as_array().unwrap_or(&empty);
+        return Ok(Value::String(format_requests_text(items)));
+    }
+    Ok(json!(requests))
 }
 fn leases(ctx: &mut Context, _: &Params) -> Result<Value, MusterError> {
-    Ok(json!(
-        crate::secret_leases::Store::open(&ctx.state_dir)?
-            .data
-            .leases
-    ))
+    let leases = crate::secret_leases::Store::open(&ctx.state_dir)?
+        .data
+        .leases;
+    if ctx.format == crate::output::Format::Text {
+        let serialized = serde_json::to_value(&leases).unwrap_or(Value::Array(Vec::new()));
+        let empty = Vec::new();
+        let items = serialized.as_array().unwrap_or(&empty);
+        return Ok(Value::String(format_leases_text(items)));
+    }
+    Ok(json!(leases))
+}
+
+fn format_requests_text(requests: &[Value]) -> String {
+    if requests.is_empty() {
+        return "No pending secret requests.".to_owned();
+    }
+    let mut text = String::new();
+    for r in requests {
+        text.push_str(&format!(
+            "{}  agent {}  (from {})\n  approve: muster secret approve {}\n",
+            r["reference"].as_str().unwrap_or_default(),
+            r["agent"].as_str().unwrap_or_default(),
+            r["source"].as_str().unwrap_or("unknown"),
+            r["id"].as_str().unwrap_or_default(),
+        ));
+    }
+    text
+}
+
+fn format_leases_text(leases: &[Value]) -> String {
+    if leases.is_empty() {
+        return "No active secret approvals.".to_owned();
+    }
+    let mut text = String::new();
+    for l in leases {
+        text.push_str(&format!(
+            "{}  agent {}  expires {}  (granted by {}; revoke: muster secret revoke {})\n",
+            l["reference"].as_str().unwrap_or_default(),
+            l["agent"].as_str().unwrap_or_default(),
+            l["expires_at"]
+                .as_i64()
+                .map(|t| {
+                    time::OffsetDateTime::from_unix_timestamp(t)
+                        .map(|t| {
+                            t.format(&time::format_description::well_known::Rfc3339)
+                                .unwrap_or_default()
+                        })
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default(),
+            l["granted_by"].as_str().unwrap_or("unknown"),
+            l["id"].as_str().unwrap_or_default(),
+        ));
+    }
+    text
 }
 fn approve_request(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     if !ctx.is_tty && !ctx.web_approval {

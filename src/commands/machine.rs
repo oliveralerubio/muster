@@ -650,11 +650,78 @@ fn list(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
         })
         .collect();
 
-    Ok(json!({
+    let result = json!({
         "config_path": ctx.config_dir,
         "machines": machines,
         "pending": pending,
-    }))
+    });
+    if ctx.format == crate::output::Format::Text {
+        return Ok(Value::String(format_list_text(&result)));
+    }
+    Ok(result)
+}
+
+fn format_list_text(result: &Value) -> String {
+    let mut text = String::new();
+    text.push_str(&format!(
+        "Config: {}\n",
+        result["config_path"].as_str().unwrap_or("unknown")
+    ));
+    text.push_str("Machines:\n");
+    let machines = result["machines"].as_array().cloned().unwrap_or_default();
+    for m in &machines {
+        let agents = m["agents"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        let host = m["host"]
+            .as_str()
+            .map(|h| format!("  ssh {h}"))
+            .unwrap_or_default();
+        text.push_str(&format!(
+            "  {}{}  {}  platform {}  version {}{}  last sync {}\n",
+            m["name"].as_str().unwrap_or("?"),
+            if m["is_current"] == Value::Bool(true) {
+                " (this machine)"
+            } else {
+                ""
+            },
+            m["status"].as_str().unwrap_or("?"),
+            m["platform"].as_str().unwrap_or("unknown"),
+            m["version"].as_str().unwrap_or("unknown"),
+            if agents.is_empty() {
+                String::new()
+            } else {
+                format!("  agents {agents}")
+            },
+            m["last_sync"].as_str().unwrap_or("never"),
+        ));
+        if !host.is_empty() {
+            text.push_str(&format!("    {host}\n"));
+        }
+    }
+    if machines.is_empty() {
+        text.push_str("  none\n");
+    }
+    let pending = result["pending"].as_array().cloned().unwrap_or_default();
+    if !pending.is_empty() {
+        text.push_str("Pending enrollment requests:\n");
+        for p in &pending {
+            text.push_str(&format!(
+                "  {}  {}  approvals {}/{}\n",
+                p["name"].as_str().unwrap_or("?"),
+                p["platform"].as_str().unwrap_or("unknown"),
+                p["approvals_received"].as_u64().unwrap_or(0),
+                p["approvals_required"].as_u64().unwrap_or(0),
+            ));
+        }
+    }
+    text
 }
 
 fn rm(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
@@ -995,6 +1062,18 @@ fn sync_machines(ctx: &mut Context, params: &Params) -> Result<Value, MusterErro
         }));
     }
 
+    // Nothing to do: asking to "sync 0 machines" would only confuse. Checked
+    // before the remote requirement: with no remote machines there is nothing
+    // to exchange anyway.
+    if targets.is_empty() {
+        ctx.diag(crate::output::Diagnostic::new(
+            crate::output::Severity::Info,
+            "machine_sync_empty",
+            "no remote fleet machines to sync; assign SSH hosts with `muster machine assign`",
+        ));
+        return Ok(json!({ "machines": [], "synced": 0 }));
+    }
+
     if !crate::git::has_remote(&ctx.config_dir) {
         return Err(MusterError::Usage(
             "the config repo has no git remote; run `muster sync --remote <url>` first".into(),
@@ -1024,8 +1103,41 @@ fn sync_machines(ctx: &mut Context, params: &Params) -> Result<Value, MusterErro
     if any_ok {
         let _ = crate::git::pull(&ctx.config_dir);
     }
-    Ok(json!({
+    let result = json!({
         "machines": results,
         "synced": results.iter().filter(|r| r["ok"] == true).count(),
-    }))
+    });
+    if ctx.format == crate::output::Format::Text {
+        return Ok(Value::String(format_sync_text(&result)));
+    }
+    Ok(result)
+}
+
+fn format_sync_text(result: &Value) -> String {
+    let machines = result["machines"].as_array().cloned().unwrap_or_default();
+    if machines.is_empty() {
+        return "No remote fleet machines to sync.".to_owned();
+    }
+    let mut text = String::new();
+    for m in &machines {
+        let status = if m["ok"] == Value::Bool(true) {
+            match m["approval_needed"].as_bool() {
+                Some(true) => "synced; approvals pending on that machine".to_owned(),
+                _ => "synced".to_owned(),
+            }
+        } else {
+            format!("failed: {}", m["error"].as_str().unwrap_or("unknown error"))
+        };
+        text.push_str(&format!(
+            "  {} ({}): {status}\n",
+            m["machine"].as_str().unwrap_or("?"),
+            m["host"].as_str().unwrap_or("?"),
+        ));
+    }
+    text.push_str(&format!(
+        "{} of {} machine(s) synced.\n",
+        result["synced"],
+        machines.len()
+    ));
+    text
 }

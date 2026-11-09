@@ -111,7 +111,15 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         std::fs::write(&pending, status.to_string()).map_err(sync_io)?;
         std::fs::rename(pending, ctx.state_dir.join("sync-status.json")).map_err(sync_io)?;
     }
-    result
+    // Text mode summarizes; sync-status.json above still records the full JSON
+    // result (including `applied`), so the panel and `status` stay accurate.
+    result.map(|r| {
+        if ctx.format == crate::output::Format::Text {
+            Value::String(format_text(&r))
+        } else {
+            r
+        }
+    })
 }
 
 fn sync_io(e: std::io::Error) -> MusterError {
@@ -179,6 +187,81 @@ fn sync(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     result["transport"] = transport;
     result["skills_updated"] = Value::Array(skills_updated);
     Ok(result)
+}
+
+/// `muster sync --format text`: a concise summary. The full per-file diffs
+/// stay in the JSON result; text mode reports what happened, not every hunk.
+fn format_text(result: &Value) -> String {
+    let mut text = String::new();
+    if result["joined"] == Value::Bool(true) {
+        text.push_str("Joined the fleet's config repo; nothing applied yet. Run `muster enroll` to request joining.\n");
+        return text;
+    }
+    if let Some(transport) = result["transport"].as_object() {
+        let pulled = transport.get("pulled").and_then(Value::as_str);
+        let pushed = transport.get("pushed").and_then(Value::as_bool);
+        match (pulled, pushed) {
+            (Some(p), Some(true)) => text.push_str(&format!("Transport: pulled {p}, pushed.\n")),
+            (Some(p), _) => text.push_str(&format!("Transport: pulled {p}.\n")),
+            (None, Some(true)) => text.push_str("Transport: pushed.\n"),
+            _ => {}
+        }
+    }
+    if result["governance_pending"] == Value::Bool(true) {
+        text.push_str(
+            "A governance change is waiting for admin co-signatures; nothing was applied. An \
+             admin completes it with `muster trust cosign`.\n",
+        );
+        return text;
+    }
+    if result["applied"] == Value::Bool(true) {
+        text.push_str(&format!(
+            "Applied generation {}: {} change(s).\n",
+            result["generation"].as_u64().unwrap_or_default(),
+            result["changes"].as_u64().unwrap_or_default()
+        ));
+        if let Some(agents) = result["agents"].as_array() {
+            let mut lines = Vec::new();
+            for agent in agents {
+                let changed_files = agent["files"]
+                    .as_array()
+                    .map(|files| {
+                        files
+                            .iter()
+                            .filter(|f| f["changed"] == Value::Bool(true))
+                            .count()
+                    })
+                    .unwrap_or_default();
+                if changed_files > 0 {
+                    lines.push(format!(
+                        "{}: {} file(s) {}",
+                        agent["id"].as_str().unwrap_or("?"),
+                        changed_files,
+                        agent["status"].as_str().unwrap_or("?"),
+                    ));
+                }
+            }
+            if !lines.is_empty() {
+                text.push_str(&format!("  {}\n", lines.join(", ")));
+            }
+        }
+    } else {
+        text.push_str("Nothing to apply; already converged.\n");
+    }
+    if let Some(approvals) = result["approvals"].as_array().filter(|a| !a.is_empty()) {
+        text.push_str(&format!(
+            "Approvals pending: {} (run `muster sync` in a terminal to review them).\n",
+            approvals.len()
+        ));
+    }
+    if let Some(updated) = result["skills_updated"]
+        .as_array()
+        .filter(|a| !a.is_empty())
+    {
+        let names = updated.iter().filter_map(Value::as_str).collect::<Vec<_>>();
+        text.push_str(&format!("Skills updated: {}.\n", names.join(", ")));
+    }
+    text
 }
 
 /// Commit local config changes and exchange them with the remote. Skipped

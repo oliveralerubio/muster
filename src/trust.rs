@@ -95,9 +95,21 @@ pub fn guard(ctx: &mut Context, command: &str, mutating: bool) -> Result<(), Mus
                 return Ok(());
             }
             // A signed fleet without its governance is never "no policy".
+            // Missing and unreadable are different situations: a missing file
+            // is restored from a trusted copy, a present but broken one is
+            // fixed in place (or restored) — never silently re-signed.
+            let exists = ctx.config_dir.join(crate::manifest::FILE_NAME).exists();
+            let situation = if exists {
+                format!(
+                    "muster.toml cannot be read ({e}); fix the file, or restore it from a \
+                     trusted copy"
+                )
+            } else {
+                format!("muster.toml is missing ({e}); restore it from a trusted copy")
+            };
             let message = format!(
-                "muster.toml is missing or unreadable but this fleet has a trust pin or signed \
-                 state ({e}); restore it from a trusted copy"
+                "{situation} but this fleet has a trust pin or signed state; muster refuses to \
+                 run until the governance it can verify is back"
             );
             if command == "doctor" {
                 ctx.fleet_state_invalid = true;
