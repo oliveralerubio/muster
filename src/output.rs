@@ -128,6 +128,14 @@ pub fn render(envelope: &Envelope, format: Format, quiet: bool) {
                         );
                     }
                 }
+            } else if envelope.command == "secret.run" && envelope.result["stdout"].is_string() {
+                if let Some(out) = envelope.result["stdout"].as_str() {
+                    let _ = write!(stdout, "{out}");
+                }
+                if let Some(err) = envelope.result["stderr"].as_str() {
+                    let mut stderr = std::io::stderr().lock();
+                    let _ = write!(stderr, "{err}");
+                }
             } else {
                 match &envelope.result {
                     Value::Null => {}

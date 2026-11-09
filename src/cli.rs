@@ -251,6 +251,10 @@ fn with_params(cmd: Command, spec: &'static CommandSpec) -> Command {
                 // List values that look like flags themselves (MCP `--args -y`)
                 // need the `--args=-y` form: `allow_hyphen_values` would swallow
                 // following global flags (`--args --dry-run`, `--args --yes`).
+                ParamKind::List if p.positional => arg
+                    .action(ArgAction::Append)
+                    .num_args(1..)
+                    .trailing_var_arg(true),
                 ParamKind::List => arg.action(ArgAction::Append),
                 ParamKind::Secret => unreachable!("filtered above"),
             })

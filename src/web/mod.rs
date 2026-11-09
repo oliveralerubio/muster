@@ -108,7 +108,7 @@ const ROUTES: &[Route] = &[
     get("profiles", "profile.list"),
     get("providers", "provider.list"),
     Route {
-        hidden: &["value-stdin"],
+        hidden: &["value-stdin", "prompt", "reason"],
         ..post("provider/add", "provider.add")
     },
     post("provider/rm", "provider.rm"),
@@ -161,11 +161,11 @@ const ROUTES: &[Route] = &[
     post("mcp-server/rm", "mcp-server.rm"),
     post("secret/rm", "secret.rm"),
     Route {
-        hidden: &["value-stdin"],
+        hidden: &["value-stdin", "prompt", "reason"],
         ..post("secret/add", "secret.add")
     },
     Route {
-        hidden: &["value-stdin"],
+        hidden: &["value-stdin", "prompt", "reason"],
         ..post("secret/rotate", "secret.rotate")
     },
     post("proposal/create", "proposal.create"),

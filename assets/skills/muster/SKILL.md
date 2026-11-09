@@ -15,11 +15,13 @@ Muster is a local-first configuration, secret and agent synchronizer. A config r
 
 ## Secrets
 
-Never print, log or paste secret values in chat or command output.
+Never ask the user to paste a secret in chat, and never print, log or echo secret values in command output.
 
 - `muster secret list`: names and paths only, safe to show.
-- `muster secret get <ref> --reveal --yes` (e.g. `muster secret get native://app/api --reveal --yes`): prints the value. Pipe it straight into the command that needs it; never echo it. With `--format json`, extract `.result` from the envelope.
-- `muster secret add <path> --value-stdin`: read the value from stdin, e.g. `printf %s "$VALUE" | muster secret add <path> --value-stdin`. Do not put the value in argv or shell history.
+- `muster secret prompt <group>/<name> [--reason "<why>"] [--allow <agent>] [--rotate] --format json`: opens a graphical password dialog (or local browser prompt) so the user pastes the secret out of band. The value is encrypted straight into the vault and never enters chat, argv, stdin or model-visible output. (`muster secret add <path> --prompt`, `muster secret rotate <path> --prompt`, and `muster provider add <id> ... --prompt` work the same way.)
+- `muster secret run --agent <agent> [--env VAR=<ref>...] [--stdin <ref>] --yes -- <command> [args...]`: runs `<command>` with authorized secrets injected into child environment variables or stdin and scrubs raw/encoded secret occurrences from captured `stdout` and `stderr`.
+- `muster secret add <path> --value-stdin`: read the value from stdin in scripts, e.g. `printf %s "$VALUE" | muster secret add <path> --value-stdin`. Do not put the value in argv or shell history.
+- `muster secret get <ref> --reveal --yes` (e.g. `muster secret get native://app/api --reveal --yes`): prints the plaintext value for human terminal pipelines; agents should prefer `muster secret run` or `muster sync` so plaintext never enters model context.
 
 ## Apply changes
 

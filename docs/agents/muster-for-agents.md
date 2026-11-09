@@ -243,3 +243,85 @@ or MCP for lease checks; static configuration injection does not check them.
 Agent installs preserve versions newer than `muster.lock` and emit the warning
 `agent_newer_than_pin`, suggesting a pin bump. Status includes `kept_newer` and a
 note for these agents; they count as converged when a platform artifact exists.
+
+## Graphical secret capture & blind secret use
+
+Agents must never ask a human to paste a secret in chat or pass a secret in CLI
+arguments (`argv`). Instead, an agent can trigger an out-of-band graphical
+prompt and subsequently consume the secret by reference without the plaintext
+ever entering conversation transcripts or model-accessible output.
+
+### 1. Requesting a secret via GUI (`secret.prompt`)
+
+```sh
+muster secret prompt <group>/<name> [--reason "<text>"] [--allow <agent>] [--rotate] --format json
+```
+
+Equivalent flags `--prompt [--reason "<text>"]` are also accepted on
+`muster secret add`, `muster secret rotate`, and `muster provider add` (with a
+`native://` key reference).
+
+- **Out-of-band capture:** Muster opens a native graphical dialog (`MUSTER_ASKPASS`
+  when configured, macOS `osascript` native dialog, Linux `zenity`, `kdialog`,
+  or Assuan `pinentry-*` when `DISPLAY`/`WAYLAND_DISPLAY` is present) or falls
+  back to an ephemeral localhost browser dialog (`127.0.0.1:0`).
+- **No model-visible token or value:** For the localhost browser fallback, Muster
+  launches the browser directly with a one-time URL token, exchanges it on first
+  visit for an `HttpOnly; SameSite=Strict` session cookie plus a per-session
+  CSRF token, and shuts down immediately after the single write-only `POST /submit`
+  or `POST /cancel`. Neither the one-time token nor the submitted secret is ever
+  printed to `stdout`, `stderr`, diagnostics, or audit history.
+- **Fail-closed on headless sessions:** If no graphical display or browser launcher
+  is available, the command fails with exit code `4` (`unavailable`). Empty
+  submissions and user cancellations fail without modifying the vault or
+  manifest.
+- **Metadata-only result:** The JSON envelope returns only `group`, `name`,
+  `reference` (`native://<group>/<name>`), `action` (`"added"` or `"rotated"`),
+  and `allow`.
+
+### 2. Using a secret without exposing it (`secret.run` and `sync`)
+
+Once stored in Muster, a secret can be used in two ways without exposing its
+plaintext to the model:
+
+1. **Declarative config injection (`muster sync` / `muster agents apply`):**
+   Reference `native://<group>/<name>` in `[providers.<id>]` or
+   `[mcp_servers.<id>]` alongside `[secrets."native://<group>/<name>"] allow = ["<agent>"]`,
+   then run `muster sync`.
+2. **Scoped subprocess execution (`muster secret run`):**
+   ```sh
+   muster secret run --agent <agent> [--env VAR=native://<group>/<name>...] [--stdin native://<group>/<name>] --yes -- <command> [args...]
+   ```
+   - Enforces the same fail-closed policy and runtime lease checks as
+     `secret.get --reveal`: if `[secrets."<ref>"]` exists, `allow` must be
+     non-empty, `--agent` is required, the agent must be allowed, and
+     `approval = "each"` requires an active human-approved lease.
+   - Rejects dangerous environment variable names (`PATH`, `HOME`, `SHELL`,
+     `IFS`, `ENV`, `BASH_ENV`, `PROMPT_COMMAND`, `LD_*`, `DYLD_*`, `MUSTER_*`)
+     with exit code `5` (`security`).
+   - Injects resolved secrets only into the child process's environment or
+     `stdin` pipe, never into `argv` or `cli_line`.
+   - Scrubs exact, line-split, JSON/TOML/shell-escaped, URL-percent-encoded, and
+     Base64-encoded occurrences of every resolved secret from the child's
+     captured `stdout` and `stderr` before emitting the output or JSON envelope
+     (replacing matches with `<redacted:ref>` and emitting warning
+     `secret_output_redacted`).
+
+### 3. Security boundaries & residual risks
+
+- **Same-UID local process boundary:** An autonomous agent that can execute
+  arbitrary shell commands as the same OS user could bypass `muster secret run`
+  (for example, by invoking a custom binary under `secret.run` that transforms
+  the secret using an arbitrary cipher/hash or writes it to an external file or
+  socket, or by reading native agent config files where `sync` materialised the
+  key). Output scrubbing is a defense-in-depth guard against accidental echoes,
+  debug logs, and standard encodings (`raw`, `JSON`, `TOML`, `URL`, `Base64`),
+  not a cryptographic enclaved sandbox against a hostile process running under
+  the same OS UID.
+- **Mitigation for sensitive secrets:** Set `approval = "each"` (with a short
+  `approval_ttl`) on `[secrets."native://..."]` so every agent-initiated
+  `secret.run` or `secret.get --reveal` requires explicit human approval in a
+  real terminal (`muster secret approve <id>`) or authenticated web panel session.
+- **Self-declared `--agent`:** As with `secret.get`, `--agent` on the CLI is
+  self-declared for policy selection and audit attribution, not cryptographically
+  authenticated per process.

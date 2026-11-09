@@ -959,3 +959,479 @@ allow = []
     assert!(!out_corrupt.status.success());
     assert!(!String::from_utf8_lossy(&out_corrupt.stdout).contains("denied-secret-value"));
 }
+
+#[test]
+fn secret_prompt_adds_and_rotates_via_gui_without_exposing_secret() {
+    let env = initialized();
+    let askpass = env.path().join("fake-askpass.sh");
+    std::fs::write(
+        &askpass,
+        "#!/bin/sh\nprintf '%s' \"$MUSTER_PROMPT_SECRET_TEST_INPUT\"\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&askpass, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let secret_v1 = "gui-prompt-secret-v1-never-in-output";
+    let secret_v2 = "gui-prompt-secret-v2-rotated-value";
+
+    let mut cmd = env.run(&[
+        "--format",
+        "json",
+        "secret",
+        "prompt",
+        "app/token",
+        "--reason",
+        "Configure deployment token",
+        "--allow",
+        "claude",
+    ]);
+    cmd.env("MUSTER_ASKPASS", &askpass)
+        .env("MUSTER_PROMPT_SECRET_TEST_INPUT", secret_v1);
+    let (out, envelope) = support::json(cmd);
+    assert!(out.status.success(), "{}", envelope.raw);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stdout.contains(secret_v1));
+    assert!(!stderr.contains(secret_v1));
+    assert_eq!(envelope.result()["reference"], "native://app/token");
+    assert_eq!(envelope.result()["action"], "added");
+    assert_eq!(envelope.result()["allow"], serde_json::json!(["claude"]));
+
+    // Without --rotate, prompting for an existing secret fails before opening GUI.
+    let dup = env
+        .run(&["--format", "json", "secret", "prompt", "app/token"])
+        .env("MUSTER_ASKPASS", &askpass)
+        .env("MUSTER_PROMPT_SECRET_TEST_INPUT", secret_v2)
+        .output()
+        .unwrap();
+    assert_eq!(dup.status.code(), Some(2));
+
+    // Rotate via desktop zenity backend when DISPLAY is set.
+    env.fake_exe(
+        "zenity",
+        "printf '%s\\n' \"$MUSTER_PROMPT_SECRET_TEST_INPUT\"",
+    );
+    let mut rot_cmd = env.run(&[
+        "--format",
+        "json",
+        "secret",
+        "prompt",
+        "app/token",
+        "--rotate",
+        "--reason",
+        "Rotate deployment token",
+    ]);
+    rot_cmd
+        .env("MUSTER_PROMPT_BACKEND", "zenity")
+        .env("DISPLAY", ":99")
+        .env("MUSTER_PROMPT_SECRET_TEST_INPUT", secret_v2);
+    let (rot_out, rot_env) = support::json(rot_cmd);
+    assert!(rot_out.status.success(), "{}", rot_env.raw);
+    assert!(!String::from_utf8_lossy(&rot_out.stdout).contains(secret_v2));
+    assert!(!String::from_utf8_lossy(&rot_out.stderr).contains(secret_v2));
+    assert_eq!(rot_env.result()["action"], "rotated");
+
+    // Also verify `secret add --prompt` and `provider add --prompt`.
+    let mut add_cmd = env.run(&[
+        "--format",
+        "json",
+        "secret",
+        "add",
+        "app/second",
+        "--prompt",
+        "--reason",
+        "Second token",
+        "--allow",
+        "claude",
+    ]);
+    add_cmd
+        .env("MUSTER_ASKPASS", &askpass)
+        .env("MUSTER_PROMPT_SECRET_TEST_INPUT", secret_v1);
+    let (add_out, add_env) = support::json(add_cmd);
+    assert!(add_out.status.success(), "{}", add_env.raw);
+    assert!(!String::from_utf8_lossy(&add_out.stdout).contains(secret_v1));
+
+    let mut prov_cmd = env.run(&[
+        "--format",
+        "json",
+        "provider",
+        "add",
+        "gateway",
+        "--kind",
+        "anthropic",
+        "--key",
+        "native://app/provider_key",
+        "--prompt",
+        "--reason",
+        "Provider API key",
+        "--allow",
+        "claude",
+        "--yes",
+    ]);
+    prov_cmd
+        .env("MUSTER_ASKPASS", &askpass)
+        .env("MUSTER_PROMPT_SECRET_TEST_INPUT", secret_v1);
+    let (prov_out, prov_env) = support::json(prov_cmd);
+    assert!(prov_out.status.success(), "{}", prov_env.raw);
+    assert!(!String::from_utf8_lossy(&prov_out.stdout).contains(secret_v1));
+
+    // Confirm neither secret appears in muster.toml, history, audit, or git log.
+    let manifest = std::fs::read_to_string(env.config_dir().join("muster.toml")).unwrap();
+    assert!(!manifest.contains(secret_v1) && !manifest.contains(secret_v2));
+    let (_, history_env) = env.run_json(&["--format", "json", "history"]);
+    let history_text = history_env.raw.to_string();
+    assert!(!history_text.contains(secret_v1) && !history_text.contains(secret_v2));
+}
+
+#[test]
+fn secret_prompt_web_fallback_captures_secret_and_rejects_unauthenticated_requests() {
+    let env = initialized();
+    let browser = env.path().join("fake-browser.sh");
+    let web_secret = "browser-gui-secret-never-printed-98765";
+    std::fs::write(
+        &browser,
+        r#"#!/bin/sh
+set -eu
+URL="$1"
+BASE="$(printf '%s' "$URL" | sed 's|/prompt?token=.*||')"
+HDR="$HOME/prompt-headers.txt"
+BODY="$HOME/prompt-page.html"
+
+# 1. Unauthenticated submit must be rejected (401).
+CODE="$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/submit" \
+  -H 'Content-Type: application/json' \
+  -d '{"value":"unauth","csrf":"bad"}')"
+if [ "$CODE" != "401" ]; then
+  exit 11
+fi
+
+# 2. Exchange one-time URL token for HttpOnly session cookie + CSRF token.
+curl -s -D "$HDR" -o "$BODY" "$URL"
+COOKIE="$(awk 'tolower($1) == "set-cookie:" { sub(/;.*/, "", $2); print $2 }' "$HDR" | tr -d '\r')"
+CSRF="$(sed -n 's/.*name="csrf" value="\([^"]*\)".*/\1/p' "$BODY" | head -n 1 | tr -d '\r')"
+
+# 3. Reusing the one-time token URL must fail with 401.
+REUSE="$(curl -s -o /dev/null -w '%{http_code}' "$URL")"
+if [ "$REUSE" != "401" ]; then
+  exit 12
+fi
+
+# 4. Submit secret over authenticated session with matching CSRF token.
+SUB_CODE="$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/submit" \
+  -H "Cookie: $COOKIE" \
+  -H "Origin: $BASE" \
+  -H 'Content-Type: application/json' \
+  -d "{\"value\":\"$MUSTER_WEB_TEST_SECRET\",\"csrf\":\"$CSRF\"}")"
+if [ "$SUB_CODE" != "200" ]; then
+  exit 13
+fi
+"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&browser, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let mut web_cmd = env.run(&[
+        "--format",
+        "json",
+        "secret",
+        "prompt",
+        "app/web_key",
+        "--reason",
+        "Paste webhook secret in browser",
+        "--allow",
+        "claude",
+    ]);
+    web_cmd
+        .env("MUSTER_PROMPT_BACKEND", "web")
+        .env("MUSTER_PROMPT_TIMEOUT_MS", "5000")
+        .env("MUSTER_BROWSER", &browser)
+        .env("MUSTER_WEB_TEST_SECRET", web_secret);
+    let (out, envelope) = support::json(web_cmd);
+    assert!(out.status.success(), "{}", envelope.raw);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stdout.contains(web_secret));
+    assert!(!stderr.contains(web_secret));
+    assert!(
+        !stdout.contains("?token=") && !stderr.contains("?token="),
+        "one-time browser token must never appear in stdout/stderr"
+    );
+
+    // Verify stored value matches via authorized human reveal.
+    let (_, revealed) = env.run_json(&[
+        "--format",
+        "json",
+        "secret",
+        "get",
+        "native://app/web_key",
+        "--agent",
+        "claude",
+        "--reveal",
+        "--yes",
+    ]);
+    assert_eq!(revealed.result().as_str(), Some(web_secret));
+}
+
+#[test]
+fn secret_prompt_fails_closed_when_headless_cancelled_or_empty() {
+    let env = initialized();
+
+    // 1. Headless environment without DISPLAY, WAYLAND_DISPLAY, or browser -> exit 4.
+    let headless = env
+        .run_isolated(&["--format", "json", "secret", "prompt", "app/headless"])
+        .env("MUSTER_PROMPT_BACKEND", "web")
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("MUSTER_BROWSER")
+        .env_remove("BROWSER")
+        .output()
+        .unwrap();
+    assert_eq!(
+        headless.status.code(),
+        Some(4),
+        "headless prompt must fail with code 4: {}",
+        String::from_utf8_lossy(&headless.stdout)
+    );
+
+    // 2. Cancelled dialog -> exit 1 and nothing stored.
+    let cancel_script = env.path().join("cancel-askpass.sh");
+    std::fs::write(&cancel_script, "#!/bin/sh\nexit 1\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cancel_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let cancelled = env
+        .run(&["--format", "json", "secret", "prompt", "app/cancelled"])
+        .env("MUSTER_ASKPASS", &cancel_script)
+        .output()
+        .unwrap();
+    assert_eq!(cancelled.status.code(), Some(1));
+
+    // 3. Empty secret -> exit 2 and nothing stored.
+    let empty_script = env.path().join("empty-askpass.sh");
+    std::fs::write(&empty_script, "#!/bin/sh\nprintf '\\n'\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&empty_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let empty = env
+        .run(&["--format", "json", "secret", "prompt", "app/empty"])
+        .env("MUSTER_ASKPASS", &empty_script)
+        .output()
+        .unwrap();
+    assert_eq!(empty.status.code(), Some(2));
+
+    let (_, list_env) = env.run_json(&["--format", "json", "secret", "list"]);
+    assert_eq!(list_env.result(), &serde_json::json!([]));
+}
+
+#[test]
+fn secret_run_injects_env_and_stdin_and_scrubs_raw_and_encoded_output() {
+    let env = initialized();
+    let askpass = env.path().join("run-askpass.sh");
+    let secret_val = "sk-live-secret-token/with+special=chars!";
+    std::fs::write(&askpass, format!("#!/bin/sh\nprintf '%s' '{secret_val}'\n")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&askpass, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    env.run(&[
+        "--format", "json", "secret", "prompt", "app/api", "--allow", "claude",
+    ])
+    .env("MUSTER_ASKPASS", &askpass)
+    .assert()
+    .success();
+
+    let verify_file = env.path().join("verified-ok.txt");
+    let child_script = env.path().join("use-secret.sh");
+    // The child verifies both env var and stdin match the secret without printing it,
+    // and then deliberately echoes raw, URL-encoded, and Base64-encoded forms to stdout/stderr
+    // to test output scrubbing.
+    let b64 = "c2stbGl2ZS1zZWNyZXQtdG9rZW4vd2l0aCtzcGVjaWFsPWNoYXJzIQ==";
+    let url_enc = "sk-live-secret-token%2Fwith%2Bspecial%3Dchars%21";
+    std::fs::write(
+        &child_script,
+        format!(
+            "#!/bin/sh\n\
+             STDIN_VAL=\"$(cat)\"\n\
+             if [ \"$SERVICE_KEY\" = '{secret_val}' ] && [ \"$STDIN_VAL\" = '{secret_val}' ]; then\n\
+               printf 'verified' > '{}'\n\
+             fi\n\
+             printf 'ok raw=%s url={url_enc}\\n' \"$SERVICE_KEY\"\n\
+             printf 'err b64={b64}\\n' >&2\n",
+            verify_file.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&child_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let (out, envelope) = env.run_json(&[
+        "--format",
+        "json",
+        "secret",
+        "run",
+        "--agent",
+        "claude",
+        "--env",
+        "SERVICE_KEY=native://app/api",
+        "--stdin",
+        "native://app/api",
+        "--yes",
+        "--",
+        child_script.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "{}", envelope.raw);
+    assert_eq!(std::fs::read_to_string(&verify_file).unwrap(), "verified");
+
+    let raw_out = String::from_utf8_lossy(&out.stdout);
+    let raw_err = String::from_utf8_lossy(&out.stderr);
+    for forbidden in [secret_val, b64, url_enc] {
+        assert!(
+            !raw_out.contains(forbidden) && !raw_err.contains(forbidden),
+            "leaked '{forbidden}' in output: {raw_out} / {raw_err}"
+        );
+    }
+    assert_eq!(envelope.result()["exit_code"], 0);
+    assert_eq!(envelope.result()["redacted"], true);
+    assert!(envelope.result()["stdout"]
+        .as_str()
+        .unwrap()
+        .contains("<redacted:native://app/api>"));
+    assert!(envelope.result()["stderr"]
+        .as_str()
+        .unwrap()
+        .contains("<redacted:native://app/api>"));
+    assert!(envelope
+        .diagnostics()
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|d| d["code"] == "secret_output_redacted"));
+}
+
+#[test]
+fn secret_run_enforces_allow_policy_approval_leases_and_protected_env_vars() {
+    let env = initialized();
+    let added = env
+        .run(&[
+            "--format",
+            "json",
+            "secret",
+            "add",
+            "app/guarded",
+            "--value-stdin",
+            "--allow",
+            "claude",
+        ])
+        .write_stdin("guarded-secret-value-12345")
+        .output()
+        .unwrap();
+    assert!(added.status.success());
+
+    // 1. Missing --agent when policy exists -> exit 5.
+    let no_agent = env
+        .run(&[
+            "--format",
+            "json",
+            "secret",
+            "run",
+            "--env",
+            "API_KEY=native://app/guarded",
+            "--yes",
+            "--",
+            "true",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(no_agent.status.code(), Some(5));
+    assert!(String::from_utf8_lossy(&no_agent.stdout).contains("secret_policy_requires_agent"));
+
+    // 2. Unauthorized agent -> exit 5.
+    let wrong_agent = env
+        .run(&[
+            "--format",
+            "json",
+            "secret",
+            "run",
+            "--agent",
+            "codex",
+            "--env",
+            "API_KEY=native://app/guarded",
+            "--yes",
+            "--",
+            "true",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(wrong_agent.status.code(), Some(5));
+    assert!(String::from_utf8_lossy(&wrong_agent.stdout).contains("secret_not_allowed_for_agent"));
+
+    // 3. Protected environment variable override (PATH, LD_PRELOAD, MUSTER_*) -> exit 5.
+    for var in ["PATH", "LD_PRELOAD", "MUSTER_CONFIG_DIR"] {
+        let protected = env
+            .run(&[
+                "--format",
+                "json",
+                "secret",
+                "run",
+                "--agent",
+                "claude",
+                "--env",
+                &format!("{var}=native://app/guarded"),
+                "--yes",
+                "--",
+                "true",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(protected.status.code(), Some(5), "{var}");
+    }
+
+    // 4. `approval = "each"` requires an active human lease before `secret run` executes.
+    let manifest_path = env.config_dir().join("muster.toml");
+    let mut manifest: muster::manifest::Manifest =
+        muster::manifest::Manifest::load(&env.config_dir()).unwrap();
+    manifest
+        .secrets
+        .get_mut("native://app/guarded")
+        .unwrap()
+        .approval = muster::manifest::SecretApproval::Each;
+    manifest.save(&env.config_dir()).unwrap();
+    let _ = manifest_path;
+    env.run(&["trust", "resign", "--yes"]).assert().success();
+
+    let needs_approval = env
+        .run(&[
+            "--format",
+            "json",
+            "secret",
+            "run",
+            "--agent",
+            "claude",
+            "--env",
+            "API_KEY=native://app/guarded",
+            "--yes",
+            "--",
+            "true",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(needs_approval.status.code(), Some(5));
+    assert!(String::from_utf8_lossy(&needs_approval.stdout).contains("secret_approval_required"));
+}
