@@ -59,6 +59,18 @@ pub const ADD: CommandSpec = CommandSpec {
             positional: false,
         },
         ParamSpec {
+            name: "prompt",
+            about: "Prompt for the native vault value via graphical interface (never in chat, argv or stdout)",
+            kind: ParamKind::Bool,
+            required: false,
+            positional: false,
+        },
+        option(
+            "reason",
+            "Short reason shown in the graphical prompt (requires --prompt)",
+            false,
+        ),
+        ParamSpec {
             name: "allow",
             about: "Agent allowed to receive the native secret (repeatable)",
             kind: ParamKind::List,
@@ -179,7 +191,14 @@ fn add(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
             path: Some(format!("providers.{id}.key")),
         })?;
     }
-    let stores_value = params.get_string("value").is_some() || params.get_bool("value-stdin");
+    let reason = super::secret::validate_reason(params.get_string("reason"))?;
+    if reason.is_some() && !params.get_bool("prompt") {
+        return Err(MusterError::Usage("--reason requires --prompt".into()));
+    }
+    let has_value = params.get_string("value").is_some();
+    let has_stdin = params.get_bool("value-stdin");
+    let has_prompt = params.get_bool("prompt");
+    let stores_value = has_value || has_stdin || has_prompt;
     if stores_value
         && provider
             .key
@@ -191,9 +210,19 @@ fn add(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
             "a native:// key reference is required to store a value".into(),
         ));
     }
-    if params.get_string("value").is_some() && params.get_bool("value-stdin") {
+    if has_value && has_stdin && !has_prompt {
         return Err(MusterError::Usage(
             "use either --value or --value-stdin".into(),
+        ));
+    }
+    if [has_value, has_stdin, has_prompt]
+        .into_iter()
+        .filter(|b| *b)
+        .count()
+        > 1
+    {
+        return Err(MusterError::Usage(
+            "use only one of --value, --value-stdin, or --prompt".into(),
         ));
     }
     let mut manifest = Manifest::load(&ctx.config_dir)?;
@@ -205,13 +234,27 @@ fn add(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     ctx.confirm(&format!("Set provider '{id}'?"))?;
     if stores_value {
         let reference = SecretRef::parse(provider.key.as_deref().expect("validated key"))?;
+        let allow = params.get_list("allow");
         let mut secret_params = Params::default();
         secret_params.set("path", json!(reference.segments().join("/")));
-        secret_params.set("allow", json!(params.get_list("allow")));
+        secret_params.set("allow", json!(allow.clone()));
         let value = if let Some(value) = params.get_string("value") {
-            ctx.diag(crate::output::Diagnostic::new(crate::output::Severity::Warning,
-                "secret_in_argv", "--value may be visible in shell history and process arguments; prefer --value-stdin"));
+            ctx.diag(crate::output::Diagnostic::new(
+                crate::output::Severity::Warning,
+                "secret_in_argv",
+                "--value may be visible in shell history and process arguments; prefer --prompt or --value-stdin",
+            ));
             SecretValue::new(value.to_owned())
+        } else if has_prompt {
+            let segments = reference.segments();
+            super::secret::prompt_secret_gui(
+                ctx,
+                &segments[0],
+                &segments[1],
+                false,
+                reason,
+                &allow,
+            )?
         } else {
             ctx.read_secret_stdin()?
         };
