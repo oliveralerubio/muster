@@ -980,15 +980,20 @@ const views = {
     showCli("muster secret list");
     const secrets = Array.isArray(data.result) ? data.result : [];
     const policyCell = (s) => {
-      // The three states are distinct on purpose: "no policy" (deny by
-      // default, human CLI can still reveal), "deny all" (explicit empty
-      // allow) and a list of allowed agents.
+      // The four states are distinct on purpose: "no policy" (deny by
+      // default, human CLI can still reveal), "approval only" (no allow
+      // list, but a per-use approval requirement), "deny all" (explicit
+      // empty allow) and a list of allowed agents.
       const entries = s.allow || [];
       const approvalNote = s.approval === "each"
         ? ` · per-use approval (${s.approval_ttl || "15m"})` : "";
       const badge = (cls, label, title) => el("span", { class: "badge " + cls, title: title || "" }, label);
       if (s.policy_state === "deny_all") {
         return el("span", {}, badge("warning", "deny all", "Explicit allow = []: no agent may receive it"), approvalNote ? el("span", { class: "muted" }, approvalNote) : null);
+      }
+      if (s.policy_state === "approval_only") {
+        return el("span", {}, badge("", "no allow list", "No allow list is declared: agents never receive it; the per-use approval policy still applies"),
+          approvalNote ? el("span", { class: "muted" }, approvalNote) : null);
       }
       if (s.policy_state === "allows" && entries.length) {
         return el("span", {}, badge("success", `allowed: ${entries.join(", ")}`, "These agents may receive the secret; agent@project only in that project"),
@@ -1710,26 +1715,35 @@ $("#secret-form").addEventListener("submit", async (event) => {
   }
 });
 
-// Access-policy editing: one of three states (no policy, deny everyone, a
-// list of agents), saved through `secret/allow` — the same signed-publication
-// circuit as the CLI. The confirmation teaches the exact change; secret
-// values are never read.
+// Access-policy editing: the allow side of a secret's policy (no allow
+// list, deny everyone, or a list of agents), saved through `secret/allow` —
+// the same signed-publication circuit as the CLI. An approval policy
+// (approval/approval_ttl) is never editable here and survives every choice;
+// the confirmation teaches the exact change; secret values are never read.
 const policyDialog = $("#secret-policy");
 let policySecret = null;
-// The three states, resolved from per-radio ids (the fake DOM used by the
-// Node suite does not support attribute selectors).
+// The three editable allow states, resolved from per-radio ids (the fake DOM
+// used by the Node suite does not support attribute selectors).
 const POLICY_STATE_INPUTS = ["none", "deny_all", "allows"].map((state) => [state, `secret-policy-state-${state === "deny_all" ? "deny-all" : state}`]);
 function policyRadio(dialog, state) {
   return dialog.querySelector(`#${POLICY_STATE_INPUTS.find(([s]) => s === state)[1]}`);
 }
 function policyStateOf(s) {
+  // "approval_only" (no allow list, approval policy kept) edits like "none":
+  // both mean "no allow list".
   if (s.policy_state === "deny_all") return "deny_all";
   if (s.policy_state === "allows" && (s.allow || []).length) return "allows";
   return "none";
 }
-function policyText(state, entries) {
+// What each choice means for THIS secret: picking "no allow list" on a
+// secret with an approval policy removes only the allow list — the
+// confirmation must say the approval policy is kept, not claim "no policy".
+function policyText(state, entries, s) {
   if (state === "deny_all") return "no agent may receive it (allow = [])";
   if (state === "allows") return `allow = [${entries.join(", ")}]`;
+  if (s && s.approval === "each") {
+    return `no allow list (the approval policy is kept: per-use approval, ttl ${s.approval_ttl || "15m"})`;
+  }
   return "no access policy";
 }
 function openPolicyEdit(s) {
@@ -1737,9 +1751,9 @@ function openPolicyEdit(s) {
   const state = policyStateOf(s);
   $("#secret-policy-ref").textContent = s.reference;
   const approvalNote = s.approval === "each"
-    ? ` Approval "each" (ttl ${s.approval_ttl || "15m"}) is preserved.` : "";
+    ? ` Approval "each" (ttl ${s.approval_ttl || "15m"}) is never edited here and is preserved by every choice.` : "";
   $("#secret-policy-current").textContent =
-    `Current: ${policyText(state, s.allow || [])}.${approvalNote}`;
+    `Current: ${policyText(state, s.allow || [], s)}.${approvalNote}`;
   const radio = policyRadio(policyDialog, state);
   if (radio) radio.checked = true;
   $("#secret-policy-entries").value = state === "allows" ? (s.allow || []).join(", ") : "";
@@ -1763,8 +1777,8 @@ $("#secret-policy-save").addEventListener("click", async () => {
     error.textContent = "Name at least one agent, or choose \"Deny everyone\".";
     return;
   }
-  const current = policyText(policyStateOf(policySecret), policySecret.allow || []);
-  const next = policyText(state, entries);
+  const current = policyText(policyStateOf(policySecret), policySecret.allow || [], policySecret);
+  const next = policyText(state, entries, policySecret);
   const confirmed = await askConfirm(
     `Change the access policy for ${policySecret.reference}? From: ${current}. To: ${next}.`,
     "Edit access policy", "Change policy");

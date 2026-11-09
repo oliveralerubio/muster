@@ -548,7 +548,8 @@ async function testProvidersViewListsReferencesAndAddsAndRemoves() {
 }
 
 async function testSecretPolicyDialogThreeStatesAndExactChange() {
-  // Three secrets, one per policy state, like `secret list` reports them.
+  // Secrets across the policy states, like `secret list` reports them —
+  // including the approval-only state (no allow list, approval policy kept).
   setResponder((call) => {
     if (call.path === "secrets" || call.path === "secret/requests" || call.path === "secret/leases") {
       const secret = (name, extra) => Object.assign({
@@ -561,6 +562,7 @@ async function testSecretPolicyDialogThreeStatesAndExactChange() {
             secret("none"),
             secret("denied", { policy_state: "deny_all" }),
             secret("shared", { policy_state: "allows", allow: ["claude"], approval: "each", approval_ttl: "30m" }),
+            secret("gated", { policy_state: "approval_only", approval: "each", approval_ttl: "45m" }),
           ]
         : [];
       return { ok: true, diagnostics: [], result };
@@ -574,20 +576,21 @@ async function testSecretPolicyDialogThreeStatesAndExactChange() {
   await flush();
   const text = (node) => (typeof node === "string" ? node : (node.children || []).map(text).join(" "));
   const rendered = text(view);
-  // The three states render as distinct labels, never flattened.
+  // The states render as distinct labels, never flattened.
   assert.match(rendered, /no policy/, "absent policy must be labeled");
   assert.match(rendered, /deny all/, "explicit empty allow must be labeled");
   assert.match(rendered, /allowed: claude/, "entry list must be labeled");
   assert.match(rendered, /per-use approval \(30m\)/, "approval policy must be visible");
+  assert.match(rendered, /no allow list/, "approval-only policy must be labeled as such");
 
   // Open the editor on the third secret: the current state is taught.
   const editButtons = allElements.filter((el) => el.tagName === "BUTTON" && el.children[0] === "Edit policy");
-  assert.equal(editButtons.length, 3, "every secret row gets an Edit policy button");
+  assert.equal(editButtons.length, 4, "every secret row gets an Edit policy button");
   editButtons[2].fire("click");
   await flush();
   assert.equal(need("secret-policy-ref").textContent, "native://app/shared");
   assert.match(need("secret-policy-current").textContent, /allow = \[claude\]/, "current entries are shown");
-  assert.match(need("secret-policy-current").textContent, /Approval "each" \(ttl 30m\) is preserved/, "preserved approval is stated");
+  assert.match(need("secret-policy-current").textContent, /Approval "each" \(ttl 30m\)/, "preserved approval is stated");
   assert.equal(byId("secret-policy-state-allows").checked, true, "current state preselected");
   assert.equal(need("secret-policy-entries").value, "claude", "entries prefilled");
 
@@ -634,6 +637,25 @@ async function testSecretPolicyDialogThreeStatesAndExactChange() {
   await flush();
   assert.equal(callSince(mark4, "secret/allow"), undefined, "empty allows state must not post");
   assert.match(need("secret-policy-error").textContent, /Name at least one agent/);
+
+  // Removing the allow list of an approval-only secret keeps the approval
+  // policy, and the confirmation must teach exactly that — not "no policy".
+  editButtons[3].fire("click");
+  await flush();
+  assert.match(need("secret-policy-current").textContent, /no allow list \(the approval policy is kept/, "approval-only current state is taught");
+  assert.equal(byId("secret-policy-state-none").checked, true, "approval-only edits like no-allow-list");
+  check("none");
+  const confirmMessages = [];
+  const previousConfirm = sandbox.confirm;
+  sandbox.confirm = (message) => { confirmMessages.push(message); return true; };
+  const mark5 = baseline();
+  need("secret-policy-save").fire("click");
+  await flush();
+  sandbox.confirm = previousConfirm;
+  assert.deepEqual(callSince(mark5, "secret/allow").body, { reference: "native://app/gated", remove: true, confirm: true });
+  assert.ok(confirmMessages.length, "a confirmation was requested");
+  assert.match(confirmMessages[0], /the approval policy is kept: per-use approval, ttl 45m/, "confirmation teaches the approval survival");
+  assert.doesNotMatch(confirmMessages[0], /To: no access policy\./, "confirmation must not claim no policy while an approval policy remains");
   setResponder();
 }
 

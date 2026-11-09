@@ -7,7 +7,7 @@
 mod support;
 
 use std::io::Write;
-use std::process::{Output, Stdio};
+use std::process::Stdio;
 
 use serde_json::Value;
 use support::{Envelope, MusterEnv};
@@ -362,7 +362,88 @@ fn secret_allow_preserves_approval_fields_and_supports_all_transitions() {
         "approval lost on set: {manifest}"
     );
 
-    // entries -> absent.
+    // entries -> no allow list. Only the allow list goes: the approval
+    // policy (approval=each, ttl=30m) survives the removal untouched.
+    let result = ok(
+        &env,
+        &["secret", "allow", "native://app/api", "--remove", "--yes"],
+    );
+    assert_eq!(result["policy_state"], "approval_only");
+    assert_eq!(result["approval"], "each");
+    assert_eq!(result["approval_ttl"], "30m");
+    let manifest = std::fs::read_to_string(env.config_dir().join("muster.toml")).unwrap();
+    assert!(
+        manifest.contains("[secrets.\"native://app/api\"]"),
+        "policy entry dropped while it still carries approval: {manifest}"
+    );
+    assert!(
+        manifest.contains("approval = \"each\"") && manifest.contains("approval_ttl = \"30m\""),
+        "approval policy lost on remove: {manifest}"
+    );
+    assert!(
+        !manifest.contains("allow = "),
+        "allow list kept after --remove: {manifest}"
+    );
+    // `secret list` reports the fourth state (not flattened into "none").
+    let listed = ok(&env, &["secret", "list"]);
+    assert_eq!(listed[0]["policy_state"], "approval_only", "{listed}");
+    assert_eq!(listed[0]["approval"], "each", "{listed}");
+    let (stdout, _) = text(&env, &["secret", "list"]);
+    assert!(
+        stdout.contains("no allow list (agents never receive it)"),
+        "list text hides the approval-only state: {stdout}"
+    );
+    assert!(
+        stdout.contains("per-use approval, ttl 30m"),
+        "list text hides the approval policy: {stdout}"
+    );
+    // The per-use approval requirement still gates reveals after --remove:
+    // removing the allow list cannot remove the approval requirement. An
+    // unnamed caller still trips the policy, and a named agent outside the
+    // (now absent) allow list is still refused.
+    let envelope = fails(
+        &env,
+        &["secret", "get", "native://app/api", "--reveal", "--yes"],
+        5,
+    );
+    assert!(
+        envelope.raw["diagnostics"][0]["code"] == "secret_policy_requires_agent",
+        "approval policy no longer constrains unnamed reveals: {}",
+        envelope.raw
+    );
+    let envelope = fails(
+        &env,
+        &[
+            "secret",
+            "get",
+            "native://app/api",
+            "--agent",
+            "claude",
+            "--reveal",
+            "--yes",
+        ],
+        5,
+    );
+    assert!(
+        envelope.raw["diagnostics"][0]["code"] == "secret_not_allowed_for_agent",
+        "approval-only policy stopped gating agent reveals: {}",
+        envelope.raw
+    );
+
+    // deny_all -> absent: with the approval policy also gone (declared
+    // "none" again), --remove takes the whole entry down.
+    let path = env.config_dir().join("muster.toml");
+    let manifest = std::fs::read_to_string(&path).unwrap();
+    let manifest = manifest.replace(
+        "approval = \"each\"\napproval_ttl = \"30m\"",
+        "approval = \"none\"",
+    );
+    std::fs::write(&path, manifest).unwrap();
+    ok(&env, &["trust", "resign", "--yes"]);
+    ok(
+        &env,
+        &["secret", "allow", "native://app/api", "--deny-all", "--yes"],
+    );
     let result = ok(
         &env,
         &["secret", "allow", "native://app/api", "--remove", "--yes"],
@@ -373,6 +454,234 @@ fn secret_allow_preserves_approval_fields_and_supports_all_transitions() {
     assert!(
         !manifest.contains("[secrets."),
         "policy table kept: {manifest}"
+    );
+}
+
+#[test]
+fn secret_allow_remove_distinguishes_absent_approval_only_and_empty_policies() {
+    let env = MusterEnv::new();
+    ok(&env, &["init", "--yes", "--machine", "box"]);
+    add_secret(&env, "app/api", "v");
+
+    // Absent policy: teaches instead of no-op (kept from before).
+    let envelope = fails(
+        &env,
+        &["secret", "allow", "native://app/api", "--remove", "--yes"],
+        2,
+    );
+    assert!(
+        envelope.raw["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no access policy declared"),
+        "{}",
+        envelope.raw
+    );
+
+    // An approval-only policy (no allow list, approval=each + ttl declared by
+    // hand) is NOT "no policy": --remove refuses and names what it holds.
+    ok(
+        &env,
+        &[
+            "secret",
+            "allow",
+            "native://app/api",
+            "--entry",
+            "claude",
+            "--yes",
+        ],
+    );
+    let path = env.config_dir().join("muster.toml");
+    let manifest = std::fs::read_to_string(&path).unwrap();
+    let manifest = manifest.replace("allow = [\"claude\"]\n", "").replace(
+        "approval = \"none\"",
+        "approval = \"each\"\napproval_ttl = \"45m\"",
+    );
+    std::fs::write(&path, manifest).unwrap();
+    ok(&env, &["trust", "resign", "--yes"]);
+
+    let listed = ok(&env, &["secret", "list"]);
+    assert_eq!(listed[0]["policy_state"], "approval_only", "{listed}");
+
+    let envelope = fails(
+        &env,
+        &["secret", "allow", "native://app/api", "--remove", "--yes"],
+        2,
+    );
+    let message = envelope.raw["diagnostics"][0]["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        message.contains("no allow list") && message.contains("approval=each, ttl=45m"),
+        "approval-only policy not distinguished: {message}"
+    );
+    // Refused, so the approval policy is still exactly there.
+    let manifest = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        manifest.contains("approval = \"each\"") && manifest.contains("approval_ttl = \"45m\""),
+        "refusal still changed the manifest: {manifest}"
+    );
+
+    // An empty policy entry (no allow list, no approval fields) is its own
+    // state too: refused with its own words, not the absent-policy ones.
+    let manifest = manifest.replace(
+        "approval = \"each\"\napproval_ttl = \"45m\"",
+        "approval = \"none\"",
+    );
+    std::fs::write(&path, manifest).unwrap();
+    ok(&env, &["trust", "resign", "--yes"]);
+    let envelope = fails(
+        &env,
+        &["secret", "allow", "native://app/api", "--remove", "--yes"],
+        2,
+    );
+    let message = envelope.raw["diagnostics"][0]["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        message.contains("empty") && !message.contains("no access policy declared"),
+        "empty policy not distinguished: {message}"
+    );
+}
+
+#[test]
+fn secret_allow_remove_confirmation_and_help_describe_the_exact_change() {
+    let env = MusterEnv::new();
+    ok(&env, &["init", "--yes", "--machine", "box"]);
+    add_secret(&env, "app/api", "v");
+    ok(
+        &env,
+        &[
+            "secret",
+            "allow",
+            "native://app/api",
+            "--entry",
+            "claude",
+            "--yes",
+        ],
+    );
+    let path = env.config_dir().join("muster.toml");
+    let manifest = std::fs::read_to_string(&path).unwrap();
+    let manifest = manifest.replace("approval = \"none\"", "approval = \"each\"");
+    std::fs::write(&path, manifest).unwrap();
+    ok(&env, &["trust", "resign", "--yes"]);
+
+    // No --yes and no terminal: the confirmation question itself is the
+    // error, so its exact wording is testable. With an approval policy
+    // present it must promise the approval policy survives.
+    let envelope = fails(
+        &env,
+        &["secret", "allow", "native://app/api", "--remove"],
+        2,
+    );
+    let question = envelope.raw["diagnostics"][0]["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        question.contains("Remove only the allow list"),
+        "question does not scope the removal to the allow list: {question}"
+    );
+    assert!(
+        question.contains("approval policy (approval=each) is preserved"),
+        "question does not teach the approval survival: {question}"
+    );
+    assert!(
+        !question.contains("approval and approval_ttl go with it"),
+        "question still promises the old destructive behavior: {question}"
+    );
+    // Nothing changed: no policy was removed by the refused confirmation.
+    let manifest = std::fs::read_to_string(&path).unwrap();
+    assert!(manifest.contains("allow = [\"claude\"]"), "{manifest}");
+
+    // Without an approval policy the question says the whole entry goes.
+    let manifest = manifest.replace("approval = \"each\"", "approval = \"none\"");
+    std::fs::write(&path, manifest).unwrap();
+    ok(&env, &["trust", "resign", "--yes"]);
+    let envelope = fails(
+        &env,
+        &["secret", "allow", "native://app/api", "--remove"],
+        2,
+    );
+    let question = envelope.raw["diagnostics"][0]["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        question.contains("Remove the access policy"),
+        "whole-entry removal not described as such: {question}"
+    );
+
+    // The dry run predicts the state it would leave behind, including the
+    // approval-only outcome of removing an allow list under an approval
+    // policy.
+    let manifest = std::fs::read_to_string(&path).unwrap();
+    let manifest = manifest.replace(
+        "approval = \"none\"",
+        "approval = \"each\"\napproval_ttl = \"20m\"",
+    );
+    std::fs::write(&path, manifest).unwrap();
+    ok(&env, &["trust", "resign", "--yes"]);
+    let result = ok(
+        &env,
+        &[
+            "secret",
+            "allow",
+            "native://app/api",
+            "--remove",
+            "--yes",
+            "--dry-run",
+        ],
+    );
+    assert_eq!(result["policy_state"], "approval_only", "{result}");
+    let manifest = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        manifest.contains("allow = [\"claude\"]"),
+        "dry run mutated the manifest: {manifest}"
+    );
+}
+
+#[test]
+fn secret_allow_remove_is_covered_by_the_signed_fleet_state() {
+    let env = MusterEnv::new();
+    ok(&env, &["init", "--yes", "--machine", "box"]);
+    add_secret(&env, "app/api", "v");
+    ok(
+        &env,
+        &[
+            "secret",
+            "allow",
+            "native://app/api",
+            "--entry",
+            "claude",
+            "--yes",
+        ],
+    );
+
+    // Applied removal, then a hand edit re-adds the allow list: the security
+    // check must trip, proving the removal was sealed into the signed state.
+    ok(
+        &env,
+        &["secret", "allow", "native://app/api", "--remove", "--yes"],
+    );
+    let path = env.config_dir().join("muster.toml");
+    let manifest = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !manifest.contains("[secrets."),
+        "entry should be fully gone (no approval fields): {manifest}"
+    );
+    let manifest = format!("{manifest}\n[secrets.\"native://app/api\"]\nallow = [\"claude\"]\n");
+    std::fs::write(&path, manifest).unwrap();
+    let envelope = fails(&env, &["status"], 5);
+    assert!(
+        envelope.raw["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("do not match the signed fleet state"),
+        "allow-list removal is not inside the signature: {}",
+        envelope.raw
     );
 }
 
@@ -603,11 +912,98 @@ fn secret_allow_under_quorum_stays_pending_without_pinning_or_applying() {
 }
 
 #[test]
+fn secret_allow_remove_under_quorum_preserves_approval_and_stays_pending() {
+    let env = MusterEnv::new();
+    ok(&env, &["init", "--yes", "--machine", "alpha"]);
+    add_secret(&env, "app/api", "v");
+
+    // An applied policy with both an allow list and an approval policy,
+    // declared while the quorum is still 1 (applied at once), then sealed.
+    ok(
+        &env,
+        &[
+            "secret",
+            "allow",
+            "native://app/api",
+            "--entry",
+            "claude",
+            "--yes",
+        ],
+    );
+    let path = env.config_dir().join("muster.toml");
+    let manifest = std::fs::read_to_string(&path).unwrap();
+    let manifest = manifest.replace(
+        "approval = \"none\"",
+        "approval = \"each\"\napproval_ttl = \"30m\"",
+    );
+    std::fs::write(&path, manifest).unwrap();
+    ok(&env, &["trust", "resign", "--yes"]);
+
+    // Raise the quorum to 2 (a second admin exists), so the removal below
+    // is a governance change one signature short.
+    ok(&env, &["member", "add", "bob", "--role", "admin"]);
+    ok(&env, &["member", "approve", "bob", "--yes"]);
+    let manifest = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        format!("{manifest}\n[team]\nrequired_approvals = 2\n"),
+    )
+    .unwrap();
+    ok(&env, &["trust", "resign", "--yes"]);
+
+    // The removal is a proposal: one admin signature of two. Even as a
+    // proposal it must preserve the approval policy — the old whole-entry
+    // removal would have deleted it from the proposal manifest too.
+    let result = ok(
+        &env,
+        &["secret", "allow", "native://app/api", "--remove", "--yes"],
+    );
+    assert_eq!(result["quorum"]["pending"], true, "{result}");
+    assert_eq!(result["quorum"]["received"], 1, "{result}");
+    assert_eq!(result["quorum"]["required"], 2, "{result}");
+    let manifest = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !manifest.contains("allow = "),
+        "proposal manifest still allows agents: {manifest}"
+    );
+    assert!(
+        manifest.contains("approval = \"each\"") && manifest.contains("approval_ttl = \"30m\""),
+        "pending proposal lost the approval policy: {manifest}"
+    );
+
+    // The pinned-but-unaccepted state refuses the next security-consuming
+    // command instead of laundering the proposal, and the proposal sits one
+    // epoch ahead of the pin.
+    let envelope = fails(&env, &["status"], 5);
+    let message = envelope.raw["diagnostics"][0]["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        message.contains("required admin signatures") && message.contains("NOT accepted"),
+        "pending removal was accepted: {message}"
+    );
+    let pin: Value = serde_json::from_str(
+        &std::fs::read_to_string(env.path().join(".local/state/muster/trust.json")).unwrap(),
+    )
+    .unwrap();
+    let state: Value = serde_json::from_str(
+        &std::fs::read_to_string(env.config_dir().join("fleet.state.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        state["payload"]["epoch"].as_u64().unwrap(),
+        pin["epoch"].as_u64().unwrap() + 1,
+        "the pending removal must sit one epoch ahead of the pin"
+    );
+}
+
+#[test]
 fn secret_allow_on_a_machine_without_signing_authority_is_refused() {
     // The admin machine owns a bare remote with one secret.
     let remote_dir = tempfile::TempDir::new().unwrap();
     let remote = remote_dir.path().join("origin.git");
-    let mut init = std::process::Command::new("git")
+    let init = std::process::Command::new("git")
         .args(["init", "--bare", "--", remote.to_str().unwrap()])
         .output()
         .unwrap();

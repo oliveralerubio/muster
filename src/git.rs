@@ -281,6 +281,46 @@ fn require_repo(dir: &Path) -> Result<(), MusterError> {
     }
 }
 
+/// Whether `rel_path` (relative to the repo root) has uncommitted local
+/// changes: untracked, modified or staged. Used to tell a request that never
+/// reached a commit apart from one that is at least recorded locally.
+pub fn path_dirty(dir: &Path, rel_path: &str) -> Result<bool, MusterError> {
+    require_repo(dir)?;
+    let out = run(dir, &["status", "--porcelain", "--", rel_path])?;
+    if !out.status.success() {
+        return Err(MusterError::Operational(format!(
+            "git status failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(!String::from_utf8_lossy(&out.stdout).trim().is_empty())
+}
+
+/// Whether `rel_path` exists in the last-known state of the fleet remote:
+/// the current branch's tracking ref (`origin/<branch>`, updated by every
+/// fetch, pull and push), or `@{upstream}` when only that is configured.
+/// `Some(true)` = published as of the last sync, `Some(false)` = committed
+/// but not on the remote yet, `None` = no remote state is known locally, so
+/// publication cannot be determined without the network.
+pub fn path_on_upstream(dir: &Path, rel_path: &str) -> Result<Option<bool>, MusterError> {
+    require_repo(dir)?;
+    // The last-known state of the fleet remote: the current branch's
+    // tracking ref (updated by every fetch, pull and push), falling back to
+    // `@{upstream}` (set by `git push -u`).
+    let mut candidates = Vec::new();
+    if let Ok(branch) = current_branch(dir) {
+        candidates.push(format!("refs/remotes/{REMOTE}/{branch}"));
+    }
+    candidates.push("@{upstream}".to_owned());
+    let Some(target) = candidates.iter().find(|rev| {
+        run(dir, &["rev-parse", "--verify", "--quiet", rev]).is_ok_and(|out| out.status.success())
+    }) else {
+        return Ok(None);
+    };
+    let check = run(dir, &["cat-file", "-e", &format!("{target}:{rel_path}")])?;
+    Ok(Some(check.status.success()))
+}
+
 fn require_remote(dir: &Path) -> Result<(), MusterError> {
     require_repo(dir)?;
     if has_remote(dir) {

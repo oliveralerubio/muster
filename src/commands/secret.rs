@@ -180,7 +180,8 @@ pub const ALLOW: CommandSpec = CommandSpec {
         },
         ParamSpec {
             name: "remove",
-            about: "Remove the access policy entry (approval and approval_ttl go with it)",
+            about: "Remove only the allow list; the approval policy (approval, approval_ttl) \
+                    is preserved",
             kind: ParamKind::Bool,
             required: false,
             positional: false,
@@ -190,14 +191,16 @@ pub const ALLOW: CommandSpec = CommandSpec {
     handler: allow,
 };
 
-/// The three distinguishable states of a secret's access policy. They are not
+/// The four distinguishable states of a secret's access policy. They are not
 /// flattened: "no policy" (deny by default, human CLI can still reveal) is a
-/// different state from an explicit `allow = []` (deny everyone) and from a
-/// list of allowed agents.
+/// different state from an approval-only policy (no allow list, but a
+/// per-use approval requirement), from an explicit `allow = []` (deny
+/// everyone) and from a list of allowed agents.
 fn policy_state(policy: Option<&SecretPolicy>) -> &'static str {
     match policy {
         None => "none",
         Some(p) => match p.allow.as_ref() {
+            None if approval_fields(p).is_some() => "approval_only",
             None => "none",
             Some(entries) if entries.is_empty() => "deny_all",
             Some(_) => "allows",
@@ -205,9 +208,25 @@ fn policy_state(policy: Option<&SecretPolicy>) -> &'static str {
     }
 }
 
+/// The approval policy a `SecretPolicy` carries besides its allow list, as
+/// `approval=each, ttl=30m` (either half alone is reported too). `None` when
+/// the policy declares no approval fields — the case where nothing would
+/// survive removing the allow list.
+fn approval_fields(policy: &SecretPolicy) -> Option<String> {
+    let mut parts = Vec::new();
+    if policy.approval == SecretApproval::Each {
+        parts.push("approval=each".to_owned());
+    }
+    if let Some(ttl) = &policy.approval_ttl {
+        parts.push(format!("ttl={ttl}"));
+    }
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
 fn describe_policy(policy: Option<&SecretPolicy>) -> String {
     match policy_state(policy) {
         "none" => "no access policy".to_owned(),
+        "approval_only" => "no allow list (approval policy only)".to_owned(),
         "deny_all" => "allow = [] (no agent may receive it)".to_owned(),
         _ => {
             let entries = policy
@@ -242,32 +261,53 @@ fn allow(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let mut manifest = Manifest::load(&ctx.config_dir)?;
     let reference = reference.as_str().to_owned();
     let current = manifest.secrets.get(&reference).cloned();
-    if remove && current.is_none() {
-        return Err(MusterError::Usage(format!(
-            "no access policy declared for {reference}; nothing to remove"
-        )));
+    if remove {
+        match &current {
+            None => {
+                return Err(MusterError::Usage(format!(
+                    "no access policy declared for {reference}; nothing to remove"
+                )));
+            }
+            // A policy without an allow list is not "no policy": distinguish
+            // an approval-only policy (which `--remove` must keep whole) from
+            // an entry that carries nothing at all.
+            Some(p) if p.allow.is_none() => {
+                return Err(MusterError::Usage(match approval_fields(p) {
+                    Some(fields) => format!(
+                        "the policy for {reference} declares no allow list; only its approval \
+                         policy ({fields}) exists, and --remove never touches it — nothing to \
+                         remove"
+                    ),
+                    None => format!(
+                        "the policy entry for {reference} is empty (no allow list, no approval \
+                         policy); nothing to remove"
+                    ),
+                }));
+            }
+            Some(_) => {}
+        }
     }
 
-    // The exact change, taught before anything is written.
-    let kept = current
+    // The exact change, taught before anything is written. `--remove` takes
+    // only the allow list: the approval policy survives it when one exists,
+    // and the question must say so.
+    let approval = current.as_ref().and_then(approval_fields);
+    let kept = approval
         .as_ref()
-        .map(|p| {
-            let approval = if p.approval == SecretApproval::Each {
-                format!(
-                    "approval=each, ttl={}",
-                    p.approval_ttl.as_deref().unwrap_or("15m")
-                )
-            } else {
-                "approval=none".to_owned()
-            };
-            format!(" ({approval} preserved)")
-        })
+        .map(|fields| format!(" ({fields} preserved)"))
         .unwrap_or_default();
     let question = if remove {
-        format!(
-            "Remove the access policy for {reference} (was: {})?",
-            describe_policy(current.as_ref())
-        )
+        match &approval {
+            Some(fields) => format!(
+                "Remove only the allow list for {reference} (was: {})? The approval policy \
+                 ({fields}) is preserved.",
+                describe_policy(current.as_ref())
+            ),
+            None => format!(
+                "Remove the access policy for {reference} (was: {})?",
+                describe_policy(current.as_ref())
+            ),
+        }
     } else if deny_all {
         format!("Set an explicit empty allow list for {reference} (no agent may receive it){kept}?")
     } else {
@@ -276,28 +316,51 @@ fn allow(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     ctx.confirm(&question)?;
 
     if ctx.dry_run {
+        let predicted = if remove {
+            if current
+                .as_ref()
+                .is_some_and(|p| approval_fields(p).is_some())
+            {
+                "approval_only"
+            } else {
+                "none"
+            }
+        } else if deny_all {
+            "deny_all"
+        } else {
+            "allows"
+        };
         return Ok(json!({
             "dry_run": true,
             "reference": reference,
-            "policy_state": if remove { "none" } else if deny_all { "deny_all" } else { "allows" },
+            "policy_state": predicted,
             "allow": entries,
         }));
     }
 
-    // Mutate only the allow field; approval and approval_ttl of an existing
-    // policy are preserved as-is.
+    // Mutate only the allow field. `--remove` takes the whole entry down
+    // solely when no approval policy lives in it; otherwise the entry stays
+    // with `allow` unset and approval/approval_ttl exactly as they were.
     if remove {
-        manifest.secrets.remove(&reference);
+        let policy = manifest
+            .secrets
+            .get_mut(&reference)
+            .expect("current policy checked above");
+        if approval_fields(policy).is_some() {
+            policy.allow = None;
+        } else {
+            manifest.secrets.remove(&reference);
+        }
     } else {
         let policy = manifest.secrets.entry(reference.clone()).or_default();
         policy.allow = Some(entries.clone());
     }
 
-    // Absent (None) and explicit empty (Some([])) are different states: the
-    // comparison must see an absent → deny-all transition as a change.
-    let before = current.as_ref().and_then(|p| p.allow.clone());
+    // The whole policy is compared, not just `allow`: "no policy entry" and
+    // "an entry without an allow list" are different states, and absent →
+    // deny-all must still be seen as a change.
     let after = manifest.secrets.get(&reference).cloned();
-    let changed = before != after.as_ref().and_then(|p| p.allow.clone());
+    let changed = current != after;
     let original_text =
         std::fs::read_to_string(ctx.config_dir.join(crate::manifest::FILE_NAME)).ok();
     let result_policy = if changed {
@@ -376,6 +439,7 @@ fn format_allow_text(result: &Value) -> String {
     let state = result["policy_state"].as_str().unwrap_or("none");
     let described = match state {
         "deny_all" => "allow = [] (no agent may receive it)".to_owned(),
+        "approval_only" => "no allow list (approval policy only)".to_owned(),
         "allows" => format!(
             "allow = [{}]",
             result["allow"]
@@ -484,9 +548,10 @@ fn list(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
                 "name": meta.name,
                 "reference": reference,
                 "allow": allow,
-                // The three distinguishable policy states (not flattened):
-                // "none" (no policy declared), "deny_all" (explicit `allow =
-                // []`), "allows" (a non-empty allow list).
+                // The four distinguishable policy states (not flattened):
+                // "none" (no policy declared), "approval_only" (no allow
+                // list, but a per-use approval requirement), "deny_all"
+                // (explicit `allow = []`), "allows" (a non-empty allow list).
                 "policy_state": policy_state(policy),
                 "approval": match policy.map(|p| p.approval) {
                     Some(SecretApproval::Each) => "each",
@@ -515,6 +580,7 @@ fn format_list_text(secrets: &[Value]) -> String {
     for s in secrets {
         let access = match s["policy_state"].as_str() {
             Some("deny_all") => "no agent may receive it (allow = [])".to_owned(),
+            Some("approval_only") => "no allow list (agents never receive it)".to_owned(),
             Some("allows") => format!(
                 "allowed: {}",
                 s["allow"]
