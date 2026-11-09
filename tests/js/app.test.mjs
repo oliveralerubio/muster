@@ -144,6 +144,21 @@ seed("input", "secret-confirm", secretForm);
 seed("button", "secret-save", secretForm);
 seed("button", "secret-cancel", secretForm);
 seed("p", "secret-error", secretForm);
+const policyDialog = seed("dialog", "secret-policy");
+seed("h2", "secret-policy-title", policyDialog);
+seed("code", "secret-policy-ref", policyDialog);
+seed("p", "secret-policy-current", policyDialog);
+const policyRadios = [["none", "secret-policy-state-none"], ["deny_all", "secret-policy-state-deny-all"], ["allows", "secret-policy-state-allows"]].map(([value, id]) => {
+  const radio = seed("input", id, policyDialog);
+  radio.type = "radio";
+  radio.name = "secret-policy-state";
+  radio.value = value;
+  return radio;
+});
+seed("input", "secret-policy-entries", policyDialog);
+seed("button", "secret-policy-save", policyDialog);
+seed("button", "secret-policy-cancel", policyDialog);
+seed("p", "secret-policy-error", policyDialog);
 const profileDialog = seed("dialog", "profile-edit");
 const profileForm = seed("form", "profile-form", profileDialog);
 seed("h2", "profile-edit-title", profileDialog);
@@ -529,6 +544,163 @@ async function testProvidersViewListsReferencesAndAddsAndRemoves() {
   assert.ok(removed);
   assert.equal(removed.body.id, "gateway");
   assert.equal(removed.body.confirm, true);
+  setResponder();
+}
+
+async function testSecretPolicyDialogThreeStatesAndExactChange() {
+  // Three secrets, one per policy state, like `secret list` reports them.
+  setResponder((call) => {
+    if (call.path === "secrets" || call.path === "secret/requests" || call.path === "secret/leases") {
+      const secret = (name, extra) => Object.assign({
+        reference: `native://app/${name}`, allow: [], policy_state: "none",
+        approval: "none", approval_ttl: null, updated_at: "2026-11-09T12:00:00Z",
+        updated_by: "box", readers: [],
+      }, extra);
+      const result = call.path === "secrets"
+        ? [
+            secret("none"),
+            secret("denied", { policy_state: "deny_all" }),
+            secret("shared", { policy_state: "allows", allow: ["claude"], approval: "each", approval_ttl: "30m" }),
+          ]
+        : [];
+      return { ok: true, diagnostics: [], result };
+    }
+    if (call.path === "secret/allow") {
+      return { ok: true, diagnostics: [], result: { reference: "native://app/shared", policy_state: "deny_all", quorum: null, committed: true } };
+    }
+    return { ok: true, result: {}, diagnostics: [] };
+  });
+  await sandbox.show("secrets");
+  await flush();
+  const text = (node) => (typeof node === "string" ? node : (node.children || []).map(text).join(" "));
+  const rendered = text(view);
+  // The three states render as distinct labels, never flattened.
+  assert.match(rendered, /no policy/, "absent policy must be labeled");
+  assert.match(rendered, /deny all/, "explicit empty allow must be labeled");
+  assert.match(rendered, /allowed: claude/, "entry list must be labeled");
+  assert.match(rendered, /per-use approval \(30m\)/, "approval policy must be visible");
+
+  // Open the editor on the third secret: the current state is taught.
+  const editButtons = allElements.filter((el) => el.tagName === "BUTTON" && el.children[0] === "Edit policy");
+  assert.equal(editButtons.length, 3, "every secret row gets an Edit policy button");
+  editButtons[2].fire("click");
+  await flush();
+  assert.equal(need("secret-policy-ref").textContent, "native://app/shared");
+  assert.match(need("secret-policy-current").textContent, /allow = \[claude\]/, "current entries are shown");
+  assert.match(need("secret-policy-current").textContent, /Approval "each" \(ttl 30m\) is preserved/, "preserved approval is stated");
+  assert.equal(byId("secret-policy-state-allows").checked, true, "current state preselected");
+  assert.equal(need("secret-policy-entries").value, "claude", "entries prefilled");
+
+  // Switch to deny-everyone and save: the exact body posts through the
+  // signed circuit (`secret/allow`), with confirmation attached.
+  const check = (state) => {
+    // The fake DOM does not uncheck sibling radios automatically.
+    for (const radio of policyRadios) radio.checked = radio.value === state;
+  };
+  check("deny_all");
+  need("secret-policy-entries").value = "";
+  const mark = baseline();
+  need("secret-policy-save").fire("click");
+  await flush();
+  const call = callSince(mark, "secret/allow");
+  assert.ok(call, "save posts secret/allow");
+  assert.deepEqual(call.body, { reference: "native://app/shared", deny_all: true, confirm: true });
+
+  // The remove state posts `remove`, the agent list posts entries.
+  editButtons[0].fire("click");
+  await flush();
+  check("none");
+  const mark2 = baseline();
+  need("secret-policy-save").fire("click");
+  await flush();
+  assert.deepEqual(callSince(mark2, "secret/allow").body, { reference: "native://app/none", remove: true, confirm: true });
+
+  editButtons[2].fire("click");
+  await flush();
+  check("allows");
+  need("secret-policy-entries").value = "claude, codex@demo";
+  const mark3 = baseline();
+  need("secret-policy-save").fire("click");
+  await flush();
+  assert.deepEqual(callSince(mark3, "secret/allow").body, { reference: "native://app/shared", entry: ["claude", "codex@demo"], confirm: true });
+
+  // "allows" without entries refuses to post.
+  editButtons[0].fire("click");
+  await flush();
+  check("allows");
+  need("secret-policy-entries").value = "";
+  const mark4 = baseline();
+  need("secret-policy-save").fire("click");
+  await flush();
+  assert.equal(callSince(mark4, "secret/allow"), undefined, "empty allows state must not post");
+  assert.match(need("secret-policy-error").textContent, /Name at least one agent/);
+  setResponder();
+}
+
+async function testDashboardAgentsSummaryIsHonest() {
+  setResponder((call) => {
+    if (call.path === "status") {
+      return {
+        ok: true, diagnostics: [],
+        result: {
+          machines: [{ name: "box", platform: "linux-x86_64", version: "0.1.0", status: "current", is_current: true, last_sync: null }],
+          sync: null, pending: { members: [], machines: [] }, drift: { members: [], machines: [] },
+          pending_secret_approvals: [{ id: "r1", reference: "native://app/api", agent: "claude", requested_at: 1 }],
+        },
+      };
+    }
+    if (call.path === "schedule") {
+      return { ok: true, diagnostics: [], result: { enabled: false } };
+    }
+    if (call.path === "agents") {
+      return {
+        ok: true, diagnostics: [],
+        result: { agents: [
+          { id: "claude", experimental: false, enabled: true, detected: true, available: true, platforms: ["linux"] },
+          { id: "pi", experimental: true, enabled: false, detected: false, available: true, platforms: ["linux"] },
+        ] },
+      };
+    }
+    return { ok: true, result: {}, diagnostics: [] };
+  });
+  await sandbox.show("dashboard");
+  await flush();
+  const text = (node) => (typeof node === "string" ? node : (node.children || []).map(text).join(" "));
+  const rendered = text(view);
+  assert.match(rendered, /Agents on this machine/, "dashboard must show the agents section");
+  assert.match(rendered, /Enabled comes from the shared config/, "the summary must explain what enabled/detected mean");
+  assert.match(rendered, /None of these say the agent is signed in or reachable/, "must not promise connectivity or authentication");
+  assert.match(rendered, /Pending approvals \(1\)/, "pending secret approvals count towards attention");
+  assert.match(rendered, /native:\/\/app\/api\s+for claude/, "the pending approval names reference and agent");
+  assert.ok(liveButton("Review secret approvals"), "attention links to the Secrets view");
+  setResponder();
+}
+
+async function testHistoryShowsEventActor() {
+  setResponder((call) => {
+    if (call.path === "history") {
+      return {
+        ok: true, diagnostics: [],
+        result: {
+          generations: [],
+          commits: [],
+          events: [
+            { at: "2026-10-01T00:00:00Z", action: "secret.reveal", subject: "native://app/api", actor: null },
+            { at: "2026-11-09T00:00:00Z", action: "secret.reveal", subject: "native://app/api", actor: "box" },
+          ],
+        },
+      };
+    }
+    return { ok: true, result: {}, diagnostics: [] };
+  });
+  await sandbox.show("history");
+  await flush();
+  const text = (node) => (typeof node === "string" ? node : (node.children || []).map(text).join(" "));
+  const rendered = text(view);
+  assert.match(rendered, /Actor/, "events table has an Actor column");
+  assert.match(rendered, /unknown/, "events without an actor show unknown");
+  assert.match(rendered, /box/, "recorded actor is displayed");
+  assert.match(rendered, /not a cryptographically verified identity/, "attribution is not claimed as verification");
   setResponder();
 }
 
@@ -973,6 +1145,9 @@ const tests = {
   testUsageWithoutSessionsExplainsNoCoverage,
   testSecretApprovalsRequireConfirmationAndRefresh,
   testProvidersViewListsReferencesAndAddsAndRemoves,
+  testSecretPolicyDialogThreeStatesAndExactChange,
+  testDashboardAgentsSummaryIsHonest,
+  testHistoryShowsEventActor,
   testProfileSaveIsGatedOnPreview,
   testMcpFormUsesJsonArrayValues,
   testMcpPreviewIgnoresStaleResponse,

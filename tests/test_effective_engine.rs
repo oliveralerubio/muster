@@ -484,7 +484,8 @@ fn compute_serializes_the_same_json_shape_as_the_command() {
             "extra_on_disk",
             "skills",
             "layers",
-            "instructions"
+            "instructions",
+            "providers"
         ]
     );
     assert_eq!(

@@ -266,6 +266,22 @@ pub struct ProviderItem {
     pub provider: AiProvider,
 }
 
+impl ProviderItem {
+    /// Metadata and origin for the effective view. `key` is a secret
+    /// reference (what the manifest stores), never a value.
+    fn to_json(&self) -> Value {
+        json!({
+            "id": self.id,
+            "layer": self.layer,
+            "kind": self.provider.kind,
+            "base_url": self.provider.base_url,
+            "default_model": self.provider.default_model,
+            "key": self.provider.key,
+            "api_key_helper": self.provider.api_key_helper,
+        })
+    }
+}
+
 /// The effective configuration of a machine (and, optionally, a project).
 ///
 /// `totals` and `extra_on_disk` keep report order (the global scope's
@@ -298,6 +314,7 @@ impl EffectiveConfig {
             "skills": self.skills.iter().map(SkillItem::to_json).collect::<Vec<_>>(),
             "layers": self.layers.iter().map(LayerOrigin::to_json).collect::<Vec<_>>(),
             "instructions": self.instructions.iter().map(InstructionsItem::to_json).collect::<Vec<_>>(),
+            "providers": self.providers.iter().map(ProviderItem::to_json).collect::<Vec<_>>(),
         })
     }
 

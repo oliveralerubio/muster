@@ -67,6 +67,7 @@ fn format_text(result: &Value) -> String {
         ("Skills", "skills"),
         ("MCP", "mcp"),
         ("Subagents", "subagents"),
+        ("AI providers", "providers"),
     ] {
         text.push_str(&format!("{heading}\n"));
         let Some(items) = result[key].as_array() else {
@@ -76,6 +77,7 @@ fn format_text(result: &Value) -> String {
             let name = item["name"]
                 .as_str()
                 .or_else(|| item["source"].as_str())
+                .or_else(|| item["id"].as_str())
                 .unwrap_or("");
             // Provenance: the supplying layer plus per-kind detail.
             let mut parts: Vec<String> = Vec::new();
@@ -116,6 +118,18 @@ fn format_text(result: &Value) -> String {
                         .collect();
                     if !overridden.is_empty() {
                         parts.push(format!("overrides {}", overridden.join(", ")));
+                    }
+                }
+                "providers" => {
+                    // Metadata and origin only; `key` is a reference, not a value.
+                    if let Some(kind) = item["kind"].as_str() {
+                        parts.push(kind.to_owned());
+                    }
+                    if let Some(model) = item["default_model"].as_str() {
+                        parts.push(format!("default {model}"));
+                    }
+                    if let Some(key) = item["key"].as_str() {
+                        parts.push(format!("key {key}"));
                     }
                 }
                 _ => {}

@@ -135,7 +135,60 @@ fn list(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
             })
         })
         .collect();
-    Ok(json!({ "agents": agents }))
+    let result = json!({ "agents": agents });
+    if ctx.format == crate::output::Format::Text {
+        return Ok(Value::String(format_text(&result)));
+    }
+    Ok(result)
+}
+
+/// Honest agent summary: enabled (in the shared config), detected (its files
+/// were found on this machine) and available (supported on this platform) say
+/// nothing about connectivity or authentication.
+fn format_text(result: &Value) -> String {
+    let mut text = String::from("Agents:\n");
+    let agents = result["agents"].as_array().cloned().unwrap_or_default();
+    for a in &agents {
+        let platforms = a["platforms"]
+            .as_array()
+            .map(|p| {
+                p.iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        text.push_str(&format!(
+            "  {}  {}  enabled: {}  detected on this machine: {}  platforms: {}{}\n",
+            a["id"].as_str().unwrap_or("?"),
+            a["name"].as_str().unwrap_or(""),
+            yes_no(a["enabled"].as_bool()),
+            yes_no(a["detected"].as_bool()),
+            platforms,
+            if a["experimental"] == Value::Bool(true) {
+                "  (experimental)"
+            } else {
+                ""
+            },
+        ));
+        // Not claimed: connectivity, sign-in or a working API key.
+    }
+    if agents.is_empty() {
+        text.push_str("  none\n");
+    }
+    text.push_str(
+        "Enabled comes from the shared config; detection only means the agent's files exist\n\
+         here. Neither implies the agent is signed in or reachable.\n",
+    );
+    text
+}
+
+fn yes_no(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "unknown",
+    }
 }
 
 fn apply(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {

@@ -75,14 +75,120 @@ fn run(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
         }
     };
     let convergence = convergence(ctx)?;
-    Ok(json!({
+    // Local, per-use approval requests an agent created on this machine: the
+    // human approving them is here, so status is where they surface.
+    let pending_secret_approvals: Vec<Value> = crate::secret_leases::Store::open(&ctx.state_dir)?
+        .data
+        .requests
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.id,
+                "reference": r.reference,
+                "agent": r.agent,
+                "requested_at": r.requested_at,
+            })
+        })
+        .collect();
+    let result = json!({
         "convergence": convergence,
         "sync": sync,
         "config_path": ctx.config_dir,
         "machines": machines,
         "pending": team["pending"],
         "drift": team["drift"],
-    }))
+        "pending_secret_approvals": pending_secret_approvals,
+    });
+    if ctx.format == crate::output::Format::Text {
+        return Ok(Value::String(format_text(&result)));
+    }
+    Ok(result)
+}
+
+/// `muster status --format text`: a short human summary of the same JSON.
+fn format_text(result: &Value) -> String {
+    let mut text = String::new();
+    text.push_str(&format!(
+        "Config: {}\n",
+        result["config_path"].as_str().unwrap_or("unknown")
+    ));
+    if let Some(sync) = result["sync"].as_object() {
+        let ts = sync.get("ts").and_then(Value::as_str).unwrap_or("unknown");
+        let outcome = sync.get("result").and_then(Value::as_str).unwrap_or("?");
+        let applied = sync.get("applied").and_then(Value::as_bool);
+        text.push_str(&format!(
+            "Last sync: {ts} ({outcome}{})\n",
+            applied
+                .map(|a| if a { ", applied" } else { ", not applied" })
+                .unwrap_or_default()
+        ));
+    } else {
+        text.push_str("Last sync: never\n");
+    }
+    text.push_str("Machines:\n");
+    if let Some(machines) = result["machines"].as_array() {
+        for m in machines {
+            let agents = m["agents"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            text.push_str(&format!(
+                "  {}{}  {}  {}  platform {}  version {}  last sync {}\n",
+                m["name"].as_str().unwrap_or("?"),
+                if m["is_current"] == Value::Bool(true) {
+                    " (this machine)"
+                } else {
+                    ""
+                },
+                m["status"].as_str().unwrap_or("?"),
+                if agents.is_empty() {
+                    "no agents".to_owned()
+                } else {
+                    format!("agents {agents}")
+                },
+                m["platform"].as_str().unwrap_or("unknown"),
+                m["version"].as_str().unwrap_or("unknown"),
+                m["last_sync"].as_str().unwrap_or("never"),
+            ));
+        }
+        if machines.is_empty() {
+            text.push_str("  none\n");
+        }
+    }
+    let pending = result["pending_secret_approvals"].as_array();
+    if let Some(requests) = pending.filter(|r| !r.is_empty()) {
+        text.push_str("Pending secret approvals (this machine):\n");
+        for r in requests {
+            text.push_str(&format!(
+                "  {} for {}  (muster secret approve {})\n",
+                r["reference"].as_str().unwrap_or("?"),
+                r["agent"].as_str().unwrap_or("?"),
+                r["id"].as_str().unwrap_or("?"),
+            ));
+        }
+    }
+    let drift = result["drift"].as_object();
+    let drift_count = drift
+        .map(|d| {
+            d.get("members")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0)
+                + d.get("machines")
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+                    .unwrap_or(0)
+        })
+        .unwrap_or(0);
+    if drift_count > 0 {
+        text.push_str(&format!("Drift: {drift_count} item(s) need attention\n"));
+    }
+    text
 }
 
 /// One convergence report shared by the CLI, web status and MCP status.
