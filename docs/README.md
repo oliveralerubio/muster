@@ -10,6 +10,10 @@ Welcome to the Muster documentation directory. Below is the index of available d
 
 - [Security verification](security/verification.md) — Property tests, fuzzing, Kani proofs and the TLA+ team-revocation model.
 
+## Research
+
+- [Muster Cloud: un SaaS de pago junto al núcleo abierto](research/paid-product.md). Dos tamaños de SaaS autoservicio, con evidencia, precios experimentales y límites de la investigación.
+
 ## Specifications & Concepts
 
 - [Muster Specification](SPEC.md) — The comprehensive product and design specification.
