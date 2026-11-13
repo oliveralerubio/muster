@@ -1,0 +1,6 @@
+scenario,currency,price_month,support_hours_month,human_hour_cost,infra_month,identity_month,payment_percent,payment_fixed,acquisition_onboarding_reserve_month,contribution_month,fixed_month,surplus_goal_month,organizations_needed
+team_15min,USD,99,0.25,40,8,0,3.5,.30,16.67,60.565,500,3000,58
+team_1hour,USD,99,1,40,8,0,3.5,.30,16.67,30.565,500,3000,115
+team_3hours,USD,99,3,40,8,0,3.5,.30,16.67,-49.435,500,3000,not_viable
+team_higher_price,USD,199,0.25,40,8,0,3.5,.30,16.67,157.065,500,3000,23
+enterprise,USD,1500,4,40,50,250,3.5,.30,0,987.200,35000,3000,39

@@ -10,6 +10,10 @@ Welcome to the Muster documentation directory. Below is the index of available d
 
 - [Security verification](security/verification.md) — Property tests, fuzzing, Kani proofs and the TLA+ team-revocation model.
 
+## Research
+
+- [Un producto de pago alrededor de Muster](research/paid-product.md). Comparación de negocio pequeño y oferta empresarial, con evidencia, precios experimentales y límites de la investigación.
+
 ## Specifications & Concepts
 
 - [Muster Specification](SPEC.md) — The comprehensive product and design specification.
