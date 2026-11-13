@@ -131,9 +131,6 @@ if the directory is not on it.
 
 Override defaults with optional environment variables:
 - `MUSTER_VERSION`: release tag to install, e.g. `v0.1.0` or `0.1.0` (default: latest published release).
-
-No release has been published yet, so until the first tagged release the script
-has nothing to download; build from source in the meantime.
 - `MUSTER_INSTALL_DIR`: directory where the executable will be placed (default: `~/.local/bin`).
 - `MUSTER_REPO`: GitHub repository to download from (default: `oliveralerubio/muster`).
 
@@ -190,7 +187,7 @@ muster ui            # web admin on 127.0.0.1 with a one-time login token
 ```
 
 1. **`muster init`** creates your config repository (`$XDG_CONFIG_HOME/muster` by default), generates this machine's identity and an empty age vault, and shows your recovery key once — store it somewhere safe.
-2. **`muster agents apply`** renders your configuration into the native files of every agent in `[agents].enabled` — by default every stable adapter (the four in the table above), whether or not its binary is installed on this machine. List the agents you want in `muster.toml` to restrict the set; preview first with `muster plan` if you want the exact diff.
+2. **`muster agents apply`** renders your configuration into the native files of every agent in `[agents].enabled` — by default every stable adapter (the five in the table above), whether or not its binary is installed on this machine. List the agents you want in `muster.toml` to restrict the set; preview first with `muster plan` if you want the exact diff.
 3. **`muster ui`** opens the web admin interface in your browser: machines, secrets, agents, skills and history in one panel.
 
 Everything the UI does has a CLI equivalent, and every ordinary command answers `--format json` with a stable envelope for scripts and AI agents. Two commands are their own protocol: `muster mcp` speaks JSON-RPC over stdio, and `muster ui` prints one startup JSON object (`url`, `port`, `token`) before serving.
@@ -285,12 +282,29 @@ Only admins add, update or remove skills.
 - **Localhost-only UI.** `muster ui` listens on `127.0.0.1` on a random free port and requires a one-time login token from your terminal.
 - **No telemetry.** Muster collects no usage data and sends no telemetry. Its only network traffic is what you trigger: syncing with your Git remote, asking a subscribed skill upstream for updates, and approved `muster sync` or manual `muster agents install` downloading pinned agent CLIs.
 
+## Why Muster? (FAQ & Comparisons)
+
+### How do I sync Claude Code, Codex, and OpenCode skills, subagents, and MCP servers across machines?
+
+Install Muster (`curl -fsSL https://raw.githubusercontent.com/oliveralerubio/muster/main/install.sh | bash`), run `muster init`, point at a Git remote (`muster sync --remote <url>`), and add your skills, subagents, instructions (`AGENTS.md`), and MCP servers once. Each enrolled machine runs `muster sync` to decrypt its permitted secrets with its own `age` key and render native files for Claude Code, Codex, OpenCode, Antigravity CLI, and Pi.
+
+### How is Muster different from dotfile managers (`chezmoi`, `stow`) and secret managers (`1Password CLI`, `Bitwarden`)?
+
+| Capability | Muster | Traditional Dotfiles (`chezmoi`, `stow`) | Secret Managers (`1Password CLI`, `Bitwarden`) |
+|---|---|---|---|
+| **Native AI agent translation** | Renders one canonical config into `CLAUDE.md`, `.codex/config.toml`, OpenCode JSON, Pi packages, and Hermes YAML | Treats files as opaque text or symlinks; requires manual per-agent templates | Not applicable |
+| **Lossless merging** | Rewrites only managed blocks/keys and leaves hand-edited local settings untouched | Overwrites or conflicts on partial file edits | Not applicable |
+| **Agent Skills & Subagents** | Vendors & pins skills in `skills.lock` (SHA-256) and translates subagents across agents | Manual file copies without lockfile verification or format translation | Not applicable |
+| **Secrets without third-party servers** | Local-first Git + `age` vault; per-machine keys, recovery key, and signed fleet quorum | External encryption wrappers without per-agent access policies | Requires cloud accounts, paid tiers, or external vault servers |
+| **Granular agent secret access** | Deny-by-default `[secrets] allow` per agent/project, runtime leases (`approval = "each"`), GUI capture (`secret prompt`), and output-scrubbed `secret run` | All-or-nothing file decryption | Coarse CLI token access; no native MCP `allow` gating |
+
 ## Documentation
 
 - [`docs/SPEC.md`](docs/SPEC.md) — the full product specification.
 - [`GLOSSARY.md`](GLOSSARY.md) — the project's vocabulary.
 - [`docs/adr/`](docs/adr) — architecture decision records.
 - [`docs/agents/muster-for-agents.md`](docs/agents/muster-for-agents.md) — operating Muster from the CLI or MCP.
+- [`llms.txt`](llms.txt) and [`llms-full.txt`](llms-full.txt) — machine-readable documentation index and full context for AI tools.
 
 ## Status
 

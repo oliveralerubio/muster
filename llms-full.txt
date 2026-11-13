@@ -1,0 +1,134 @@
+# Muster — Full Reference for LLMs and AI Tools
+
+> Muster (`oliveralerubio/muster`, Apache-2.0, Rust) syncs AI coding agent configurations, Agent Skills, subagents, MCP servers, AI provider endpoints, and age-encrypted secrets across machines and teams from a single Git repository — local-first, with zero telemetry and no third-party servers.
+
+---
+
+## 1. What Problem Muster Solves
+
+Developers using AI coding agents (Claude Code, Codex, OpenCode, Antigravity CLI, Pi, Hermes Agent) across multiple machines (laptop, workstation, remote Linux box, or team) face three recurring problems:
+1. **Configuration drift:** Instructions (`CLAUDE.md`, `AGENTS.md`), MCP server definitions, permissions, hooks, custom subagents, and Agent Skills live in incompatible per-agent paths and formats (Markdown, JSON, TOML, YAML).
+2. **Insecure secret sharing:** API keys and tokens for MCP servers or AI providers often end up duplicated in plaintext dotfiles or passed into LLM conversation transcripts.
+3. **Unverified skill & binary sprawl:** Skills installed ad-hoc have no integrity pinning or cross-machine sync.
+
+Muster solves all three with one canonical Git repository (`$XDG_CONFIG_HOME/muster` by default), rendering native config files losslessly per adapter while encrypting secrets per machine with `age` and gating agent access deny-by-default.
+
+---
+
+## 2. Installation & Platforms
+
+**Supported platforms:** Linux, WSL2, and macOS (`x86_64` and `aarch64`). Native Windows is not supported.
+**Runtime dependency:** `git` only (`curl` or `wget` needed only for the install script or pinned agent binary downloads).
+
+**Option 1 — Release binary installer:**
+```sh
+curl -fsSL https://raw.githubusercontent.com/oliveralerubio/muster/main/install.sh | bash
+```
+- Detects OS/architecture, downloads `muster-<tag>-<target>.tar.gz`, verifies SHA-256 against `SHA256SUMS`, and installs to `~/.local/bin/muster`.
+- Optional environment variables: `MUSTER_VERSION` (e.g. `v0.1.0`), `MUSTER_INSTALL_DIR`, `MUSTER_REPO`.
+
+**Option 2 — Build from source with Cargo:**
+```sh
+git clone https://github.com/oliveralerubio/muster
+cd muster
+cargo install --path .
+```
+
+---
+
+## 3. Supported Agent Adapters & Native Paths
+
+Stable adapters (enabled by default unless `[agents].enabled` restricts them):
+
+| Agent | ID | Binary | Capabilities | User Skills | Project Skills | User Subagents |
+|---|---|---|---|---|---|---|
+| Claude Code | `claude` | `claude` | instructions, MCP (stdio + remote), models, permissions, hooks, skills, subagents, providers (`api_key_helper`) | `~/.claude/skills/<skill>/` | `.claude/skills/<skill>/` | `~/.claude/agents/<name>.md` |
+| Codex | `codex` | `codex` | instructions, MCP (stdio + remote), models, skills, subagents (TOML), providers | `~/.agents/skills/<skill>/` | `.agents/skills/<skill>/` | `~/.codex/agents/<name>.toml` |
+| OpenCode | `opencode` | `opencode` | instructions, MCP (stdio + remote), models, skills, subagents, providers | `$XDG_CONFIG_HOME/opencode/skills/<skill>/` | `.opencode/skills/<skill>/` | `$XDG_CONFIG_HOME/opencode/agents/<name>.md` |
+| Antigravity CLI | `antigravity` | `agy` | instructions, MCP (stdio + remote), skills, subagents | `~/.gemini/antigravity-cli/skills/<skill>/` | `.agents/skills/<skill>/` | `~/.gemini/antigravity-cli/agents/<name>.md` |
+| Pi | `pi` | `pi` | instructions, MCP (stdio + remote), models, skills, subagents, packages | `~/.pi/agent/skills/<skill>/` | `.pi/skills/<skill>/` | `~/.pi/agent/agents/<name>.md` |
+
+Experimental adapter (opt-in via `[agents].enabled`):
+- **Hermes Agent** (`hermes`, binary `hermes`): instructions (`~/.hermes/SOUL.md` / project `AGENTS.md`), MCP (stdio + remote), models (`~/.hermes/config.yaml`), skills (`~/.hermes/skills/`).
+
+Lossless merging rules:
+- Markdown instruction files use `BEGIN/END MUSTER MANAGED BLOCK` delimiters so hand-written content outside the block is preserved.
+- JSON/TOML/YAML configs update only keys Muster manages, leaving personal settings untouched.
+- Agent-specific instruction overlays (`AGENTS.<agent-id>.md`) extend canonical `AGENTS.md` per adapter.
+- Per-layer toggles (`[agents.toggles]` with `enable`/`disable` for `skill:<name>`, `mcp:<name>@<adapter>`, `subagent:<name>`) evaluate in fixed precedence: `team -> group -> member -> machine -> project`.
+
+---
+
+## 4. Core Workflows
+
+### 4.1 First machine setup & multi-machine sync
+```sh
+muster init                              # Create config repo, machine age identity, recovery key, empty vault
+muster agents apply                      # Render native config for enabled adapters
+muster sync --remote <git-url>           # Push config repo to your private Git remote
+muster ui                                # Launch localhost web admin (127.0.0.1, one-time token)
+```
+Enroll a second machine via SSH in one command:
+```sh
+muster machine add <ssh-host> [--name <alias>] [--profile <profile>]
+```
+Or from the second machine directly:
+```sh
+muster sync --remote <git-url> --pull
+muster enroll
+# Approve on an existing admin machine:
+muster approve <machine-name>
+# Pull & apply on the new machine:
+muster sync
+```
+Scheduled background sync (`systemd` user timer on Linux/WSL2, `launchd` on macOS):
+```sh
+muster schedule enable [--pull]
+```
+
+### 4.2 Agent Skills & Subagents lifecycle
+- **Own skills:** `muster skill add <name> --description "..."` creates `skills/<name>/SKILL.md` and pins its SHA-256 hash in `skills.lock`.
+- **Subscribed external skills:** `muster skill add --url <git-url> [--ref <ref>] [--path <dir>] [--include <skill>]` vendors skills into `skills/` and records upstream commit + `content_hash` in `skills.lock`.
+- **Import existing unmanaged skills:** `muster skill import --all` brings hand-installed or `npx skills`-installed skills under Muster management (linking upstream repos from `~/.agents/.skill-lock.json` when present).
+- **Check & update:** `muster skill check`, `muster skill update [name] [--all]`, or opt-in `muster skill auto-update on`.
+- **Inspect & prune:** `muster effective`, `muster why <text>`, and `muster usage --since 14d` (analyzes local transcripts without network access to report unused skills/MCPs/subagents).
+
+### 4.3 Secrets, Vault, Graphical Capture & Blind Execution
+- **age vault:** Each secret group is stored as an `age`-encrypted ciphertext in the Git repo with plaintext metadata sidecars (never values). Each machine has its own private key; an offline recovery key is shown once at `muster init`.
+- **Deny-by-default access:** Secrets are only materialized into an agent's MCP config or revealed via `muster mcp` when `[secrets."native://<group>/<name>"]` explicitly lists that agent in `allow` (e.g. `allow = ["claude", "codex@my-repo"]`).
+- **Runtime approval leases:** Setting `approval = "each"` and `approval_ttl = "15m"` requires explicit human approval (`muster secret approve <id>` in a real terminal or authenticated Web UI) before `secret.get --reveal`, `secret.run`, or MCP `secret_reveal` succeeds.
+- **Out-of-band GUI capture (never paste secrets in agent chat):**
+  ```sh
+  muster secret prompt <group>/<name> --reason "API key for Postgres MCP" --allow claude --format json
+  ```
+  Opens native GUI askpass/osascript/zenity/kdialog/pinentry or an ephemeral localhost browser dialog (`127.0.0.1:0`) with `HttpOnly; SameSite=Strict` cookies and CSRF protection; never writes plaintext secrets to stdout, stderr, or transcripts.
+- **Blind subprocess execution with output scrubbing:**
+  ```sh
+  muster secret run --agent claude --env API_KEY=native://prod/api_key --yes -- <command> [args...]
+  ```
+  Injects secrets only via child env or stdin (never argv), blocks dangerous env vars (`PATH`, `LD_*`, `DYLD_*`, `MUSTER_*`), and scrubs raw, JSON/TOML/shell-escaped, URL-encoded, and Base64-encoded secret occurrences from stdout/stderr.
+
+### 4.4 AI Providers
+Declare endpoints once in `[providers.<id>]` (`openai`, `openai-compatible`, `anthropic`, `google`, `ollama`) with optional `base_url`, `default_model`, and `key = "native://..."` or `env://...`, then bind per agent via `muster provider use <id> --agent <agent>`. Subscription logins stay local per machine via `muster provider login claude|codex` (Muster never copies OAuth tokens).
+
+### 4.5 Team Mode & Cryptographic Fleet Governance
+Team mode activates when `[members]` is non-empty (`muster member add`). Supports `admin` and `member` roles, secret groups (`muster group create/grant/revoke/rekey`), configurable multi-admin approval quorums (`[team] required_approvals`), and Ed25519 signed fleet state (`muster trust show/resign/cosign/checkpoint`) protecting against unauthorized manifest or key-injection tampering in Git remotes.
+
+---
+
+## 5. CLI Contract & MCP Server (`muster mcp`)
+
+- Every CLI command supports `--format json`, `--dry-run`, and `--yes`, returning a single JSON envelope:
+  ```json
+  { "schema_version": 1, "command": "...", "ok": true, "result": { ... }, "diagnostics": [] }
+  ```
+- Deterministic exit codes: `0` success, `1` operational failure, `2` usage/TTY confirmation required, `3` invalid config, `4` dependency unavailable, `5` security/authorization denial, `130` interrupted.
+- Run `muster schema --format json` to inspect the full machine-readable command & parameter registry.
+- `muster mcp` runs a newline-delimited JSON-RPC 2.0 server over stdio exposing read-only inspection tools (`status`, `doctor`, `plan`, `effective`, `why`, `usage`, `provider_list`, `secret_list_meta`), proposal-gated mutation (`propose_change`, which stages edits into `proposals/<id>/` for human `muster proposal accept`), and allowlisted `secret_reveal`.
+
+---
+
+## 6. Comparisons (Muster vs. Alternatives)
+
+- **vs. chezmoi / GNU stow / dotbot:** Generic dotfile managers treat files as raw templates or symlinks. Muster understands native schemas for Claude Code, Codex, OpenCode, Antigravity CLI, Pi, and Hermes; performs key-level/block-level lossless merges; verifies vendored Agent Skills via `skills.lock` SHA-256 hashes; translates subagents across Markdown/TOML; and enforces per-agent secret `allow` policies.
+- **vs. 1Password CLI / Bitwarden:** Cloud secret managers require third-party servers/accounts and lack native awareness of AI agent config files, MCP `allow` gating, `propose_change` workflows, or output-scrubbed `secret run`. Muster stores secrets in a local-first Git + `age` vault under your exclusive control (and also supports `muster import bws` / `chezmoi` / `cuartel`).

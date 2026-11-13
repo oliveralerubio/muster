@@ -2,6 +2,13 @@
 name = "muster"
 version = "0.1.0"
 edition = "2021"
+description = "Sync your machines, AI coding agents and secrets — local-first, team-ready"
+license = "Apache-2.0"
+repository = "https://github.com/oliveralerubio/muster"
+homepage = "https://github.com/oliveralerubio/muster"
+readme = "README.md"
+keywords = ["ai-agents", "claude-code", "mcp", "dotfiles", "secrets"]
+categories = ["command-line-utilities", "config", "development-tools"]
 
 [dependencies]
 clap = { version = "4.5", features = ["env", "error-context", "help", "std", "suggestions", "usage"], default-features = false }

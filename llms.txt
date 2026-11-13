@@ -1,0 +1,43 @@
+# Muster
+
+> Local-first, team-ready sync for AI coding agent configurations, Agent Skills, subagents, MCP servers, AI providers, and age-encrypted secrets across Linux, WSL2, and macOS. Single Rust binary providing a scriptable CLI (`--format json`), localhost Web UI (`muster ui`), and stdio MCP server (`muster mcp`).
+
+Muster maintains one canonical Git repository (`muster.toml`, `AGENTS.md`, `skills/`, `subagents/`, `skills.lock`, `muster.lock`, and an `age`-encrypted vault) and renders native configuration files for each supported AI coding agent without overwriting unmanaged local edits. Secrets are encrypted per machine with `age`, gated deny-by-default per agent (`allow`), and never leave your machines except encrypted to your own Git remote. Zero telemetry, zero accounts, zero third-party servers.
+
+## Supported Agents
+
+- **Claude Code** (`claude`): instructions, stdio/remote MCP servers, models, permissions, hooks, skills, subagents, AI providers (`api_key_helper`).
+- **Codex** (`codex`): instructions, stdio/remote MCP servers, models, skills, subagents (TOML translation), AI providers.
+- **OpenCode** (`opencode`): instructions, stdio/remote MCP servers, models, skills, subagents, AI providers.
+- **Antigravity CLI** (`agy`): instructions, stdio/remote MCP servers, skills, subagents.
+- **Pi** (`pi`): instructions, stdio/remote MCP servers, models, skills, subagents, packages.
+- **Hermes Agent** (`hermes`, experimental): instructions (`SOUL.md` / `AGENTS.md`), stdio/remote MCP servers, models, skills.
+
+## Install & Quick Start
+
+- Install binary (Linux / macOS / WSL2): `curl -fsSL https://raw.githubusercontent.com/oliveralerubio/muster/main/install.sh | bash`
+- Build from source: `git clone https://github.com/oliveralerubio/muster && cd muster && cargo install --path .`
+- Quick start: `muster init && muster agents apply && muster ui`
+- Sync across machines: `muster sync --remote <git-url>` (or `muster machine add <ssh-host>` to enroll a remote machine over SSH)
+
+## Core Documentation
+
+- [Full LLM Context (llms-full.txt)](https://raw.githubusercontent.com/oliveralerubio/muster/main/llms-full.txt): Complete self-contained technical reference, CLI/MCP contract, comparisons, and workflows in a single file.
+- [README](https://raw.githubusercontent.com/oliveralerubio/muster/main/README.md): Overview, installation, supported agents table, skills lifecycle, AI providers, team mode, and FAQ.
+- [Muster for AI Agents](https://raw.githubusercontent.com/oliveralerubio/muster/main/docs/agents/muster-for-agents.md): JSON envelope contract, exit codes, stdio MCP server tools (`status`, `doctor`, `plan`, `effective`, `why`, `usage`, `provider_list`, `secret_list_meta`, `propose_change`, `secret_reveal`), proposal workflow, graphical secret capture (`secret prompt`), and blind command execution (`secret run`).
+- [Product Specification](https://raw.githubusercontent.com/oliveralerubio/muster/main/docs/SPEC.md): Complete v1 specification covering adapters, fleet enrollment, quorum, vault encryption, and engine invariants.
+- [Team Mode Guide](https://raw.githubusercontent.com/oliveralerubio/muster/main/docs/guides/team-mode.md): Multi-user GitOps setup, roles (`admin`/`member`), secret groups, and quorum approvals.
+- [Glossary](https://raw.githubusercontent.com/oliveralerubio/muster/main/GLOSSARY.md): Canonical domain vocabulary (Machine, Fleet, Vault, Secret group, Quorum, Adapter, Effective configuration, Vendored skill, Generation, Toggle).
+
+## Security & Architecture
+
+- [Verification & Threat Model](https://raw.githubusercontent.com/oliveralerubio/muster/main/docs/security/verification.md): Cryptographic fleet state verification, signed quorums, Kani/proptest formal invariants.
+- [Network Security](https://raw.githubusercontent.com/oliveralerubio/muster/main/docs/security/network.md): Network surface, zero-telemetry guarantees, pinned artifact SHA-256 verification.
+- [ADR 0001: Single Command Registry](https://raw.githubusercontent.com/oliveralerubio/muster/main/docs/adr/0001-single-command-registry.md): Shared command registry across CLI, MCP, and Web UI.
+- [ADR 0002: Skills Vendoring and Lockfile](https://raw.githubusercontent.com/oliveralerubio/muster/main/docs/adr/0002-skills-vendoring-and-lockfile.md): Reproducible `skills.lock` SHA-256 verification and vendoring model.
+- [ADR 0005: Signed Fleet State](https://raw.githubusercontent.com/oliveralerubio/muster/main/docs/adr/0005-signed-fleet-state.md): Ed25519 signed fleet state and quorum governance.
+
+## Optional
+
+- [Install Script](https://raw.githubusercontent.com/oliveralerubio/muster/main/install.sh): POSIX shell installer verifying release tarballs against `SHA256SUMS`.
+- [Repository](https://github.com/oliveralerubio/muster): GitHub source repository (Apache-2.0 License).
