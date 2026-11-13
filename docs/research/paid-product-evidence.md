@@ -2,6 +2,8 @@
 
 Fecha de corte: 13 de noviembre de 2026. Este anexo acompaña [la propuesta](paid-product.md). Distingue hechos comprobados, interpretación y experimentos pendientes.
 
+El alcance del producto es SaaS autoservicio: cuenta, suscripción, conexión de dispositivos y operación automatizada. Se excluyen recomendaciones de consultoría, migración manual y operación realizada por Oliver como oferta comercial. La comparación es entre dos tamaños del mismo negocio de software por suscripción.
+
 ## Método y alcance
 
 Se encargaron 30 investigaciones con frentes distintos: 10 a `gpt-6-luna`, 10 a `claude-haiku-4-5` y 10 a `zai-coding-plan/glm-5.3-flash`. Cada investigador tenía un archivo de salida propio, instrucciones de no modificar el repositorio y prohibición de subdelegar. El primer intento de usar el identificador abreviado de GLM fue rechazado; las diez tareas de ese grupo se iniciaron después con el identificador anunciado por el proveedor. No se sustituyó el modelo solicitado.
@@ -60,6 +62,7 @@ Como evidencia del problema, se contrastaron directamente las solicitudes [Claud
 | SSO, SCIM o revocación de flota invalidan todo acceso y secretos anteriores. | Descartada. Servicio, Git, sistema operativo y proveedor de credenciales tienen autoridades diferentes. |
 | Recibir el estado firmado de flota demuestra que cada dispositivo aplicó el cambio. | Descartada. Hace falta un reporte por dispositivo con frescura y alcance definidos; el protocolo alojado no existe hoy. |
 | Pedir SSO, firmar una intención o pulsar un botón demuestra demanda pagada. | No. Se exige distinguir interés, pago, uso repetido y renovación. |
+| Un piloto atendido a mano por Oliver valida el SaaS propuesto. | Descartada. La beta debe activar y sincronizar por software; el trabajo manual no es el producto buscado. |
 | Las recomendaciones de 30 agentes demuestran mercado. | No. Constituyen cobertura de investigación y propuestas de experimentos. |
 
 ## Cobertura de las investigaciones
@@ -95,7 +98,7 @@ La valoración de uso corresponde a la síntesis, no al `PASS` que cada agente a
 | 25 | GLM Flash | Primer producto cobrable | Seguimiento sin custodia como alternativa; corregida la equivalencia entre firma de estado y aplicación por máquina. |
 | 26 | GLM Flash | Compra empresarial | Mapa de preguntas útil; descartadas exenciones automáticas de privacidad y cumplimiento. |
 | 27 | GLM Flash | Comunidad y frontera comercial | Operación adicional, exportación y continuidad local como propuesta; no compromiso contractual nuevo. |
-| 28 | GLM Flash | Otros modelos de negocio | Comparación de soporte, despliegue privado, Pro, marketplace y proxy; consultoría no equivale a poca operación. |
+| 28 | GLM Flash | Otros modelos de negocio | Se descartó consultoría y trabajo por encargo; la oferta elegida es suscripción a software alojado y automatizado. |
 | 29 | GLM Flash | Caso adversario | Alternativas gratuitas y metadatos sensibles; la conclusión de que nadie pagará tampoco está demostrada. |
 | 30 | GLM Flash | Dos rutas estratégicas | Diferencia entre venta directa y empresarial; descartados umbrales de lista de espera como prueba suficiente de pago. |
 

@@ -12,7 +12,7 @@ Welcome to the Muster documentation directory. Below is the index of available d
 
 ## Research
 
-- [Un producto de pago alrededor de Muster](research/paid-product.md). Comparación de negocio pequeño y oferta empresarial, con evidencia, precios experimentales y límites de la investigación.
+- [Muster Cloud: un SaaS de pago junto al núcleo abierto](research/paid-product.md). Dos tamaños de SaaS autoservicio, con evidencia, precios experimentales y límites de la investigación.
 
 ## Specifications & Concepts
 
