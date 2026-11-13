@@ -1,195 +1,197 @@
-# Muster Cloud: un SaaS de pago junto al núcleo abierto
+# Muster Cloud como producto de suscripción
 
-Investigación del 13 de noviembre de 2026. Esta es una propuesta de negocio, no una hoja de ruta aprobada ni una oferta comercial vigente. La [evidencia y sus límites](paid-product-evidence.md) acompañan el análisis.
+Propuesta del 13 de noviembre de 2026. Sustituye la primera investigación con una segunda ronda dedicada al SaaS autoservicio. No es una oferta vigente ni autoriza construir o desplegar el servicio. La [evidencia](paid-product-evidence.md) distingue código existente, fuentes externas, propuestas y supuestos económicos.
 
-## La oportunidad que merece probarse
+## El producto que recomiendo probar
 
-El producto buscado es un SaaS autoservicio. El cliente crea una cuenta, elige una suscripción, conecta sus dispositivos y usa el software alojado. Registro, pago, incorporación, sincronización, actualizaciones, recuperación y cancelación deben funcionar como producto. La entrega no puede depender de contratar a Oliver, de consultoría ni de una instalación hecha a mano por el fundador.
+**Muster Cloud es un espacio alojado que mantiene la configuración de tus agentes en tus dispositivos, permite recuperar cambios y administra el equipo desde una cuenta.** El cliente conecta sus máquinas; Muster opera almacenamiento, sincronización, versiones, identidad, facturación y recuperación. Los agentes continúan ejecutándose localmente.
 
-La propuesta es **Muster Cloud**: configuración de agentes, skills, herramientas MCP y secretos cifrados sincronizados entre dispositivos desde una cuenta, con administración de equipos en la web. El cliente de cada dispositivo aplica la configuración local. El servicio aloja y opera la coordinación y el almacenamiento necesarios; el usuario de pago no tiene que administrar repositorios Git, servidores ni tareas de sincronización.
+Empezaría por equipos de 2 a 15 personas que usan varios agentes y máquinas. Es un segmento propuesto, no un mercado medido. El comprador inicial sería quien hoy prepara el entorno de los compañeros: responsable técnico, fundador técnico o responsable de plataforma. Mantendría un plan personal sobre el mismo producto y compararía sus pagos y renovaciones por separado. Cloud debe permitir alta directa; no exige adoptar primero el OSS. Quien eligió el núcleo precisamente para evitar cuentas puede no ser el comprador adecuado.
 
-Muster conserva el núcleo abierto para quienes prefieren operarlo por su cuenta. Cloud vende la experiencia administrada completa. Además de sincronizar, informa de cambios pendientes, detecta fallos y automatiza la recuperación de los casos que pueda resolver con seguridad. Todavía no hay evidencia de compradores que paguen por esta propuesta.
+La promesa a probar es:
 
-La promesa inicial que probaría es:
+> Conecta tus máquinas y tu equipo. Distribuye la configuración aprobada de tus agentes, ve qué dispositivos la aplicaron y recupera cambios desde una cuenta.
 
-> Conecta tus máquinas una vez. Tus agentes, skills y configuración se mantienen sincronizados, y tu equipo se administra desde la web.
+La suscripción paga por ese resultado continuo. Una incorporación puede ser ocasional; los cambios de skills, MCP, instrucciones y dispositivos mantienen el trabajo recurrente. Debemos medir que ese trabajo ocurra con frecuencia suficiente para renovar. Si solo se usa al instalar una máquina, la tesis de suscripción se debilita.
 
-Es una propuesta para validar. No significa que Cloud ya exista ni que pueda demostrar que un agente obedeció las instrucciones. La comparación de negocios se refiere a un SaaS pequeño y rentable frente a un SaaS de mayor escala. Ambos entregan software por suscripción.
+El núcleo abierto sigue funcionando gratis con Git propio. Un cliente local que aplica archivos es compatible con SaaS, como muestran servicios con clientes de escritorio. En Cloud, el usuario no crea remotos Git, configura SSH, instala servidores ni programa sincronizaciones. Una decisión sobre un conflicto o aprobar un dispositivo corresponde al cliente; instalarle el producto a mano corresponde a un fallo de autoservicio que debemos corregir.
 
-## Qué tenemos y qué falta
+## Qué existe y qué hay que construir
 
-La base examinada es el commit [`f8ebe16`](https://github.com/oliveralerubio/muster/tree/f8ebe16faf88c1790f1a54e16bfbd5167fe152ab). Ya incluye configuración para varios agentes, sincronización sobre Git, cifrado de secretos, miembros, grupos, aprobaciones, quórum, perfiles, firmas de estado y una interfaz web local. El [modo equipo](../guides/team-mode.md) ya forma parte del producto gratuito.
+La base examinada es [`f8ebe16`](https://github.com/oliveralerubio/muster/tree/f8ebe16faf88c1790f1a54e16bfbd5167fe152ab). Existe una [release v0.1.0](https://github.com/oliveralerubio/muster/releases/tag/v0.1.0), aunque el README de ese snapshot conserva una frase anterior que lo contradice.
 
-La [especificación actual](../SPEC.md#out-of-scope) deja expresamente para otro momento el servicio alojado, la interfaz multiusuario, SSO/SAML, SCIM, facturación y autorización en servidor. Un producto de pago aprovecharía el núcleo, pero exige construir y operar capacidades nuevas.
-
-Hay una [release pública v0.1.0](https://github.com/oliveralerubio/muster/releases/tag/v0.1.0), publicada el 13 de noviembre de 2026, con binarios Linux y macOS. Algunas revisiones encontraron un README anterior que decía que no había releases. Para ese hecho prevalece el registro actual de GitHub. La existencia de una release o de pruebas automatizadas no demuestra adopción ni preparación empresarial.
-
-En los issues y PRs públicos examinados no encontramos una señal suficiente de compradores independientes. Eso describe el alcance de la investigación; no demuestra que nadie lo use ni que el problema carezca de mercado.
-
-Sí encontramos relatos externos del problema. Una [solicitud de sincronización entre dispositivos en Claude Code](https://github.com/anthropics/claude-code/issues/22648) describe configuraciones mantenidas por separado. Otra [solicitud sobre secretos de MCP](https://github.com/anthropics/claude-code/issues/28942) relata la dificultad de compartir configuración y preparar a nuevos desarrolladores. Son evidencia de fricción, no de disposición a pagar por Muster. Piden mejoras al fabricante, que también podría resolver parte del problema.
-
-## Qué copiar de Supabase y n8n
-
-[Supabase](https://supabase.com/docs/guides/self-hosting) permite operar su software y vende la comodidad y las prestaciones de su plataforma administrada. Su [monorepo tiene licencia Apache-2.0](https://github.com/supabase/supabase/blob/master/LICENSE). Esto no establece la licencia de cada componente del conjunto. El aprendizaje para Muster es que un cliente puede preferir pagar por una operación resuelta aunque tenga acceso al código.
-
-La diferencia económica importa. Supabase aloja bases de datos y otros servicios con consumo continuo. Muster ya sincroniza usando Git del cliente. Cloud debe eliminar esa operación para el usuario que se suscribe: alta desde una cuenta, almacenamiento administrado, sincronización automática, versiones y recuperación. El valor incremental debe probarse frente a GitHub, GitLab y otros productos que ya sincronizan.
-
-[n8n combina una edición comunitaria y ofertas comerciales](https://docs.n8n.io/sustainable-use-license/), pero su Sustainable Use License tiene restricciones comerciales. No es equivalente a Apache-2.0 ni a una licencia abierta según la [definición de OSI](https://opensource.org/osd). Su [licencia](https://github.com/n8n-io/n8n/blob/master/LICENSE.md) separa además los componentes empresariales. Podemos aprender de cómo empaqueta conveniencia y funciones para organizaciones sin copiar su licencia.
-
-Muster no necesita cambiar de licencia para cobrar. Apache-2.0 permite uso comercial y servicios de pago. En esta propuesta el cliente paga una suscripción a Cloud y sus prestaciones administradas. La licencia del núcleo no obliga a contratar ese servicio.
-
-Conservaría Apache-2.0 para el núcleo existente. Si más adelante aparecen módulos empresariales nuevos, su licencia y separación requieren una decisión expresa. Los derechos ya concedidos sobre las versiones publicadas permanecen. Esta investigación no acredita titularidad exclusiva, disponibilidad de marca ni viabilidad jurídica de un cambio de licencia.
-
-## El mercado ya tiene alternativas
-
-No sostendría la afirmación de que el espacio está vacío:
-
-| Alternativa | Lo que ya ofrece | Pregunta que Muster debe responder |
+| Capacidad | Producto abierto actual | Trabajo nuevo de Cloud |
 |---|---|---|
-| [Packmind](https://packmind.com/pricing/) | Distribución de instrucciones entre agentes y repositorios; oferta empresarial de gobernanza, identidad y auditoría. | ¿La gestión de máquinas y su configuración completa resuelve un trabajo que su enfoque sobre repositorios deja pendiente? |
-| [CC Switch](https://github.com/farion1231/cc-switch) | Gestión de proveedores, MCP, skills y prompts; sincronización entre dispositivos mediante WebDAV o almacenamiento compatible con S3. | ¿Un equipo necesita coordinación de personas y máquinas que esta sincronización no le da? |
-| [chezmoi](https://www.chezmoi.io/) y Git con scripts | Gestión flexible de configuración usando herramientas conocidas. | ¿El ahorro de trabajo de Muster compensa adoptar otra herramienta? |
-| [Infisical](https://infisical.com/), [Doppler](https://www.doppler.com/) y [Bitwarden Secrets Manager](https://bitwarden.com/products/secrets-manager/) | Productos especializados en secretos y acceso de organizaciones. | ¿Muster aporta distribución y configuración de agentes sin obligar a sustituir el gestor existente? |
+| Configuración | Formato canónico, adaptadores y aplicación local con perfiles. | Selección e importación guiadas, revisiones compartidas y propuestas desde la web. |
+| Sincronización | Git del usuario, pull y push. Un conflicto puede exigir resolución manual. | Transporte operado por Muster, reintentos, concurrencia y conflictos comprensibles dentro del producto. |
+| Secretos | Bóvedas age por grupos, claves por máquina y recuperación. | Enlace seguro de cuenta y dispositivo, recuperación explicada y autorización cloud sin sustituir las firmas. |
+| Equipos | Miembros, grupos, quórum, aprobaciones y revocación gratuitos. | Invitaciones y gestión web conectadas con las autorizaciones criptográficas existentes. |
+| Versiones | Historial Git y generaciones locales restaurables. | Historial alojado, restauración distribuida, exportación y backups probados. |
+| Estado | Estado deseado firmado y resultados operativos locales. | Recibos por dispositivo con revisión, resultado y antigüedad. |
+| Servicio comercial | Interfaz web local, CLI y MCP. | Cuentas, aislamiento, planes, cobro, baja, observabilidad y operación multiusuario. |
 
-El enfoque que probaría es el entorno de trabajo completo de un equipo que usa varios agentes y máquinas. Su diferenciación tendría que demostrarse en ese flujo completo. La suma de funcionalidades no demuestra exclusividad ni disposición a pagar.
+La [especificación](../SPEC.md#out-of-scope) deja el hub para trabajo futuro. Esa decisión anterior describe el alcance implementado; no impide diseñar ahora el SaaS pedido. Tener un motor local útil no convierte el panel local en un servicio multiusuario.
 
-La convergencia de formatos y los controles propios de los fabricantes pueden reducir el valor de traducir archivos. Necesitamos que el valor pagado sobreviva a esa simplificación. Competir por contenido de skills o por un marketplace añadiría otro negocio antes de probar este.
+## Tres formas de negocio y una entrada recomendada
 
-## Qué permanece gratuito y qué se vendería
+| Forma | Trabajo pagado | Ventaja | Riesgo principal | Decisión propuesta |
+|---|---|---|---|---|
+| Cloud personal | Mantener el entorno entre máquinas y recuperarlo sin operar transporte. | Alta y compra individuales; recorrido más corto. | Sustitutos gratuitos, ingreso bajo y posible uso episódico. | Ofrecerlo sobre la misma base, con una cohorte propia. |
+| Cloud para equipos pequeños | Incorporar personas y máquinas, distribuir cambios aprobados y ver resultados. | Un comprador coordina varios usuarios; hay más ocasiones de uso compartido. | El equipo puede considerar suficiente Git privado. | Centro del lanzamiento y de la primera prueba comercial. |
+| Cloud para organizaciones mayores | El mismo servicio con identidad corporativa, políticas, auditoría y garantías operativas. | Más ingresos posibles por cuenta. | Mayor coste de seguridad, identidad, contratación e incidentes. | Expansión condicionada a clientes recurrentes; no alcance inicial. |
 
-La frontera propuesta conserva las capacidades actuales:
+Un SaaS pequeño y una empresa mayor pueden vender exactamente el mismo software. El pequeño mantiene una región, pocos planes, una matriz de compatibilidad acotada y compra autónoma. La empresa mayor amplía capacidad, controles y equipo interno. Ninguna ruta requiere vender horas, instalaciones o proyectos personalizados.
 
-| Núcleo abierto y gratuito | Servicio de pago propuesto |
+La recomendación de equipos es una apuesta razonada sobre coordinación y frecuencia, no una conclusión obtenida por mayoría de agentes. Si la cohorte personal activa y renueva mejor con menos coste, el lanzamiento debe adaptarse a ese resultado.
+
+## Por qué pagar si existen alternativas
+
+| Alternativa comprobada | Lo que ya resuelve | Diferencia que Muster debe demostrar |
+|---|---|---|
+| Muster OSS, Git privado y chezmoi | Transporte barato, historial y control sobre los datos. | El recorrido completo evita configurar transporte, aprobaciones dispersas, diagnóstico y recuperación manual. |
+| [CC Switch](https://github.com/farion1231/cc-switch) | Proveedores, MCP, skills y prompts; sync entre dispositivos con WebDAV o S3 del usuario. | Un servicio alojado listo para usar y coordinación de personas, permisos y dispositivos. No basta afirmar que CC Switch carece de sync. |
+| [Praxl](https://praxl.app/) | Gestión multiagente de skills, sincronización, versiones y oferta cloud gratuita. Pro anuncia $5/mes. | Alcance adicional de entorno, MCP, secretos y dispositivos en un recorrido mejor. Pro aparece como "Coming soon"; su precio no demuestra ventas. |
+| [Packmind](https://packmind.com/pricing/) | Centralización y distribución de estándares, reglas y prompts; gobernanza empresarial. | Administración del entorno por dispositivo, además del contenido de repositorios. Hay solapamiento real. |
+| Doppler, Infisical y gestores de secretos | Distribución especializada de secretos y controles organizacionales. | Configuración del entorno de agentes sin exigir sustituir la fuente de secretos del cliente. |
+| Sincronización nativa de cada agente | Puede resolver parte del trabajo dentro de un proveedor. | Una experiencia útil entre herramientas y perfiles distintos. Los fabricantes también pueden ampliar su alcance. |
+
+No encontramos base para afirmar que Muster sea único. Tampoco para concluir que nadie paga por sincronización personal. [Obsidian Sync](https://obsidian.md/sync) comercializa sync e historial desde $4 por usuario al mes con pago anual. El relato de ConfigMesh sobre rechazo a $5 es un caso de un fundador, no un techo universal de precio.
+
+De Supabase Cloud y n8n Cloud copiaría la separación entre software utilizable por cuenta propia y una operación alojada que el comprador recibe completa. No copiaría su unidad de consumo: Muster no ejecuta consultas, workflows ni tokens de agentes en el servidor. n8n usa además una licencia con restricciones comerciales; no equivale al núcleo Apache-2.0 de Muster.
+
+## El recorrido completo del cliente
+
+Las pantallas y comandos descritos aquí son propuestas, no funciones ya disponibles.
+
+1. El usuario crea cuenta y espacio desde la web. Ve precio, alcance, retención y prueba de 14 días antes de conectar dispositivos. La prueba no requiere tarjeta; sin compra explícita no hay cobro.
+2. Descarga el cliente firmado para un sistema admitido. Un enlace en el navegador conecta el dispositivo con un código temporal. El instalador prepara las dependencias necesarias; el usuario no configura Git.
+3. El cliente muestra qué archivos y campos importará, su destino y su diff. Permite excluir contenido y mover credenciales detectadas a la bóveda. Detectar patrones de secretos no garantiza encontrarlos todos. Nada se sube sin confirmar.
+4. La primera máquina establece las claves y la confianza del workspace. El usuario guarda y comprueba el material de recuperación antes de confiar secretos al servicio.
+5. Para la segunda máquina, el usuario inicia sesión y solicita enlace. Un dispositivo o administrador ya autorizado aprueba su identidad y acceso criptográfico. Recuperar email o pagar no concede descifrado automáticamente.
+6. El cliente sincroniza en segundo plano y aplica el perfil correspondiente a cada máquina. La web distingue revisión deseada, recibida, aplicada, bloqueada y dispositivo sin contacto. Un dispositivo desconectado no figura como actualizado.
+7. Si dos máquinas editan el mismo contenido, el producto conserva ambas propuestas y muestra el conflicto. Combina únicamente cambios seguros y disjuntos. El cliente decide los conflictos reales; no abre una terminal Git ni espera a Oliver.
+8. En Team, el administrador invita miembros, asigna grupos, aprueba dispositivos y retira acceso. Los cambios que necesitan firma o quórum esperan esas aprobaciones dentro del producto.
+9. La web muestra historial y propone restaurar una revisión. Un cliente autorizado valida, firma cuando corresponde y aplica el cambio como una revisión nueva. Restaurar no rebobina épocas de seguridad ni revive destinatarios revocados.
+10. Al terminar la prueba, el usuario compra en un checkout alojado. El servicio activa el plan mediante eventos verificados y reconciliación con el proveedor de pagos. Repetir o retrasar un evento no duplica el cobro ni rebaja un plan vigente.
+11. El portal permite cambiar plan y cancelar renovaciones. Propongo una ventana de exportación de 30 días tras terminar el acceso pagado, con fechas de borrado anunciadas. La exportación incluye historial y ciphertext verificables por una instalación OSS limpia.
+12. El cliente conserva la última configuración aplicada y puede continuar con el núcleo abierto. Cancelar Cloud no inutiliza la CLI, la bóveda local ni el modo equipo gratuito.
+
+La recuperación tiene tres objetos distintos: cuenta, historial y claves. Backups del proveedor recuperan datos alojados. Para descifrar secretos tras perder todos los dispositivos se necesita recuperación del cliente o administradores autorizados. Si también se pierde ese material, el proveedor no puede prometer recuperar los secretos.
+
+## La frontera entre abierto y pago
+
+Mantendría Apache-2.0 y todas las capacidades actuales del núcleo: CLI, adaptadores, formato, perfiles, importación, motor local, secretos, equipos, firmas, quórum, historial local y sync con Git propio. No retiraría funciones para crear la suscripción.
+
+Cloud vende API y transporte operados por Muster, almacenamiento e historial remotos, consola de cuenta y equipo, estado de dispositivos, backups, recuperación operativa y ciclo de suscripción. Un futuro nivel organizacional puede añadir SSO, SCIM y retención avanzada. Su implementación y licencia requieren una decisión explícita; el backend puede tener licencia propia separada del núcleo.
+
+Apache-2.0 permite comercializar servicios sin obligar al cliente a contratarlos. También permite competidores sobre el código publicado. La defensa comercial propuesta es una experiencia fiable y una marca de confianza. Cambiar la licencia no revoca derechos ya concedidos. No hemos auditado titularidad, marca ni todas las dependencias.
+
+## Arquitectura inicial sin reescribir el producto entero
+
+Recomiendo probar una API Cloud con Git administrado internamente por workspace. La base de datos mantiene cuentas, membresías, planes y dispositivos. Un servicio de sync conserva revisiones y conflictos. Clientes locales verifican confianza, cifran secretos, renderizan perfiles y aplican archivos. Colas y copias fuera del almacenamiento primario completan la operación.
+
+Git es una decisión interna provisional. Conserva historia y facilita exportación; el verificador actual recorre estados intermedios en ese historial. Sustituirlo por snapshots sueltos exige preservar o rediseñar esa prueba, no solo cambiar una URL. La API debe controlar revisión base, idempotencia, aislamiento y límites. No debe aceptar órdenes Git arbitrarias del cliente.
+
+La primera versión puede conservar una copia Git local preparada automáticamente por el instalador. Quitar el binario del cliente no justifica romper la verificación existente. Si un transporte distinto demuestra las mismas propiedades con menor coste, puede sustituirse detrás de la API. Git del cliente queda disponible como salida o integración opcional.
+
+Antes de escoger definitivamente el transporte, un prototipo debe demostrar dos clientes concurrentes, uno offline, conflicto recuperable, cero pérdida silenciosa, cadena de firmas intacta y exportación verificable y utilizable desde OSS. Son pruebas por ejecutar; esta investigación no las ejecutó.
+
+### Privacidad y autorización de la primera versión
+
+Propongo secretos cifrados en el cliente y configuración seleccionada visible al proveedor, protegida en tránsito y reposo. Permite historial y diffs web sin desarrollar inicialmente un segundo cliente criptográfico completo en navegador. Es una decisión de producto por validar, no una garantía de seguridad existente.
+
+La separación requiere cuidado: instrucciones, rutas, comandos MCP y campos de configuración también pueden contener tokens o información privada. La importación explica qué se aloja y qué conserva el historial. No se suben generaciones locales completas: pueden contener secretos ya resueltos. El cifrado age actual protege grupos de secretos, no todo el workspace; sus metadatos actuales también son visibles.
+
+El cifrado integral en cliente es una alternativa válida si los compradores lo exigen. Añade recuperación de claves, edición y comparación en cliente y un diseño nuevo de fusión. No lo anunciaría como implementado ni usaría "zero-knowledge" para describir la versión propuesta.
+
+Cuenta, facturación, autorización del servidor y autorización criptográfica son controles distintos. La web puede proponer cambios y solicitar aprobación; el backend no recibe por ello claves administrativas. Un recibo firmado acredita lo que declara el dispositivo, no que el agente obedeció instrucciones ni que el equipo esté libre de compromiso.
+
+Revocar un miembro corta acceso futuro a Cloud. No borra copias ni invalida credenciales externas ya entregadas. Rotar esas credenciales requiere integración con su emisor y autorización suficiente. En ausencia de integración, el producto debe mostrar la acción pendiente; no prometer una revocación universal instantánea.
+
+## Una primera versión cobrable y sus límites
+
+La primera entrega debe completar el recorrido anterior en Linux y macOS, con una matriz pública y acotada de versiones de agentes. El alcance incluye un workspace, sync, historial, restauración, exportación, billing y permisos básicos de equipo. Las actualizaciones de compatibilidad pasan por pruebas con CLIs reales, despliegue gradual y recuperación. Los mocks actuales no demuestran esa compatibilidad.
+
+No incluiría ejecución cloud de agentes, marketplace, Windows nativo, regiones múltiples, certificaciones prometidas, políticas arbitrarias ni conectores personalizados en esa primera versión. La fecha depende del prototipo, del protocolo de confianza y de la revisión de seguridad. Esta investigación no establece un plazo de construcción.
+
+El servicio debe automatizar los casos normales:
+
+| Situación | Respuesta del producto |
 |---|---|
-| CLI, interfaz local y MCP. | Interfaz alojada para administrar una organización. |
-| Configuración, adaptadores, skills y sincronización con Git propio. | Sincronización automática y almacenamiento operados por Muster, sin administrar Git. |
-| Miembros, grupos, perfiles, quórum y aprobaciones actuales. | Invitaciones, conexión de dispositivos y administración del equipo desde la web. |
-| Cifrado, validación de firmas, historial y diagnóstico local. | Versiones, recuperación, alertas y seguimiento central de máquinas. |
-| Uso local con la configuración disponible cuando no hay conexión. | Suscripción, facturación, exportación y cancelación autoservicio; después, identidad corporativa e integración de directorios. |
+| Alta incompleta o enlace abandonado | Reanudar de forma idempotente; expirar códigos y solicitudes sin dejar recursos huérfanos. |
+| Red caída o dispositivo offline | Mantener la configuración local; cola y reintentos con espera creciente; mostrar antigüedad. |
+| Conflicto o cambio local | Conservar propuestas y respaldos; pedir una decisión comprensible sin sobrescribir silenciosamente. |
+| Pago fallido | Reintentos y avisos; gracia explícita; suspender sync futuro conservando exportación. |
+| Cliente incompatible | Bloquear el cambio afectado, explicar la actualización y preservar la última configuración válida. |
+| Backup o restauración fallidos | Ensayos automáticos aislados; detener publicación de datos inválidos y alertar al operador. |
+| Cancelación | Detener renovación, exportar, notificar plazos y borrar según política, incluido vencimiento de backups. |
 
-Las correcciones de seguridad y compatibilidad del núcleo seguirían siendo públicas. La propuesta de pago tendría que aportar una operación mejor resuelta. Si solo traslada al navegador comandos que ya funcionan bien, el negocio puede no existir.
+Los incidentes sistémicos siguen requiriendo responsables internos. Comprar infraestructura administrada reduce esa carga; no elimina mantenimiento de adaptadores, seguridad y soporte ordinario. Una corrección repetida a mano es un fallo del producto a automatizar. No se vende ese trabajo al cliente como un servicio adicional.
 
-Cloud requiere una aplicación web, un servicio de cuentas y suscripciones, y un transporte administrado para la configuración y las versiones. El cliente cifra los secretos antes de enviarlos. El diseño propuesto almacena ese material cifrado y metadatos mínimos, conservando las claves privadas y la recuperación en los dispositivos autorizados. No necesita recopilar transcripciones de los agentes.
+## Precios experimentales y cuotas
 
-El núcleo actual usa Git. Es necesario diseñar un transporte nuevo o encapsular un backend administrado para que el cliente de pago no tenga que operar Git. Mantener el Git del cliente puede ser una integración opcional. Un panel que únicamente recibe estado no cumple por sí solo la propuesta de Cloud.
+Probaría estos precios mensuales en USD, antes de impuestos. Son hipótesis elegidas para el experimento, no disposición a pagar observada.
 
-El estado firmado compartido describe el estado autorizado de la flota. Por sí solo no acredita que cada máquina lo aplicó. Esa confirmación, su fecha y sus límites requieren un protocolo nuevo de reporte por máquina que habría que diseñar y probar. No basta con subir `fleet.state.json` al servicio.
-
-## Dos tamaños de SaaS
-
-| Decisión | SaaS pequeño y rentable | SaaS de mayor escala |
+| Plan | Hipótesis | Alcance propuesto |
 |---|---|---|
-| Cliente inicial supuesto | Responsable técnico de una agencia o equipo de aproximadamente 5 a 30 personas que usa varios agentes. | Responsable de plataforma o ingeniería con patrocinio de seguridad e identidad corporativa. El tamaño por sí solo no define al comprador. |
-| Trabajo por el que paga | Sincronizar y recuperar su entorno de agentes sin operar la infraestructura. | Lo anterior entre equipos y departamentos, con integración corporativa y controles adicionales. |
-| Producto | Cloud autoservicio, pocas integraciones y una matriz de versiones acotada. | El mismo Cloud con identidad, directorios, permisos y retención ampliados. |
-| Compra | Registro, prueba y tarjeta en la web; activación automática. | Plan empresarial con aprovisionamiento automático; puede añadir proceso de compra corporativa. |
-| Operación | Altas, cobro, sincronización, actualizaciones y recuperación automatizados. | La misma automatización con personal para disponibilidad, incidentes e integraciones comunes del producto. |
-| Coste que puede limitarlo | Adquisición, soporte por cuenta y cambios de los fabricantes de agentes. | Personal, ciclo de ventas, integraciones de identidad, seguridad y obligaciones contractuales. |
-| Motivo para descartarlo | Git y las alternativas gratuitas ya bastan o cada cliente exige trabajo a medida. | No aparece presupuesto suficiente para cubrir la venta y la operación adicionales. |
+| OSS | Gratis | Capacidades actuales y transporte propio. |
+| Cloud Personal | $8 por persona al mes | Un workspace personal, hasta 5 dispositivos activos, historial de 30 días. |
+| Cloud Team | $12 por miembro al mes, mínimo $36 por workspace | Equipo, grupos e invitaciones web; hasta 5 dispositivos por miembro e historial de 90 días. |
+| Organización | Sin precio fijado | El mismo Cloud con identidad y controles adicionales, tras validar su coste y compra. |
 
-Los tamaños de equipo son criterios de selección propuestos para el experimento, no segmentos de mercado validados. La ruta pequeña permite aprender con menos compromisos. La empresarial puede justificar suscripciones mayores, pero exige más producto y capacidad operativa. No cambia la entrega a trabajo por encargo.
+No cobraría por agente, token o cada sincronización. Un humano puede usar varias herramientas. Los dispositivos adicionales necesitan una política visible tras medir su uso; en el experimento no habría sobrecargos automáticos. La cuota inicial propuesta es 1 GB de configuración e historial por workspace y 10 MB por archivo. Binarios y cachés no se sincronizan. Exceder cuota avisa y pausa nuevas cargas, sin borrar ni impedir exportar.
 
-Automatizar reduce trabajo; no elimina la responsabilidad por incidentes, proveedores que cambian o clientes que necesitan ayuda. Una función que necesita intervención recurrente de Oliver no está terminada como SaaS. Hay que automatizar las causas repetidas y financiar la operación normal con la suscripción.
+Las facturas Team serían $36 con una persona, $60 con cinco, $240 con veinte y $1.200 con cien. Para una persona sin equipo existe Personal. El mínimo de Team debe probarse: puede cubrir coste por organización o impedir adopción. No desplegaría un Cloud gratuito permanente antes de conocer abuso y coste de las cuentas inactivas; sí una prueba y OSS gratuito.
 
-La oferta inicial se limita a lo que fortalece ese SaaS:
+SSO y SCIM no son gratuitos por usar un proveedor de login gratuito. WorkOS publica productos separados: SSO y Directory Sync parten de $125 por conexión al mes cada uno en su primer tramo. Esos costes pueden exceder el precio Team. No ofrecería ambos por $12 al mes sin modelar conexión, volumen y coste de operación.
 
-| Opción | Decisión inicial | Motivo |
-|---|---|---|
-| Cloud para personas | Puede probarse con el mismo registro y sincronización automáticos. | El problema entre máquinas tiene relatos públicos, aunque no prueba de pago. |
-| Cloud para equipos | Primera oferta propuesta. | Permite probar administración compartida además de sincronización. |
-| Cloud empresarial | Ampliación condicionada a demanda pagada. | Necesita identidad, controles y operación adicionales. |
-| Marketplace o proxy de modelos | Fuera del primer producto. | Añade otro negocio y más obligaciones antes de validar Cloud. |
+## Dos tamaños de SaaS con cuentas completas
 
-La consultoría, las migraciones realizadas por Oliver y los proyectos particulares para clientes quedan fuera del modelo. Las mejoras de producto pueden incluir importación automática y asistentes de recuperación para todos los suscriptores.
+El [CSV económico](paid-product-economics.csv) contiene escenarios ilustrativos en USD. Todos los inputs de demanda y costes internos son supuestos. Solo la tarifa base de Paddle, 5% más $0,50 por transacción, se usa como precio público comprobado. La elegibilidad comercial, país de la entidad y contrato del proveedor deben confirmarse antes de adoptarlo.
 
-## El primer producto cobrable
+El modelo calcula por cuenta: ingreso menos cobro, reserva del 1% para devoluciones o pérdidas, soporte variable, coste cloud variable y adquisición para reemplazar bajas. Añade infraestructura fija, herramientas y trabajo interno. La adquisición de crecimiento se paga aparte. Los costes de personal son asignaciones sin añadir un segundo sueldo por las mismas horas.
 
-La primera versión cobrable debe completar esta secuencia de principio a fin:
+| Escenario hipotético | Clientes | Ingreso mensual | Coste fijo mensual | Contribución por cliente después de variables y reposición de bajas | Resultado mensual antes de impuestos y construcción |
+|---|---:|---:|---:|---:|---:|
+| Solo Personal, $8 | 600 personas | $4.800 | $3.210 | $5,42 | $42 |
+| SaaS pequeño, Team medio de 5 personas | 100 equipos | $6.000 | $3.360 | $49,50 | $1.590 |
+| Empresa mayor, Team medio de 20 personas | 300 equipos | $72.000 | $34.000 | $199,10 | $25.730 |
 
-1. La persona crea una cuenta y un espacio de trabajo desde la web.
-2. Elige un plan o una prueba, con activación automática y cobro recurrente.
-3. Instala el cliente en un dispositivo y lo vincula mediante un flujo de autenticación.
-4. El cliente detecta la configuración existente y presenta una importación revisable.
-5. Vincula una segunda máquina; el servicio sincroniza y el cliente aplica lo aprobado.
-6. Desde la web invita a otros miembros, distribuye perfiles y ve qué cambios se aplicaron.
-7. Puede consultar versiones, recuperar un estado anterior y resolver fallos habituales con acciones del producto.
-8. Administra pagos, exporta sus datos y cancela desde la cuenta.
+El equilibrio de esos supuestos sería 593 cuentas personales, 68 equipos pequeños o 171 equipos mayores. Son cálculos condicionados, no objetivos respaldados por mercado. El último escenario no incluye SSO o SCIM contratado, SLA, nuevas regiones ni certificaciones; al añadirlos cambian precio y costes.
 
-La segunda máquina demuestra el primer valor. Las actualizaciones posteriores y la incorporación de otros miembros permiten comprobar si se repite. Las aprobaciones humanas de permisos o cambios sensibles siguen siendo decisiones del usuario; no son trabajo operativo que deba hacer Oliver.
+En los dos escenarios pequeños, $2.960 de trabajo fijo se reparten entre 24 horas mensuales de compatibilidad a $30, ocho de incidentes y $2.000 de desarrollo y administración. El soporte variable se añade por ticket. Para 100 equipos, el supuesto de 0,4 tickets por cuenta de 15 minutos implica diez horas mensuales. La capacidad y las horas deben medirse; no demuestra que una persona pueda sostener cualquier volumen.
 
-La beta pagada debe ejecutar ese recorrido como software. Una instalación que el fundador completa a mano no cuenta como activación autoservicio. Una tarea manual excepcional se registra como fallo de producto o incidencia, y no como prestación que se vende al cliente. No se simula automatización detrás de un panel.
+La empresa mayor reserva $30.000 mensuales para personal, mantenimiento y cumplimiento interno, además de $4.000 de infraestructura y herramientas. No representa un equipo contratado ni una estimación de plantilla suficiente. El soporte variable y CAC se contabilizan aparte; sus horas o facturas no deben volver a incluirse en la asignación fija.
 
-Dejaría fuera inicialmente un proxy de modelos, reventa de tokens, marketplace, custodia central de secretos en claro y desarrollos particulares para cada cliente. Cada uno añade dependencias y obligaciones que no necesitamos para comprobar la hipótesis principal.
+Sensibilidades del escenario pequeño Team:
 
-## Precios para probar
+- Subir el soporte de 0,4 a 1,2 tickets por cuenta al mes reduce el resultado de $1.590 a $990.
+- Subir la baja mensual supuesta del 2% al 5%, con CAC de $120, lo reduce a $1.230.
+- Bajar el ingreso por cuenta de $60 a $36 manteniendo los demás supuestos lo reduce a una pérdida de $666.
+- Añadir diez horas fijas de mantenimiento a $30 reduce el resultado en $300.
 
-Estos importes en USD son ofertas experimentales. No son precios vigentes ni una estimación de lo que el mercado acepta. Los precios de competidores sirven para estudiar su empaquetado, no para demostrar el precio de Muster.
+Presupuestaría la construcción por separado. A modo de límite de inversión, 600 o 1.200 horas valoradas a $30 representan $18.000 o $36.000. No son estimaciones de duración ni coste real. Recuperarlas en 24 meses requeriría $750 o $1.500 mensuales adicionales. Seguridad independiente, gastos legales y constitución necesitan cotización antes de comprometer ese presupuesto. Ningún escenario incorpora su coste desconocido como cero certificado.
 
-Una propuesta coherente para entrevistar compradores y ofrecer una beta de autoservicio sería:
+Para ilustrar adquisición inicial, llegar desde cero a 100 equipos con CAC supuesto de $120 requiere $12.000 antes de bajas. No se deduce de tener GitHub o documentación. En régimen, 100 equipos con baja del 2% requieren dos nuevos equipos al mes solo para mantener tamaño. Una lista de espera no demuestra ese embudo.
 
-| Oferta hipotética | Precio de prueba | Qué se compra |
-|---|---|---|
-| Community | Gratis. | Núcleo actual, incluido modo equipo sobre Git propio. |
-| Cloud Team | USD 99 por organización al mes, hasta 10 personas; USD 10 por persona adicional. | Cuenta, sincronización administrada y flujo de equipos descrito antes. |
-| Cloud Enterprise | Como escenario financiero, suscripción de USD 18.000 al año. | El mismo SaaS con prestaciones corporativas definidas. No implica que hoy estén disponibles. |
+## Validar el SaaS que se va a vender
 
-Con esa fórmula, 5 personas costarían USD 99 al mes, 20 costarían USD 199 y 100 costarían USD 999 antes de contratar prestaciones empresariales adicionales. Una persona puede seguir usando Community gratis. Las máquinas y los agentes automáticos no se convierten en asientos humanos facturables.
+La investigación inicial puede incluir entrevistas sobre incidentes recientes y alternativas. Las entrevistas no entregan el producto. Una landing con precio prueba interés; un checkout de prueba comprueba una integración. Ninguno acredita ingresos ni renovación.
 
-Probaría también USD 199 por equipo para saber si el valor soporta un precio que cubra la operación. No publicaría simultáneamente muchas tarifas. Mediría aceptación de una oferta concreta, pago, renovación y motivo de rechazo. Una carta de intención aporta menos evidencia que un piloto pagado que renueva.
+Primero construiría una prueba técnica con datos sintéticos y el recorrido de dos dispositivos. Debe incluir aislamiento entre cuentas, pérdida de red, eventos de pago duplicados o fuera de orden, conflicto, actualización incompatible, restauración y salida a OSS. La recuperación de secretos debe probarse en una máquina limpia. Fallar en aislamiento, pérdida silenciosa o autorización bloquea la beta con datos reales.
 
-## Qué tendría que pasar para ser rentable
+Después abriría una beta pequeña del software completo con dos cohortes: diez individuos y diez equipos cualificados. Son tamaños propuestos para aprender, no muestras representativas. Cada participante debe activar sin ayuda del proveedor. Los asientos facturados son miembros humanos que aceptaron la invitación, no invitaciones pendientes ni agentes. Team requiere dos miembros y dos dispositivos con una revisión compartida aplicada; Personal requiere dos dispositivos. Una simulación sobre Git propio solo valida OSS.
 
-Los siguientes cálculos son escenarios ilustrativos. No son costes medidos, márgenes observados ni previsiones de ingresos. El [CSV](paid-product-economics.csv) permite comprobar las cuentas. El soporte aparece como coste interno de operar el SaaS; no son horas vendidas ni un trabajo que el cliente encarga a Oliver. El objetivo es reducirlo con diagnóstico y recuperación automáticos.
+Fijaría antes del lanzamiento estas reglas de decisión provisionales:
 
-Para el negocio pequeño supongo USD 8 mensuales de infraestructura por organización; comisión de pago de 3,5 % más USD 0,30; trabajo humano valorado en USD 40 por hora; y USD 16,67 mensuales de reserva por cuenta para recuperar aproximadamente USD 200 de adquisición e incorporación durante 12 meses. Esa duración es un supuesto contable, no retención observada.
+- Al menos seis de diez cuentas de cada cohorte completan activación sin asistencia de configuración.
+- Al menos tres compran con dinero real y al menos dos de esas tres renuevan un segundo ciclo. Se informa la fracción exacta; no se extrapola una tasa de mercado.
+- Se registran cambios sincronizados, restauraciones, cancelaciones y motivo de abandono. No basta mantener un dispositivo enviando señales.
+- Se contabilizan todos los tickets, minutos, intervenciones, incidentes y costes cloud. Una reparación repetida exige automatización antes de ampliar la cohorte.
+- Para crecer, la contribución observada debe ser positiva y el trabajo recurrente debe caber en un presupuesto interno fijado. Como primer límite, propondría 48 horas mensuales de operación, compatibilidad y soporte para 100 equipos, separado del desarrollo. Excederlo exige corregir producto, precio o capacidad.
 
-Los costes fijos supuestos son USD 500 al mes: USD 100 comunes y 10 horas de mantenimiento a USD 40. El objetivo del cálculo es dejar USD 3.000 mensuales de excedente después de esos costes y de imputar el trabajo, antes de impuestos.
+Mediría el embudo en el servicio alojado con datos operativos mínimos y política de privacidad. El núcleo OSS conserva su funcionamiento sin telemetría obligatoria. Contar eventos de Cloud no autoriza recopilar prompts, código ni secretos.
 
-| Precio mensual por organización | Soporte mensual por organización | Contribución mensual aproximada | Organizaciones para cubrir costes fijos y objetivo |
-|---|---|---|---|
-| USD 99 | 15 minutos | USD 60,57 | 58 |
-| USD 99 | 1 hora | USD 30,57 | 115 |
-| USD 199 | 15 minutos | USD 157,07 | 23 |
-| USD 99 | 3 horas | Negativa. | El volumen no arregla esta oferta. |
+Si paga y renueva la cohorte personal, merece prioridad aunque el razonamiento inicial favorezca equipos. Si paga Team con incorporación autónoma, se expande ese plan. Si solo compran después de una instalación personalizada, no se validó el SaaS pedido. Si ninguna cohorte renueva por un trabajo recurrente, se cambia la propuesta antes de construir controles empresariales.
 
-La contribución resta infraestructura, pago, soporte y reserva de adquisición e incorporación. El número de organizaciones se redondea hacia arriba. El modelo no incluye impuestos, devoluciones, pérdidas extraordinarias ni una garantía de continuidad de ingresos. Cada renovación fallida cambia la recuperación de la adquisición y puede exigir más caja. Tampoco establece cuánto esfuerzo o dinero permite conseguir esas organizaciones.
-
-Para la ruta empresarial, un ejemplo deliberadamente distinto supone USD 35.000 de costes fijos mensuales de personal, venta y operación; USD 1.500 de ingreso mensual por organización; USD 50 de infraestructura; USD 250 de integración de identidad; cuatro horas de soporte a USD 40; y la misma comisión de pago. Deja USD 987,20 de contribución por organización y exige 39 organizaciones para cubrir los costes fijos y el mismo objetivo de USD 3.000. Todos esos importes son supuestos y el presupuesto fijo no está dimensionado para un equipo contratado real.
-
-La integración de identidad merece presupuesto separado: [WorkOS publica cobro por conexión](https://workos.com/pricing), no solo por usuario. No basta con calcular el precio de un servidor. El escenario empresarial tampoco incluye una reserva adicional por adquisición e incorporación por cuenta; ambas tendrían que caber en el presupuesto fijo de ventas y operación o añadirse al modelo. No usaría estas cuentas para contratar ni comprometer un SLA.
-
-El dato decisivo del piloto será cuánto cuesta adquirir, incorporar y atender a una cuenta que renueva. Si el trabajo por cuenta no baja después de automatizar las causas repetidas, habría que subir precio, reducir alcance o abandonar la oferta.
-
-Las cuentas tampoco incluyen el coste inicial de construir el producto nuevo ni el tiempo sin clientes. Ese gasto necesita un presupuesto separado. Una cuenta mensual que cierra con clientes supuestos no demuestra que podamos conseguirlos o financiar la llegada hasta ellos.
-
-## Límites de seguridad que afectan a la venta
-
-Las [garantías actuales](../security/verification.md) deben acompañar cualquier propuesta comercial:
-
-- Retirar acceso al servicio mediante SSO o SCIM no retira por sí mismo permisos en Git, acceso al sistema operativo ni credenciales de terceros.
-- Revocar una máquina y volver a cifrar la bóveda protege generaciones futuras. No borra secretos ya copiados. Esos secretos necesitan rotación en el proveedor que los emite.
-- Un dispositivo desconectado no recibe una orden inmediata. Su último estado conocido debe aparecer con fecha y alcance, sin presentarlo como confirmación actual.
-- Una firma de estado o una confirmación de configuración aplicada no demuestra todas las acciones del agente ni quién humano las ejecutó.
-- Los controles locales de entrega de secretos reducen exposición accidental; no aíslan procesos que corren bajo el mismo usuario.
-
-Un servicio alojado añadiría identidades de organización y dispositivo, aislamiento entre organizaciones, recuperación de cuentas, retención y borrado. Las claves privadas, la recuperación y los secretos en claro permanecerían fuera de ese servicio según el diseño propuesto. Los metadatos también pueden revelar información sensible y requieren minimización.
-
-El servicio tampoco debería poder aprobar cambios de flota únicamente porque alguien inició sesión en la web. La autoridad de la sesión alojada y las firmas administrativas de la flota son distintas. Cancelar la suscripción no debería inutilizar el núcleo local ni el repositorio del cliente.
-
-No hay base aquí para afirmar certificación SOC 2, ISO 27001, cumplimiento automático, revocación universal o auditoría completa. Un producto local puede seguir tratando datos mediante soporte, facturación e integraciones. Los requisitos de privacidad y compra se evalúan por los flujos reales, no por la ausencia de un servidor en el núcleo actual.
-
-## Cómo elegir durante los próximos 90 días
-
-Este es un experimento propuesto. Los umbrales se eligen para orientar una decisión con recursos limitados; no tienen validez estadística ni garantizan mercado. Esta investigación no ha contactado ni cobrado a nadie.
-
-Durante los primeros 30 días buscaría 15 conversaciones con responsables de equipos que ya usan varios agentes. La pregunta inicial sería sobre el último cambio o incorporación que salió mal: cómo lo detectaron, quién lo resolvió, cuánto trabajo exigió y qué alternativa usan. Después pediría observar el flujo con consentimiento y sin recoger secretos. Es más informativo que preguntar si les gusta un futuro panel.
-
-Avanzaría a una prueba si cinco equipos independientes describen un problema recurrente concreto y tres responsables aceptan probar el mismo resultado. Si cada uno pide algo distinto, todavía no hay una oferta coherente. Probaría al menos una alternativa gratuita con ellos para comprobar qué valor incremental queda.
-
-Entre los días 31 y 60 probaría un prototipo del recorrido autoservicio y la oferta de suscripción con esos equipos. Antes de que exista producto cobrable, se puede medir interés con una lista de acceso y precio explícito, sin simular ventas. La beta pagada comienza cuando el recorrido central ya funciona como software. El objetivo sería que tres organizaciones se suscriban por sí mismas, con al menos dos fuera del círculo cercano de Oliver. Registraría pagos, abandonos, tiempo hasta la segunda máquina sincronizada y fallos que requieren intervención.
-
-Entre los días 61 y 90 buscaría renovación y un segundo cambio real del equipo, siempre que la beta ya esté disponible. Estos plazos organizan el experimento; no estiman el trabajo de construir Cloud. Para seguir con la ruta pequeña, propondría exigir al menos dos renovaciones al precio ofrecido, altas sin intervención del fundador y soporte estabilizado cerca de 15 minutos por organización al mes. Una incidencia de seguridad o una recuperación no probada puede detener la beta aunque haya ventas.
-
-La vía empresarial necesitaría, además, responsables con presupuesto y requisitos comunes que el plan pequeño no satisfaga. Dos clientes que ya pagan por Cloud y comprometen presupuesto para las mismas funciones de identidad o auditoría justificarían diseñar esa ampliación. Esas funciones pasan al producto compartido. Pedir SSO sin presupuesto no basta.
-
-Si los equipos resuelven el problema con Git, Packmind o CC Switch y no pagan por la diferencia, conservaría Muster como herramienta abierta y descartaría ese servicio. Si pagan pero requieren atención constante, la propuesta tampoco cumple el objetivo de poca operación. La decisión de construir nube llega después de comprobar el trabajo por el que se paga.
+La siguiente inversión concreta es ese recorrido completo y verificable. La investigación respalda una forma coherente de producto; su éxito comercial se decidirá con uso autónomo, cobros y renovaciones.

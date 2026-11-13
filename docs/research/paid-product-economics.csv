@@ -1,6 +1,4 @@
-scenario,currency,price_month,support_hours_month,human_hour_cost,infra_month,identity_month,payment_percent,payment_fixed,acquisition_onboarding_reserve_month,contribution_month,fixed_month,surplus_goal_month,organizations_needed
-team_15min,USD,99,0.25,40,8,0,3.5,.30,16.67,60.565,500,3000,58
-team_1hour,USD,99,1,40,8,0,3.5,.30,16.67,30.565,500,3000,115
-team_3hours,USD,99,3,40,8,0,3.5,.30,16.67,-49.435,500,3000,not_viable
-team_higher_price,USD,199,0.25,40,8,0,3.5,.30,16.67,157.065,500,3000,23
-enterprise,USD,1500,4,40,50,250,3.5,.30,0,987.200,35000,3000,39
+scenario,price,accounts,fee,refund_reserve,support,variable_cloud,churn,cac,replacement_acquisition,contribution,fixed_cost,breakeven,mrr,result,payment_rate,payment_fixed_usd,refund_reserve_rate,ticket_rate_per_account_month,minutes_per_ticket,support_usd_per_hour,fixed_cloud_usd,fixed_tools_usd,fixed_labor_usd,assumptions
+personal,8,600,0.9,0.08,0.5,0.3,0.04,20,0.8,5.42,3210,593,4800,42.0,0.05,0.5,0.01,0.1,10,30,200,50,2960,"All quantities hypothetical except published base payment fee; USD monthly; taxes, build, initial growth CAC and enterprise add-ons excluded"
+team_small,60,100,3.5,0.6,3.0,1,0.02,120,2.4,49.5,3360,68,6000,1590.0,0.05,0.5,0.01,0.4,15,30,300,100,2960,"All quantities hypothetical except published base payment fee; USD monthly; taxes, build, initial growth CAC and enterprise add-ons excluded"
+team_company,240,300,12.5,2.4,10.0,4,0.015,800,12.0,199.1,34000,171,72000,25730.0,0.05,0.5,0.01,1,20,30,2500,1500,30000,"All quantities hypothetical except published base payment fee; USD monthly; taxes, build, initial growth CAC and enterprise add-ons excluded"
