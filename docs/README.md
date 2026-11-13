@@ -12,7 +12,7 @@ Welcome to the Muster documentation directory. Below is the index of available d
 
 ## Research
 
-- [Muster Cloud: un SaaS de pago junto al núcleo abierto](research/paid-product.md). Dos tamaños de SaaS autoservicio, con evidencia, precios experimentales y límites de la investigación.
+- [Muster Cloud: un SaaS de pago junto al núcleo abierto](research/paid-product.md). Segunda investigación: producto autoservicio, comparación personal y equipos, arquitectura propuesta y economía reproducible.
 
 ## Specifications & Concepts
 

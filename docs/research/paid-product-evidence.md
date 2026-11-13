@@ -1,122 +1,147 @@
-# Evidencia de la propuesta de pago de Muster
+# Evidencia de la propuesta Muster Cloud
 
-Fecha de corte: 13 de noviembre de 2026. Este anexo acompaña [la propuesta](paid-product.md). Distingue hechos comprobados, interpretación y experimentos pendientes.
+Fecha de corte: 13 de noviembre de 2026. Este documento acompaña la [propuesta de producto](paid-product.md) y el [modelo económico](paid-product-economics.csv). La propuesta no implementa Cloud ni valida ventas.
 
-El alcance del producto es SaaS autoservicio: cuenta, suscripción, conexión de dispositivos y operación automatizada. Se excluyen recomendaciones de consultoría, migración manual y operación realizada por Oliver como oferta comercial. La comparación es entre dos tamaños del mismo negocio de software por suscripción.
+## Qué significa cada clase de afirmación
 
-## Método y alcance
+- Un hecho de código describe el snapshot indicado mediante un enlace permanente.
+- Una fuente externa describe lo que el proveedor o autor publica. Una página comercial no prueba compras, ingresos ni resultados de Muster.
+- Una propuesta es una elección para construir o experimentar. Aún no está implementada.
+- Un supuesto numérico permite calcular escenarios. No es una medición ni una previsión.
 
-Se encargaron 30 investigaciones con frentes distintos: 10 a `gpt-6-luna`, 10 a `claude-haiku-4-5` y 10 a `zai-coding-plan/glm-5.3-flash`. Cada investigador tenía un archivo de salida propio, instrucciones de no modificar el repositorio y prohibición de subdelegar. El primer intento de usar el identificador abreviado de GLM fue rechazado; las diez tareas de ese grupo se iniciaron después con el identificador anunciado por el proveedor. No se sustituyó el modelo solicitado.
+El acuerdo entre investigadores no equivale a evidencia independiente. Muchos consultaron los mismos precios y el mismo código. Los estados PASS y PARTIAL de sus entregas describen su evaluación del trabajo, no el estado comercial de Muster.
 
-Una revisión adicional de Sol 6.1 comprobó el plan una vez. La coordinación contrastó fuentes primarias, corrigió contradicciones y redactó la recomendación. Treinta informes no equivalen a treinta validaciones independientes: muchos consultan las mismas fuentes, comparten premisas y contienen propuestas sin demostrar.
+## Producto existente y límites técnicos
 
-Las 30 investigaciones entregaron un archivo. No quedaron frentes sin entrega; sí quedaron afirmaciones sin evidencia que se excluyen a continuación.
+Fuente común: [`f8ebe16faf88c1790f1a54e16bfbd5167fe152ab`](https://github.com/oliveralerubio/muster/tree/f8ebe16faf88c1790f1a54e16bfbd5167fe152ab).
 
-El examen del producto se refiere principalmente a [`f8ebe16faf88c1790f1a54e16bfbd5167fe152ab`](https://github.com/oliveralerubio/muster/tree/f8ebe16faf88c1790f1a54e16bfbd5167fe152ab). El documento se redactó en una rama separada sobre un `origin/main` posterior. No se ejecutó una auditoría de seguridad, un ensayo de carga ni una evaluación de compatibilidad con todos los agentes reales. No se entrevistó a clientes, no se realizó contacto comercial y no se cobró a nadie.
-
-Las notas originales son material de trabajo, no fuentes de autoridad. Este anexo recoge la cobertura y las decisiones de uso. Las afirmaciones comerciales dependen de las fuentes citadas y de los límites expresos; los precios propuestos y las cuentas son hipótesis.
-
-## Hechos que sostienen la propuesta
-
-| Hecho | Evidencia primaria | Límite |
+| Hecho | Fuente primaria | Límite de la conclusión |
 |---|---|---|
-| El núcleo permite uso comercial bajo Apache-2.0. | [LICENSE del snapshot](https://github.com/oliveralerubio/muster/blob/f8ebe16faf88c1790f1a54e16bfbd5167fe152ab/LICENSE), secciones 2, 4 y 9; [FAQ de Apache](https://www.apache.org/foundation/license-faq.html). | No acredita titularidad exclusiva ni disponibilidad de una marca. |
-| Las funciones de equipo ya forman parte del núcleo. | [README, modo equipo](https://github.com/oliveralerubio/muster/blob/f8ebe16faf88c1790f1a54e16bfbd5167fe152ab/README.md#team-mode); [comandos de miembros](https://github.com/oliveralerubio/muster/blob/f8ebe16faf88c1790f1a54e16bfbd5167fe152ab/src/commands/member.rs#L32-L100); [grupos](https://github.com/oliveralerubio/muster/blob/f8ebe16faf88c1790f1a54e16bfbd5167fe152ab/src/commands/group.rs#L30-L95). | La existencia de código no demuestra que una empresa lo haya adoptado. |
-| Git transporta configuración y el equipo aplica localmente. | [Sync](https://github.com/oliveralerubio/muster/blob/f8ebe16faf88c1790f1a54e16bfbd5167fe152ab/src/commands/sync.rs#L131-L179); [transporte Git](https://github.com/oliveralerubio/muster/blob/f8ebe16faf88c1790f1a54e16bfbd5167fe152ab/src/git.rs#L54-L147). | Un servicio adicional tiene que demostrar valor sobre ese flujo. |
-| La interfaz actual es local. | [Servidor web y escucha loopback](https://github.com/oliveralerubio/muster/blob/f8ebe16faf88c1790f1a54e16bfbd5167fe152ab/src/web/mod.rs#L226-L259). | No es autenticación de una organización ni aislamiento entre clientes de un servicio. |
-| El servicio alojado sigue fuera del alcance de la especificación actual. | [SPEC, alcance excluido](https://github.com/oliveralerubio/muster/blob/f8ebe16faf88c1790f1a54e16bfbd5167fe152ab/docs/SPEC.md#L387-L397). | Es intención de producto, no capacidad disponible ni demanda. |
-| Hay una release pública. | [v0.1.0](https://github.com/oliveralerubio/muster/releases/tag/v0.1.0); [API de releases](https://api.github.com/repos/oliveralerubio/muster/releases/tags/v0.1.0). Fecha publicada: `2026-11-13T01:57:06Z`. | El README del snapshot tenía información anterior. No se instaló cada artefacto. |
-| Volver a cifrar no invalida credenciales ya copiadas. | [Guía de baja y rotación](https://github.com/oliveralerubio/muster/blob/f8ebe16faf88c1790f1a54e16bfbd5167fe152ab/docs/guides/team-mode.md#L205-L260). | Se necesita rotación en el proveedor; no se ha probado una revocación remota universal. |
-| Las garantías de firmas y secretos tienen alcance definido. | [ADR de estado firmado](https://github.com/oliveralerubio/muster/blob/f8ebe16faf88c1790f1a54e16bfbd5167fe152ab/docs/adr/0005-signed-fleet-state.md); [verificación](https://github.com/oliveralerubio/muster/blob/f8ebe16faf88c1790f1a54e16bfbd5167fe152ab/docs/security/verification.md); [límites de entrega a agentes](https://github.com/oliveralerubio/muster/blob/f8ebe16faf88c1790f1a54e16bfbd5167fe152ab/docs/agents/muster-for-agents.md#L200-L241). | No son certificación, aislamiento entre procesos del mismo usuario ni auditoría de toda ejecución. |
+| Configuración canónica multiagente, equipos y licencia Apache-2.0. | [README](https://github.com/oliveralerubio/muster/blob/f8ebe16faf88c1790f1a54e16bfbd5167fe152ab/README.md), [LICENSE](https://github.com/oliveralerubio/muster/blob/f8ebe16faf88c1790f1a54e16bfbd5167fe152ab/LICENSE). | No acredita adopción, titularidad exclusiva ni licencia de cada dependencia. |
+| Git es dependencia del transporte actual; hay conflictos que exigen resolución manual. | [src/git.rs](https://github.com/oliveralerubio/muster/blob/f8ebe16faf88c1790f1a54e16bfbd5167fe152ab/src/git.rs#L1), en particular el tratamiento de rebase y errores. | Una URL Git gestionada no completa por sí sola un recorrido SaaS. |
+| El panel actual escucha localmente y usa un token de entrada. | [src/web/mod.rs](https://github.com/oliveralerubio/muster/blob/f8ebe16faf88c1790f1a54e16bfbd5167fe152ab/src/web/mod.rs#L1). | No es backend multiusuario con aislamiento, cuentas o billing. |
+| Hub, sync cloud, SSO y facturación son trabajo posterior. | [docs/SPEC.md](https://github.com/oliveralerubio/muster/blob/f8ebe16faf88c1790f1a54e16bfbd5167fe152ab/docs/SPEC.md#L387). | La exclusión anterior no prohíbe la nueva propuesta de producto. |
+| El vault cifra grupos con age; hay sidecars de metadatos sin valores secretos. | [src/vault.rs](https://github.com/oliveralerubio/muster/blob/f8ebe16faf88c1790f1a54e16bfbd5167fe152ab/src/vault.rs#L1), [metadatos](https://github.com/oliveralerubio/muster/blob/f8ebe16faf88c1790f1a54e16bfbd5167fe152ab/src/vault.rs#L63). | No cifra todo el workspace. Configuración y nombres pueden revelar datos sensibles. |
+| Hay claves locales y recuperación; miembros, roles y aprobaciones ya existen. | [src/identity.rs](https://github.com/oliveralerubio/muster/blob/f8ebe16faf88c1790f1a54e16bfbd5167fe152ab/src/identity.rs#L1), [src/team.rs](https://github.com/oliveralerubio/muster/blob/f8ebe16faf88c1790f1a54e16bfbd5167fe152ab/src/team.rs#L1), [init](https://github.com/oliveralerubio/muster/blob/f8ebe16faf88c1790f1a54e16bfbd5167fe152ab/src/commands/init.rs#L58). | Login, billing y firma autorizada son autoridades distintas. Recuperar cuenta no recupera claves. |
+| Las firmas encadenan estados; el verificador puede necesitar historia intermedia. | [ADR 0005](https://github.com/oliveralerubio/muster/blob/f8ebe16faf88c1790f1a54e16bfbd5167fe152ab/docs/adr/0005-signed-fleet-state.md#L39), [cadena contigua](https://github.com/oliveralerubio/muster/blob/f8ebe16faf88c1790f1a54e16bfbd5167fe152ab/docs/adr/0005-signed-fleet-state.md#L65). | Guardar snapshots sueltos no preserva automáticamente esas garantías. |
+| Generaciones y backups de archivos aplicados son locales. | [src/engine/store.rs](https://github.com/oliveralerubio/muster/blob/f8ebe16faf88c1790f1a54e16bfbd5167fe152ab/src/engine/store.rs#L1). | Pueden incluir secretos resueltos. No deben subirse como si fueran backups cloud inocuos. |
+| Hay resultado local de sync y coordinación remota. | [src/commands/sync.rs](https://github.com/oliveralerubio/muster/blob/f8ebe16faf88c1790f1a54e16bfbd5167fe152ab/src/commands/sync.rs#L85), [src/commands/machine.rs](https://github.com/oliveralerubio/muster/blob/f8ebe16faf88c1790f1a54e16bfbd5167fe152ab/src/commands/machine.rs#L868). | Estado deseado firmado no prueba aplicación ni obediencia del agente. Recibos cloud son diseño nuevo. |
+| v0.1.0 está publicada. | [Release oficial](https://github.com/oliveralerubio/muster/releases/tag/v0.1.0). | Prevalece sobre la frase antigua del README. No equivale a uso o ventas. |
 
-## Fuentes externas que cambian la decisión
+La selección técnica se apoya especialmente en los frentes Luna 02, 04, 05, 07, 09 y 10. Sus recomendaciones sobre Git interno y cifrado integral no son idénticas. La síntesis elige una API con Git interno provisional y cifrado de secretos; exige probar confianza, concurrencia, exportación y aceptación de privacidad antes de adoptar ese diseño.
 
-Se consultaron las siguientes fuentes oficiales. Los sitios comerciales cambian; las capacidades se describen al corte de la investigación. No se compararon todos sus productos mediante instalaciones reales.
+## Fuentes externas comprobadas directamente en la síntesis
 
-- [Supabase, self-hosting](https://supabase.com/docs/guides/self-hosting), [precios](https://supabase.com/pricing) y [licencia del monorepo](https://github.com/supabase/supabase/blob/master/LICENSE). Respaldan la distinción entre software disponible y plataforma administrada. No prueban que el mismo ahorro operativo exista en Muster.
-- [n8n, licencia](https://github.com/n8n-io/n8n/blob/master/LICENSE.md) y [FAQ de licencia](https://docs.n8n.io/sustainable-use-license/). El uso comercial interno permitido no equivale a permiso irrestricto de reventa. La Sustainable Use License no debe describirse como Apache-2.0.
-- [OSI, definición de código abierto](https://opensource.org/osd). Permite distinguir una licencia abierta de una licencia con restricciones sobre campos de uso.
-- [Packmind, precios](https://packmind.com/pricing/) y [README oficial](https://github.com/PackmindHub/packmind). Su oferta gratuita ya distribuye instrucciones y su oferta empresarial anuncia gobierno e identidad. No se verificó una tarifa pública para Enterprise ni el alcance de cada promesa mediante una prueba del producto.
-- [CC Switch, README oficial](https://github.com/farion1231/cc-switch#readme). La sección de capacidades describe sincronización WebDAV y almacenamiento compatible con S3. Se excluyen como evidencia las afirmaciones de patrocinadores insertadas en ese README.
-- [PostHog, precios](https://posthog.com/pricing). Publica unidades de consumo por producto. Se descartó caracterizar su negocio como exclusivamente cobro por asientos.
-- [GNU, Apache-2.0 y GPLv3](https://www.gnu.org/licenses/license-list.html#apache2). Contradice una afirmación demasiado amplia de incompatibilidad jurídica aparecida en los apuntes. La compatibilidad de una integración concreta requiere analizar sus componentes y obligaciones.
-- [WorkOS, precios](https://workos.com/pricing). El cobro por conexiones de identidad justifica presupuestar ese coste por separado. La reserva de USD 250 del escenario no es una cotización para Muster ni una arquitectura elegida.
+Las siguientes páginas se recuperaron el 13 de noviembre de 2026. Los extractos son breves y respaldan solo la afirmación indicada. Páginas de precios pueden cambiar y contener diferencias entre pago mensual, anual y anuncios futuros.
 
-La señal pública de Muster se examinó mediante `gh issue list --state all`, `gh pr list --state all`, `gh repo view` y la API de releases. La actividad consultada estaba dominada por el propietario. No existe en esta investigación evidencia suficiente de uso independiente, comprador con presupuesto o renovación. Tampoco existe una estimación defendible del mercado total.
+| Fuente | Extracto o dato observado | Uso permitido en la conclusión |
+|---|---|---|
+| [Praxl](https://praxl.app/) | "Cloud Free", "Coming soon Pro", "$5 /month", "Join waitlist". | Competencia directa y precio anunciado. No afirmar Pro activo, ventas ni precio por asiento. |
+| [Packmind pricing](https://packmind.com/pricing/) | "Open Source Free", "Enterprise Custom", "SSO / SAML / SCIM". | Solapamiento en estándares y gobernanza. La página no prueba su infraestructura ni ventas. |
+| [CC Switch README](https://github.com/farion1231/cc-switch) | "Sync across devices via WebDAV" y "S3-compatible storage". | Ya tiene sincronización usando almacenamiento aportado por el usuario. No tratarla como una amenaza exclusivamente futura. |
+| [Obsidian Sync](https://obsidian.md/sync) | "$4 USD Per user, per month, billed annually"; "$5" mensual; "End-to-end encryption". | Oferta real de servicio de sync de pago con cliente local. No acredita elasticidad ni disposición a pagar por Muster. |
+| [Raycast pricing](https://www.raycast.com/pricing) | La página incluye Cloud Sync entre prestaciones Pro. | Otro empaquetado posible. No permite atribuir toda compra de Pro a sync. |
+| [Relato de ConfigMesh](https://david.coffee/configmesh-1-1/) | El autor describe pasar de $5 a $1,99 al mes; actualización de agosto de 2026 indica el nombre Synclet. | Una experiencia publicada de precio y confianza. No permite fijar un techo universal ni inferir el resultado de Muster. |
+| [Supabase pricing](https://supabase.com/pricing) | Niveles Free, Pro y Team con prestaciones y uso diferenciados. | Patrón de empaquetado de servicio administrado. No trasladar consumo de base de datos a configuración de agentes. |
+| [n8n pricing](https://n8n.io/pricing/) | "20€ /mo, billed annually", "Hosted by n8n", "No credit card required". | Patrón de compra y trial autoservicio. Su unidad de ejecuciones no encaja automáticamente con Muster. |
+| [Paddle pricing](https://www.paddle.com/pricing) | "5% + 50¢ per Checkout transaction"; Merchant of Record y gestión de impuestos de venta. | Tarifa base usada en escenarios. No confirma elegibilidad, contrato, impuestos sobre beneficio ni todos los costes especiales. |
+| [WorkOS pricing](https://workos.com/pricing) | AuthKit gratuito hasta un millón de usuarios; SSO y Directory Sync con "1–15 $125 / ea" cada uno. | Login gratuito no implica identidad enterprise gratuita. Hay descuentos por tramo; no multiplicar $125 por cualquier volumen como tarifa universal. |
+| [Cloudflare R2 pricing](https://developers.cloudflare.com/r2/pricing/) | Storage Standard "$0.015 / GB-month" y transferencia de salida gratuita. | El almacenamiento de objetos tiene una tarifa pública. Operaciones, bases de datos, Git y toda la operación SaaS tienen costes aparte. |
 
-Como evidencia del problema, se contrastaron directamente las solicitudes [Claude Code #22648](https://github.com/anthropics/claude-code/issues/22648), sobre sincronización entre dispositivos, y [#28942](https://github.com/anthropics/claude-code/issues/28942), sobre secretos por desarrollador en configuración MCP compartida. Son relatos de usuarios y solicitudes a un fabricante. No se interpreta la ausencia de pagos en esos hilos como disposición a pagar igual a cero; sencillamente no aportan evidencia de pago por Muster. Tampoco validan el seguimiento de flota propuesto ni un incidente concreto de baja de empleados.
+Las páginas recuperadas y sus hashes se conservaron como material de trabajo fuera del repositorio. Estos enlaces y extractos permiten revisar las afirmaciones duraderas sin publicar volcados de HTML ni depender de rutas temporales.
 
-## Correcciones aplicadas antes de recomendar
+## Fuentes primarias adicionales usadas por los investigadores
 
-| Afirmación encontrada en los apuntes | Tratamiento |
+- [Solicitud de sync de configuración en Claude Code](https://github.com/anthropics/claude-code/issues/22648). Evidencia de un problema expresado. Un voto o comentario no es compra.
+- [Configuración oficial de Claude Code](https://code.claude.com/docs/en/settings). Describe configuración local y controles del fabricante. No determina qué funcionalidades ofrecerá en el futuro.
+- [chezmoi](https://www.chezmoi.io/). Alternativa libre para configuración entre máquinas; la familiaridad del usuario y la operación real deben investigarse.
+- [Stripe subscription webhooks](https://docs.stripe.com/billing/subscriptions/webhooks). Respalda verificar eventos y manejar cambios de estado. Stripe es una referencia de protocolo, no el proveedor de cobro elegido por el escenario Paddle.
+- [AWS tenant isolation](https://docs.aws.amazon.com/whitepapers/latest/saas-architecture-fundamentals/tenant-isolation.html). Explica por qué autenticación no basta para aislamiento. El documento advierte que es histórico; no lo usamos para elegir una arquitectura vigente de AWS.
+- [Especificación age](https://github.com/C2SP/C2SP/blob/main/age.md). Describe el formato criptográfico. No prueba el diseño de enrolamiento, recuperación o navegador de Muster Cloud.
+- [n8n Sustainable Use License](https://docs.n8n.io/sustainable-use-license/), [licencia Apache-2.0](https://www.apache.org/licenses/LICENSE-2.0), [Open Source Definition](https://opensource.org/osd). Distinguen el permiso comercial del núcleo y las restricciones del modelo de n8n. No sustituyen asesoría legal específica.
+
+No incorporamos recuentos de estrellas o mercados estimados como justificación comercial. Tampoco dependemos de enlaces de issues adicionales cuya relevancia no se verificó en la síntesis. No encontrar evidencia de compra por Muster no significa demostrar que nadie compraría.
+
+## Cobertura de la segunda ronda
+
+Se lanzaron 30 frentes: diez Luna, diez Haiku y diez GLM 5.3 Flash. Cuatro tareas GLM agotaron cuota y tuvieron un único reintento con el mismo modelo y proveedor. Los cuatro reintentos terminaron y se recibieron 30 archivos distintos. Un archivo recibido no certifica sus afirmaciones.
+
+| Modelo | Frentes recibidos | Cobertura |
+|---|---|---|
+| Luna | 01–10 | Frontera abierto y pago; transporte; alta; cifrado; estado; equipos; suscripción; compatibilidad; operación; v1 cobrable. |
+| Haiku | 11–20 | Supabase; n8n; competencia directa; clientes locales; sync personal; comprador; señales públicas; proveedores; distribución; licencia. |
+| GLM | 21–30 | Personal; Team; organizaciones mayores; comparación; precios; economía; validación; ciclo de vida; conversión desde OSS; refutación del negocio. |
+
+El frente 24 y el 28 incluyen dominios de fuentes escritos en texto, sin URL completa. El recuento automático de enlaces los registra como cero. Sus flujos se usan como propuestas, no como certificación de cada afirmación externa.
+
+El frente 30 aporta el argumento de que atraer usuarios por ausencia de cuentas no garantiza convertirlos a Cloud. Su descripción de CC Switch sin sync contradice la fuente actual y se descarta. Su precio de $9 y regla de cinco pagos son propuestas distintas, no resultados que deban imponerse a la síntesis.
+
+Sol 6.1 revisó el plan en una pasada. Exigió separar firmas de la web, recuperación de cuenta y claves, secretos incrustados en configuración y continuidad verificable al exportar. Las cuatro correcciones se incorporan. Esa revisión no es una auditoría de seguridad ni una validación de mercado.
+
+## Afirmaciones corregidas o excluidas
+
+| Afirmación de uno o más informes | Tratamiento de la síntesis |
 |---|---|
-| No existe release. | Corregida con el registro de GitHub publicado el mismo día. |
-| CC Switch sería una amenaza si añadiera sincronización. | Descartada como premisa actual: su README ya anuncia sincronización entre dispositivos. |
-| No hay competidores o Muster es el único producto integrado. | No demostrado. Se incorporaron Packmind, CC Switch y alternativas combinables. |
-| El margen sería superior al 90 %, la infraestructura casi gratis o la operación nula. | No demostrado. Se sustituyó por supuestos explícitos que imputan trabajo humano y adquisición. |
-| Hay ingresos futuros, inversión necesaria o plazos de construcción determinados. | No se adoptaron como previsiones. Los escenarios no tienen demanda ni costes medidos. |
-| Un cambio a Sustainable Use, BSL o módulos cerrados es necesario para cobrar. | Descartado. Apache-2.0 ya permite servicios comerciales. |
-| Oliver es el titular exclusivo y la marca está disponible. | No acreditado. Un listado de autores de Git no resuelve ninguna de las dos cuestiones. |
-| n8n prohíbe todo uso comercial. | Corregida: la licencia permite determinados usos internos y limita otras formas de uso y distribución. |
-| El núcleo local satisface automáticamente privacidad, residencia o requisitos de contratación. | Descartada. Hay que examinar soporte, facturación, diagnóstico, integraciones y contratos reales. |
-| SSO, SCIM o revocación de flota invalidan todo acceso y secretos anteriores. | Descartada. Servicio, Git, sistema operativo y proveedor de credenciales tienen autoridades diferentes. |
-| Recibir el estado firmado de flota demuestra que cada dispositivo aplicó el cambio. | Descartada. Hace falta un reporte por dispositivo con frescura y alcance definidos; el protocolo alojado no existe hoy. |
-| Pedir SSO, firmar una intención o pulsar un botón demuestra demanda pagada. | No. Se exige distinguir interés, pago, uso repetido y renovación. |
-| Un piloto atendido a mano por Oliver valida el SaaS propuesto. | Descartada. La beta debe activar y sincronizar por software; el trabajo manual no es el producto buscado. |
-| Las recomendaciones de 30 agentes demuestran mercado. | No. Constituyen cobertura de investigación y propuestas de experimentos. |
+| La oferta Pro de Praxl ya cobra $5 por usuario. | La fuente muestra anuncio y lista de espera; no acredita cobro ni unidad por usuario. |
+| No existen competidores integrados. | Búsqueda limitada y funciones solapadas. Se elimina la exclusividad. |
+| CC Switch todavía tendría que añadir sincronización. | Ya publica WebDAV y S3. Se compara contra esa capacidad actual. |
+| Los individuos solo pagarían $3 o $4. | Casos y precios ajenos no establecen un techo universal. |
+| Una issue y precios de competidores prueban compradores o disposición a pagar. | Demuestran fricción y ofertas adyacentes. Las compras de Muster siguen sin observarse. |
+| Conversión trial a pago del 20–30%, equilibrio con 15 clientes o construcción en cuatro semanas. | No sustentados por las fuentes consultadas. No se usan. |
+| La arquitectura actual es zero-knowledge o cifra todo. | age cifra grupos; configuración y metadatos pueden ser legibles. Cloud requiere un diseño explícito. |
+| Basta `sync --remote` para no modificar el motor o completar Cloud. | Faltan identidad, experiencia, conflictos, aislamiento, versiones y recuperación. |
+| El estado firmado demuestra que todos aplicaron la configuración. | Hace falta resultado fresco por dispositivo. Incluso ese recibo no prueba obediencia del agente. |
+| Revocar borra o invalida todos los secretos entregados. | Corta acceso futuro; la rotación externa es otra operación. |
+| Un fabricante nunca sincronizará herramientas competidoras. | Predicción no demostrable. Se modela como riesgo. |
+| Empresa mayor siempre exige SOC 2 antes de vender o un SaaS jamás requiere trabajo humano. | Los requisitos dependen de compradores y promesas. Incidentes y mantenimiento interno tienen coste. |
+| Los márgenes o puntos de equilibrio de informes individuales son resultados medidos. | Se rehace el modelo en una sola moneda con supuestos y fórmula explícitos. |
 
-## Cobertura de las investigaciones
+## Fórmulas y reproducción de los escenarios
 
-La valoración de uso corresponde a la síntesis, no al `PASS` que cada agente asignó a su propia tarea. "Parcial" significa que se aprovecharon preguntas, referencias o límites, pero se descartaron conclusiones no demostradas. Ninguna fila valida demanda.
-
-| N.º | Modelo | Frente | Uso y limitación |
-|---|---|---|---|
-| 01 | Luna | Producto y valor existente | Inventario con referencias; se corrigió el estado de releases. |
-| 02 | Luna | Frontera del servicio alojado | Base para separar Git, dispositivos y servicio; arquitectura todavía hipotética. |
-| 03 | Luna | Garantías de seguridad | Límites incorporados; revisión estática, sin auditoría externa. |
-| 04 | Luna | Incorporación y primer valor | Fricción y métrica de activación propuestas; no observación de clientes. |
-| 05 | Luna | Equipo gratuito | Base para preservar funciones existentes y distinguir autoridad cliente/servidor. |
-| 06 | Luna | Adaptadores y compatibilidad | Riesgo de mantenimiento y diferencia entre simulaciones y agentes reales. |
-| 07 | Luna | Preparación comercial | Distingue release, tests y preparación empresarial. |
-| 08 | Luna | Identidad y facturación | Separación propuesta; sin implementación ni garantía de aislamiento. |
-| 09 | Luna | Señales públicas | Ausencia de evidencia suficiente en la muestra; no censo de usuarios. |
-| 10 | Luna | Operación y soporte | Costes humanos y automatización; afirmaciones antiguas de releases corregidas. |
-| 11 | Haiku | Supabase | Parcial: licencia y separación de servicio; no se adoptaron todos los detalles de tarifas ni garantías. |
-| 12 | Haiku | n8n | Parcial: distinción de licencia; excluidas fuentes secundarias de embedding y promesas de operación casi nula. |
-| 13 | Haiku | Tailscale | Parcial: analogía de coordinación; no se equiparó conectividad de red con control local de agentes. |
-| 14 | Haiku | Gestores de secretos | Solo orientación para estudiar complementariedad; exclusividad, márgenes e ingresos proyectados descartados. |
-| 15 | Haiku | Alternativas de configuración | Parcial: referencias de alternativas; descartados valor monetario imputado y ausencia de competidores. |
-| 16 | Haiku | Fabricantes y estándares | Parcial: riesgo de convergencia; no se adoptó la inviabilidad categórica del servicio ni un permiso comercial innecesario. |
-| 17 | Haiku | Otros negocios abiertos | Parcial: preguntas sobre empaquetado; datos de precios, licencias y garantías requerían corrección o exclusión. |
-| 18 | Haiku | Licencias y marca | Se conservó la posibilidad de cobrar bajo Apache; titularidad, marca y conclusiones legales no acreditadas excluidas. |
-| 19 | Haiku | Distribución | Canales como experimentos; tiempos, coste cero y predicciones de respuesta no adoptados. |
-| 20 | Haiku | Comprador y presupuesto | Personas y desencadenantes como hipótesis; precios de otros productos no equivalen a presupuesto de Muster. |
-| 21 | GLM Flash | Demanda observable | Issues externos aportan relatos de fricción; no prueban pago ni demanda de la oferta de flota. |
-| 22 | GLM Flash | Precio y unidad de cobro | Oferta experimental por organización/persona; se rechazó que el alojamiento sea la única forma legal de cobrar. |
-| 23 | GLM Flash | Economía | Preguntas sobre identidad y coste fundador; sustituidos márgenes optimistas por escenarios explícitos. |
-| 24 | GLM Flash | Validación | Secuencia de pruebas adaptada; corregidas premisas de releases, competidores y ausencia de operación. |
-| 25 | GLM Flash | Primer producto cobrable | Seguimiento sin custodia como alternativa; corregida la equivalencia entre firma de estado y aplicación por máquina. |
-| 26 | GLM Flash | Compra empresarial | Mapa de preguntas útil; descartadas exenciones automáticas de privacidad y cumplimiento. |
-| 27 | GLM Flash | Comunidad y frontera comercial | Operación adicional, exportación y continuidad local como propuesta; no compromiso contractual nuevo. |
-| 28 | GLM Flash | Otros modelos de negocio | Se descartó consultoría y trabajo por encargo; la oferta elegida es suscripción a software alojado y automatizado. |
-| 29 | GLM Flash | Caso adversario | Alternativas gratuitas y metadatos sensibles; la conclusión de que nadie pagará tampoco está demostrada. |
-| 30 | GLM Flash | Dos rutas estratégicas | Diferencia entre venta directa y empresarial; descartados umbrales de lista de espera como prueba suficiente de pago. |
-
-## Cómo se comprobaron los números
-
-El [CSV](paid-product-economics.csv) contiene escenarios hipotéticos en USD por mes, sin redondear la contribución. Las fórmulas son:
+Todas las cantidades monetarias del CSV son USD mensuales. `price` es ingreso por cuenta; `accounts` cuenta personas en Personal y organizaciones en Team. Los escenarios son independientes, no sumables.
 
 ```text
-comisión = precio × 0,035 + 0,30
-soporte = horas de soporte × 40
-contribución = precio − infraestructura − identidad − comisión − soporte − reserva
-organizaciones = techo((costes fijos + objetivo de excedente) / contribución)
+fee = price * payment_rate + payment_fixed_usd
+refund_reserve = price * refund_reserve_rate
+support = ticket_rate_per_account_month * minutes_per_ticket / 60 * support_usd_per_hour
+replacement_acquisition = churn * cac
+contribution = price - fee - refund_reserve - support - variable_cloud - replacement_acquisition
+fixed_cost = fixed_cloud_usd + fixed_tools_usd + fixed_labor_usd
+breakeven = ceil(fixed_cost / contribution)
+mrr = price * accounts
+result = accounts * contribution - fixed_cost
 ```
 
-Una contribución negativa se marca como `not_viable`. El escenario pequeño reserva USD 16,67 por cuenta al mes para adquisición e incorporación. El empresarial los deja dentro del presupuesto fijo supuesto de venta y operación; no están medidos ni garantizados. La tabla de la propuesta redondea moneda a dos decimales y explica exclusiones. No se midieron rendimiento, conversión, retención, adquisición ni soporte de clientes.
+`churn` es baja mensual de cuentas. `cac` es coste completo de adquirir una cuenta, incluidos tiempo o gasto asignados a esa adquisición. La fórmula solo cubre reemplazar bajas en una base estable; el crecimiento inicial exige efectivo adicional. `support` se calcula como coste variable y no vuelve a cargarse a personal fijo. `fixed_labor_usd` incluye mantenimiento y trabajo interno asignados, no otro sueldo que duplicar.
 
-## Evidencia que todavía falta
+Para verificar la aritmética desde la raíz del repositorio:
 
-Faltan clientes observados, un problema recurrente compartido, comparación del flujo contra alternativas, pagos y renovaciones. También faltan costes reales de incorporación, soporte, adquisición y recuperación; una prueba del flujo alojado y sus límites de seguridad; y revisión de contratación para los compradores concretos.
+```bash
+python - <<'PY'
+import csv
+import math
+from pathlib import Path
 
-La siguiente investigación con más valor ocurre con equipos reales. Más opiniones de agentes sobre la misma documentación no sustituyen esa evidencia.
+path = Path('docs/research/paid-product-economics.csv')
+for row in csv.DictReader(path.open()):
+    x = {k: float(v) for k, v in row.items() if k not in ('scenario', 'assumptions')}
+    fee = x['price'] * x['payment_rate'] + x['payment_fixed_usd']
+    support = x['ticket_rate_per_account_month'] * x['minutes_per_ticket'] / 60 * x['support_usd_per_hour']
+    cm = x['price'] - fee - x['price'] * x['refund_reserve_rate'] - support - x['variable_cloud'] - x['churn'] * x['cac']
+    fixed = x['fixed_cloud_usd'] + x['fixed_tools_usd'] + x['fixed_labor_usd']
+    assert math.isclose(fee, x['fee'], abs_tol=0.0001)
+    assert math.isclose(support, x['support'], abs_tol=0.0001)
+    assert math.isclose(cm, x['contribution'], abs_tol=0.0001)
+    assert fixed == x['fixed_cost']
+    assert math.ceil(fixed / cm) == x['breakeven']
+    assert x['price'] * x['accounts'] == x['mrr']
+    assert math.isclose(x['accounts'] * cm - fixed, x['result'], abs_tol=0.01)
+    print(row['scenario'], 'OK')
+PY
+```
+
+El ingreso excluye impuestos de venta. La reserva del 1% es un supuesto de pérdidas, no una estadística sobre devoluciones. El resultado no es beneficio neto: excluye impuestos sobre beneficio, construcción y costes empresariales sin cotizar. El precio de una instancia o un GB no permite deducir capacidad ni disponibilidad sin medir cargas, réplicas, backups y recuperación.
+
+## Qué no se hizo
+
+No se construyó ni desplegó Cloud, se contactó a compradores, se cobraron suscripciones ni se observaron renovaciones. Tampoco se ejecutó el prototipo del transporte, la matriz real de compatibilidad ni una auditoría de seguridad. El entregable es una propuesta accionable y verificable para esas decisiones. Una implementación futura necesita especificación, aceptación y presupuesto propios.
