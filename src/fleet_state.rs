@@ -2157,8 +2157,32 @@ pub fn verify_with(
     manifest: &Manifest,
     options: &VerifyOptions,
 ) -> Result<Verification, MusterError> {
-    let expect_signer = options.expect_signer;
     let anchor = TrustAnchor::load(state_dir)?;
+    let (verification, adopt) = verify_against(config_dir, manifest, anchor.as_ref(), options)?;
+    if options.persist {
+        if let Some(pin) = adopt {
+            pin.save(state_dir)?;
+        }
+    }
+    Ok(verification)
+}
+
+/// Verifies the repository at `config_dir` (a checkout with its full git
+/// history) against an explicit trust anchor, without reading or writing any
+/// local pin, identity or home directory. `anchor = None` means no state has
+/// been accepted yet (genesis / trust on first use rules).
+///
+/// Returns the verdict and the anchor the caller should adopt (`None` for
+/// `Legacy`; for `Pending`, the newest accepted state before it, when it
+/// differs from `anchor`). `options.persist` is ignored here.
+pub fn verify_against(
+    config_dir: &Path,
+    manifest: &Manifest,
+    anchor: Option<&TrustAnchor>,
+    options: &VerifyOptions,
+) -> Result<(Verification, Option<TrustAnchor>), MusterError> {
+    let expect_signer = options.expect_signer;
+    let anchor = anchor.cloned();
     let Some(state) = FleetState::load(config_dir)? else {
         if let Some(expected) = expect_signer {
             if anchor.is_none() {
@@ -2176,7 +2200,7 @@ pub fn verify_with(
                     .into(),
             ))
         } else {
-            Ok(Verification::Legacy)
+            Ok((Verification::Legacy, None))
         };
     };
     state.verify_signature()?;
@@ -2254,13 +2278,16 @@ pub fn verify_with(
     };
     if !options.check_content {
         if let Some(held) = pending(outcome) {
-            return Ok(held);
+            return Ok((held, None));
         }
-        return Ok(Verification::Verified {
-            epoch: state.payload.epoch,
-            signer,
-            first_use: anchor.is_none(),
-        });
+        return Ok((
+            Verification::Verified {
+                epoch: state.payload.epoch,
+                signer,
+                first_use: anchor.is_none(),
+            },
+            None,
+        ));
     }
     if state.payload.governance != governance_digest(manifest)? {
         return Err(MusterError::Security(
@@ -2329,34 +2356,30 @@ pub fn verify_with(
 
     // Pending: content was checked above, but the pin stays where it is (a
     // machine with no pin gets the last quorate state, never the pending one).
+    // A first-use pin stays unconfirmed until a run names the signer with
+    // `--expect-signer`; a pin that was already confirmed stays so.
+    let confirmed = options.expect_state.is_some()
+        || expect_signer.is_some_and(|e| signing::signer_matches(e, &signer));
+    let tofu = match &anchor {
+        Some(pin) => pin.tofu && !confirmed,
+        None => !confirmed,
+    };
     if let Some(held) = pending(outcome) {
-        if let (true, Some((step, step_manifest))) = (options.persist, &bootstrap) {
-            let confirmed = options.expect_state.is_some()
-                || expect_signer.is_some_and(|e| signing::signer_matches(e, &signer));
-            let tofu = match &anchor {
-                Some(pin) => pin.tofu && !confirmed,
-                None => !confirmed,
-            };
-            TrustAnchor::for_state(step, step_manifest, tofu)?.save(state_dir)?;
-        }
-        return Ok(held);
-    }
-    if options.persist {
-        // A first-use pin stays unconfirmed until a run names the signer with
-        // `--expect-signer`; a pin that was already confirmed stays so.
-        let confirmed = options.expect_state.is_some()
-            || expect_signer.is_some_and(|e| signing::signer_matches(e, &signer));
-        let tofu = match &anchor {
-            Some(pin) => pin.tofu && !confirmed,
-            None => !confirmed,
+        let adopt = match &bootstrap {
+            Some((step, step_manifest)) => Some(TrustAnchor::for_state(step, step_manifest, tofu)?),
+            None => None,
         };
-        TrustAnchor::for_state(&state, manifest, tofu)?.save(state_dir)?;
+        return Ok((held, adopt));
     }
-    Ok(Verification::Verified {
-        epoch: state.payload.epoch,
-        signer,
-        first_use: anchor.is_none(),
-    })
+    let adopt = TrustAnchor::for_state(&state, manifest, tofu)?;
+    Ok((
+        Verification::Verified {
+            epoch: state.payload.epoch,
+            signer,
+            first_use: anchor.is_none(),
+        },
+        Some(adopt),
+    ))
 }
 
 #[cfg(test)]
