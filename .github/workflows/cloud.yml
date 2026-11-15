@@ -108,6 +108,22 @@ jobs:
       - name: Clippy (muster-cloud)
         run: cargo clippy --locked -p muster-cloud --all-targets --all-features -- -D warnings
 
+      # cli_cloud.rs drives the REAL CLI binary through MUSTER_CLI_BIN, so the
+      # tests exercise the CLI as actually shipped from this same checkout.
+      # Build it here and export the absolute path for the later step:
+      # deploy/pg-test.sh passes the environment through to cargo test.
+      # CARGO_TARGET_DIR wins when defined (Swatinem/rust-cache and local
+      # builds may set it); otherwise the checkout's own target/ is used.
+      - name: Build CLI (current, for cli_cloud)
+        run: |
+          set -eu
+          cargo build --locked -p muster --bin muster
+          target_dir="${CARGO_TARGET_DIR:-$PWD/target}"
+          target_dir="$(cd "$target_dir" && pwd)"
+          bin="$target_dir/debug/muster"
+          test -x "$bin"
+          echo "MUSTER_CLI_BIN=$bin" >> "$GITHUB_ENV"
+
       # Ephemeral PostgreSQL via deploy/pg-test.sh; the command's exit status
       # is preserved, so any failure (including a missing cluster) is red.
       # Migrations are the caller's choice: cloud tests run sqlx migrations
