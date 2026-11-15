@@ -493,3 +493,25 @@ p {
     grid-template-columns: 1fr;
   }
 }
+
+.diff-panel {
+  border-top: 1px solid var(--border);
+  padding-top: 0.85rem;
+}
+
+.diff-file {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.75rem;
+  background: var(--surface);
+}
+
+.diff-patch {
+  margin: 0;
+  padding: 0.65rem 0.75rem;
+  border-radius: 6px;
+  background: var(--surface-subtle);
+  overflow-x: auto;
+  white-space: pre-wrap;
+  line-height: 1.4;
+}

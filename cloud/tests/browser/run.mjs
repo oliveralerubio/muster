@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import os from 'node:os';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -804,6 +806,331 @@ async function journey12RemoveMemberAndLastOwnerGuard(browser) {
   await noah.ctx.close();
 }
 
+
+function loadFixtures() {
+  const raw = process.env.MUSTER_BROWSER_FIXTURES;
+  assert.ok(raw, "MUSTER_BROWSER_FIXTURES must be set");
+  return JSON.parse(raw);
+}
+
+async function journey13HistoryAndRedactedDiff(browser) {
+  const fixtures = loadFixtures();
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  const page = await context.newPage();
+  const pageErrors = [];
+  page.on("pageerror", (err) => pageErrors.push(err.message));
+
+  await page.goto(`${baseUrl}/`, { waitUntil: "networkidle" });
+  await signInViaIdp(page, { subject: "olivia-sub-1", email: "olivia@example.com" });
+
+  // Open pre-seeded workspace with real signed history
+  await page.getByRole("link", { name: new RegExp(fixtures.historyWorkspaceName, "i") }).click();
+  await page.waitForURL(new RegExp(`/workspaces/${fixtures.historyWorkspaceId}$`), { timeout: 5000 });
+
+  const historySection = page.getByRole("region", { name: /^History$/i });
+  await historySection.waitFor({ timeout: 5000 });
+
+  const revHead = fixtures.revisions[0];
+  const revGenesis = fixtures.revisions[1];
+  await historySection.getByText(revHead.message, { exact: true }).waitFor({ timeout: 5000 });
+  await historySection.getByText(revGenesis.message, { exact: true }).waitFor({ timeout: 5000 });
+  await historySection.getByText(revHead.revision.slice(0, 8)).waitFor({ timeout: 5000 });
+
+  // Verify newest-first order
+  const textOrder = await historySection.innerText();
+  assert.ok(
+    textOrder.indexOf(revHead.message) < textOrder.indexOf(revGenesis.message),
+    "expected newest revision first in history"
+  );
+
+  // Open diff for newest revision: text patch visible, .age vault redacted
+  const revCard = historySection.locator("article", { hasText: revHead.message });
+  await revCard.getByRole("button", { name: /View diff/i }).click();
+
+  await historySection.getByText("settings.toml", { exact: true }).waitFor({ timeout: 5000 });
+  await historySection.getByText(/model = "opus"/).waitFor({ timeout: 5000 });
+  await historySection.getByText("vault/default.age", { exact: true }).waitFor({ timeout: 5000 });
+  await historySection.getByText(/\[ciphertext changed\]/).waitFor({ timeout: 5000 });
+
+  const mainText = await page.locator("main").innerText();
+  assert.equal(mainText.includes("SUPER_SECRET_CIPHERTEXT_MARKER_999"), false, "must never render vault ciphertext");
+  assert.equal(mainText.includes("synthetic-ciphertext"), false, "must never render vault ciphertext");
+
+  await saveScreenshot(page, "24-history-redacted-diff");
+
+  // Also verify member role (peter) can read history and diff
+  const memberCtx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  const memberPage = await memberCtx.newPage();
+  const memberErrors = [];
+  memberPage.on("pageerror", (err) => memberErrors.push(err.message));
+
+  await memberPage.goto(`${baseUrl}/`, { waitUntil: "networkidle" });
+  await signInViaIdp(memberPage, { subject: "peter-sub-1", email: "peter@example.com" });
+  await memberPage.getByRole("link", { name: new RegExp(fixtures.historyWorkspaceName, "i") }).click();
+  await memberPage.waitForURL(new RegExp(`/workspaces/${fixtures.historyWorkspaceId}$`), { timeout: 5000 });
+
+  const memberHistory = memberPage.getByRole("region", { name: /^History$/i });
+  await memberHistory.getByText(revHead.message, { exact: true }).waitFor({ timeout: 5000 });
+  await memberHistory.locator("article", { hasText: revHead.message }).getByRole("button", { name: /View diff/i }).click();
+  await memberHistory.getByText(/\[ciphertext changed\]/).waitFor({ timeout: 5000 });
+
+  assert.deepEqual(pageErrors, [], `unexpected page errors: ${pageErrors.join("; ")}`);
+  assert.deepEqual(memberErrors, [], `unexpected member errors: ${memberErrors.join("; ")}`);
+  await context.close();
+  await memberCtx.close();
+}
+
+
+async function journey14ProposalsAndConflictsVisible(browser) {
+  const fixtures = loadFixtures();
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 }, acceptDownloads: true });
+  const page = await context.newPage();
+  const pageErrors = [];
+  page.on("pageerror", (err) => pageErrors.push(err.message));
+
+  await page.goto(`${baseUrl}/`, { waitUntil: "networkidle" });
+  await signInViaIdp(page, { subject: "olivia-sub-1", email: "olivia@example.com" });
+
+  await page.getByRole("link", { name: new RegExp(fixtures.historyWorkspaceName, "i") }).click();
+  await page.waitForURL(new RegExp(`/workspaces/${fixtures.historyWorkspaceId}$`), { timeout: 5000 });
+
+  const proposalsSection = page.getByRole("region", { name: /^Proposals$/i });
+  await proposalsSection.waitFor({ timeout: 5000 });
+
+  // Enrollment proposal visible with machine name and honest local signing requirement
+  const enrollCard = proposalsSection.locator("article", { hasText: fixtures.enrollmentMachineName });
+  await enrollCard.waitFor({ timeout: 5000 });
+  await enrollCard.getByText(/Enrollment/i).waitFor({ timeout: 3000 });
+  await enrollCard.getByText(/^Open$/i).waitFor({ timeout: 3000 });
+  assert.equal(await enrollCard.getByRole("link", { name: /Download proposal bundle/i }).count(), 0);
+  assert.equal(await enrollCard.getByRole("button", { name: /Approve enrollment/i }).count(), 0);
+
+  // Conflict proposal visible with real Open status and downloadable retained bundle
+  const conflictCard = proposalsSection.locator("article", { hasText: fixtures.conflictRevision.slice(0, 8) });
+  await conflictCard.waitFor({ timeout: 5000 });
+  await conflictCard.getByText(/Conflict/i).waitFor({ timeout: 3000 });
+  await conflictCard.getByText(/^Open$/i).waitFor({ timeout: 3000 });
+
+  const [bundleDownload] = await Promise.all([
+    page.waitForEvent("download"),
+    conflictCard.getByRole("link", { name: /Download proposal bundle/i }).click(),
+  ]);
+  const bundlePath = await bundleDownload.path();
+  const bundleHead = fs.readFileSync(bundlePath, "utf8").slice(0, 32);
+  assert.ok(bundleHead.startsWith("# v2 git bundle"), `expected git bundle, got: ${bundleHead}`);
+
+  // Owner rejects the conflict proposal via real API
+  await conflictCard.getByRole("button", { name: /Reject proposal/i }).click();
+  await conflictCard.getByText(/^Rejected$/i).waitFor({ timeout: 5000 });
+  await page.reload({ waitUntil: "networkidle" });
+  const conflictReloaded = page
+    .getByRole("region", { name: /^Proposals$/i })
+    .locator("article", { hasText: fixtures.conflictRevision.slice(0, 8) });
+  await conflictReloaded.getByText(/^Rejected$/i).waitFor({ timeout: 5000 });
+  assert.equal(await conflictReloaded.getByRole("button", { name: /Reject proposal/i }).count(), 0);
+
+  await saveScreenshot(page, "25-proposals-and-conflicts");
+
+  // Pending quorum workspace
+  await page.getByRole("link", { name: /All workspaces/i }).click();
+  await page.getByRole("link", { name: new RegExp(fixtures.quorumWorkspaceName, "i") }).click();
+  await page.waitForURL(new RegExp(`/workspaces/${fixtures.quorumWorkspaceId}$`), { timeout: 5000 });
+
+  const quorumProposals = page.getByRole("region", { name: /^Proposals$/i });
+  const pendingCard = quorumProposals.locator("article", { hasText: fixtures.pendingQuorumRevision.slice(0, 8) });
+  await pendingCard.waitFor({ timeout: 5000 });
+  await pendingCard.getByText(/Pending quorum/i).waitFor({ timeout: 3000 });
+  await pendingCard.getByText(/^Open$/i).waitFor({ timeout: 3000 });
+  await pendingCard.getByRole("link", { name: /Download proposal bundle/i }).waitFor({ timeout: 3000 });
+  await saveScreenshot(page, "26-proposals-pending-quorum");
+
+  // Member role sees proposals read-only without Reject controls
+  const memberCtx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  const memberPage = await memberCtx.newPage();
+  const memberErrors = [];
+  memberPage.on("pageerror", (err) => memberErrors.push(err.message));
+
+  await memberPage.goto(`${baseUrl}/`, { waitUntil: "networkidle" });
+  await signInViaIdp(memberPage, { subject: "peter-sub-1", email: "peter@example.com" });
+  await memberPage.getByRole("link", { name: new RegExp(fixtures.historyWorkspaceName, "i") }).click();
+  await memberPage.waitForURL(new RegExp(`/workspaces/${fixtures.historyWorkspaceId}$`), { timeout: 5000 });
+
+  const memberProposals = memberPage.getByRole("region", { name: /^Proposals$/i });
+  await memberProposals.locator("article", { hasText: fixtures.enrollmentMachineName }).waitFor({ timeout: 5000 });
+  assert.equal(await memberProposals.getByRole("button", { name: /Reject proposal/i }).count(), 0);
+
+  assert.deepEqual(pageErrors, [], `unexpected page errors: ${pageErrors.join("; ")}`);
+  assert.deepEqual(memberErrors, [], `unexpected member errors: ${memberErrors.join("; ")}`);
+  await context.close();
+  await memberCtx.close();
+}
+
+
+async function journey15RequestRestoreProposal(browser) {
+  const fixtures = loadFixtures();
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  const page = await context.newPage();
+  const pageErrors = [];
+  page.on("pageerror", (err) => pageErrors.push(err.message));
+
+  await page.goto(`${baseUrl}/`, { waitUntil: "networkidle" });
+  await signInViaIdp(page, { subject: "olivia-sub-1", email: "olivia@example.com" });
+  await page.getByRole("link", { name: new RegExp(fixtures.historyWorkspaceName, "i") }).click();
+  await page.waitForURL(new RegExp(`/workspaces/${fixtures.historyWorkspaceId}$`), { timeout: 5000 });
+
+  const historySection = page.getByRole("region", { name: /^History$/i });
+  const revHead = fixtures.revisions[0];
+  const revGenesis = fixtures.revisions[1];
+
+  // Owner clicks "Propose restore" on the genesis revision
+  const genesisCard = historySection.locator("article", { hasText: revGenesis.message });
+  await genesisCard.waitFor({ timeout: 5000 });
+  await genesisCard.getByRole("button", { name: /Propose restore/i }).click();
+
+  const proposalsSection = page.getByRole("region", { name: /^Proposals$/i });
+  const targetSelect = proposalsSection.getByLabel(/Target revision/i);
+  assert.equal(await targetSelect.inputValue(), revGenesis.revision);
+
+  // Empty paths validation
+  const pathsInput = proposalsSection.getByLabel(/Paths to restore/i);
+  await pathsInput.fill("   ");
+  await proposalsSection.getByRole("button", { name: /Create restore proposal/i }).click();
+  await proposalsSection.locator('[role="alert"]').waitFor({ timeout: 3000 });
+  assert.equal(await pathsInput.getAttribute("aria-invalid"), "true");
+
+  // Traversal path rejected by real server 400
+  await pathsInput.fill("../secret");
+  await proposalsSection.getByRole("button", { name: /Create restore proposal/i }).click();
+  await proposalsSection.locator('[role="alert"]').waitFor({ timeout: 5000 });
+
+  // Valid relative path creates an unsigned restore proposal (never claims applied)
+  await pathsInput.fill("settings.toml");
+  await proposalsSection.getByRole("button", { name: /Create restore proposal/i }).click();
+
+  await proposalsSection.getByText(/requires local signing/i).waitFor({ timeout: 5000 });
+  const restoreCard = proposalsSection.locator("article", { hasText: "settings.toml" });
+  await restoreCard.waitFor({ timeout: 5000 });
+  await restoreCard.getByText(/^Restore$/i).waitFor({ timeout: 3000 });
+  await restoreCard.getByText(/^Open$/i).waitFor({ timeout: 3000 });
+  await restoreCard.getByText(revGenesis.revision.slice(0, 8)).waitFor({ timeout: 3000 });
+
+  const pageText = await page.locator("main").innerText();
+  assert.equal(/restored successfully|files reverted/i.test(pageText), false, "must never claim restore applied files");
+
+  await saveScreenshot(page, "27-restore-proposal-created");
+
+  // Persists across reload and accepted head remains unchanged
+  await page.reload({ waitUntil: "networkidle" });
+  await page.getByRole("region", { name: /^Proposals$/i }).locator("article", { hasText: "settings.toml" }).waitFor({ timeout: 5000 });
+  const historyText = await page.getByRole("region", { name: /^History$/i }).innerText();
+  assert.ok(historyText.indexOf(revHead.message) < historyText.indexOf(revGenesis.message));
+
+  // Member role does not see restore creation controls
+  const memberCtx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  const memberPage = await memberCtx.newPage();
+  const memberErrors = [];
+  memberPage.on("pageerror", (err) => memberErrors.push(err.message));
+
+  await memberPage.goto(`${baseUrl}/`, { waitUntil: "networkidle" });
+  await signInViaIdp(memberPage, { subject: "peter-sub-1", email: "peter@example.com" });
+  await memberPage.getByRole("link", { name: new RegExp(fixtures.historyWorkspaceName, "i") }).click();
+  await memberPage.waitForURL(new RegExp(`/workspaces/${fixtures.historyWorkspaceId}$`), { timeout: 5000 });
+
+  await memberPage.getByRole("region", { name: /^Proposals$/i }).locator("article", { hasText: "settings.toml" }).waitFor({ timeout: 5000 });
+  assert.equal(await memberPage.getByRole("button", { name: /Create restore proposal/i }).count(), 0);
+  assert.equal(await memberPage.getByRole("button", { name: /Propose restore/i }).count(), 0);
+
+  assert.deepEqual(pageErrors, [], `unexpected page errors: ${pageErrors.join("; ")}`);
+  assert.deepEqual(memberErrors, [], `unexpected member errors: ${memberErrors.join("; ")}`);
+  await context.close();
+  await memberCtx.close();
+}
+
+
+async function journey16ExportBundleAndOssInstructions(browser) {
+  const fixtures = loadFixtures();
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 }, acceptDownloads: true });
+  const page = await context.newPage();
+  const pageErrors = [];
+  page.on("pageerror", (err) => pageErrors.push(err.message));
+
+  await page.goto(`${baseUrl}/`, { waitUntil: "networkidle" });
+  await signInViaIdp(page, { subject: "olivia-sub-1", email: "olivia@example.com" });
+
+  // 1. Fresh empty workspace shows honest empty export state (no broken 204 link)
+  await page.getByLabel(/Workspace name/i).fill("Blank Export Workspace");
+  await page.getByRole("button", { name: /Create workspace/i }).click();
+  await page.waitForURL(/\/workspaces\/([0-9a-f-]{36})$/, { timeout: 5000 });
+
+  const emptyExport = page.getByRole("region", { name: /Export & offline recovery/i });
+  await emptyExport.waitFor({ timeout: 5000 });
+  await emptyExport.getByText(/No accepted history to export yet/i).waitFor({ timeout: 5000 });
+  assert.equal(await emptyExport.getByRole("link", { name: /Download Git bundle/i }).count(), 0);
+
+  // 2. Populated workspace exposes full downloadable bundle + honest OSS recovery commands
+  await page.getByRole("link", { name: /All workspaces/i }).click();
+  await page.getByRole("link", { name: new RegExp(fixtures.historyWorkspaceName, "i") }).click();
+  await page.waitForURL(new RegExp(`/workspaces/${fixtures.historyWorkspaceId}$`), { timeout: 5000 });
+
+  const exportSection = page.getByRole("region", { name: /Export & offline recovery/i });
+  await exportSection.waitFor({ timeout: 5000 });
+
+  const revHead = fixtures.revisions[0];
+  await exportSection.getByText(revHead.signer, { exact: true }).waitFor({ timeout: 5000 });
+  await exportSection.getByText(/git clone -b main workspace\.bundle/i).waitFor({ timeout: 3000 });
+  await exportSection.getByText(new RegExp(`--expect-signer ${revHead.signer}`)).waitFor({ timeout: 3000 });
+  await exportSection.getByText(/no Cloud subscription/i).waitFor({ timeout: 3000 });
+
+  const [download] = await Promise.all([
+    page.waitForEvent("download"),
+    exportSection.getByRole("link", { name: /Download Git bundle/i }).click(),
+  ]);
+  const bundlePath = await download.path();
+  assert.ok(bundlePath, "downloaded bundle must exist");
+
+  // Real offline OSS verification via git clone
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "muster-export-verify-"));
+  try {
+    const cloneDir = path.join(tmpDir, "muster-config");
+    execFileSync("git", ["clone", "-q", "-b", "main", bundlePath, cloneDir], { stdio: "pipe" });
+    const clonedHead = execFileSync("git", ["-C", cloneDir, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+    assert.equal(clonedHead, revHead.revision);
+    const gitLog = execFileSync("git", ["-C", cloneDir, "log", "--oneline"], { encoding: "utf8" });
+    assert.ok(gitLog.includes("update config and vault"));
+    assert.ok(gitLog.includes("genesis"));
+    assert.ok(fs.existsSync(path.join(cloneDir, "settings.toml")));
+    assert.ok(fs.existsSync(path.join(cloneDir, "vault/default.age")));
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+
+  await saveScreenshot(page, "28-export-and-oss-recovery");
+
+  // 3. Member role can also export full bundle
+  const memberCtx = await browser.newContext({ viewport: { width: 1280, height: 800 }, acceptDownloads: true });
+  const memberPage = await memberCtx.newPage();
+  const memberErrors = [];
+  memberPage.on("pageerror", (err) => memberErrors.push(err.message));
+
+  await memberPage.goto(`${baseUrl}/`, { waitUntil: "networkidle" });
+  await signInViaIdp(memberPage, { subject: "peter-sub-1", email: "peter@example.com" });
+  await memberPage.getByRole("link", { name: new RegExp(fixtures.historyWorkspaceName, "i") }).click();
+  await memberPage.waitForURL(new RegExp(`/workspaces/${fixtures.historyWorkspaceId}$`), { timeout: 5000 });
+
+  const memberExport = memberPage.getByRole("region", { name: /Export & offline recovery/i });
+  const [memberDownload] = await Promise.all([
+    memberPage.waitForEvent("download"),
+    memberExport.getByRole("link", { name: /Download Git bundle/i }).click(),
+  ]);
+  const memberBundleHead = fs.readFileSync(await memberDownload.path(), "utf8").slice(0, 32);
+  assert.ok(memberBundleHead.startsWith("# v2 git bundle"));
+
+  assert.deepEqual(pageErrors, [], `unexpected page errors: ${pageErrors.join("; ")}`);
+  assert.deepEqual(memberErrors, [], `unexpected member errors: ${memberErrors.join("; ")}`);
+  await context.close();
+  await memberCtx.close();
+}
+
 const journeys = [
   ['journey_1_signin_and_account', journey1SignInAndAccount],
   ['journey_2_empty_workspaces', journey2EmptyWorkspaces],
@@ -817,6 +1144,10 @@ const journeys = [
   ['journey_10_invite_member_and_role_limits', journey10InviteMemberAndRoleLimits],
   ['journey_11_accept_invitation_explicit_and_mismatch', journey11AcceptInvitationExplicitAndMismatch],
   ['journey_12_remove_member_and_last_owner_guard', journey12RemoveMemberAndLastOwnerGuard],
+  ['journey_13_history_and_redacted_diff', journey13HistoryAndRedactedDiff],
+  ['journey_14_proposals_and_conflicts_visible', journey14ProposalsAndConflictsVisible],
+  ['journey_15_request_restore_proposal', journey15RequestRestoreProposal],
+  ['journey_16_export_bundle_and_oss_instructions', journey16ExportBundleAndOssInstructions],
 ];
 
 async function main() {

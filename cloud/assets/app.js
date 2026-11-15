@@ -41,6 +41,26 @@
     acceptInFlight: false,
     acceptError: null,
     acceptResult: null,
+    revisions: null,
+    loadingRevisions: false,
+    revisionsError: null,
+    loadingMoreRevisions: false,
+    hasMoreRevisions: false,
+    selectedDiffRev: null,
+    diffsByRev: {},
+    loadingDiffRev: null,
+    diffError: null,
+    proposals: null,
+    loadingProposals: false,
+    proposalsError: null,
+    proposalActionError: null,
+    rejectingProposalId: null,
+    restoreTargetRev: '',
+    restorePathsText: '',
+    restoreFieldError: null,
+    restoreSubmitError: null,
+    restoreInFlight: false,
+    restoreCreatedMessage: null,
     signOutInFlight: false,
     signOutError: null,
   };
@@ -229,6 +249,26 @@
       state.acceptInFlight = false;
       state.acceptError = null;
       state.acceptResult = null;
+      state.revisions = null;
+      state.loadingRevisions = false;
+      state.revisionsError = null;
+      state.loadingMoreRevisions = false;
+      state.hasMoreRevisions = false;
+      state.selectedDiffRev = null;
+      state.diffsByRev = {};
+      state.loadingDiffRev = null;
+      state.diffError = null;
+      state.proposals = null;
+      state.loadingProposals = false;
+      state.proposalsError = null;
+      state.proposalActionError = null;
+      state.rejectingProposalId = null;
+      state.restoreTargetRev = '';
+      state.restorePathsText = '';
+      state.restoreFieldError = null;
+      state.restoreSubmitError = null;
+      state.restoreInFlight = false;
+      state.restoreCreatedMessage = null;
       window.history.pushState({}, '', '/');
       renderShell();
     } catch (_err) {
@@ -260,6 +300,26 @@
     state.deviceResult = null;
     state.deviceSubmitError = null;
     state.deviceFieldError = null;
+    state.revisions = null;
+    state.loadingRevisions = false;
+    state.revisionsError = null;
+    state.loadingMoreRevisions = false;
+    state.hasMoreRevisions = false;
+    state.selectedDiffRev = null;
+    state.diffsByRev = {};
+    state.loadingDiffRev = null;
+    state.diffError = null;
+    state.proposals = null;
+    state.loadingProposals = false;
+    state.proposalsError = null;
+    state.proposalActionError = null;
+    state.rejectingProposalId = null;
+    state.restoreTargetRev = '';
+    state.restorePathsText = '';
+    state.restoreFieldError = null;
+    state.restoreSubmitError = null;
+    state.restoreInFlight = false;
+    state.restoreCreatedMessage = null;
     window.history.pushState({}, '', '/');
     if (!state.workspaces) {
       loadWorkspaces();
@@ -914,6 +974,854 @@
     ]);
   }
 
+  async function loadWorkspaceProposals(id) {
+    state.loadingProposals = true;
+    state.proposalsError = null;
+    state.proposals = null;
+    state.proposalActionError = null;
+    renderShell();
+    try {
+      const resp = await fetch(
+        `/v1/workspaces/${encodeURIComponent(id)}/proposals`,
+        { headers: { Accept: 'application/json' }, credentials: 'same-origin' }
+      );
+      if (resp.status === 401) {
+        state.me = null;
+        state.loadingProposals = false;
+        renderShell();
+        return;
+      }
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      state.proposals = await resp.json();
+      state.loadingProposals = false;
+      renderShell();
+    } catch (_err) {
+      state.loadingProposals = false;
+      state.proposalsError = 'Could not load proposals. Please try again.';
+      renderShell();
+    }
+  }
+
+  function canReviewProposals(ws) {
+    return Boolean(ws && (ws.role === 'owner' || ws.role === 'admin'));
+  }
+
+  function formatProposalKind(kind) {
+    switch (kind) {
+      case 'conflict':
+        return 'Conflict';
+      case 'pending_quorum':
+        return 'Pending quorum';
+      case 'unauthorized':
+        return 'Unauthorized';
+      case 'enrollment':
+        return 'Enrollment';
+      case 'restore':
+        return 'Restore';
+      default:
+        return kind;
+    }
+  }
+
+  function formatProposalStatus(status) {
+    switch (status) {
+      case 'open':
+        return { label: 'Open', badgeClass: 'badge badge-warn' };
+      case 'resolved':
+        return { label: 'Resolved', badgeClass: 'badge badge-trialing' };
+      case 'rejected':
+        return { label: 'Rejected', badgeClass: 'badge badge-neutral' };
+      case 'superseded':
+        return { label: 'Superseded', badgeClass: 'badge badge-neutral' };
+      default:
+        return { label: status, badgeClass: 'badge badge-neutral' };
+    }
+  }
+
+  function proposalGuidance(p) {
+    switch (p.kind) {
+      case 'conflict':
+        return 'Push collided with a newer head. Pull latest history or this bundle, rebase and re-sign locally, then push again.';
+      case 'pending_quorum':
+        return 'Held waiting for additional local admin signatures to meet governance quorum.';
+      case 'unauthorized':
+        return 'Signing key is not authorized in accepted fleet governance.';
+      case 'enrollment':
+        return 'An authorized admin machine must approve and sign this machine into the fleet locally.';
+      case 'restore':
+        return 'Unsigned restore request. An authorized machine must review, sign a forward commit locally, and push to apply.';
+      default:
+        return null;
+    }
+  }
+
+  async function handleRejectProposal(ws, proposal) {
+    if (state.rejectingProposalId || !state.me) return;
+    state.rejectingProposalId = proposal.id;
+    state.proposalActionError = null;
+    renderShell();
+    try {
+      const resp = await fetch(
+        `/v1/workspaces/${encodeURIComponent(ws.id)}/proposals/${encodeURIComponent(proposal.id)}/resolve`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+            'X-CSRF-Token': state.me.csrf_token,
+          },
+          credentials: 'same-origin',
+          body: JSON.stringify({ result_revision: null }),
+        }
+      );
+      if (resp.status === 401) {
+        state.me = null;
+        state.rejectingProposalId = null;
+        renderShell();
+        return;
+      }
+      const data = await resp.json().catch(() => null);
+      if (!resp.ok) {
+        state.rejectingProposalId = null;
+        state.proposalActionError =
+          (data && data.error && data.error.message) ||
+          'Could not reject this proposal. Please try again.';
+        renderShell();
+        return;
+      }
+      state.rejectingProposalId = null;
+      state.proposals = (state.proposals || []).map((item) =>
+        item.id === data.id ? data : item
+      );
+      renderShell();
+    } catch (_err) {
+      state.rejectingProposalId = null;
+      state.proposalActionError =
+        'Connection failed while rejecting the proposal. Please try again.';
+      renderShell();
+    }
+  }
+
+  function selectRestoreTarget(rev) {
+    state.restoreTargetRev = rev;
+    state.restoreFieldError = null;
+    state.restoreSubmitError = null;
+    state.restoreCreatedMessage = null;
+    renderShell();
+    const input = document.getElementById('restore-paths');
+    if (input) {
+      input.focus();
+    }
+  }
+
+  async function handleCreateRestoreProposal(e, ws) {
+    e.preventDefault();
+    if (state.restoreInFlight || !state.me) return;
+    const revisions = state.revisions || [];
+    if (revisions.length === 0) return;
+
+    const targetRev =
+      revisions.some((r) => r.revision === state.restoreTargetRev)
+        ? state.restoreTargetRev
+        : revisions[0].revision;
+    const paths = state.restorePathsText
+      .split(/[\n,]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    if (paths.length === 0) {
+      state.restoreFieldError = 'Enter at least one relative repository path to restore.';
+      state.restoreSubmitError = null;
+      state.restoreCreatedMessage = null;
+      renderShell();
+      const input = document.getElementById('restore-paths');
+      if (input) input.focus();
+      return;
+    }
+
+    state.restoreFieldError = null;
+    state.restoreSubmitError = null;
+    state.restoreCreatedMessage = null;
+    state.restoreInFlight = true;
+    renderShell();
+
+    try {
+      const resp = await fetch(
+        `/v1/workspaces/${encodeURIComponent(ws.id)}/proposals`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+            'X-CSRF-Token': state.me.csrf_token,
+          },
+          credentials: 'same-origin',
+          body: JSON.stringify({
+            kind: 'restore',
+            base_revision: revisions[0].revision,
+            payload: {
+              target_revision: targetRev,
+              paths,
+            },
+          }),
+        }
+      );
+      if (resp.status === 401) {
+        state.me = null;
+        state.restoreInFlight = false;
+        renderShell();
+        return;
+      }
+      const data = await resp.json().catch(() => null);
+      if (!resp.ok) {
+        state.restoreInFlight = false;
+        state.restoreSubmitError =
+          (data && data.error && data.error.message) ||
+          'Could not create restore proposal. Please try again.';
+        renderShell();
+        return;
+      }
+      state.restoreInFlight = false;
+      state.restorePathsText = '';
+      state.restoreCreatedMessage =
+        'Restore proposal created (unsigned). It requires local signing and a new forward commit pushed from an authorized machine.';
+      state.proposals = [data, ...(state.proposals || [])];
+      renderShell();
+    } catch (_err) {
+      state.restoreInFlight = false;
+      state.restoreSubmitError =
+        'Connection failed while creating the restore proposal. Please try again.';
+      renderShell();
+    }
+  }
+
+  function renderRestoreForm(ws) {
+    const revisions = state.revisions || [];
+    if (!canReviewProposals(ws) || revisions.length === 0) return null;
+
+    const selectedRev =
+      revisions.some((r) => r.revision === state.restoreTargetRev)
+        ? state.restoreTargetRev
+        : revisions[0].revision;
+    const hasFieldError = Boolean(state.restoreFieldError);
+
+    return el(
+      'form',
+      {
+        className: 'stack-md invite-controls',
+        noValidate: true,
+        onSubmit: (e) => handleCreateRestoreProposal(e, ws),
+      },
+      [
+        el('div', { className: 'stack-sm' }, [
+          el('h3', { textContent: 'Request restore proposal' }),
+          el('p', {
+            className: 'muted',
+            textContent:
+              'Submits an unsigned restore proposal only. Clicking this never modifies or reverts files; an authorized client must review, sign a new forward commit locally, and push.',
+          }),
+        ]),
+        state.restoreSubmitError
+          ? el('div', { className: 'alert', role: 'alert' }, [
+              el('span', { textContent: state.restoreSubmitError }),
+            ])
+          : null,
+        state.restoreCreatedMessage
+          ? el('div', { className: 'share-box', role: 'status' }, [
+              el('p', { textContent: state.restoreCreatedMessage }),
+            ])
+          : null,
+        el('div', { className: 'field' }, [
+          el('label', { for: 'restore-target', textContent: 'Target revision' }),
+          el(
+            'select',
+            {
+              id: 'restore-target',
+              className: 'input mono',
+              onChange: (e) => {
+                state.restoreTargetRev = e.target.value;
+              },
+            },
+            revisions.map((r) =>
+              el('option', {
+                value: r.revision,
+                selected: selectedRev === r.revision,
+                textContent: `${r.revision.slice(0, 8)} — ${r.message} (Epoch ${r.epoch})`,
+              })
+            )
+          ),
+        ]),
+        el('div', { className: 'field' }, [
+          el('label', { for: 'restore-paths', textContent: 'Paths to restore' }),
+          el('input', {
+            id: 'restore-paths',
+            type: 'text',
+            className: 'input mono',
+            autocomplete: 'off',
+            placeholder: 'settings.toml, vault/default.age',
+            value: state.restorePathsText,
+            'aria-invalid': hasFieldError ? 'true' : null,
+            'aria-describedby': hasFieldError ? 'restore-paths-error' : null,
+            onInput: (e) => {
+              state.restorePathsText = e.target.value;
+              state.restoreFieldError = null;
+              state.restoreSubmitError = null;
+            },
+          }),
+          hasFieldError
+            ? el('p', {
+                id: 'restore-paths-error',
+                className: 'field-error',
+                role: 'alert',
+                textContent: state.restoreFieldError,
+              })
+            : null,
+        ]),
+        el('div', {}, [
+          el('button', {
+            type: 'submit',
+            className: 'btn btn-primary btn-sm',
+            disabled: state.restoreInFlight,
+            textContent: state.restoreInFlight
+              ? 'Creating proposal…'
+              : 'Create restore proposal',
+          }),
+        ]),
+      ]
+    );
+  }
+
+  function renderProposalsSection(ws) {
+    const heading = el('h2', { id: 'proposals-heading', textContent: 'Proposals' });
+    const note = el('p', {
+      className: 'muted',
+      textContent:
+        'Conflicts, pending quorum changes, enrollment requests, and restore requests. Cloud never signs governance or applies changes on your behalf.',
+    });
+
+    if (state.loadingProposals) {
+      return el(
+        'section',
+        { className: 'card stack-sm', 'aria-labelledby': 'proposals-heading', 'aria-live': 'polite' },
+        [heading, note, el('p', { className: 'muted', textContent: 'Loading proposals…' })]
+      );
+    }
+
+    if (state.proposalsError) {
+      return el('section', { className: 'card stack-md', 'aria-labelledby': 'proposals-heading' }, [
+        heading,
+        note,
+        el('div', { className: 'alert', role: 'alert' }, [
+          el('span', { textContent: state.proposalsError }),
+          el('button', {
+            type: 'button',
+            className: 'btn btn-secondary btn-sm',
+            onClick: () => loadWorkspaceProposals(ws.id),
+            textContent: 'Retry',
+          }),
+        ]),
+      ]);
+    }
+
+    const proposals = state.proposals || [];
+    const restoreForm = renderRestoreForm(ws);
+    if (proposals.length === 0) {
+      return el('section', { className: 'card stack-md', 'aria-labelledby': 'proposals-heading' }, [
+        heading,
+        note,
+        el('p', { textContent: 'No proposals or conflicts.' }),
+        restoreForm,
+      ]);
+    }
+
+    const reviewer = canReviewProposals(ws);
+
+    return el('section', { className: 'card stack-md', 'aria-labelledby': 'proposals-heading' }, [
+      heading,
+      note,
+      state.proposalActionError
+        ? el('div', { className: 'alert', role: 'alert' }, [
+            el('span', { textContent: state.proposalActionError }),
+          ])
+        : null,
+      el(
+        'div',
+        { className: 'member-list' },
+        proposals.map((p) => {
+          const st = formatProposalStatus(p.status);
+          const kindLabel = formatProposalKind(p.kind);
+          const guidance = proposalGuidance(p);
+          const metaItems = [
+            el('div', { className: 'meta-item' }, [
+              el('dt', { textContent: 'Base revision' }),
+              el('dd', {
+                className: 'mono',
+                textContent: p.base_revision && p.base_revision !== 'none' ? p.base_revision.slice(0, 8) : 'none',
+              }),
+            ]),
+          ];
+          if (p.revision) {
+            metaItems.push(
+              el('div', { className: 'meta-item' }, [
+                el('dt', { textContent: 'Proposed revision' }),
+                el('dd', { className: 'mono', textContent: p.revision.slice(0, 8) }),
+              ])
+            );
+          }
+          if (p.epoch !== null && p.epoch !== undefined) {
+            metaItems.push(
+              el('div', { className: 'meta-item' }, [
+                el('dt', { textContent: 'Epoch' }),
+                el('dd', { textContent: String(p.epoch) }),
+              ])
+            );
+          }
+          metaItems.push(
+            el('div', { className: 'meta-item' }, [
+              el('dt', { textContent: 'Created' }),
+              el('dd', { textContent: formatDate(p.created_at) }),
+            ])
+          );
+          if (p.kind === 'enrollment' && p.payload && p.payload.name) {
+            metaItems.push(
+              el('div', { className: 'meta-item' }, [
+                el('dt', { textContent: 'Machine' }),
+                el('dd', { textContent: p.payload.name }),
+              ])
+            );
+          }
+          if (p.kind === 'restore' && p.payload) {
+            if (p.payload.target_revision) {
+              metaItems.push(
+                el('div', { className: 'meta-item' }, [
+                  el('dt', { textContent: 'Target revision' }),
+                  el('dd', {
+                    className: 'mono',
+                    textContent: p.payload.target_revision.slice(0, 8),
+                  }),
+                ])
+              );
+            }
+            if (Array.isArray(p.payload.paths) && p.payload.paths.length > 0) {
+              metaItems.push(
+                el('div', { className: 'meta-item meta-item-wide' }, [
+                  el('dt', { textContent: 'Paths' }),
+                  el('dd', { className: 'mono', textContent: p.payload.paths.join(', ') }),
+                ])
+              );
+            }
+          }
+          if (p.result_revision) {
+            metaItems.push(
+              el('div', { className: 'meta-item' }, [
+                el('dt', { textContent: 'Result revision' }),
+                el('dd', { className: 'mono', textContent: p.result_revision.slice(0, 8) }),
+              ])
+            );
+          }
+
+          const actions = [];
+          if (p.revision) {
+            actions.push(
+              el('a', {
+                href: `/v1/workspaces/${encodeURIComponent(ws.id)}/proposals/${encodeURIComponent(p.id)}/bundle`,
+                download: `proposal-${p.id.slice(0, 8)}.bundle`,
+                className: 'btn btn-secondary btn-sm',
+                textContent: 'Download proposal bundle',
+              })
+            );
+          }
+          if (reviewer && p.status === 'open') {
+            const busy = state.rejectingProposalId === p.id;
+            actions.push(
+              el('button', {
+                type: 'button',
+                className: 'btn btn-danger btn-sm',
+                disabled: Boolean(state.rejectingProposalId),
+                onClick: () => handleRejectProposal(ws, p),
+                textContent: busy ? 'Rejecting…' : 'Reject proposal',
+              })
+            );
+          }
+
+          return el('article', { className: 'member-card stack-sm' }, [
+            el('div', { className: 'row-between' }, [
+              el('strong', { textContent: kindLabel }),
+              el('div', { className: 'badge-row' }, [
+                el('span', { className: st.badgeClass, textContent: st.label }),
+              ]),
+            ]),
+            guidance ? el('p', { className: 'muted', textContent: guidance }) : null,
+            el('dl', { className: 'meta-list' }, metaItems),
+            actions.length > 0 ? el('div', { className: 'btn-row' }, actions) : null,
+          ]);
+        })
+      ),
+      restoreForm,
+    ]);
+  }
+
+  const REVISIONS_PAGE_SIZE = 20;
+
+  async function loadWorkspaceRevisions(id) {
+    state.loadingRevisions = true;
+    state.revisionsError = null;
+    state.revisions = null;
+    state.hasMoreRevisions = false;
+    renderShell();
+    try {
+      const resp = await fetch(
+        `/v1/workspaces/${encodeURIComponent(id)}/revisions?limit=${REVISIONS_PAGE_SIZE}`,
+        { headers: { Accept: 'application/json' }, credentials: 'same-origin' }
+      );
+      if (resp.status === 401) {
+        state.me = null;
+        state.loadingRevisions = false;
+        renderShell();
+        return;
+      }
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const list = await resp.json();
+      state.revisions = list;
+      state.hasMoreRevisions = list.length === REVISIONS_PAGE_SIZE;
+      state.loadingRevisions = false;
+      renderShell();
+    } catch (_err) {
+      state.loadingRevisions = false;
+      state.revisionsError = 'Could not load revision history. Please try again.';
+      renderShell();
+    }
+  }
+
+  async function loadMoreRevisions(id) {
+    if (state.loadingMoreRevisions || !state.revisions || state.revisions.length === 0) return;
+    const oldest = state.revisions[state.revisions.length - 1];
+    state.loadingMoreRevisions = true;
+    renderShell();
+    try {
+      const resp = await fetch(
+        `/v1/workspaces/${encodeURIComponent(id)}/revisions?before=${encodeURIComponent(oldest.revision)}&limit=${REVISIONS_PAGE_SIZE}`,
+        { headers: { Accept: 'application/json' }, credentials: 'same-origin' }
+      );
+      if (resp.status === 401) {
+        state.me = null;
+        state.loadingMoreRevisions = false;
+        renderShell();
+        return;
+      }
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const older = await resp.json();
+      state.revisions = [...state.revisions, ...older];
+      state.hasMoreRevisions = older.length === REVISIONS_PAGE_SIZE;
+      state.loadingMoreRevisions = false;
+      renderShell();
+    } catch (_err) {
+      state.loadingMoreRevisions = false;
+      state.revisionsError = 'Could not load older revisions. Please try again.';
+      renderShell();
+    }
+  }
+
+  async function toggleRevisionDiff(wsId, rev) {
+    if (state.selectedDiffRev === rev) {
+      state.selectedDiffRev = null;
+      state.diffError = null;
+      renderShell();
+      return;
+    }
+    state.selectedDiffRev = rev;
+    state.diffError = null;
+    if (state.diffsByRev[rev]) {
+      renderShell();
+      return;
+    }
+    state.loadingDiffRev = rev;
+    renderShell();
+    try {
+      const resp = await fetch(
+        `/v1/workspaces/${encodeURIComponent(wsId)}/revisions/${encodeURIComponent(rev)}/diff`,
+        { headers: { Accept: 'application/json' }, credentials: 'same-origin' }
+      );
+      if (resp.status === 401) {
+        state.me = null;
+        state.loadingDiffRev = null;
+        renderShell();
+        return;
+      }
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      state.diffsByRev[rev] = await resp.json();
+      state.loadingDiffRev = null;
+      renderShell();
+    } catch (_err) {
+      state.loadingDiffRev = null;
+      state.diffError = 'Could not load diff for this revision. Please try again.';
+      renderShell();
+    }
+  }
+
+  function renderDiffFiles(diff) {
+    if (!diff.files || diff.files.length === 0) {
+      return el('p', { className: 'muted', textContent: 'No file changes in this commit.' });
+    }
+    return el(
+      'div',
+      { className: 'diff-list stack-sm' },
+      diff.files.map((file) => {
+        const changeBadge =
+          file.change === 'deleted'
+            ? 'badge badge-warn'
+            : file.change === 'added'
+              ? 'badge badge-trialing'
+              : 'badge badge-neutral';
+        return el('div', { className: 'diff-file stack-sm' }, [
+          el('div', { className: 'row-between' }, [
+            el('span', { className: 'mono', textContent: file.path }),
+            el('div', { className: 'badge-row' }, [
+              el('span', { className: changeBadge, textContent: file.change }),
+              file.is_vault
+                ? el('span', { className: 'badge badge-warn', textContent: 'Encrypted (.age)' })
+                : null,
+            ]),
+          ]),
+          file.is_vault
+            ? el('p', {
+                className: 'muted mono',
+                textContent: file.patch || '[ciphertext changed]',
+              })
+            : el('pre', { className: 'diff-patch mono' }, [
+                el('code', { textContent: file.patch || 'No text diff.' }),
+              ]),
+        ]);
+      })
+    );
+  }
+
+  function renderExportSection(ws) {
+    const heading = el('h2', {
+      id: 'export-heading',
+      textContent: 'Export & offline recovery',
+    });
+    const note = el('p', {
+      className: 'muted',
+      textContent:
+        'Download the full accepted Git history as a portable bundle. Available to any workspace member with no Cloud subscription required.',
+    });
+
+    if (state.loadingRevisions) {
+      return el(
+        'section',
+        {
+          className: 'card stack-sm',
+          'aria-labelledby': 'export-heading',
+          'aria-live': 'polite',
+        },
+        [
+          heading,
+          note,
+          el('p', { className: 'muted', textContent: 'Checking export availability…' }),
+        ]
+      );
+    }
+
+    if (state.revisionsError) {
+      return el(
+        'section',
+        { className: 'card stack-md', 'aria-labelledby': 'export-heading' },
+        [
+          heading,
+          note,
+          el('p', {
+            className: 'muted',
+            textContent: 'Could not verify export status while history failed to load.',
+          }),
+        ]
+      );
+    }
+
+    const revisions = state.revisions || [];
+    if (revisions.length === 0) {
+      return el(
+        'section',
+        { className: 'card stack-sm', 'aria-labelledby': 'export-heading' },
+        [
+          heading,
+          note,
+          el('p', {
+            textContent:
+              'No accepted history to export yet. Push your first fleet commit with the CLI before exporting a bundle.',
+          }),
+        ]
+      );
+    }
+
+    const head = revisions[0];
+    const ossCommands = [
+      'git clone -b main workspace.bundle muster-config',
+      `muster sync --pull --expect-signer ${head.signer}`,
+    ].join('\n');
+
+    return el(
+      'section',
+      { className: 'card stack-md', 'aria-labelledby': 'export-heading' },
+      [
+        heading,
+        note,
+        el('dl', { className: 'meta-list' }, [
+          el('div', { className: 'meta-item' }, [
+            el('dt', { textContent: 'Head revision' }),
+            el('dd', { className: 'mono', textContent: head.revision.slice(0, 8) }),
+          ]),
+          el('div', { className: 'meta-item' }, [
+            el('dt', { textContent: 'Epoch' }),
+            el('dd', { textContent: String(head.epoch) }),
+          ]),
+          el('div', { className: 'meta-item meta-item-wide' }, [
+            el('dt', { textContent: 'Trusted signer' }),
+            el('dd', { className: 'mono', textContent: head.signer }),
+          ]),
+        ]),
+        el('div', { className: 'btn-row' }, [
+          el('a', {
+            href: `/v1/workspaces/${encodeURIComponent(ws.id)}/export`,
+            download: 'workspace.bundle',
+            className: 'btn btn-primary btn-sm',
+            textContent: 'Download Git bundle',
+          }),
+        ]),
+        el('div', { className: 'stack-sm' }, [
+          el('p', {
+            className: 'muted',
+            textContent:
+              'Offline exit with the open-source CLI (unbundle with Git and pin your trusted signer):',
+          }),
+          el('pre', { className: 'diff-patch mono' }, [
+            el('code', { textContent: ossCommands }),
+          ]),
+        ]),
+      ]
+    );
+  }
+
+  function renderHistorySection(ws) {
+    const heading = el('h2', { id: 'history-heading', textContent: 'History' });
+    const note = el('p', {
+      className: 'muted',
+      textContent:
+        'Accepted fleet revisions, newest first. Encrypted .age vault files remain redacted on the server.',
+    });
+
+    if (state.loadingRevisions) {
+      return el(
+        'section',
+        { className: 'card stack-sm', 'aria-labelledby': 'history-heading', 'aria-live': 'polite' },
+        [heading, note, el('p', { className: 'muted', textContent: 'Loading history…' })]
+      );
+    }
+
+    if (state.revisionsError) {
+      return el('section', { className: 'card stack-md', 'aria-labelledby': 'history-heading' }, [
+        heading,
+        note,
+        el('div', { className: 'alert', role: 'alert' }, [
+          el('span', { textContent: state.revisionsError }),
+          el('button', {
+            type: 'button',
+            className: 'btn btn-secondary btn-sm',
+            onClick: () => loadWorkspaceRevisions(ws.id),
+            textContent: 'Retry',
+          }),
+        ]),
+      ]);
+    }
+
+    const revisions = state.revisions || [];
+    if (revisions.length === 0) {
+      return el('section', { className: 'card stack-sm', 'aria-labelledby': 'history-heading' }, [
+        heading,
+        note,
+        el('p', { textContent: 'No revisions synced yet. Push your first fleet commit with the CLI.' }),
+      ]);
+    }
+
+    return el('section', { className: 'card stack-md', 'aria-labelledby': 'history-heading' }, [
+      heading,
+      note,
+      el(
+        'div',
+        { className: 'member-list' },
+        revisions.map((rev) => {
+          const isOpen = state.selectedDiffRev === rev.revision;
+          const diff = state.diffsByRev[rev.revision];
+          return el('article', { className: 'member-card stack-sm' }, [
+            el('div', { className: 'row-between' }, [
+              el('strong', { textContent: rev.message }),
+              el('div', { className: 'badge-row' }, [
+                el('span', { className: 'badge badge-neutral', textContent: `Epoch ${rev.epoch}` }),
+                el('span', {
+                  className: 'badge badge-neutral mono',
+                  textContent: rev.revision.slice(0, 8),
+                }),
+              ]),
+            ]),
+            el('div', { className: 'row-between' }, [
+              el('dl', { className: 'meta-list' }, [
+                el('div', { className: 'meta-item' }, [
+                  el('dt', { textContent: 'Accepted' }),
+                  el('dd', { textContent: formatDate(rev.accepted_at) }),
+                ]),
+                el('div', { className: 'meta-item' }, [
+                  el('dt', { textContent: 'Signer' }),
+                  el('dd', { className: 'mono', textContent: rev.signer }),
+                ]),
+              ]),
+              el('div', { className: 'btn-row' }, [
+                el('button', {
+                  type: 'button',
+                  className: 'btn btn-secondary btn-sm',
+                  'aria-expanded': isOpen ? 'true' : 'false',
+                  onClick: () => toggleRevisionDiff(ws.id, rev.revision),
+                  textContent: isOpen ? 'Hide diff' : 'View diff',
+                }),
+                canReviewProposals(ws)
+                  ? el('button', {
+                      type: 'button',
+                      className: 'btn btn-secondary btn-sm',
+                      onClick: () => selectRestoreTarget(rev.revision),
+                      textContent: 'Propose restore',
+                    })
+                  : null,
+              ]),
+            ]),
+            isOpen
+              ? el('div', { className: 'diff-panel stack-sm' }, [
+                  state.loadingDiffRev === rev.revision
+                    ? el('p', { className: 'muted', textContent: 'Loading diff…' })
+                    : state.diffError && !diff
+                      ? el('div', { className: 'alert', role: 'alert' }, [
+                          el('span', { textContent: state.diffError }),
+                        ])
+                      : diff
+                        ? renderDiffFiles(diff)
+                        : null,
+                ])
+              : null,
+          ]);
+        })
+      ),
+      state.hasMoreRevisions
+        ? el('div', {}, [
+            el('button', {
+              type: 'button',
+              className: 'btn btn-secondary btn-sm',
+              disabled: state.loadingMoreRevisions,
+              onClick: () => loadMoreRevisions(ws.id),
+              textContent: state.loadingMoreRevisions ? 'Loading…' : 'Load older revisions',
+            }),
+          ])
+        : null,
+    ]);
+  }
+
   function renderMachinesSection(ws) {
     if (state.loadingDevices) {
       return el('section', { className: 'card stack-sm', 'aria-live': 'polite' }, [
@@ -1363,6 +2271,9 @@
           ]),
         ]),
         renderMachinesSection(ws),
+        renderHistorySection(ws),
+        renderProposalsSection(ws),
+        renderExportSection(ws),
         renderMembersSection(ws),
       ]);
     }
@@ -1547,6 +2458,26 @@
     state.inviteRole = 'member';
     state.inviteFieldError = null;
     state.inviteSubmitError = null;
+    state.revisions = null;
+    state.loadingRevisions = false;
+    state.revisionsError = null;
+    state.loadingMoreRevisions = false;
+    state.hasMoreRevisions = false;
+    state.selectedDiffRev = null;
+    state.diffsByRev = {};
+    state.loadingDiffRev = null;
+    state.diffError = null;
+    state.proposals = null;
+    state.loadingProposals = false;
+    state.proposalsError = null;
+    state.proposalActionError = null;
+    state.rejectingProposalId = null;
+    state.restoreTargetRev = '';
+    state.restorePathsText = '';
+    state.restoreFieldError = null;
+    state.restoreSubmitError = null;
+    state.restoreInFlight = false;
+    state.restoreCreatedMessage = null;
     renderShell();
     try {
       const resp = await fetch(`/v1/workspaces/${encodeURIComponent(id)}`, {
@@ -1575,7 +2506,7 @@
       state.activeWorkspace = await resp.json();
       state.loadingDetail = false;
       renderShell();
-      const loaders = [loadWorkspaceDevices(id), loadWorkspaceMembers(id)];
+      const loaders = [loadWorkspaceDevices(id), loadWorkspaceMembers(id), loadWorkspaceRevisions(id), loadWorkspaceProposals(id)];
       if (canManageInvites(state.activeWorkspace)) {
         loaders.push(loadWorkspaceInvitations(id));
       }
