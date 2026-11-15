@@ -1,0 +1,31 @@
+# Per-Dockerfile ignore for deploy/Dockerfile (BuildKit).
+# Applies when the image is built with:
+#   docker build -f deploy/Dockerfile -t muster-cloud:local .
+# Paths are relative to the build-context root (the repository root).
+# Only the build stage needs the workspace; everything excluded here is
+# either never needed by `cargo build -p muster-cloud --locked` or must
+# never enter an image (secrets, local state, caches). Source directories,
+# manifests (Cargo.toml/Cargo.lock) and cloud assets stay in the context.
+
+# Version control and local agent state — never part of an image.
+.git
+.git/**
+.hillclimb
+.hillclimb/**
+.claude
+
+# Build caches (workspace root and any member/subproject).
+target
+**/target
+
+# Local env/secret files: runtime configuration is injected via the
+# environment, never baked into the image.
+.env
+.env.*
+**/.env
+**/.env.*
+
+# Local tooling caches that cannot affect the build.
+**/node_modules
+**/__pycache__
+**/.DS_Store

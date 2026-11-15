@@ -126,6 +126,22 @@ fn sync_io(e: std::io::Error) -> MusterError {
     MusterError::Operational(format!("sync state: {e}"))
 }
 
+/// Whether this machine's identity is enrolled in the manifest on disk
+/// (after a join pull, that manifest is the fleet's).
+fn enrolled(ctx: &Context) -> bool {
+    let Ok(manifest) = Manifest::load(&ctx.config_dir) else {
+        return false;
+    };
+    crate::identity::Identity::load(&ctx.state_dir)
+        .map(|identity| {
+            manifest
+                .machines
+                .values()
+                .any(|m| m.recipient == identity.recipient())
+        })
+        .unwrap_or(false)
+}
+
 /// The lock file remains in place: unlinking it would allow a second inode
 /// to be locked while a waiting process still owns the first one.
 fn sync(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
@@ -153,6 +169,17 @@ fn sync(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     } else {
         transport(ctx, params, true)?
     };
+    // A machine that just joined a fleet it is not enrolled in downloads the
+    // history but applies nothing (same rule as the Git remote join path):
+    // it proposes its enrollment first.
+    if transport.get("pulled").and_then(Value::as_str) == Some("joined") && !enrolled(ctx) {
+        return Ok(json!({
+            "joined": true,
+            "applied": false,
+            "transport": transport,
+            "skills_updated": skills_updated,
+        }));
+    }
     // A governance change is waiting for admin co-signatures: the pull above
     // may bring them, but nothing is applied from the unaccepted state.
     if ctx.governance_pending {
@@ -175,7 +202,11 @@ fn sync(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     if global {
         let recorded = crate::team::record_applied(ctx, &result)?;
         if recorded && transport["pushed"] == true {
-            git::push(&ctx.config_dir)?;
+            if let Some(link) = crate::cloud_client::CloudLink::load(&ctx.state_dir)? {
+                crate::sync_transport::push(ctx, &link)?;
+            } else {
+                git::push(&ctx.config_dir)?;
+            }
         }
         if !ctx.dry_run && !params.get_bool("pull") && !params.get_bool("push") {
             let fleet = crate::commands::machine::sync_fleet_after_local_sync(ctx)?;
@@ -276,6 +307,30 @@ fn transport(
 ) -> Result<(Value, Vec<Value>), MusterError> {
     let (only_pull, only_push) = (params.get_bool("pull"), params.get_bool("push"));
     let remote = params.get_string("remote");
+    let cloud = crate::cloud_client::CloudLink::load(&ctx.state_dir)?;
+    if let Some(link) = cloud {
+        if remote.is_some() {
+            return Err(MusterError::Usage(
+                "--remote cannot be combined with a Cloud link; unlink first".into(),
+            ));
+        }
+        if !only_pull && !only_push {
+            return Err(MusterError::Operational(
+                "Cloud sync needs an explicit --pull (download) or --push (publish)"
+                    .into(),
+            ));
+        }
+        let committed = git::commit_if_configured(&ctx.config_dir, "chore(muster): sync")?;
+        if only_push {
+            crate::sync_transport::push(ctx, &link)?;
+            return Ok((json!({"committed": committed, "pushed": true}), Vec::new()));
+        }
+        let outcome = crate::sync_transport::pull(ctx, &link)?;
+        return Ok((
+            json!({"committed": committed, "pulled": outcome.label(), "pushed": false}),
+            Vec::new(),
+        ));
+    }
     if let Some(url) = remote {
         git::set_remote(&ctx.config_dir, url)?;
     }

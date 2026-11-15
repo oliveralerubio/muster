@@ -112,8 +112,15 @@ pub(crate) fn execute_with(
                     Ok(serde_json::json!({"skipped": "locked", "applied": false}))
                 }
                 Err(e) => Err(e),
-                Ok(_held) => crate::trust::guard(&mut ctx, spec.name, spec.mutating)
-                    .and_then(|()| handler(&mut ctx)),
+                Ok(_held) => {
+                    let guard = match spec.scope() {
+                        registry::CommandScope::Fleet => {
+                            crate::trust::guard(&mut ctx, spec.name, spec.mutating)
+                        }
+                        registry::CommandScope::LocalAccount => Ok(()),
+                    };
+                    guard.and_then(|()| handler(&mut ctx))
+                }
             };
             (result, ctx.take_diagnostics(), ctx.failed())
         }

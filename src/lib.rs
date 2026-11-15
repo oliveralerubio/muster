@@ -4,6 +4,8 @@
 pub mod adapters;
 pub mod audit;
 pub mod cli;
+pub mod cloud_client;
+pub mod cloud_protocol;
 pub mod commands;
 pub mod context;
 pub mod doctor;
@@ -34,5 +36,6 @@ pub mod usage;
 pub mod vault;
 pub mod web;
 
+pub mod sync_transport;
 #[cfg(kani)]
 mod verification;

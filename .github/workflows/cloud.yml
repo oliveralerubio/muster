@@ -1,0 +1,174 @@
+name: Cloud CI
+
+# CI for the muster-cloud backend (workspace member `cloud`), kept separate
+# from .github/workflows/ci.yml (which owns the OSS CLI gates and is not
+# modified here).
+#
+# The ci-docker runner pool has no Docker daemon and no preinstalled
+# Rust/PostgreSQL: this workflow installs what it needs with apt (guarded, so
+# preexisting tooling is reused) and never touches a Docker daemon.
+#
+# PostgreSQL for tests is provisioned by deploy/pg-test.sh: an ephemeral,
+# socket-only cluster created per run (initdb + pg_ctl), never a global PG
+# service. When the runner user is root — initdb/pg_ctl refuse root — the
+# launcher delegates only those two steps to the package-installed `postgres`
+# account via runuser(1) while the test shell keeps its own user, leaving
+# HOME and the rest of the environment untouched.
+#
+# Tests are never skipped for lack of PostgreSQL: if the cluster cannot be
+# created, deploy/pg-test.sh exits non-zero (69/70/77) and this job fails.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloud-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cloud:
+    name: muster-cloud
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    # runner-up pool: fresh container per job (no docker daemon, no
+    # preinstalled rust/jq/gh). The fork guard above is kept: this repository
+    # is public.
+    runs-on: ci-docker
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools (cc, git)
+        run: |
+          set -eu
+          apt="apt-get"
+          [ "$(id -u)" -eq 0 ] || apt="sudo apt-get"
+          install=""
+          command -v cc >/dev/null 2>&1 || install="$install build-essential"
+          command -v git >/dev/null 2>&1 || install="$install git"
+          if [ -n "$install" ]; then
+            $apt update
+            $apt install -y --no-install-recommends $install
+          fi
+
+      - name: Install PostgreSQL server binaries (ephemeral clusters only, no service)
+        run: |
+          set -eu
+          apt="apt-get"
+          [ "$(id -u)" -eq 0 ] || apt="sudo apt-get"
+          # deploy/pg-test.sh needs initdb/pg_ctl (server package) and finds
+          # them via PATH or pg_config --bindir. Installing the server
+          # package also creates the non-root `postgres` account the launcher
+          # delegates to when the runner user is root. No PG service is
+          # started, and the launcher never connects to any preexisting
+          # instance anyway (socket-only cluster in its own private dir).
+          have_pg=""
+          command -v initdb >/dev/null 2>&1 && have_pg=1
+          if [ -z "$have_pg" ] && command -v pg_config >/dev/null 2>&1 \
+             && [ -x "$(pg_config --bindir)/initdb" ]; then
+            have_pg=1
+          fi
+          if [ -z "$have_pg" ]; then
+            $apt update
+            $apt install -y --no-install-recommends postgresql libpq-dev postgresql-client
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Install Node.js (web asset tests run node)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install browser test dependencies
+        working-directory: cloud/tests/browser
+        run: |
+          npm ci
+          npx --no-install playwright-core install --with-deps chromium
+
+      # Shared cargo target/ + registry cache for this job across runs.
+      - name: Cache cargo target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format (muster-cloud)
+        run: cargo fmt -p muster-cloud -- --check
+
+      - name: Clippy (muster-cloud)
+        run: cargo clippy --locked -p muster-cloud --all-targets --all-features -- -D warnings
+
+      # Ephemeral PostgreSQL via deploy/pg-test.sh; the command's exit status
+      # is preserved, so any failure (including a missing cluster) is red.
+      # Migrations are the caller's choice: cloud tests run sqlx migrations
+      # themselves against MUSTER_TEST_PG (the launcher never invents SQL).
+      - name: Tests (ephemeral PostgreSQL, socket-only)
+        run: deploy/pg-test.sh -- cargo test --locked -p muster-cloud --tests
+
+  backup-drill:
+    name: backup-drill
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ci-docker
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools (cc, git, curl)
+        run: |
+          set -eu
+          apt="apt-get"
+          [ "$(id -u)" -eq 0 ] || apt="sudo apt-get"
+          install=""
+          command -v cc >/dev/null 2>&1 || install="$install build-essential"
+          command -v git >/dev/null 2>&1 || install="$install git"
+          command -v curl >/dev/null 2>&1 || install="$install curl"
+          if [ -n "$install" ]; then
+            $apt update
+            $apt install -y --no-install-recommends $install
+          fi
+
+      - name: Install PostgreSQL server binaries (ephemeral clusters only, no service)
+        run: |
+          set -eu
+          apt="apt-get"
+          [ "$(id -u)" -eq 0 ] || apt="sudo apt-get"
+          have_pg=""
+          command -v initdb >/dev/null 2>&1 && have_pg=1
+          if [ -z "$have_pg" ] && command -v pg_config >/dev/null 2>&1 \
+             && [ -x "$(pg_config --bindir)/initdb" ]; then
+            have_pg=1
+          fi
+          if [ -z "$have_pg" ]; then
+            $apt update
+            $apt install -y --no-install-recommends postgresql libpq-dev postgresql-client
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo target
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Separate key from the test job: the drill only needs two artifacts.
+          cache-targets: false
+
+      - name: Build service binary and library for the drill
+        run: cargo build --locked -p muster --lib -p muster-cloud
+
+      # The drill composes deploy/pg-test.sh (ephemeral socket-only cluster),
+      # deploy/pg-backup.sh, deploy/pg-restore.sh and the rustc-built harness
+      # (deploy/harness/drill.rs links the just-built muster library rlib; no
+      # manifest changes). Its exit status decides the step.
+      - name: Backup/restore drill
+        run: deploy/backup-drill.sh
