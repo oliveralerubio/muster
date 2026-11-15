@@ -123,6 +123,30 @@ pub fn guard(ctx: &mut Context, command: &str, mutating: bool) -> Result<(), Mus
             return Err(MusterError::Security(message));
         }
     };
+    // A Cloud pull that joins another history names the REMOTE signer with
+    // `--expect-signer`. The local scaffold this machine generated for itself
+    // is signed by its own key, so enforcing that expectation here would
+    // reject the join before anything is downloaded. The expectation keeps
+    // being enforced where it belongs: against the staged incoming history
+    // (`sync_transport::verify_and_checkout`) and at the post-checkout
+    // pinning — both read `ctx.expect_signer`, restored below.
+    let joining_cloud_pull = ctx.sync_cloud_pull
+        && matches!(
+            crate::cloud_client::CloudLink::load(&ctx.state_dir),
+            Ok(Some(_))
+        )
+        && matches!(
+            (
+                crate::fleet_state::FleetState::load(&ctx.config_dir),
+                crate::signing::Signer::load(&ctx.state_dir),
+            ),
+            (Ok(Some(state)), Ok(Some(signer))) if signer.public() == state.payload.signer
+        );
+    let remote_expect = if joining_cloud_pull {
+        ctx.expect_signer.take()
+    } else {
+        None
+    };
     let verification = match verify(ctx, &manifest, !ctx.dry_run) {
         // `doctor` reports a failed verification next to its other findings.
         Err(MusterError::Security(message)) if command == "doctor" => {
@@ -136,6 +160,9 @@ pub fn guard(ctx: &mut Context, command: &str, mutating: bool) -> Result<(), Mus
         }
         other => other?,
     };
+    if let Some(expect) = remote_expect {
+        ctx.expect_signer = Some(expect);
+    }
     if verification == Verification::Legacy && mutating && !ctx.dry_run {
         migrate_legacy(ctx, manifest)?;
     }
