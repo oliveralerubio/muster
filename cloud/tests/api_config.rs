@@ -128,3 +128,162 @@ async fn git_storage_root_is_required_and_absolute() {
         "output: {output}"
     );
 }
+
+/// (case name, MUSTER_ENV, Paddle variables, expected text in the refusal)
+type PaddleCase<'a> = (&'a str, &'a str, Vec<(&'a str, String)>, &'a str);
+
+/// Paddle billing needs an explicit environment (`sandbox` or `live`), a key
+/// of that environment, and talks only to that environment's official API.
+/// Refusals never echo the key or the webhook secret.
+#[tokio::test]
+async fn paddle_environment_is_explicit_and_provider_url_is_safe() {
+    // Synthetic values assembled at runtime; never real credentials.
+    let sandbox_key = format!(
+        "pdl_{}_apikey_{}",
+        "sdbx", "01synthetic0000000000000000_synthetic000000000000000_zz"
+    );
+    let live_key = format!(
+        "pdl_{}_apikey_{}",
+        "live", "01synthetic0000000000000000_synthetic000000000000000_zz"
+    );
+    let secret = format!(
+        "pdl_ntfset_{}",
+        "01synthetic0000000000000000_synthetic0000000000000"
+    );
+
+    let cases: Vec<PaddleCase> = vec![
+        (
+            "missing environment",
+            "production",
+            vec![("MUSTER_PADDLE_API_KEY", sandbox_key.clone())],
+            "MUSTER_PADDLE_ENVIRONMENT",
+        ),
+        (
+            "legacy name",
+            "production",
+            vec![
+                ("MUSTER_PADDLE_API_KEY", live_key.clone()),
+                ("MUSTER_PADDLE_ENVIRONMENT", "production".into()),
+            ],
+            "MUSTER_PADDLE_ENVIRONMENT",
+        ),
+        (
+            "sandbox key on live",
+            "production",
+            vec![
+                ("MUSTER_PADDLE_API_KEY", sandbox_key.clone()),
+                ("MUSTER_PADDLE_ENVIRONMENT", "live".into()),
+            ],
+            "MUSTER_PADDLE_API_KEY",
+        ),
+        (
+            "live key on sandbox",
+            "production",
+            vec![
+                ("MUSTER_PADDLE_API_KEY", live_key.clone()),
+                ("MUSTER_PADDLE_ENVIRONMENT", "sandbox".into()),
+            ],
+            "MUSTER_PADDLE_API_KEY",
+        ),
+        (
+            "provider url override in production",
+            "production",
+            vec![
+                ("MUSTER_PADDLE_API_KEY", sandbox_key.clone()),
+                ("MUSTER_PADDLE_ENVIRONMENT", "sandbox".into()),
+                ("MUSTER_PADDLE_BASE_URL", "http://127.0.0.1:9".into()),
+            ],
+            "MUSTER_PADDLE_BASE_URL",
+        ),
+        (
+            "live outside production",
+            "development",
+            vec![
+                ("MUSTER_PADDLE_API_KEY", live_key.clone()),
+                ("MUSTER_PADDLE_ENVIRONMENT", "live".into()),
+            ],
+            "MUSTER_PADDLE_ENVIRONMENT",
+        ),
+    ];
+
+    for (name, muster_env, paddle, expected) in cases {
+        let mut env: Vec<(&str, String)> = vec![
+            ("MUSTER_ENV", muster_env.into()),
+            ("MUSTER_BIND", "127.0.0.1:0".into()),
+            ("MUSTER_REPO_ROOT", "/nonexistent/muster-repos".into()),
+            ("MUSTER_PUBLIC_URL", "https://app.example.com".into()),
+            ("MUSTER_DATABASE_URL", "postgres://localhost:1/db".into()),
+            ("MUSTER_OIDC_ISSUER", "https://idp.example.com".into()),
+            ("MUSTER_OIDC_CLIENT_ID", "client".into()),
+            ("MUSTER_OIDC_CLIENT_SECRET", "synthetic".into()),
+            ("MUSTER_PADDLE_WEBHOOK_SECRET", secret.clone()),
+            (
+                "MUSTER_PADDLE_PRICE_PERSONAL",
+                "pri_01synthetic00000000000personal".into(),
+            ),
+            (
+                "MUSTER_PADDLE_PRICE_TEAM_SEAT",
+                "pri_01synthetic00000000000teamseat".into(),
+            ),
+        ];
+        env.extend(paddle);
+        let (code, output) = run_cloud_expecting_exit(&env).await;
+        assert_eq!(code, Some(78), "{name}: {output}");
+        assert!(
+            output.contains("configuration error") && output.contains(expected),
+            "{name}: {output}"
+        );
+        for leaked in [&sandbox_key, &live_key, &secret] {
+            assert!(
+                !output.contains(leaked.as_str()),
+                "{name}: output leaks a credential"
+            );
+        }
+    }
+}
+
+/// A valid billing configuration is logged at startup with its credentials
+/// redacted.
+#[tokio::test]
+async fn startup_log_redacts_paddle_credentials() {
+    let key = format!(
+        "pdl_{}_apikey_{}",
+        "sdbx", "01synthetic0000000000000000_synthetic000000000000000_yy"
+    );
+    let secret = format!(
+        "pdl_ntfset_{}",
+        "01synthetic0000000000000000_synthetic0000000000yy"
+    );
+    let (code, output) = run_cloud_expecting_exit(&[
+        ("MUSTER_ENV", "development".into()),
+        ("MUSTER_BIND", "127.0.0.1:0".into()),
+        ("MUSTER_REPO_ROOT", "/nonexistent/muster-repos".into()),
+        ("MUSTER_PUBLIC_URL", "http://127.0.0.1:1".into()),
+        ("MUSTER_DATABASE_URL", "postgres://localhost:1/db".into()),
+        ("MUSTER_OIDC_ISSUER", "http://127.0.0.1:2".into()),
+        ("MUSTER_OIDC_CLIENT_ID", "client".into()),
+        ("MUSTER_OIDC_CLIENT_SECRET", "synthetic".into()),
+        ("MUSTER_PADDLE_API_KEY", key.clone()),
+        ("MUSTER_PADDLE_WEBHOOK_SECRET", secret.clone()),
+        ("MUSTER_PADDLE_ENVIRONMENT", "sandbox".into()),
+        (
+            "MUSTER_PADDLE_PRICE_PERSONAL",
+            "pri_01synthetic00000000000personal".into(),
+        ),
+        (
+            "MUSTER_PADDLE_PRICE_TEAM_SEAT",
+            "pri_01synthetic00000000000teamseat".into(),
+        ),
+    ])
+    .await;
+    assert_eq!(code, Some(78), "{output}");
+    assert!(
+        output.contains("PaddleConfig"),
+        "config was not logged: {output}"
+    );
+    assert!(output.contains("sandbox-api.paddle.com"), "{output}");
+    assert!(
+        !output.contains(&key) && !output.contains(&secret),
+        "credential leaked"
+    );
+}

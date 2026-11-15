@@ -9,6 +9,7 @@ pub mod protocol;
 
 pub mod auth;
 pub mod billing;
+pub mod billing_reconcile;
 pub mod config;
 pub mod device_links;
 pub mod error;

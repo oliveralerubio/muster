@@ -152,15 +152,48 @@ impl Config {
                     .ok_or(ConfigError::Missing("MUSTER_PADDLE_PRICE_PERSONAL"))?;
                 let price_team_seat = get("MUSTER_PADDLE_PRICE_TEAM_SEAT")
                     .ok_or(ConfigError::Missing("MUSTER_PADDLE_PRICE_TEAM_SEAT"))?;
-                let environment =
-                    get("MUSTER_PADDLE_ENVIRONMENT").unwrap_or_else(|| "sandbox".into());
-                let base_url = get("MUSTER_PADDLE_BASE_URL").unwrap_or_else(|| {
-                    if environment == "production" {
-                        "https://api.paddle.com".into()
-                    } else {
-                        "https://sandbox-api.paddle.com".into()
+                // Paddle: "separate sandbox and live environments. Each has its
+                // own base URL and its own set of API keys."
+                // (developer.paddle.com/api-reference/about)
+                let environment = get("MUSTER_PADDLE_ENVIRONMENT")
+                    .ok_or(ConfigError::Missing("MUSTER_PADDLE_ENVIRONMENT"))?;
+                let (official_url, key_prefix) = match environment.as_str() {
+                    "sandbox" => ("https://sandbox-api.paddle.com", "pdl_sdbx_apikey_"),
+                    "live" => ("https://api.paddle.com", "pdl_live_apikey_"),
+                    _ => {
+                        return Err(ConfigError::Invalid {
+                            name: "MUSTER_PADDLE_ENVIRONMENT",
+                            reason: "expected sandbox or live".into(),
+                        })
                     }
-                });
+                };
+                if environment == "live" && !env.is_production() {
+                    return Err(ConfigError::Invalid {
+                        name: "MUSTER_PADDLE_ENVIRONMENT",
+                        reason: "live billing requires MUSTER_ENV=production".into(),
+                    });
+                }
+                if !api_key.starts_with(key_prefix) {
+                    // Never echo the key itself.
+                    return Err(ConfigError::Invalid {
+                        name: "MUSTER_PADDLE_API_KEY",
+                        reason: format!("is not a {environment} API key"),
+                    });
+                }
+                let base_url = match get("MUSTER_PADDLE_BASE_URL") {
+                    None => official_url.to_string(),
+                    Some(url) if url.trim_end_matches('/') == official_url => official_url.to_string(),
+                    Some(_) if env.is_production() => {
+                        return Err(ConfigError::Invalid {
+                            name: "MUSTER_PADDLE_BASE_URL",
+                            reason: format!(
+                                "only the official {environment} API ({official_url}) is allowed in production"
+                            ),
+                        })
+                    }
+                    // Development only: a local provider fixture.
+                    Some(url) => url.trim_end_matches('/').to_string(),
+                };
                 Some(PaddleConfig {
                     environment,
                     api_key,
@@ -233,6 +266,7 @@ impl fmt::Debug for Config {
             .field("oidc_client_id", &self.oidc_client_id)
             .field("oidc_client_secret", &"[REDACTED]")
             .field("repo_root", &self.repo_root)
+            .field("paddle", &self.paddle)
             .finish()
     }
 }

@@ -57,6 +57,39 @@ async fn require_admin_or_owner(state: &AppState, ws: Uuid, user: Uuid) -> Resul
     Ok(())
 }
 
+/// `(plan, status, seats, current_period_end, cancel_at_period_end)`.
+pub(crate) type SubRow = (String, String, i32, OffsetDateTime, bool);
+
+/// The subscription that decides a workspace's entitlements: a workspace can
+/// accumulate several (canceled, then subscribed again); a live one wins over
+/// a canceled one, then the most recently updated by Paddle.
+pub(crate) async fn current_subscription<'e>(
+    db: impl sqlx::PgExecutor<'e>,
+    ws: Uuid,
+) -> Result<Option<SubRow>, AppError> {
+    Ok(sqlx::query_as(
+        "SELECT plan, status, seats, current_period_end, cancel_at_period_end
+           FROM subscriptions WHERE workspace_id = $1
+          ORDER BY (status <> 'canceled') DESC, provider_updated_at DESC NULLS LAST, updated_at DESC
+          LIMIT 1",
+    )
+    .bind(ws)
+    .fetch_optional(db)
+    .await?)
+}
+
+/// What a Paddle subscription status allows, with no locally invented
+/// windows. `past_due` keeps push while Paddle retries the payment (Paddle
+/// then cancels or pauses it); pull and export never depend on payment.
+pub(crate) fn subscription_entitlement(status: &str) -> (PlanStatus, bool) {
+    match status {
+        "active" | "trialing" => (PlanStatus::Active, true),
+        "past_due" => (PlanStatus::PastDue, true),
+        "canceled" => (PlanStatus::Canceled, false),
+        _ => (PlanStatus::Restricted, false),
+    }
+}
+
 /// `GET /v1/workspaces/{ws}/billing`: plan, trial, limits, and capabilities.
 pub async fn get_billing(
     State(state): State<AppState>,
@@ -77,24 +110,11 @@ pub async fn get_billing(
     let now = OffsetDateTime::now_utc();
     let billing_configured = state.config.paddle.is_some();
 
-    type SubRow = (String, String, i32, OffsetDateTime, bool);
-    let sub: Option<SubRow> = sqlx::query_as(
-        "SELECT plan, status, seats, current_period_end, cancel_at_period_end
-         FROM subscriptions WHERE workspace_id = $1",
-    )
-    .bind(ws)
-    .fetch_optional(&state.db)
-    .await?;
+    let sub = current_subscription(&state.db, ws).await?;
 
     let billing = match sub {
         Some((plan, status_str, seats, period_end, cancel_at_end)) => {
-            let plan_status = match status_str.as_str() {
-                "active" => PlanStatus::Active,
-                "past_due" => PlanStatus::PastDue,
-                "canceled" => PlanStatus::Canceled,
-                _ => PlanStatus::Active,
-            };
-            let can_push = matches!(plan_status, PlanStatus::Active | PlanStatus::PastDue);
+            let (plan_status, can_push) = subscription_entitlement(&status_str);
             let (max_devices, max_storage) = if plan == "team" {
                 (
                     (seats as u32) * 50,
@@ -166,6 +186,16 @@ pub async fn create_checkout(
     };
 
     let req: CreateCheckout = parse_json(&body)?;
+    if current_subscription(&state.db, ws)
+        .await?
+        .is_some_and(|(_, status, ..)| status != "canceled")
+    {
+        return Err(AppError::new(
+            StatusCode::CONFLICT,
+            error_codes::SUBSCRIPTION_EXISTS,
+            "workspace already has a live subscription",
+        ));
+    }
     let is_team = req.plan == "team";
     let seats = if is_team { req.seats.max(1) } else { 1 };
     let price_id = if is_team {
@@ -227,7 +257,8 @@ pub async fn create_checkout(
     let txn_id = data
         .get("id")
         .and_then(|v| v.as_str())
-        .unwrap_or_default()
+        .filter(|id| id.starts_with("txn_"))
+        .ok_or_else(|| AppError::internal("no transaction id in paddle resp"))?
         .to_string();
     let checkout_url = data
         .get("checkout")
@@ -235,6 +266,20 @@ pub async fn create_checkout(
         .and_then(|u| u.as_str())
         .ok_or_else(|| AppError::internal("no checkout url in paddle resp"))?
         .to_string();
+
+    // The association that lets `subscription.created` grant rights.
+    sqlx::query(
+        "INSERT INTO billing_checkouts (transaction_id, workspace_id, created_by, plan, seats, price_id)
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(&txn_id)
+    .bind(ws)
+    .bind(account.user_id)
+    .bind(if is_team { "team" } else { "personal" })
+    .bind(seats as i32)
+    .bind(price_id)
+    .execute(&state.db)
+    .await?;
 
     Ok(Json(CheckoutSession {
         checkout_url,
@@ -314,37 +359,46 @@ pub async fn cancel_subscription(
         return Err(AppError::billing_unconfigured());
     };
 
-    let sub_row: Option<(String,)> =
-        sqlx::query_as("SELECT paddle_subscription_id FROM subscriptions WHERE workspace_id = $1")
-            .bind(ws)
-            .fetch_optional(&state.db)
-            .await?;
+    // The row lock serialises concurrent cancels of the same subscription.
+    let mut tx = state.db.begin().await?;
+    let sub_row: Option<(String, String, bool)> = sqlx::query_as(
+        "SELECT paddle_subscription_id, status, cancel_at_period_end FROM subscriptions
+          WHERE workspace_id = $1
+          ORDER BY (status <> 'canceled') DESC, provider_updated_at DESC NULLS LAST, updated_at DESC
+          LIMIT 1
+          FOR UPDATE",
+    )
+    .bind(ws)
+    .fetch_optional(&mut *tx)
+    .await?;
 
-    let (sub_id,) = sub_row
+    let (sub_id, status, already_scheduled) = sub_row
         .ok_or_else(|| AppError::bad_request("workspace has no active subscription to cancel"))?;
+    if already_scheduled || status == "canceled" {
+        // Already cancelled or scheduled: nothing to ask Paddle again.
+        tx.commit().await?;
+        return Ok(StatusCode::OK.into_response());
+    }
 
-    let client = reqwest::Client::new();
-    let url = format!("{}/subscriptions/{sub_id}/cancel", paddle.base_url);
-
-    let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", paddle.api_key))
+    let resp = crate::billing_reconcile::paddle_http()
+        .post(format!("{}/subscriptions/{sub_id}/cancel", paddle.base_url))
+        .bearer_auth(&paddle.api_key)
         .json(&serde_json::json!({ "effective_from": "next_billing_period" }))
         .send()
         .await
-        .map_err(|e| AppError::internal(format!("paddle cancel error: {e}")))?;
+        .map_err(|e| AppError::internal(format!("paddle cancel error: {}", e.without_url())))?;
 
     if !resp.status().is_success() {
-        let err_text = resp.text().await.unwrap_or_default();
         return Err(AppError::internal(format!(
-            "paddle cancel rejected: {err_text}"
+            "paddle cancel rejected with {}",
+            resp.status()
         )));
     }
 
-    sqlx::query("UPDATE subscriptions SET cancel_at_period_end = true WHERE workspace_id = $1")
-        .bind(ws)
-        .execute(&state.db)
-        .await?;
+    // Local state comes from Paddle's canonical subscription, not from here.
+    crate::billing_reconcile::enqueue(&mut tx, &sub_id, ws).await?;
+    tx.commit().await?;
+    crate::billing_reconcile::run_now(&state, &sub_id).await;
 
     Ok(StatusCode::OK.into_response())
 }
@@ -373,21 +427,22 @@ pub async fn update_plan(
         &paddle.price_personal
     };
 
-    let sub_row: Option<(String,)> =
-        sqlx::query_as("SELECT paddle_subscription_id FROM subscriptions WHERE workspace_id = $1")
-            .bind(ws)
-            .fetch_optional(&state.db)
-            .await?;
+    let sub_row: Option<(String,)> = sqlx::query_as(
+        "SELECT paddle_subscription_id FROM subscriptions
+          WHERE workspace_id = $1 AND status <> 'canceled'
+          ORDER BY provider_updated_at DESC NULLS LAST, updated_at DESC
+          LIMIT 1",
+    )
+    .bind(ws)
+    .fetch_optional(&state.db)
+    .await?;
 
     let (sub_id,) = sub_row
         .ok_or_else(|| AppError::bad_request("workspace has no active subscription to update"))?;
 
-    let client = reqwest::Client::new();
-    let url = format!("{}/subscriptions/{sub_id}", paddle.base_url);
-
-    let resp = client
-        .patch(&url)
-        .header("Authorization", format!("Bearer {}", paddle.api_key))
+    let resp = crate::billing_reconcile::paddle_http()
+        .patch(format!("{}/subscriptions/{sub_id}", paddle.base_url))
+        .bearer_auth(&paddle.api_key)
         .json(&serde_json::json!({
             "items": [
                 {
@@ -399,14 +454,20 @@ pub async fn update_plan(
         }))
         .send()
         .await
-        .map_err(|e| AppError::internal(format!("paddle update error: {e}")))?;
+        .map_err(|e| AppError::internal(format!("paddle update error: {}", e.without_url())))?;
 
     if !resp.status().is_success() {
-        let err_text = resp.text().await.unwrap_or_default();
         return Err(AppError::internal(format!(
-            "paddle update rejected: {err_text}"
+            "paddle update rejected with {}",
+            resp.status()
         )));
     }
+
+    // Entitlements follow Paddle's canonical subscription.
+    let mut tx = state.db.begin().await?;
+    crate::billing_reconcile::enqueue(&mut tx, &sub_id, ws).await?;
+    tx.commit().await?;
+    crate::billing_reconcile::run_now(&state, &sub_id).await;
 
     Ok(StatusCode::OK.into_response())
 }
@@ -471,6 +532,37 @@ fn verify_paddle_signature(
     Ok(())
 }
 
+/// Workspace an event belongs to, from server-side state only: a subscription
+/// already bound to a workspace, or the checkout transaction this server
+/// created (`transaction_id`, present on `subscription.created`).
+/// `custom_data` is never consulted.
+async fn associated_workspace(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    data: Option<&serde_json::Value>,
+) -> Result<Option<Uuid>, AppError> {
+    let Some(data) = data else { return Ok(None) };
+    if let Some(sub_id) = data.get("id").and_then(|v| v.as_str()) {
+        let bound: Option<(Uuid,)> = sqlx::query_as(
+            "SELECT workspace_id FROM subscriptions WHERE paddle_subscription_id = $1",
+        )
+        .bind(sub_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if let Some((ws,)) = bound {
+            return Ok(Some(ws));
+        }
+    }
+    let Some(txn) = data.get("transaction_id").and_then(|v| v.as_str()) else {
+        return Ok(None);
+    };
+    let checkout: Option<(Uuid,)> =
+        sqlx::query_as("SELECT workspace_id FROM billing_checkouts WHERE transaction_id = $1")
+            .bind(txn)
+            .fetch_optional(&mut **tx)
+            .await?;
+    Ok(checkout.map(|(ws,)| ws))
+}
+
 /// `POST /v1/billing/webhook`: unauthenticated webhook endpoint for Paddle.
 pub async fn handle_webhook(
     State(state): State<AppState>,
@@ -527,11 +619,7 @@ pub async fn handle_webhook(
     }
 
     let data = event.get("data");
-    let ws_id = data
-        .and_then(|d| d.get("custom_data"))
-        .and_then(|c| c.get("workspace_id"))
-        .and_then(|w| w.as_str())
-        .and_then(|s| Uuid::parse_str(s).ok());
+    let ws_id = associated_workspace(&mut tx, data).await?;
 
     sqlx::query(
         "INSERT INTO billing_events (event_id, event_type, workspace_id, occurred_at, payload, processed_at)
@@ -545,107 +633,23 @@ pub async fn handle_webhook(
     .execute(&mut *tx)
     .await?;
 
-    // If the event maps to a known workspace, reconcile its subscription state.
-    if let (Some(ws), Some(data)) = (ws_id, data) {
-        let ws_exists: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM workspaces WHERE id = $1")
-            .bind(ws)
-            .fetch_optional(&mut *tx)
-            .await?;
-
-        if ws_exists.is_some() {
-            let sub_id = data.get("id").and_then(|v| v.as_str());
-            let customer_id = data.get("customer_id").and_then(|v| v.as_str());
-            let status = data
-                .get("status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("active");
-            let plan = data
-                .get("custom_data")
-                .and_then(|c| c.get("plan"))
-                .and_then(|p| p.as_str())
-                .unwrap_or("personal");
-
-            let period_start = data
-                .get("current_billing_period")
-                .and_then(|p| p.get("starts_at"))
-                .and_then(|s| s.as_str())
-                .and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok())
-                .unwrap_or(occurred_at);
-
-            let period_end = data
-                .get("current_billing_period")
-                .and_then(|p| p.get("ends_at"))
-                .and_then(|s| s.as_str())
-                .and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok())
-                .unwrap_or_else(|| occurred_at + time::Duration::days(30));
-
-            let seats = data
-                .get("items")
-                .and_then(|i| i.as_array())
-                .and_then(|arr| arr.first())
-                .and_then(|item| item.get("quantity"))
-                .and_then(|q| q.as_u64())
-                .unwrap_or(1) as i32;
-
-            if let Some(cust_id) = customer_id {
-                sqlx::query(
-                    "INSERT INTO billing_customers (workspace_id, customer_id, email, created_at)
-                     VALUES ($1, $2, '', now())
-                     ON CONFLICT (workspace_id) DO UPDATE SET customer_id = EXCLUDED.customer_id",
-                )
-                .bind(ws)
-                .bind(cust_id)
-                .execute(&mut *tx)
-                .await?;
-            }
-
-            if let Some(sub) = sub_id {
-                // Out-of-order check: do not overwrite with older event.
-                let prev: Option<(OffsetDateTime,)> = sqlx::query_as(
-                    "SELECT last_event_occurred_at FROM subscriptions WHERE paddle_subscription_id = $1",
-                )
-                .bind(sub)
-                .fetch_optional(&mut *tx)
-                .await?;
-
-                let should_update = match prev {
-                    Some((prev_occ,)) => occurred_at >= prev_occ,
-                    None => true,
-                };
-
-                if should_update {
-                    let is_canceled = status == "canceled";
-                    sqlx::query(
-                        "INSERT INTO subscriptions (workspace_id, paddle_subscription_id, customer_id, plan, seats, status, current_period_start, current_period_end, cancel_at_period_end, canceled_at, last_event_occurred_at, created_at, updated_at)
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false, $9, $10, now(), now())
-                         ON CONFLICT (paddle_subscription_id) DO UPDATE SET
-                           status = EXCLUDED.status,
-                           plan = EXCLUDED.plan,
-                           seats = EXCLUDED.seats,
-                           current_period_start = EXCLUDED.current_period_start,
-                           current_period_end = EXCLUDED.current_period_end,
-                           canceled_at = EXCLUDED.canceled_at,
-                           last_event_occurred_at = EXCLUDED.last_event_occurred_at,
-                           updated_at = now()",
-                    )
-                    .bind(ws)
-                    .bind(sub)
-                    .bind(customer_id.unwrap_or_default())
-                    .bind(plan)
-                    .bind(seats)
-                    .bind(status)
-                    .bind(period_start)
-                    .bind(period_end)
-                    .bind(if is_canceled { Some(occurred_at) } else { None })
-                    .bind(occurred_at)
-                    .execute(&mut *tx)
-                    .await?;
-                }
-            }
-        }
+    // Subscription events for an associated workspace trigger a canonical
+    // re-read from Paddle; the payload itself never writes entitlements.
+    let sub_to_reconcile = match (ws_id, data) {
+        (Some(ws), Some(data)) if event_type.starts_with("subscription.") => data
+            .get("id")
+            .and_then(|v| v.as_str())
+            .filter(|id| id.starts_with("sub_"))
+            .map(|id| (id.to_string(), ws)),
+        _ => None,
+    };
+    if let Some((sub, ws)) = &sub_to_reconcile {
+        crate::billing_reconcile::enqueue(&mut tx, sub, *ws).await?;
     }
-
     tx.commit().await?;
 
+    if let Some((sub, _)) = sub_to_reconcile {
+        crate::billing_reconcile::run_now(&state, &sub).await;
+    }
     Ok(StatusCode::OK)
 }

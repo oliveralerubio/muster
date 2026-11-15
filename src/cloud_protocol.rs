@@ -157,6 +157,9 @@ pub mod error_codes {
     pub const RATE_LIMITED: &str = "rate_limited";
     /// 503: billing provider not configured on this deployment.
     pub const BILLING_UNCONFIGURED: &str = "billing_unconfigured";
+    /// 409: the workspace already has a live subscription; change it
+    /// (plan/cancel/portal) instead of checking out again.
+    pub const SUBSCRIPTION_EXISTS: &str = "subscription_exists";
     /// 503: a dependency (database) is unavailable.
     pub const NOT_READY: &str = "not_ready";
     /// 507

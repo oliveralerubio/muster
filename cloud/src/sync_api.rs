@@ -267,20 +267,10 @@ pub async fn post_sync(
         .await?;
 
     // Check plan entitlements (paid subscriptions or active trial).
-    type SubStatus = (String, time::OffsetDateTime);
-    let sub: Option<SubStatus> = sqlx::query_as(
-        "SELECT status, current_period_end FROM subscriptions WHERE workspace_id = $1",
-    )
-    .bind(ws_id)
-    .fetch_optional(&mut *tx)
-    .await?;
+    let sub = crate::billing::current_subscription(&mut *tx, ws_id).await?;
 
     let can_push = match sub {
-        Some((status, period_end)) => match status.as_str() {
-            "active" => true,
-            "past_due" => time::OffsetDateTime::now_utc() < period_end + time::Duration::days(3),
-            _ => false,
-        },
+        Some((_, status, ..)) => crate::billing::subscription_entitlement(&status).1,
         None => {
             let row: Option<(time::OffsetDateTime,)> =
                 sqlx::query_as("SELECT trial_ends_at FROM workspaces WHERE id = $1")

@@ -75,6 +75,14 @@ async fn main() -> ExitCode {
         oidc,
         repos,
     };
+    if state.config.paddle.is_some() {
+        // Retries billing reconciliations left pending, including by a
+        // previous process.
+        tokio::spawn(muster_cloud::billing_reconcile::worker(
+            state.clone(),
+            Duration::from_secs(1),
+        ));
+    }
     println!("muster-cloud listening on http://{addr}");
     if let Err(err) = axum::serve(listener, muster_cloud::router(state)).await {
         eprintln!("muster-cloud: server error: {err}");
