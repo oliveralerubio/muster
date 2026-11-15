@@ -6,8 +6,18 @@
 mod support;
 
 use std::fs;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
+
+use axum::body::Bytes;
+use axum::extract::{Path as AxumPath, State as AxumState};
+use axum::http::{HeaderMap, Method, StatusCode, Uri};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use serde::Deserialize;
 
 use muster_cloud::protocol::{
     body_sha256_hex, canonical_link_v1, canonical_request_v1, AccountToken, ApiError,
@@ -432,6 +442,193 @@ async fn seed_browser_fixtures(base: &str) -> BrowserFixtures {
     }
 }
 
+#[derive(Default)]
+struct FaultRule {
+    remaining: usize,
+    path_contains: String,
+}
+
+#[derive(Clone)]
+struct PaddleProxyState {
+    upstream_base: String,
+    client: reqwest::Client,
+    fault: Arc<Mutex<FaultRule>>,
+}
+
+#[derive(Clone)]
+struct PaddleControlState {
+    paddle: support::paddle_fixture::PaddleFixture,
+    billing_cloud_url: String,
+    client: reqwest::Client,
+    fault: Arc<Mutex<FaultRule>>,
+}
+
+#[derive(Deserialize)]
+struct CompleteCheckoutReq {
+    transaction_id: String,
+    subscription_id: String,
+    customer_id: String,
+}
+
+#[derive(Deserialize)]
+struct UpdateSubscriptionReq {
+    subscription_id: String,
+    event_type: String,
+    status: Option<String>,
+    cancel_at_period_end: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct FailNextReq {
+    count: usize,
+    #[serde(default)]
+    path_contains: String,
+}
+
+async fn paddle_proxy_handler(
+    AxumState(state): AxumState<PaddleProxyState>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let path_and_query = uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or_else(|| uri.path());
+    {
+        let mut fault = state.fault.lock().unwrap();
+        if fault.remaining > 0
+            && (fault.path_contains.is_empty() || path_and_query.contains(&fault.path_contains))
+        {
+            fault.remaining -= 1;
+            return (StatusCode::SERVICE_UNAVAILABLE, "simulated provider outage").into_response();
+        }
+    }
+
+    let target = format!("{}{}", state.upstream_base, path_and_query);
+    let req_method = reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap();
+    let mut req = state.client.request(req_method, target);
+    if let Some(auth) = headers.get(axum::http::header::AUTHORIZATION) {
+        if let Ok(s) = auth.to_str() {
+            req = req.header("Authorization", s);
+        }
+    }
+    if let Some(ct) = headers.get(axum::http::header::CONTENT_TYPE) {
+        if let Ok(s) = ct.to_str() {
+            req = req.header("Content-Type", s);
+        }
+    }
+    if !body.is_empty() {
+        req = req.body(body.to_vec());
+    }
+
+    match req.send().await {
+        Ok(resp) => {
+            let status =
+                StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            let ct = resp
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            let bytes = resp.bytes().await.unwrap_or_default();
+            let mut out = (status, bytes).into_response();
+            if let Some(ct) = ct {
+                if let Ok(hv) = axum::http::HeaderValue::from_str(&ct) {
+                    out.headers_mut()
+                        .insert(axum::http::header::CONTENT_TYPE, hv);
+                }
+            }
+            out
+        }
+        Err(err) => (StatusCode::BAD_GATEWAY, format!("proxy error: {err}")).into_response(),
+    }
+}
+
+async fn send_signed_webhook(state: &PaddleControlState, event: &serde_json::Value) -> StatusCode {
+    let bytes = serde_json::to_vec(event).unwrap();
+    let ts = time::OffsetDateTime::now_utc().unix_timestamp();
+    let sig = state.paddle.sign_webhook(&bytes, ts);
+    let resp = state
+        .client
+        .post(format!("{}/v1/billing/webhook", state.billing_cloud_url))
+        .header("Paddle-Signature", sig)
+        .header("Content-Type", "application/json")
+        .body(bytes)
+        .send()
+        .await
+        .expect("deliver webhook to billing cloud");
+    StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+async fn control_complete_checkout(
+    AxumState(state): AxumState<PaddleControlState>,
+    Json(req): Json<CompleteCheckoutReq>,
+) -> Response {
+    let event =
+        state
+            .paddle
+            .complete_checkout(&req.transaction_id, &req.subscription_id, &req.customer_id);
+    let status = send_signed_webhook(&state, &event).await;
+    (
+        status,
+        Json(serde_json::json!({
+            "webhook_status": status.as_u16(),
+            "event": event,
+        })),
+    )
+        .into_response()
+}
+
+async fn control_update_subscription(
+    AxumState(state): AxumState<PaddleControlState>,
+    Json(req): Json<UpdateSubscriptionReq>,
+) -> Response {
+    let next_status = req.status;
+    let cancel_at_period_end = req.cancel_at_period_end;
+    let event = state
+        .paddle
+        .update_subscription(&req.subscription_id, &req.event_type, |sub| {
+            if let Some(st) = next_status {
+                sub["status"] = st.into();
+            }
+            if cancel_at_period_end == Some(false) {
+                sub["scheduled_change"] = serde_json::Value::Null;
+            }
+        });
+    let status = send_signed_webhook(&state, &event).await;
+    (
+        status,
+        Json(serde_json::json!({
+            "webhook_status": status.as_u16(),
+            "event": event,
+        })),
+    )
+        .into_response()
+}
+
+async fn control_calls(
+    AxumState(state): AxumState<PaddleControlState>,
+    AxumPath(name): AxumPath<String>,
+) -> Response {
+    Json(serde_json::json!({
+        "name": name,
+        "count": state.paddle.calls(&name),
+    }))
+    .into_response()
+}
+
+async fn control_fail_next(
+    AxumState(state): AxumState<PaddleControlState>,
+    Json(req): Json<FailNextReq>,
+) -> Response {
+    let mut fault = state.fault.lock().unwrap();
+    fault.remaining = req.count;
+    fault.path_contains = req.path_contains;
+    StatusCode::OK.into_response()
+}
+
 #[tokio::test]
 async fn browser_journeys() {
     let idp = support::oidc_fixture::start().await;
@@ -461,6 +658,100 @@ async fn browser_journeys() {
     let fixtures = seed_browser_fixtures(&public_url).await;
     let fixtures_json = serde_json::to_string(&fixtures).unwrap();
 
+    // Second cloud instance configured with the external Paddle HTTP fixture + fault proxy.
+    let paddle = support::paddle_fixture::start().await;
+    let fault = Arc::new(Mutex::new(FaultRule::default()));
+    let proxy_state = PaddleProxyState {
+        upstream_base: paddle.base_url.clone(),
+        client: support::http(),
+        fault: fault.clone(),
+    };
+    let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind paddle proxy");
+    let proxy_port = proxy_listener.local_addr().unwrap().port();
+    let proxy_url = format!("http://127.0.0.1:{proxy_port}");
+    let proxy_app = Router::new()
+        .fallback(paddle_proxy_handler)
+        .with_state(proxy_state);
+    let proxy_task = tokio::spawn(async move {
+        axum::serve(
+            proxy_listener,
+            proxy_app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .ok();
+    });
+
+    let billing_database_url = support::fresh_database().await;
+    let billing_repo_root = tempfile::tempdir().expect("billing repo root");
+    let billing_port = free_port();
+    let billing_public_url = format!("http://localhost:{billing_port}");
+    let billing_cloud = support::spawn_cloud(&[
+        ("MUSTER_ENV", "development".into()),
+        (
+            "MUSTER_REPO_ROOT",
+            billing_repo_root.path().display().to_string(),
+        ),
+        ("MUSTER_BIND", format!("127.0.0.1:{billing_port}")),
+        ("MUSTER_PUBLIC_URL", billing_public_url.clone()),
+        ("MUSTER_DATABASE_URL", billing_database_url),
+        ("MUSTER_OIDC_ISSUER", idp.issuer.clone()),
+        (
+            "MUSTER_OIDC_CLIENT_ID",
+            support::oidc_fixture::CLIENT_ID.into(),
+        ),
+        (
+            "MUSTER_OIDC_CLIENT_SECRET",
+            support::oidc_fixture::CLIENT_SECRET.into(),
+        ),
+        (
+            "MUSTER_PADDLE_API_KEY",
+            support::paddle_fixture::API_KEY.into(),
+        ),
+        (
+            "MUSTER_PADDLE_WEBHOOK_SECRET",
+            support::paddle_fixture::WEBHOOK_SECRET.into(),
+        ),
+        (
+            "MUSTER_PADDLE_PRICE_PERSONAL",
+            support::paddle_fixture::PRICE_PERSONAL.into(),
+        ),
+        (
+            "MUSTER_PADDLE_PRICE_TEAM_SEAT",
+            support::paddle_fixture::PRICE_TEAM_SEAT.into(),
+        ),
+        ("MUSTER_PADDLE_BASE_URL", proxy_url),
+        ("MUSTER_PADDLE_ENVIRONMENT", "sandbox".into()),
+    ])
+    .await;
+
+    let control_state = PaddleControlState {
+        paddle: paddle.clone(),
+        billing_cloud_url: billing_public_url.clone(),
+        client: support::http(),
+        fault: fault.clone(),
+    };
+    let control_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind paddle control");
+    let control_port = control_listener.local_addr().unwrap().port();
+    let control_url = format!("http://127.0.0.1:{control_port}");
+    let control_app = Router::new()
+        .route("/complete-checkout", post(control_complete_checkout))
+        .route("/update-subscription", post(control_update_subscription))
+        .route("/calls/{name}", get(control_calls))
+        .route("/fail-next", post(control_fail_next))
+        .with_state(control_state);
+    let control_task = tokio::spawn(async move {
+        axum::serve(
+            control_listener,
+            control_app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .ok();
+    });
+
     let browser_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
     let script = browser_dir.join("run.mjs");
 
@@ -468,6 +759,8 @@ async fn browser_journeys() {
     cmd.arg(&script)
         .current_dir(&browser_dir)
         .env("MUSTER_CLOUD_URL", &public_url)
+        .env("MUSTER_BILLING_CLOUD_URL", &billing_public_url)
+        .env("MUSTER_PADDLE_CONTROL_URL", &control_url)
         .env("MUSTER_BROWSER_FIXTURES", &fixtures_json)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -485,7 +778,12 @@ async fn browser_journeys() {
         .await
         .expect("failed to execute node browser suite (is Node.js installed?)");
 
-    // Keep `cloud`, `idp`, and `repo_root` alive across the entire browser run.
+    // Keep servers, fixtures, and temp dirs alive across the entire browser run.
+    control_task.abort();
+    proxy_task.abort();
+    drop(billing_cloud);
+    drop(billing_repo_root);
+    drop(paddle);
     drop(cloud);
     drop(idp);
     drop(repo_root);

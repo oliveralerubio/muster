@@ -61,6 +61,25 @@
     restoreSubmitError: null,
     restoreInFlight: false,
     restoreCreatedMessage: null,
+    billing: null,
+    loadingBilling: false,
+    billingError: null,
+    billingActionError: null,
+    billingNotice: null,
+    checkoutPlan: 'personal',
+    checkoutSeats: '2',
+    checkoutFieldError: null,
+    checkoutInFlight: false,
+    checkoutSession: null,
+    portalInFlight: false,
+    portalUrl: null,
+    updatePlanChoice: 'personal',
+    updateSeats: '2',
+    updatePlanFieldError: null,
+    confirmingPlanChange: null,
+    updatePlanInFlight: false,
+    confirmingCancel: false,
+    cancelInFlight: false,
     signOutInFlight: false,
     signOutError: null,
   };
@@ -269,6 +288,25 @@
       state.restoreSubmitError = null;
       state.restoreInFlight = false;
       state.restoreCreatedMessage = null;
+      state.billing = null;
+      state.loadingBilling = false;
+      state.billingError = null;
+      state.billingActionError = null;
+      state.billingNotice = null;
+      state.checkoutPlan = 'personal';
+      state.checkoutSeats = '2';
+      state.checkoutFieldError = null;
+      state.checkoutInFlight = false;
+      state.checkoutSession = null;
+      state.portalInFlight = false;
+      state.portalUrl = null;
+      state.updatePlanChoice = 'personal';
+      state.updateSeats = '2';
+      state.updatePlanFieldError = null;
+      state.confirmingPlanChange = null;
+      state.updatePlanInFlight = false;
+      state.confirmingCancel = false;
+      state.cancelInFlight = false;
       window.history.pushState({}, '', '/');
       renderShell();
     } catch (_err) {
@@ -320,6 +358,16 @@
     state.restoreSubmitError = null;
     state.restoreInFlight = false;
     state.restoreCreatedMessage = null;
+    state.billing = null;
+    state.loadingBilling = false;
+    state.billingError = null;
+    state.billingActionError = null;
+    state.billingNotice = null;
+    state.checkoutPlan = 'personal';
+    state.checkoutSeats = '2';
+    state.checkoutFieldError = null;
+    state.checkoutInFlight = false;
+    state.checkoutSession = null;
     window.history.pushState({}, '', '/');
     if (!state.workspaces) {
       loadWorkspaces();
@@ -1107,6 +1155,9 @@
     state.restoreFieldError = null;
     state.restoreSubmitError = null;
     state.restoreCreatedMessage = null;
+    state.billing = null;
+    state.loadingBilling = false;
+    state.billingError = null;
     renderShell();
     const input = document.getElementById('restore-paths');
     if (input) {
@@ -1596,6 +1647,797 @@
     );
   }
 
+  function formatBytes(bytes) {
+    const n = Number(bytes || 0);
+    if (n <= 0) return '0 B';
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1).replace(/\.0$/, '')} KiB`;
+    if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1).replace(/\.0$/, '')} MiB`;
+    return `${(n / (1024 * 1024 * 1024)).toFixed(1).replace(/\.0$/, '')} GiB`;
+  }
+
+  function formatPlanName(plan) {
+    switch (plan) {
+      case 'personal':
+        return 'Personal';
+      case 'team':
+        return 'Team';
+      case 'trial':
+      default:
+        return 'Trial';
+    }
+  }
+
+  function canManageBilling(ws) {
+    return Boolean(ws && (ws.role === 'owner' || ws.role === 'admin'));
+  }
+
+  function hasCheckoutReturnQuery() {
+    const params = new URLSearchParams(window.location.search);
+    return params.has('checkout') || params.has('_ptxn') || params.has('ptxn');
+  }
+
+  async function loadWorkspaceBilling(id) {
+    state.loadingBilling = true;
+    state.billingError = null;
+    if (!state.billing || state.billing.workspace_id !== id) {
+      state.billing = null;
+    }
+    renderShell();
+    try {
+      const resp = await fetch(
+        `/v1/workspaces/${encodeURIComponent(id)}/billing`,
+        { headers: { Accept: 'application/json' }, credentials: 'same-origin' }
+      );
+      if (resp.status === 401) {
+        state.me = null;
+        state.loadingBilling = false;
+        renderShell();
+        return;
+      }
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const billing = await resp.json();
+      state.billing = billing;
+      state.loadingBilling = false;
+      if (billing.plan !== 'trial' && billing.plan_status !== 'canceled') {
+        state.checkoutSession = null;
+      state.portalInFlight = false;
+      state.portalUrl = null;
+      state.updatePlanChoice = 'personal';
+      state.updateSeats = '2';
+      state.updatePlanFieldError = null;
+      state.confirmingPlanChange = null;
+      state.updatePlanInFlight = false;
+      state.confirmingCancel = false;
+      state.cancelInFlight = false;
+        if (!state.confirmingPlanChange && !state.updatePlanInFlight) {
+          state.updatePlanChoice = billing.plan === 'team' ? 'team' : 'personal';
+          state.updateSeats = String(billing.seats || 1);
+        }
+      } else {
+        state.portalUrl = null;
+        state.confirmingPlanChange = null;
+        state.confirmingCancel = false;
+      }
+      if (
+        billing.billing_configured &&
+        hasCheckoutReturnQuery() &&
+        (billing.plan === 'trial' || billing.plan_status === 'canceled')
+      ) {
+        state.billingNotice =
+          'Returned from checkout. Subscription rights activate only after server-side payment verification — use Refresh billing status once payment finishes.';
+      }
+      renderShell();
+    } catch (_err) {
+      state.loadingBilling = false;
+      state.billingError = 'Could not load workspace billing details. Please try again.';
+      renderShell();
+    }
+  }
+
+  async function handleStartCheckout(e, wsId) {
+    e.preventDefault();
+    if (state.checkoutInFlight || !state.me) return;
+
+    const plan = state.checkoutPlan === 'team' ? 'team' : 'personal';
+    let seats = 1;
+    if (plan === 'team') {
+      const rawSeats = String(state.checkoutSeats || '').trim();
+      const parsed = Number.parseInt(rawSeats, 10);
+      if (!/^\d+$/.test(rawSeats) || Number.isNaN(parsed) || parsed < 1) {
+        state.checkoutFieldError = 'Enter a whole number of seats (1 or more).';
+        renderShell();
+        const input = document.getElementById('billing-checkout-seats');
+        if (input) input.focus();
+        return;
+      }
+      seats = parsed;
+    }
+
+    state.checkoutFieldError = null;
+    state.billingActionError = null;
+    state.checkoutInFlight = true;
+    renderShell();
+
+    try {
+      const resp = await fetch(`/v1/workspaces/${encodeURIComponent(wsId)}/billing/checkout`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          'X-CSRF-Token': state.me.csrf_token,
+        },
+        credentials: 'same-origin',
+        body: JSON.stringify({ plan, seats }),
+      });
+      if (resp.status === 401) {
+        state.me = null;
+        state.checkoutInFlight = false;
+        renderShell();
+        return;
+      }
+      const data = await resp.json().catch(() => null);
+      if (!resp.ok) {
+        state.billingActionError =
+          (data && data.error && data.error.message) ||
+          'Could not create a checkout session. Please try again.';
+        state.checkoutInFlight = false;
+        renderShell();
+        return;
+      }
+      state.checkoutSession = {
+        checkout_url: data.checkout_url,
+        transaction_id: data.transaction_id,
+        plan,
+        seats,
+      };
+      state.billingNotice = null;
+      state.checkoutInFlight = false;
+      renderShell();
+    } catch (_err) {
+      state.checkoutInFlight = false;
+      state.billingActionError =
+        'Connection failed while creating the checkout session. Please retry.';
+      renderShell();
+    }
+  }
+
+  async function handleOpenPortal(wsId) {
+    if (state.portalInFlight || !state.me) return;
+    state.portalInFlight = true;
+    state.billingActionError = null;
+    renderShell();
+    try {
+      const resp = await fetch(`/v1/workspaces/${encodeURIComponent(wsId)}/billing/portal`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          'X-CSRF-Token': state.me.csrf_token,
+        },
+        credentials: 'same-origin',
+        body: '{}',
+      });
+      if (resp.status === 401) {
+        state.me = null;
+        state.portalInFlight = false;
+        renderShell();
+        return;
+      }
+      const data = await resp.json().catch(() => null);
+      if (!resp.ok) {
+        state.billingActionError =
+          (data && data.error && data.error.message) ||
+          'Could not open the billing portal. Please try again.';
+        state.portalInFlight = false;
+        renderShell();
+        return;
+      }
+      state.portalUrl = data.portal_url;
+      state.portalInFlight = false;
+      renderShell();
+    } catch (_err) {
+      state.portalInFlight = false;
+      state.billingActionError =
+        'Connection failed while requesting a billing portal session. Please retry.';
+      renderShell();
+    }
+  }
+
+  function handleReviewPlanChange(e, b) {
+    e.preventDefault();
+    if (state.updatePlanInFlight) return;
+    const plan = state.updatePlanChoice === 'team' ? 'team' : 'personal';
+    let seats = 1;
+    if (plan === 'team') {
+      const rawSeats = String(state.updateSeats || '').trim();
+      const parsed = Number.parseInt(rawSeats, 10);
+      if (!/^\d+$/.test(rawSeats) || Number.isNaN(parsed) || parsed < 1) {
+        state.updatePlanFieldError = 'Enter a whole number of seats (1 or more).';
+        state.confirmingPlanChange = null;
+        renderShell();
+        const input = document.getElementById('billing-update-seats');
+        if (input) input.focus();
+        return;
+      }
+      seats = parsed;
+    }
+    if (plan === b.plan && seats === b.seats) {
+      state.updatePlanFieldError = 'Select a different plan or seat count to update.';
+      state.confirmingPlanChange = null;
+      renderShell();
+      return;
+    }
+    state.updatePlanFieldError = null;
+    state.billingActionError = null;
+    state.confirmingPlanChange = { plan, seats };
+    renderShell();
+  }
+
+  async function handleConfirmPlanChange(wsId) {
+    if (!state.confirmingPlanChange || state.updatePlanInFlight || !state.me) return;
+    const { plan, seats } = state.confirmingPlanChange;
+    state.updatePlanInFlight = true;
+    state.billingActionError = null;
+    renderShell();
+    try {
+      const resp = await fetch(`/v1/workspaces/${encodeURIComponent(wsId)}/billing/plan`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          'X-CSRF-Token': state.me.csrf_token,
+        },
+        credentials: 'same-origin',
+        body: JSON.stringify({ plan, seats }),
+      });
+      if (resp.status === 401) {
+        state.me = null;
+        state.updatePlanInFlight = false;
+        renderShell();
+        return;
+      }
+      if (!resp.ok) {
+        const data = await resp.json().catch(() => null);
+        state.billingActionError =
+          (data && data.error && data.error.message) ||
+          'Could not update the subscription plan. Please try again.';
+        state.updatePlanInFlight = false;
+        renderShell();
+        return;
+      }
+      state.updatePlanInFlight = false;
+      state.confirmingPlanChange = null;
+      state.billingNotice = 'Subscription updated cleanly with Paddle.';
+      await loadWorkspaceBilling(wsId);
+    } catch (_err) {
+      state.updatePlanInFlight = false;
+      state.billingActionError =
+        'Connection failed while updating the subscription plan. Please retry.';
+      renderShell();
+    }
+  }
+
+  async function handleConfirmCancel(wsId) {
+    if (!state.confirmingCancel || state.cancelInFlight || !state.me) return;
+    state.cancelInFlight = true;
+    state.billingActionError = null;
+    renderShell();
+    try {
+      const resp = await fetch(`/v1/workspaces/${encodeURIComponent(wsId)}/billing/cancel`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          'X-CSRF-Token': state.me.csrf_token,
+        },
+        credentials: 'same-origin',
+        body: '{}',
+      });
+      if (resp.status === 401) {
+        state.me = null;
+        state.cancelInFlight = false;
+        renderShell();
+        return;
+      }
+      if (!resp.ok) {
+        const data = await resp.json().catch(() => null);
+        state.billingActionError =
+          (data && data.error && data.error.message) ||
+          'Could not cancel the subscription. Please try again.';
+        state.cancelInFlight = false;
+        renderShell();
+        return;
+      }
+      state.cancelInFlight = false;
+      state.confirmingCancel = false;
+      state.billingNotice =
+        'Subscription cancellation scheduled for the end of the current billing period.';
+      await loadWorkspaceBilling(wsId);
+    } catch (_err) {
+      state.cancelInFlight = false;
+      state.billingActionError =
+        'Connection failed while canceling the subscription. Please retry.';
+      renderShell();
+    }
+  }
+
+  function renderBillingSection(ws) {
+    const heading = el('h2', { id: 'billing-heading', textContent: 'Billing' });
+
+    if (!state.billing) {
+      if (state.billingError) {
+        return el('section', { className: 'card stack-md', 'aria-labelledby': 'billing-heading' }, [
+          heading,
+          el('div', { className: 'alert', role: 'alert' }, [
+            el('span', { textContent: state.billingError }),
+            el('button', {
+              type: 'button',
+              className: 'btn btn-secondary btn-sm',
+              onClick: () => loadWorkspaceBilling(ws.id),
+              textContent: 'Retry',
+            }),
+          ]),
+        ]);
+      }
+      return el(
+        'section',
+        { className: 'card stack-sm', 'aria-labelledby': 'billing-heading', 'aria-live': 'polite' },
+        [heading, el('p', { className: 'muted', textContent: 'Loading billing details…' })]
+      );
+    }
+
+    const b = state.billing;
+    const statusInfo = formatPlanStatus(b.plan_status);
+    const planLabel =
+      b.plan === 'team'
+        ? `${formatPlanName(b.plan)} (${b.seats} ${b.seats === 1 ? 'seat' : 'seats'})`
+        : formatPlanName(b.plan);
+    const badges = [el('span', { className: statusInfo.badgeClass, textContent: statusInfo.label })];
+    if (b.cancel_at_period_end) {
+      badges.push(el('span', { className: 'badge badge-warn', textContent: 'Cancels at period end' }));
+    }
+    if (b.billing_configured) {
+      badges.push(
+        el('button', {
+          type: 'button',
+          className: 'btn btn-secondary btn-sm',
+          disabled: state.loadingBilling,
+          onClick: () => loadWorkspaceBilling(ws.id),
+          textContent: state.loadingBilling ? 'Refreshing…' : 'Refresh billing status',
+        })
+      );
+    }
+
+    const metaItems = [
+      el('div', { className: 'meta-item' }, [
+        el('dt', { textContent: 'Plan' }),
+        el('dd', { textContent: planLabel }),
+      ]),
+      el('div', { className: 'meta-item' }, [
+        el('dt', { textContent: 'Status' }),
+        el('dd', { textContent: statusInfo.label }),
+      ]),
+    ];
+    if (b.trial_ends_at) {
+      metaItems.push(
+        el('div', { className: 'meta-item' }, [
+          el('dt', { textContent: 'Trial ends' }),
+          el('dd', { textContent: formatDate(b.trial_ends_at) }),
+        ])
+      );
+    }
+    if (b.current_period_end) {
+      metaItems.push(
+        el('div', { className: 'meta-item' }, [
+          el('dt', { textContent: b.cancel_at_period_end ? 'Access ends' : 'Current period ends' }),
+          el('dd', { textContent: formatDate(b.current_period_end) }),
+        ])
+      );
+    }
+    metaItems.push(
+      el('div', { className: 'meta-item' }, [
+        el('dt', { textContent: 'Push' }),
+        el('dd', { textContent: b.can_push ? 'Allowed' : 'Blocked' }),
+      ]),
+      el('div', { className: 'meta-item' }, [
+        el('dt', { textContent: 'Pull' }),
+        el('dd', { textContent: b.can_pull ? 'Allowed' : 'Unavailable' }),
+      ]),
+      el('div', { className: 'meta-item' }, [
+        el('dt', { textContent: 'Export' }),
+        el('dd', { textContent: b.can_export ? 'Available' : 'Unavailable' }),
+      ]),
+      el('div', { className: 'meta-item' }, [
+        el('dt', { textContent: 'Machines limit' }),
+        el('dd', {
+          textContent: Array.isArray(state.devices)
+            ? `${state.devices.length} / ${b.max_devices}`
+            : `${b.max_devices} max`,
+        }),
+      ]),
+      el('div', { className: 'meta-item' }, [
+        el('dt', { textContent: 'Max bundle size' }),
+        el('dd', { textContent: formatBytes(b.max_bundle_bytes) }),
+      ]),
+      el('div', { className: 'meta-item' }, [
+        el('dt', { textContent: 'Storage used' }),
+        el('dd', {
+          textContent: `${formatBytes(b.storage_used_bytes)} of ${formatBytes(b.max_storage_bytes)}`,
+        }),
+      ])
+    );
+
+    const children = [
+      el('div', { className: 'row-between' }, [
+        heading,
+        el('div', { className: 'badge-row' }, badges),
+      ]),
+      el('dl', { className: 'meta-list' }, metaItems),
+    ];
+
+    if (state.billingError) {
+      children.push(
+        el('div', { className: 'alert', role: 'alert' }, [
+          el('span', { textContent: state.billingError }),
+        ])
+      );
+    }
+
+    if (state.billingActionError) {
+      children.push(
+        el('div', { className: 'alert', role: 'alert' }, [
+          el('span', { textContent: state.billingActionError }),
+        ])
+      );
+    }
+
+    if (state.billingNotice) {
+      children.push(
+        el('div', { className: 'machine-card', role: 'status' }, [
+          el('p', { className: 'muted', textContent: state.billingNotice }),
+        ])
+      );
+    }
+
+    if (!b.billing_configured) {
+      children.push(
+        el('p', {
+          className: 'muted',
+          textContent:
+            'Billing is not configured on this server. Your workspace keeps its trial status, and pull and Git bundle export remain available.',
+        })
+      );
+    } else if (canManageBilling(ws) && (b.plan === 'trial' || b.plan_status === 'canceled')) {
+      const formFields = [
+        el('div', { className: 'field' }, [
+          el('label', { for: 'billing-checkout-plan', textContent: 'Plan' }),
+          el(
+            'select',
+            {
+              id: 'billing-checkout-plan',
+              className: 'input',
+              value: state.checkoutPlan,
+              onChange: (ev) => {
+                state.checkoutPlan = ev.target.value;
+                state.checkoutFieldError = null;
+                renderShell();
+              },
+            },
+            [
+              el('option', {
+                value: 'personal',
+                selected: state.checkoutPlan === 'personal',
+                textContent: 'Personal — 10 machines, 25 MiB bundle, 10 GiB storage',
+              }),
+              el('option', {
+                value: 'team',
+                selected: state.checkoutPlan === 'team',
+                textContent: 'Team — 50 machines & 100 GiB storage per seat',
+              }),
+            ]
+          ),
+        ]),
+      ];
+
+      if (state.checkoutPlan === 'team') {
+        formFields.push(
+          el('div', { className: 'field' }, [
+            el('label', { for: 'billing-checkout-seats', textContent: 'Seats' }),
+            el('input', {
+              id: 'billing-checkout-seats',
+              className: 'input',
+              type: 'number',
+              min: '1',
+              step: '1',
+              value: state.checkoutSeats,
+              'aria-invalid': state.checkoutFieldError ? 'true' : null,
+              'aria-describedby': state.checkoutFieldError ? 'billing-checkout-seats-err' : null,
+              onInput: (ev) => {
+                state.checkoutSeats = ev.target.value;
+              },
+            }),
+            state.checkoutFieldError
+              ? el('span', {
+                  id: 'billing-checkout-seats-err',
+                  className: 'field-error',
+                  role: 'alert',
+                  textContent: state.checkoutFieldError,
+                })
+              : null,
+          ])
+        );
+      }
+
+      children.push(
+        el('form', {
+          className: 'invite-controls stack-sm',
+          noValidate: true,
+          onSubmit: (ev) => handleStartCheckout(ev, ws.id),
+        }, [
+          el('h3', { textContent: 'Subscribe or upgrade' }),
+          el('p', {
+            className: 'muted',
+            textContent:
+              'Checkout opens Paddle for payment. Workspace rights activate only after server-side payment verification.',
+          }),
+          el('div', { className: 'invite-grid' }, formFields),
+          el('div', { className: 'btn-row' }, [
+            el('button', {
+              type: 'submit',
+              className: 'btn btn-primary',
+              disabled: state.checkoutInFlight,
+              textContent: state.checkoutInFlight ? 'Starting checkout…' : 'Continue to checkout',
+            }),
+          ]),
+        ])
+      );
+
+      if (state.checkoutSession) {
+        const s = state.checkoutSession;
+        const planSummary =
+          s.plan === 'team' ? `Team (${s.seats} ${s.seats === 1 ? 'seat' : 'seats'})` : 'Personal';
+        children.push(
+          el('div', { className: 'share-box stack-sm', role: 'status' }, [
+            el('p', {
+              textContent: `Checkout session ready for ${planSummary}. Complete payment at Paddle, then refresh billing status to confirm activation.`,
+            }),
+            el('div', { className: 'btn-row' }, [
+              el('a', {
+                className: 'btn btn-primary',
+                href: s.checkout_url,
+                target: '_blank',
+                rel: 'noopener noreferrer',
+                textContent: 'Open Paddle checkout',
+              }),
+            ]),
+          ])
+        );
+      }
+    } else if (canManageBilling(ws)) {
+      const planOptions = [
+        el('div', { className: 'field' }, [
+          el('label', { for: 'billing-update-plan', textContent: 'Change plan' }),
+          el(
+            'select',
+            {
+              id: 'billing-update-plan',
+              className: 'input',
+              value: state.updatePlanChoice,
+              onChange: (ev) => {
+                state.updatePlanChoice = ev.target.value;
+                state.updatePlanFieldError = null;
+                state.confirmingPlanChange = null;
+                renderShell();
+              },
+            },
+            [
+              el('option', {
+                value: 'personal',
+                selected: state.updatePlanChoice === 'personal',
+                textContent: 'Personal — 10 machines, 25 MiB bundle, 10 GiB storage',
+              }),
+              el('option', {
+                value: 'team',
+                selected: state.updatePlanChoice === 'team',
+                textContent: 'Team — 50 machines & 100 GiB storage per seat',
+              }),
+            ]
+          ),
+        ]),
+      ];
+
+      if (state.updatePlanChoice === 'team') {
+        planOptions.push(
+          el('div', { className: 'field' }, [
+            el('label', { for: 'billing-update-seats', textContent: 'Update seats' }),
+            el('input', {
+              id: 'billing-update-seats',
+              className: 'input',
+              type: 'number',
+              min: '1',
+              step: '1',
+              value: state.updateSeats,
+              'aria-invalid': state.updatePlanFieldError ? 'true' : null,
+              'aria-describedby': state.updatePlanFieldError ? 'billing-update-seats-err' : null,
+              onInput: (ev) => {
+                state.updateSeats = ev.target.value;
+                state.confirmingPlanChange = null;
+              },
+            }),
+          ])
+        );
+      }
+
+      const planFormChildren = [
+        el('h3', { textContent: 'Manage subscription' }),
+        el('div', { className: 'btn-row' }, [
+          el('button', {
+            type: 'button',
+            className: 'btn btn-secondary',
+            disabled: state.portalInFlight,
+            onClick: () => handleOpenPortal(ws.id),
+            textContent: state.portalInFlight ? 'Opening billing portal…' : 'Open billing portal',
+          }),
+        ]),
+      ];
+
+      if (state.portalUrl) {
+        planFormChildren.push(
+          el('div', { className: 'share-box stack-sm', role: 'status' }, [
+            el('p', { textContent: 'Billing portal session ready.' }),
+            el('div', { className: 'btn-row' }, [
+              el('a', {
+                className: 'btn btn-secondary',
+                href: state.portalUrl,
+                target: '_blank',
+                rel: 'noopener noreferrer',
+                textContent: 'Continue to billing portal',
+              }),
+            ]),
+          ])
+        );
+      }
+
+      planFormChildren.push(
+        el('div', { className: 'invite-grid' }, planOptions),
+        state.updatePlanFieldError
+          ? el('p', {
+              id: 'billing-update-seats-err',
+              className: 'field-error',
+              role: 'alert',
+              textContent: state.updatePlanFieldError,
+            })
+          : null,
+        el('div', { className: 'btn-row' }, [
+          el('button', {
+            type: 'submit',
+            className: 'btn btn-secondary',
+            disabled: state.updatePlanInFlight,
+            textContent: 'Review plan change',
+          }),
+        ])
+      );
+
+      if (state.confirmingPlanChange) {
+        const next = state.confirmingPlanChange;
+        const nextLabel =
+          next.plan === 'team'
+            ? `Team (${next.seats} ${next.seats === 1 ? 'seat' : 'seats'})`
+            : 'Personal';
+        planFormChildren.push(
+          el(
+            'div',
+            {
+              className: 'share-box stack-sm',
+              role: 'region',
+              'aria-label': 'Confirm plan change',
+            },
+            [
+              el('p', {
+                textContent: `Confirm changing subscription from ${planLabel} to ${nextLabel}. Paddle applies immediate proration.`,
+              }),
+              el('div', { className: 'btn-row' }, [
+                el('button', {
+                  type: 'button',
+                  className: 'btn btn-primary',
+                  disabled: state.updatePlanInFlight,
+                  onClick: () => handleConfirmPlanChange(ws.id),
+                  textContent: state.updatePlanInFlight ? 'Updating plan…' : 'Confirm plan change',
+                }),
+                el('button', {
+                  type: 'button',
+                  className: 'btn btn-secondary',
+                  disabled: state.updatePlanInFlight,
+                  onClick: () => {
+                    state.confirmingPlanChange = null;
+                    renderShell();
+                  },
+                  textContent: 'Keep current plan',
+                }),
+              ]),
+            ]
+          )
+        );
+      }
+
+      if (b.cancel_at_period_end) {
+        planFormChildren.push(
+          el('p', {
+            className: 'muted',
+            textContent:
+              'Cancellation is scheduled for the end of the current billing period. Pull and Git bundle export remain available after cancellation.',
+          })
+        );
+      } else if (state.confirmingCancel) {
+        planFormChildren.push(
+          el(
+            'div',
+            {
+              className: 'share-box stack-sm',
+              role: 'region',
+              'aria-label': 'Confirm subscription cancellation',
+            },
+            [
+              el('p', {
+                textContent:
+                  'Cancel subscription at the end of the current billing period? Push will be blocked after the period ends; pull and Git bundle export remain available.',
+              }),
+              el('div', { className: 'btn-row' }, [
+                el('button', {
+                  type: 'button',
+                  className: 'btn btn-danger',
+                  disabled: state.cancelInFlight,
+                  onClick: () => handleConfirmCancel(ws.id),
+                  textContent: state.cancelInFlight ? 'Canceling…' : 'Confirm cancellation',
+                }),
+                el('button', {
+                  type: 'button',
+                  className: 'btn btn-secondary',
+                  disabled: state.cancelInFlight,
+                  onClick: () => {
+                    state.confirmingCancel = false;
+                    renderShell();
+                  },
+                  textContent: 'Keep subscription',
+                }),
+              ]),
+            ]
+          )
+        );
+      } else {
+        planFormChildren.push(
+          el('div', { className: 'btn-row' }, [
+            el('button', {
+              type: 'button',
+              className: 'btn btn-danger',
+              onClick: () => {
+                state.confirmingCancel = true;
+                state.billingActionError = null;
+                renderShell();
+              },
+              textContent: 'Cancel subscription',
+            }),
+          ])
+        );
+      }
+
+      children.push(
+        el(
+          'form',
+          {
+            className: 'invite-controls stack-md',
+            noValidate: true,
+            onSubmit: (ev) => handleReviewPlanChange(ev, b),
+          },
+          planFormChildren
+        )
+      );
+    }
+
+    return el('section', { className: 'card stack-md', 'aria-labelledby': 'billing-heading' }, children);
+  }
+
   function renderExportSection(ws) {
     const heading = el('h2', {
       id: 'export-heading',
@@ -1991,9 +2833,25 @@
       state.invitations = [];
       state.invitationsError = null;
       state.createdInvite = null;
+      state.revisions = [];
+      state.revisionsError = null;
+      state.proposals = [];
+      state.proposalsError = null;
+      state.billing = null;
+      state.loadingBilling = false;
+      state.billingError = null;
       window.history.pushState({}, '', `/workspaces/${data.id}`);
       renderShell();
-      await loadWorkspaceMembers(data.id);
+      const createLoaders = [
+        loadWorkspaceMembers(data.id),
+        loadWorkspaceRevisions(data.id),
+        loadWorkspaceProposals(data.id),
+        loadWorkspaceBilling(data.id),
+      ];
+      if (canManageInvites(data)) {
+        createLoaders.push(loadWorkspaceInvitations(data.id));
+      }
+      await Promise.all(createLoaders);
     } catch (_err) {
       state.createInFlight = false;
       state.submitError = 'Connection failed while creating the workspace. Click Create workspace to retry safely.';
@@ -2275,6 +3133,7 @@
         renderProposalsSection(ws),
         renderExportSection(ws),
         renderMembersSection(ws),
+        renderBillingSection(ws),
       ]);
     }
 
@@ -2478,6 +3337,9 @@
     state.restoreSubmitError = null;
     state.restoreInFlight = false;
     state.restoreCreatedMessage = null;
+    state.billing = null;
+    state.loadingBilling = false;
+    state.billingError = null;
     renderShell();
     try {
       const resp = await fetch(`/v1/workspaces/${encodeURIComponent(id)}`, {
@@ -2506,7 +3368,7 @@
       state.activeWorkspace = await resp.json();
       state.loadingDetail = false;
       renderShell();
-      const loaders = [loadWorkspaceDevices(id), loadWorkspaceMembers(id), loadWorkspaceRevisions(id), loadWorkspaceProposals(id)];
+      const loaders = [loadWorkspaceDevices(id), loadWorkspaceMembers(id), loadWorkspaceRevisions(id), loadWorkspaceProposals(id), loadWorkspaceBilling(id)];
       if (canManageInvites(state.activeWorkspace)) {
         loaders.push(loadWorkspaceInvitations(id));
       }
