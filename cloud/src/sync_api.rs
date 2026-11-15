@@ -318,7 +318,7 @@ pub async fn post_sync(
     let bundle = body.clone();
     let (staged, object_bytes) = tokio::task::spawn_blocking(move || {
         let staged = repos.stage(ws_id, &bundle, upload)?;
-        let bytes = repos.added_bytes(&staged, false)?;
+        let bytes = repos.added_bytes(ws_id, &staged, false)?;
         Ok::<_, AppError>((staged, bytes))
     })
     .await

@@ -27,6 +27,126 @@ use crate::protocol::{error_codes, SYNC_REF};
 
 pub struct RepoStore {
     root: PathBuf,
+    instance: Instance,
+}
+
+/// This process's private scratch area, `<root>/tmp/instances/<id>/`,
+/// owned through an exclusive lock on `<id>.lease` that the kernel releases
+/// when the process ends in any way (including SIGKILL). Several processes
+/// may share one root; each reclaims only areas whose lease nobody holds.
+struct Instance {
+    dir: PathBuf,
+    _lease: fs::File,
+}
+
+const INSTANCES: &str = "tmp/instances";
+
+fn same_file(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
+
+/// Flushes a file or directory (its entries) to disk.
+fn sync_path(path: &Path) -> Result<(), AppError> {
+    fs::File::open(path)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| AppError::internal(format!("syncing {}: {e}", path.display())))
+}
+
+fn ignore_missing(r: std::io::Result<()>) -> std::io::Result<()> {
+    match r {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
+fn initialize_repo(path: &Path) -> Result<(), AppError> {
+    fs::create_dir_all(path).map_err(AppError::internal)?;
+    git_ok(path, &["init", "--quiet", "--bare", "--template="])?;
+    git_ok(path, &["config", "transfer.fsckObjects", "true"])?;
+    git_ok(path, &["config", "gc.auto", "0"])?;
+    Ok(())
+}
+
+fn directory_bytes(dir: &Path) -> std::io::Result<u64> {
+    let mut total = 0;
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let meta = entry.metadata()?;
+        total += if meta.is_dir() {
+            directory_bytes(&entry.path())?
+        } else {
+            meta.len()
+        };
+    }
+    Ok(total)
+}
+
+impl Instance {
+    /// Takes a fresh lease, then creates the area it owns. The lease is
+    /// created before the area and removed after it, so an area without a
+    /// lease never belongs to a live process.
+    fn take(area: &Path) -> std::io::Result<Self> {
+        for _ in 0..8 {
+            let id = uuid::Uuid::new_v4();
+            let path = area.join(format!("{id}.lease"));
+            let lease = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)?;
+            if lease.try_lock().is_err() {
+                continue;
+            }
+            // A reaper may have removed the file between create and lock:
+            // the lock must be on the file the path names.
+            match fs::metadata(&path) {
+                Ok(on_disk) if same_file(&on_disk, &lease.metadata()?) => {}
+                _ => continue,
+            }
+            let dir = area.join(id.to_string());
+            fs::create_dir(&dir)?;
+            return Ok(Self { dir, _lease: lease });
+        }
+        Err(std::io::Error::other("could not take a scratch lease"))
+    }
+}
+
+/// Removes scratch areas of processes that are gone: a lease whose lock is
+/// free (its process ended; the kernel released it), and an area with no
+/// lease. Live leases and every name it does not own (anything that is not
+/// `<uuid>` or `<uuid>.lease`) are left alone. Each step is idempotent, so a
+/// crash during reclaim is finished by the next one. Returns how many
+/// areas were reclaimed.
+fn reclaim(area: &Path) -> std::io::Result<usize> {
+    let mut reclaimed = 0;
+    for entry in fs::read_dir(area)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if let Some(stem) = name.strip_suffix(".lease") {
+            if uuid::Uuid::parse_str(stem).is_err() {
+                continue;
+            }
+            let lease = match fs::OpenOptions::new().write(true).open(entry.path()) {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            if lease.try_lock().is_err() {
+                continue; // held by a live process
+            }
+            ignore_missing(fs::remove_dir_all(area.join(stem)))?;
+            ignore_missing(fs::remove_file(entry.path()))?;
+            reclaimed += 1;
+        } else if uuid::Uuid::parse_str(name).is_ok()
+            && entry.file_type()?.is_dir()
+            && !area.join(format!("{name}.lease")).exists()
+        {
+            ignore_missing(fs::remove_dir_all(entry.path()))?;
+            reclaimed += 1;
+        }
+    }
+    Ok(reclaimed)
 }
 
 /// Ref under which upload `id` is kept forever.
@@ -122,27 +242,35 @@ impl Staged {
 }
 
 impl RepoStore {
-    pub fn new(root: PathBuf) -> Self {
-        Self { root }
+    /// Opens the store: reclaims scratch left by processes that are gone
+    /// (crashed or killed mid-request), then takes this process's lease.
+    pub fn open(root: PathBuf) -> std::io::Result<Self> {
+        let area = root.join(INSTANCES);
+        fs::create_dir_all(&area)?;
+        let reclaimed = reclaim(&area)?;
+        if reclaimed > 0 {
+            tracing::info!(reclaimed, "reclaimed scratch of stopped instances");
+        }
+        let instance = Instance::take(&area)?;
+        Ok(Self { root, instance })
     }
 
     fn repo(&self, ws: uuid::Uuid) -> PathBuf {
         self.root.join(format!("{ws}.git"))
     }
 
+    /// A private directory in this process's leased area, removed on drop
+    /// (or reclaimed by the next start if the process dies first).
     fn scratch(&self) -> Result<tempfile::TempDir, AppError> {
-        let dir = self.root.join("tmp");
-        fs::create_dir_all(&dir).map_err(AppError::internal)?;
-        tempfile::tempdir_in(dir).map_err(AppError::internal)
+        tempfile::tempdir_in(&self.instance.dir).map_err(AppError::internal)
     }
 
     fn ensure(&self, ws: uuid::Uuid) -> Result<PathBuf, AppError> {
         let path = self.repo(ws);
         if !path.join("HEAD").exists() {
-            fs::create_dir_all(&path).map_err(AppError::internal)?;
-            git_ok(&path, &["init", "--quiet", "--bare"])?;
-            git_ok(&path, &["config", "transfer.fsckObjects", "true"])?;
-            git_ok(&path, &["config", "gc.auto", "0"])?;
+            // No template: hook samples are never run (hooks are disabled)
+            // and would only count as storage.
+            initialize_repo(&path)?;
         }
         Ok(path)
     }
@@ -151,24 +279,11 @@ impl RepoStore {
     /// service keeps (accepted, retained proposals, stored-but-refused
     /// uploads) plus refs. Zero before the first upload.
     pub fn usage(&self, ws: uuid::Uuid) -> Result<u64, AppError> {
-        fn walk(dir: &Path) -> std::io::Result<u64> {
-            let mut total = 0;
-            for entry in fs::read_dir(dir)? {
-                let entry = entry?;
-                let meta = entry.metadata()?;
-                if meta.is_dir() {
-                    total += walk(&entry.path())?;
-                } else {
-                    total += meta.len();
-                }
-            }
-            Ok(total)
-        }
         let repo = self.repo(ws);
         if !repo.exists() {
             return Ok(0);
         }
-        walk(&repo).map_err(AppError::internal)
+        directory_bytes(&repo).map_err(AppError::internal)
     }
 
     /// Unpacks an upload into a private staging repository that borrows the
@@ -178,7 +293,10 @@ impl RepoStore {
     /// the returned [`Staged`] discards the upload completely. The bundle
     /// must carry exactly one ref, `refs/heads/main`.
     pub fn stage(&self, ws: uuid::Uuid, bundle: &[u8], id: uuid::Uuid) -> Result<Staged, AppError> {
-        let repo = self.ensure(ws)?;
+        // The workspace repository is not created here: a refused upload
+        // must leave nothing behind. Without one there are no stored objects
+        // to borrow (and a bundle with prerequisites fails `verify`).
+        let repo = self.repo(ws);
         let dir = self.scratch()?;
         let stage = dir.path().join("stage.git");
         let stage_str = stage.to_str().ok_or_else(|| AppError::internal("path"))?;
@@ -186,16 +304,18 @@ impl RepoStore {
             dir.path(),
             &["init", "--quiet", "--bare", "--template=", stage_str],
         )?;
-        let objects = repo.join("objects");
-        let objects = objects
-            .canonicalize()
-            .map_err(|e| AppError::internal(format!("workspace objects: {e}")))?;
-        fs::create_dir_all(stage.join("objects/info")).map_err(AppError::internal)?;
-        fs::write(
-            stage.join("objects/info/alternates"),
-            format!("{}\n", objects.display()),
-        )
-        .map_err(AppError::internal)?;
+        if repo.join("HEAD").exists() {
+            let objects = repo
+                .join("objects")
+                .canonicalize()
+                .map_err(|e| AppError::internal(format!("workspace objects: {e}")))?;
+            fs::create_dir_all(stage.join("objects/info")).map_err(AppError::internal)?;
+            fs::write(
+                stage.join("objects/info/alternates"),
+                format!("{}\n", objects.display()),
+            )
+            .map_err(AppError::internal)?;
+        }
 
         let file = dir.path().join("upload.bundle");
         fs::write(&file, bundle).map_err(AppError::internal)?;
@@ -269,9 +389,22 @@ impl RepoStore {
 
     /// Bytes committing `staged` adds to the workspace repository: its new
     /// object files plus the refs it will create (the upload ref, and
-    /// `refs/heads/main` when `creates_main`).
-    pub fn added_bytes(&self, staged: &Staged, creates_main: bool) -> Result<u64, AppError> {
+    /// `refs/heads/main` when `creates_main`), including repository metadata
+    /// on the first upload. Measure that metadata privately so a rejection
+    /// still creates nothing in the workspace.
+    pub fn added_bytes(
+        &self,
+        ws: uuid::Uuid,
+        staged: &Staged,
+        creates_main: bool,
+    ) -> Result<u64, AppError> {
         let mut total = 0;
+        if !self.repo(ws).join("HEAD").exists() {
+            let scratch = self.scratch()?;
+            let empty = scratch.path().join("empty.git");
+            initialize_repo(&empty)?;
+            total += directory_bytes(&empty).map_err(AppError::internal)?;
+        }
         for (_, meta_len) in staged.object_files()? {
             total += meta_len;
         }
@@ -284,7 +417,17 @@ impl RepoStore {
     /// never sees an index without its pack; files already present (same
     /// name, same content) are left alone. Nothing existing is deleted.
     pub fn commit_staged(&self, ws: uuid::Uuid, staged: Staged) -> Result<(), AppError> {
+        let created = !self.repo(ws).join("HEAD").exists();
         let repo = self.ensure(ws)?;
+        if created {
+            // The skeleton Git needs to open the repository, and its entry
+            // in the root, before anything refers to it.
+            for path in [repo.join("HEAD"), repo.join("config"), repo.join("refs")] {
+                sync_path(&path)?;
+            }
+            sync_path(&repo)?;
+            sync_path(&self.root)?;
+        }
         let target = repo.join("objects");
         let mut files = staged.object_files()?;
         files.sort_by_key(|(rel, _)| rel.extension().is_some_and(|e| e == "idx"));
@@ -309,12 +452,28 @@ impl RepoStore {
         }
         // The new directory entries too, before the PostgreSQL commit that
         // will refer to these objects.
+        dirs.insert(target.clone());
         for dir in dirs {
             fs::File::open(&dir)
                 .and_then(|f| f.sync_all())
                 .map_err(durable)?;
         }
-        git_ok(&repo, &["update-ref", &upload_ref(staged.id), &staged.tip]).map(|_| ())
+        let name = upload_ref(staged.id);
+        git_ok(&repo, &["update-ref", &name, &staged.tip])?;
+        // `update-ref` does not flush the ref or the directories holding it
+        // (Git's `core.fsync` covers files, not parent directories). PG must
+        // never refer to an upload whose ref may vanish on power loss, so
+        // flush the ref file and every directory up to the repository.
+        let mut path = repo.join(&name);
+        sync_path(&path)?;
+        while let Some(parent) = path.parent() {
+            sync_path(parent)?;
+            if parent == repo {
+                break;
+            }
+            path = parent.to_path_buf();
+        }
+        Ok(())
     }
 
     /// A private checkout of the staged upload with its complete history,

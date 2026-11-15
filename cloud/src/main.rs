@@ -66,9 +66,16 @@ async fn main() -> ExitCode {
         );
         return ExitCode::from(78);
     }
-    let repos = Arc::new(muster_cloud::repo_store::RepoStore::new(
-        config.repo_root.clone(),
-    ));
+    let repos = match muster_cloud::repo_store::RepoStore::open(config.repo_root.clone()) {
+        Ok(repos) => Arc::new(repos),
+        Err(err) => {
+            eprintln!(
+                "muster-cloud: cannot prepare scratch in MUSTER_REPO_ROOT {}: {err}",
+                config.repo_root.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
     let state = AppState {
         config: Arc::new(config),
         db,

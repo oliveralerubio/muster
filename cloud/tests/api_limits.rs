@@ -777,3 +777,52 @@ async fn a_team_subscription_enforces_its_per_seat_machine_limit() {
     assert!(billing.max_devices > trial.max_devices);
     fill_machine_limit(&s, &token, &ws.id, 0, billing.max_devices as usize).await;
 }
+
+/// A refused first push writes nothing at all: the workspace still uses
+/// zero bytes (no repository skeleton is created for it).
+#[tokio::test]
+async fn a_refused_first_push_creates_no_storage() {
+    let s = stack().await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let token = account_token(&s, &alice).await;
+    let ws = create_workspace(&s, &alice, "Empty").await;
+    let key = MachineKey::new("node-0");
+    let dev = link(&s, &token, &ws.id, &key).await;
+    assert_eq!(billing_of(&s, &alice, &ws.id).await.storage_used_bytes, 0);
+
+    // A legacy (unsigned) history is refused by the verifier.
+    let legacy = FleetRepo::legacy(&key);
+    let resp = dev.send(&s, &dev.push(legacy.bundle(None), None)).await;
+    assert_eq!(resp.status(), 422);
+    assert_eq!(billing_of(&s, &alice, &ws.id).await.storage_used_bytes, 0);
+    assert_eq!(dev.send(&s, &dev.get(&dev.sync_path())).await.status(), 204);
+}
+
+/// The first accepted upload must include the bare repository's metadata
+/// in its quota, even though the repository is created only after approval.
+#[tokio::test]
+async fn the_first_upload_counts_repository_metadata_in_its_quota() {
+    let mut s = stack().await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let token = account_token(&s, &alice).await;
+    let key = MachineKey::new("node-0");
+    let (baseline, _, repo) = genesis_workspace(&s, &alice, &key).await;
+    let needed = billing_of(&s, &alice, &baseline).await.storage_used_bytes;
+    let ws = create_workspace(&s, &alice, "First upload boundary").await;
+    let dev = link(&s, &token, &ws.id, &key).await;
+
+    s.restart_with_env(&[("MUSTER_DEV_STORAGE_LIMIT_BYTES", (needed - 1).to_string())])
+        .await;
+    let response = dev.send(&s, &dev.push(repo.bundle(None), None)).await;
+    assert_eq!(response.status(), 507);
+    assert_eq!(billing_of(&s, &alice, &ws.id).await.storage_used_bytes, 0);
+    assert_eq!(dev.send(&s, &dev.get(&dev.sync_path())).await.status(), 204);
+
+    s.restart_with_env(&[("MUSTER_DEV_STORAGE_LIMIT_BYTES", needed.to_string())])
+        .await;
+    let response = dev.send(&s, &dev.push(repo.bundle(None), None)).await;
+    assert_eq!(response.status(), 200);
+    let billing = billing_of(&s, &alice, &ws.id).await;
+    assert_eq!(billing.storage_used_bytes, needed);
+    assert!(billing.storage_used_bytes <= billing.max_storage_bytes);
+}
