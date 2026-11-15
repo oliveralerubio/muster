@@ -46,9 +46,10 @@ COPY cloud/Cargo.toml cloud/Cargo.toml
 # manifest at load time (a member with no autodiscoverable targets is a hard
 # parse error), so the root member needs placeholders too even though only
 # `muster-cloud` is built. The real sources from the next COPY replace all
-# four files.
+# source files.
 RUN set -eux; \
-    mkdir -p cloud/src src; \
+    mkdir -p cloud/src src deploy/harness; \
+    printf 'fn main() {}\n' > deploy/harness/drill.rs; \
     echo 'pub fn __placeholder() {}' > cloud/src/lib.rs; \
     printf 'fn main() {}\n' > cloud/src/main.rs; \
     echo 'pub fn __placeholder() {}' > src/lib.rs; \

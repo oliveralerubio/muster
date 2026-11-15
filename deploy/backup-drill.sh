@@ -5,8 +5,7 @@
 #
 # Composition (all synthetic data, one ephemeral PostgreSQL from
 # deploy/pg-test.sh, the real muster-cloud binary, real Git, real Ed25519
-# device signatures via deploy/harness/drill.rs — which links the previously
-# built `muster` library; nothing is rebuilt and no Cargo manifest changes):
+# device signatures via the optional Cargo-built deploy/harness/drill.rs):
 #
 #   1. Fixture IdP (harness `idp`) + real service on an ephemeral cluster
 #      (migrations applied by the service itself; MUSTER_REPO_ROOT mandatory).
@@ -35,7 +34,7 @@
 # wherever age + MUSTER_BACKUP_AGE_RECIPIENT are available.
 #
 # Exit status: non-zero on the first failed check (message on stderr). Prints
-# a DRILL-OK line with exact binary/rlib versions on success.
+# a DRILL-OK line and the service binary hash on success.
 
 set -u
 set -o pipefail

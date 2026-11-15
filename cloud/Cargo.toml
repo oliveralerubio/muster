@@ -6,9 +6,18 @@ description = "Muster Cloud backend service"
 license = "Apache-2.0"
 publish = false
 
+[features]
+# Synthetic OIDC/backup helper, excluded from normal service builds.
+backup-drill = []
+
 [[bin]]
 name = "muster-cloud"
 path = "src/main.rs"
+
+[[bin]]
+name = "muster-cloud-drill"
+path = "../deploy/harness/drill.rs"
+required-features = ["backup-drill"]
 
 [lib]
 name = "muster_cloud"

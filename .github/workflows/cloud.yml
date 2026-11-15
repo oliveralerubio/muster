@@ -179,16 +179,14 @@ jobs:
           # Separate key from the test job: the drill only needs two artifacts.
           cache-targets: false
 
-      - name: Build service binary and library for the drill
+      - name: Build service binary for the drill
         run: |
           set -eu
-          cargo build --locked -p muster --lib
           cargo build --locked -p muster-cloud --bin muster-cloud
           test -x "${CARGO_TARGET_DIR:-target}/debug/muster-cloud"
 
       # The drill composes deploy/pg-test.sh (ephemeral socket-only cluster),
-      # deploy/pg-backup.sh, deploy/pg-restore.sh and the rustc-built harness
-      # (deploy/harness/drill.rs links the just-built muster library rlib; no
-      # manifest changes). Its exit status decides the step.
+      # deploy/pg-backup.sh, deploy/pg-restore.sh and the optional Cargo-built
+      # drill helper. Its exit status decides the step.
       - name: Backup/restore drill
         run: deploy/backup-drill.sh

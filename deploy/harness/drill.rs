@@ -215,7 +215,7 @@ fn http_req(
 ) -> std::io::Result<Resp> {
     let rest = url
         .strip_prefix("http://")
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "only http:// URLs"))?;
+        .ok_or_else(|| std::io::Error::other("only http:// URLs"))?;
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),
@@ -238,9 +238,8 @@ fn http_req(
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw)?;
 
-    let sep = find(&raw, b"\r\n\r\n").ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::Other, "no header terminator")
-    })?;
+    let sep =
+        find(&raw, b"\r\n\r\n").ok_or_else(|| std::io::Error::other("no header terminator"))?;
     let head = String::from_utf8_lossy(&raw[..sep]).into_owned();
     let mut lines = head.split("\r\n");
     let status_line = lines.next().unwrap_or_default();
@@ -294,13 +293,11 @@ fn url_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn de_chunk(data: &[u8]) -> Vec<u8> {    let mut out = Vec::new();
+fn de_chunk(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
     let mut i = 0;
-    loop {
-        let line_end = match find(&data[i..], b"\r\n") {
-            Some(p) => i + p,
-            None => break,
-        };
+    while let Some(p) = find(&data[i..], b"\r\n") {
+        let line_end = i + p;
         let size_str = String::from_utf8_lossy(&data[i..line_end]);
         let size = usize::from_str_radix(size_str.trim().split(';').next().unwrap_or("0"), 16)
             .unwrap_or(0);
@@ -328,7 +325,10 @@ struct Pending {
 }
 
 fn openssl(args: &[&str]) -> Vec<u8> {
-    let out = Command::new("openssl").args(args).output().expect("openssl");
+    let out = Command::new("openssl")
+        .args(args)
+        .output()
+        .expect("openssl");
     if !out.status.success() {
         die(&format!(
             "openssl {:?} failed: {}",
@@ -340,8 +340,14 @@ fn openssl(args: &[&str]) -> Vec<u8> {
 }
 
 fn jwk_n(key_file: &Path) -> String {
-    let text = String::from_utf8_lossy(&openssl(&["rsa", "-in", key_file.to_str().unwrap(), "-noout", "-modulus"]))
-        .into_owned();
+    let text = String::from_utf8_lossy(&openssl(&[
+        "rsa",
+        "-in",
+        key_file.to_str().unwrap(),
+        "-noout",
+        "-modulus",
+    ]))
+    .into_owned();
     let hexmod = text
         .lines()
         .find_map(|l| l.strip_prefix("Modulus="))
@@ -420,8 +426,12 @@ fn cmd_idp(args: &[String]) {
         let codes = Arc::clone(&codes);
         let n = n.clone();
         let issuer = issuer.clone();
-        let (client_id, client_secret, subject, email) =
-            (client_id.clone(), client_secret.clone(), subject.clone(), email.clone());
+        let (client_id, client_secret, subject, email) = (
+            client_id.clone(),
+            client_secret.clone(),
+            subject.clone(),
+            email.clone(),
+        );
         let key_file = key_file.clone();
         std::thread::spawn(move || {
             let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
@@ -437,7 +447,8 @@ fn cmd_idp(args: &[String]) {
                         raw.extend_from_slice(&buf[..k]);
                         if !saw_headers && find(&raw, b"\r\n\r\n").is_some() {
                             saw_headers = true;
-                            let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(250)));
+                            let _ = stream
+                                .set_read_timeout(Some(std::time::Duration::from_millis(250)));
                         } else if saw_headers {
                             break;
                         }
@@ -498,7 +509,17 @@ fn cmd_idp(args: &[String]) {
                 }
                 ("GET", "/authorize") => {
                     let q = params(&query);
-                    let mut bad = |msg: &str| respond("400 Bad Request", "application/json", None, format!("{{\"error\":\"invalid_request\",\"error_description\":\"{msg}\"}}").as_bytes());
+                    let mut bad = |msg: &str| {
+                        respond(
+                            "400 Bad Request",
+                            "application/json",
+                            None,
+                            format!(
+                                "{{\"error\":\"invalid_request\",\"error_description\":\"{msg}\"}}"
+                            )
+                            .as_bytes(),
+                        )
+                    };
                     if q.get("response_type").map(String::as_str) != Some("code") {
                         bad("response_type must be code");
                         return;
@@ -511,7 +532,11 @@ fn cmd_idp(args: &[String]) {
                         bad("PKCE S256 required");
                         return;
                     }
-                    if !q.get("scope").map(|s| s.split(' ').any(|x| x == "openid")).unwrap_or(false) {
+                    if !q
+                        .get("scope")
+                        .map(|s| s.split(' ').any(|x| x == "openid"))
+                        .unwrap_or(false)
+                    {
                         bad("openid scope required");
                         return;
                     }
@@ -547,7 +572,14 @@ fn cmd_idp(args: &[String]) {
                     respond("303 See Other", "text/plain", Some(&location), b"");
                 }
                 ("POST", "/token") => {
-                    let mut bad = |err: &str| respond("400 Bad Request", "application/json", None, format!("{{\"error\":\"{err}\"}}").as_bytes());
+                    let mut bad = |err: &str| {
+                        respond(
+                            "400 Bad Request",
+                            "application/json",
+                            None,
+                            format!("{{\"error\":\"{err}\"}}").as_bytes(),
+                        )
+                    };
                     let expected = format!(
                         "Basic {}",
                         b64std(format!("{client_id}:{client_secret}").as_bytes())
@@ -577,7 +609,9 @@ fn cmd_idp(args: &[String]) {
                         bad("invalid_grant");
                         return;
                     };
-                    if form.get("redirect_uri").map(|s| s.as_str()) != Some(pending.redirect_uri.as_str()) {
+                    if form.get("redirect_uri").map(|s| s.as_str())
+                        != Some(pending.redirect_uri.as_str())
+                    {
                         bad("invalid_grant");
                         return;
                     }
@@ -604,8 +638,10 @@ fn cmd_idp(args: &[String]) {
                         .as_bytes(),
                     );
                     let signing_input = format!("{header}.{payload}");
-                    let input_file = std::env::temp_dir().join(format!("drill-jwt-{}.in", std::process::id()));
-                    let sig_file = std::env::temp_dir().join(format!("drill-jwt-{}.sig", std::process::id()));
+                    let input_file =
+                        std::env::temp_dir().join(format!("drill-jwt-{}.in", std::process::id()));
+                    let sig_file =
+                        std::env::temp_dir().join(format!("drill-jwt-{}.sig", std::process::id()));
                     std::fs::write(&input_file, signing_input.as_bytes()).expect("write jwt input");
                     openssl(&[
                         "dgst",
@@ -635,7 +671,13 @@ fn cmd_idp(args: &[String]) {
 // browser stand-in: OIDC login through the fixture IdP
 // ---------------------------------------------------------------------------
 
-fn login(endpoint: &str, client_id: &str, client_secret: &str, subject: &str, email: &str) -> (String, String, String) {
+fn login(
+    endpoint: &str,
+    client_id: &str,
+    client_secret: &str,
+    subject: &str,
+    email: &str,
+) -> (String, String, String) {
     let resp = http_req(
         "GET",
         &format!("{endpoint}/auth/login?return_to=/"),
@@ -652,7 +694,11 @@ fn login(endpoint: &str, client_id: &str, client_secret: &str, subject: &str, em
         .unwrap_or_else(|| die("login: no Location from /auth/login"));
 
     // Fixture contract: the browser signs in by appending login_as/email.
-    let sep = if authorize_url.contains('?') { '&' } else { '?' };
+    let sep = if authorize_url.contains('?') {
+        '&'
+    } else {
+        '?'
+    };
     let authorize_url = format!("{authorize_url}{sep}login_as={subject}&email={email}");
     let resp = http_req("GET", &authorize_url, &[], b"")
         .unwrap_or_else(|e| die(&format!("GET authorize: {e}")));
@@ -666,13 +712,8 @@ fn login(endpoint: &str, client_id: &str, client_secret: &str, subject: &str, em
     let callback_url = resp
         .header("Location")
         .unwrap_or_else(|| die("login: no Location from IdP"));
-    let resp = http_req(
-        "GET",
-        &callback_url,
-        &[("Cookie", login_cookie)],
-        b"",
-    )
-    .unwrap_or_else(|e| die(&format!("GET callback: {e}")));
+    let resp = http_req("GET", &callback_url, &[("Cookie", login_cookie)], b"")
+        .unwrap_or_else(|e| die(&format!("GET callback: {e}")));
     if resp.status != 303 {
         die(&format!(
             "login: callback did not redirect: status={} body={} url={}",
@@ -752,8 +793,13 @@ impl Device {
         if let Some(k) = idem {
             headers.push((HEADER_IDEMPOTENCY_KEY, k.to_string()));
         }
-        http_req(method, &format!("{}{}", self.endpoint, path_and_query), &headers, body)
-            .unwrap_or_else(|e| die(&format!("{method} {path_and_query}: {e}")))
+        http_req(
+            method,
+            &format!("{}{}", self.endpoint, path_and_query),
+            &headers,
+            body,
+        )
+        .unwrap_or_else(|e| die(&format!("{method} {path_and_query}: {e}")))
     }
 }
 
@@ -806,11 +852,19 @@ fn cmd_seed(args: &[String]) {
             other => die(&format!("seed: unknown arg {other}")),
         }
     }
-    check(!endpoint.is_empty() && !idp.is_empty(), "seed: endpoint and idp set");
+    check(
+        !endpoint.is_empty() && !idp.is_empty(),
+        "seed: endpoint and idp set",
+    );
 
     // 1) Browser-style login through the fixture IdP.
-    let (session_cookie, account_id, csrf) =
-        login(&endpoint, "muster-drill", "drill-client-secret-not-real", "alice", "alice@drill.invalid");
+    let (session_cookie, account_id, csrf) = login(
+        &endpoint,
+        "muster-drill",
+        "drill-client-secret-not-real",
+        "alice",
+        "alice@drill.invalid",
+    );
 
     // 2) Create a workspace (session + CSRF + Origin + Idempotency-Key).
     let resp = http_req(
@@ -860,7 +914,10 @@ fn cmd_seed(args: &[String]) {
         "POST",
         &format!("{endpoint}/v1/device/token"),
         &[("Content-Type", "application/json".into())],
-        format!("{{\"grant_type\":\"{DEVICE_CODE_GRANT_TYPE}\",\"device_code\":\"{device_code}\"}}").as_bytes(),
+        format!(
+            "{{\"grant_type\":\"{DEVICE_CODE_GRANT_TYPE}\",\"device_code\":\"{device_code}\"}}"
+        )
+        .as_bytes(),
     )
     .unwrap_or_else(|e| die(&format!("POST /v1/device/token: {e}")));
     check(resp.status == 200, "seed: account token issued");
@@ -896,20 +953,48 @@ fn cmd_seed(args: &[String]) {
             applied_profile: None,
         },
     );
-    std::fs::write(config.join("vault/default.age"), b"synthetic-ciphertext").expect("vault fixture");
+    std::fs::write(config.join("vault/default.age"), b"synthetic-ciphertext")
+        .expect("vault fixture");
     manifest.save(&config).expect("manifest save");
     seal(&config, &state_dir, &manifest, &signer, true)
         .expect("seal")
         .expect("sealed genesis");
     git(&config, &["add", "-A"]);
-    git(&config, &["-c", "user.name=drill", "-c", "user.email=d@drill.invalid", "commit", "-q", "-m", "genesis"]);
+    git(
+        &config,
+        &[
+            "-c",
+            "user.name=drill",
+            "-c",
+            "user.email=d@drill.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "genesis",
+        ],
+    );
     let head1 = git(&config, &["rev-parse", "HEAD"]);
     let bundle_file = work.join("genesis.bundle");
-    git(&config, &["bundle", "create", "-q", bundle_file.to_str().unwrap(), "main"]);
+    git(
+        &config,
+        &[
+            "bundle",
+            "create",
+            "-q",
+            bundle_file.to_str().unwrap(),
+            "main",
+        ],
+    );
     let bundle = std::fs::read(&bundle_file).expect("genesis bundle");
 
     // 5) Link this machine (real proof over canonical_link_v1).
-    let proof = signer.sign(&canonical_link_v1(&ws, &account_id, &machine, &signing_key, &recipient));
+    let proof = signer.sign(&canonical_link_v1(
+        &ws,
+        &account_id,
+        &machine,
+        &signing_key,
+        &recipient,
+    ));
     let resp = http_req(
         "POST",
         &format!("{endpoint}/v1/workspaces/{ws}/devices"),
@@ -928,7 +1013,10 @@ fn cmd_seed(args: &[String]) {
     let linked = resp.text();
     let device_id = json_str(&linked, "device_id");
     let device_token = json_str(&linked, "device_token");
-    check(!device_id.is_empty() && !device_token.is_empty(), "seed: device credentials");
+    check(
+        !device_id.is_empty() && !device_token.is_empty(),
+        "seed: device credentials",
+    );
 
     // 6) Push genesis (signed request, CAS base "none").
     let device = Device {
@@ -952,10 +1040,31 @@ fn cmd_seed(args: &[String]) {
     // 7) Ordinary change (no new epoch) + incremental push.
     std::fs::write(config.join("drill-note.txt"), b"synthetic drill note\n").expect("note");
     git(&config, &["add", "-A"]);
-    git(&config, &["-c", "user.name=drill", "-c", "user.email=d@drill.invalid", "commit", "-q", "-m", "drill note"]);
+    git(
+        &config,
+        &[
+            "-c",
+            "user.name=drill",
+            "-c",
+            "user.email=d@drill.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "drill note",
+        ],
+    );
     let head2 = git(&config, &["rev-parse", "HEAD"]);
     let inc_file = work.join("incremental.bundle");
-    git(&config, &["bundle", "create", "-q", inc_file.to_str().unwrap(), &format!("{head1}..main")]);
+    git(
+        &config,
+        &[
+            "bundle",
+            "create",
+            "-q",
+            inc_file.to_str().unwrap(),
+            &format!("{head1}..main"),
+        ],
+    );
     let inc = std::fs::read(&inc_file).expect("incremental bundle");
     let resp = device.signed(
         "POST",
@@ -977,7 +1086,8 @@ fn cmd_seed(args: &[String]) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o600)).expect("chmod state");
+        std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod state");
     }
     println!("seeded ws={ws} head1={head1} head2={head2}");
 }
@@ -1035,14 +1145,26 @@ fn cmd_verify(args: &[String]) {
     check(!ws.is_empty(), "verify: state loaded");
 
     // a) readiness of the instance under test.
-    let resp = http_req("GET", &format!("{endpoint}/readyz"), &[], b"").unwrap_or_else(|e| die(&format!("GET /readyz: {e}")));
+    let resp = http_req("GET", &format!("{endpoint}/readyz"), &[], b"")
+        .unwrap_or_else(|e| die(&format!("GET /readyz: {e}")));
     check(resp.status == 200, "verify: /readyz ready");
 
     // b) the pre-backup browser session still authenticates.
-    let resp = http_req("GET", &format!("{endpoint}/v1/me"), &[("Cookie", session_cookie)], b"")
-        .unwrap_or_else(|e| die(&format!("GET /v1/me: {e}")));
-    check(resp.status == 200, "verify: pre-backup session valid on /v1/me");
-    check(json_str(&resp.text(), "id") == account_id, "verify: same account id");
+    let resp = http_req(
+        "GET",
+        &format!("{endpoint}/v1/me"),
+        &[("Cookie", session_cookie)],
+        b"",
+    )
+    .unwrap_or_else(|e| die(&format!("GET /v1/me: {e}")));
+    check(
+        resp.status == 200,
+        "verify: pre-backup session valid on /v1/me",
+    );
+    check(
+        json_str(&resp.text(), "id") == account_id,
+        "verify: same account id",
+    );
 
     // c) the pre-backup account token still lists the workspace.
     let resp = http_req(
@@ -1079,7 +1201,15 @@ fn cmd_verify(args: &[String]) {
     let bundle_file = clone_dir.join("pulled.bundle");
     std::fs::write(&bundle_file, &resp.body).expect("write pulled bundle");
     git(&clone_dir, &["init", "-q", "-b", "main"]);
-    git(&clone_dir, &["fetch", "-q", bundle_file.to_str().unwrap(), "refs/heads/main:refs/heads/pulled"]);
+    git(
+        &clone_dir,
+        &[
+            "fetch",
+            "-q",
+            bundle_file.to_str().unwrap(),
+            "refs/heads/main:refs/heads/pulled",
+        ],
+    );
     let pulled = git(&clone_dir, &["rev-parse", "pulled"]);
     check(pulled == expect_head, "verify: pulled bundle head matches");
 
@@ -1092,10 +1222,31 @@ fn cmd_verify(args: &[String]) {
         )
         .expect("marker");
         git(&config, &["add", "-A"]);
-        git(&config, &["-c", "user.name=drill", "-c", "user.email=d@drill.invalid", "commit", "-q", "-m", &format!("verify {label}")]);
+        git(
+            &config,
+            &[
+                "-c",
+                "user.name=drill",
+                "-c",
+                "user.email=d@drill.invalid",
+                "commit",
+                "-q",
+                "-m",
+                &format!("verify {label}"),
+            ],
+        );
         let new_head = git(&config, &["rev-parse", "HEAD"]);
         let inc = clone_dir.join("verify.bundle");
-        git(&config, &["bundle", "create", "-q", inc.to_str().unwrap(), &format!("{expect_head}..main")]);
+        git(
+            &config,
+            &[
+                "bundle",
+                "create",
+                "-q",
+                inc.to_str().unwrap(),
+                &format!("{expect_head}..main"),
+            ],
+        );
         let body = std::fs::read(&inc).expect("verify bundle");
         let resp = device.signed(
             "POST",
@@ -1104,13 +1255,20 @@ fn cmd_verify(args: &[String]) {
             Some(&expect_head),
             Some(&uuid_v4()),
         );
-        check(resp.status == 200, "verify: incremental push accepted after restore");
+        check(
+            resp.status == 200,
+            "verify: incremental push accepted after restore",
+        );
         check(
             resp.header(HEADER_REVISION).unwrap_or_default() == new_head,
             "verify: push revision echoed",
         );
         check(
-            resp.header(HEADER_EPOCH).unwrap_or_default().parse::<u64>().unwrap_or(0) >= 1,
+            resp.header(HEADER_EPOCH)
+                .unwrap_or_default()
+                .parse::<u64>()
+                .unwrap_or(0)
+                >= 1,
             "verify: epoch header sane",
         );
         println!("verified label={label} new_head={new_head}");

@@ -312,8 +312,8 @@ deploy/backup-drill.sh
 Runs the whole loop against synthetic data in one ephemeral PostgreSQL
 cluster (`deploy/pg-test.sh`) with the real `muster-cloud` binary: a reusable
 fixture OIDC provider plus a signed-request client
-(`deploy/harness/drill.rs`, compiled by `deploy/harness/build.sh` against the
-previously built `muster` library rlib — no Cargo manifest changes) seed a
+(`deploy/harness/drill.rs`, built by `deploy/harness/build.sh` through the
+optional Cargo feature `backup-drill`) seed a
 workspace through the PUBLIC HTTP API (OIDC login, workspace, RFC 8628 device
 flow, machine link with a real link proof, signed genesis + incremental
 pushes). Then: backup → restore into new targets → a SECOND real service
