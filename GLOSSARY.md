@@ -31,7 +31,7 @@ _Avoid_: backup key, master key
 ### Secrets
 
 **Vault**:
-The age-encrypted files in the config repository that hold all secrets: one ciphertext file per secret group plus plaintext metadata sidecars with no values. No server or account is involved.
+The age-encrypted files in the config repository that hold all secrets: one ciphertext file per secret group plus plaintext metadata sidecars with no values. A vault requires no server or account. Optional Cloud storage does not decrypt its values.
 _Avoid_: secret store, password manager
 
 **Secret group**:
@@ -111,7 +111,7 @@ The last known state of a subscribed skill: `local`, `up_to_date`, `update_avail
 ### Operations
 
 **Sync**:
-The act of exchanging the config repository with its Git remote and applying the desired state with backups and a generation (`muster sync`). This is how every machine converges.
+The act of exchanging the config repository through its configured transport and applying the desired state with backups and a generation (`muster sync`). This is how every machine converges.
 _Avoid_: deploy, push (unqualified)
 
 **Schedule**:
@@ -136,3 +136,31 @@ optionally limited to one adapter. Toggles control deployment and do not change
 A local summary of observed skill, MCP server, and subagent calls in agent
 session transcripts. An unused item has no observed calls in the selected
 window; incomplete transcript coverage does not prove it was never used.
+
+### Cloud
+
+**Cloud account**:
+A person's identity for access to the optional hosted service. Account access
+does not grant possession of machine keys or the recovery key.
+
+**Workspace**:
+The hosted space for one fleet, with its service membership and subscription.
+
+**Cloud role**:
+A person's service permissions within a workspace. A Cloud role is separate
+from the member role and signed approvals that authorize fleet changes.
+
+**Cloud link**:
+A machine's local connection to a workspace. Linking a machine does not by
+itself approve its enrollment in the fleet.
+
+**Accepted revision**:
+The workspace configuration whose signed fleet history the service has accepted.
+
+**Proposal**:
+A retained candidate change awaiting resolution or sufficient signed approvals.
+It does not replace the accepted revision while pending.
+
+**Machine receipt**:
+A machine's signed report of the revision it applied or failed to apply. The
+report does not establish what an agent subsequently did.

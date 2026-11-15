@@ -41,7 +41,39 @@ Muster se usa por tres vías equivalentes, todas apoyadas en el mismo núcleo:
 
 El mismo producto sirve a dos públicos:
 - **Modo individual:** gratis y open source. Una persona y sus máquinas, sobre su propio repo Git.
-- **Modo equipo:** un repo Git del equipo con miembros, grupos y permisos, administrado desde la interfaz web o la CLI. Un hub alojado de pago queda fuera de esta spec.
+- **Modo equipo:** un repo Git del equipo con miembros, grupos y permisos, administrado desde la interfaz web o la CLI. El servicio opcional Muster Cloud se define en la ampliación de alcance siguiente.
+
+### Ampliación de alcance: Muster Cloud
+
+Estado: diseño autorizado, implementación en curso. Esta sección amplía el
+alcance original del núcleo gratuito. No acredita un servicio desplegado.
+
+Muster Cloud es una suscripción autoservicio con cuenta web, workspace alojado,
+enlace de máquinas, sincronización administrada, equipo, historial, restauración,
+exportación y cancelación. El cliente no necesita operar un remoto Git ni
+contratar un servicio de instalación. El núcleo individual y de equipo conserva
+su licencia Apache-2.0 y funciona con Git propio sin cuenta Cloud.
+
+El servicio es independiente del panel local `muster ui`. La cuenta y la
+facturación autorizan acceso al servicio. Las firmas locales y el quórum siguen
+autorizando los cambios de flota. Cloud no recibe las claves privadas ni
+descifra los valores de la bóveda. La configuración y los metadatos pueden ser
+visibles al servicio. Revocar una máquina no borra credenciales ya entregadas.
+
+El transporte conserva la historia Git autenticada completa. Un cambio basado
+en una revisión antigua se conserva como propuesta para resolverlo sin perder
+datos. Restaurar crea una revisión nueva bajo el gobierno vigente. La salida
+al núcleo gratuito incluye una exportación verificable sin suscripción.
+[ADR 0006](adr/0006-cloud-service.md) registra estas decisiones.
+
+La aceptación usa tres interfaces confirmadas: API HTTP pública, CLI instalada
+en dos máquinas y navegador. Los recorridos incluyen aislamiento, permisos,
+desconexión, conflictos, recuperación, pago, cancelación y salida al modo OSS.
+Los proveedores externos se prueban en sus entornos de prueba o mediante
+fixtures de sus protocolos. Configurar producción y verificar un cobro real
+son actividades distintas a pasar estas pruebas.
+
+SSO/SAML, SCIM y contratos enterprise quedan para una ampliación posterior.
 
 ## User Stories
 
@@ -137,7 +169,7 @@ El mismo producto sirve a dos públicos:
 ## Implementation Decisions
 
 ### Producto y alcance
-- Producto open source con licencia **Apache-2.0**. El mismo núcleo sirve al modo individual y al modo equipo. Un hub alojado de pago se especificará más adelante sobre el mismo modelo de datos.
+- Producto open source con licencia **Apache-2.0**. El mismo núcleo sirve al modo individual y al modo equipo. Muster Cloud añade un servicio opcional sobre el mismo modelo de datos, según la ampliación de alcance y ADR 0006.
 - **Dependencia externa obligatoria: solo Git.** chezmoi, Bitwarden (`bws`/`bw`), Tailscale y el model hub dejan de ser obligatorios.
 - **Agentes soportados de forma completa en v1: Claude Code, Codex, OpenCode, Antigravity CLI y Pi.** Hermes, como adaptador experimental.
 - **Plataformas:** Linux, WSL2 y macOS. Windows nativo no entra.
@@ -386,7 +418,7 @@ Opciones globales: `--config`, `--format text|json`, `--yes`, `--dry-run` (en to
 
 ## Out of Scope
 
-- **Hub alojado de pago:** sync en la nube, panel multiusuario hospedado, SSO/SAML, SCIM, facturación y RBAC en servidor. Irá en una spec posterior sobre este mismo modelo.
+- SSO/SAML, SCIM y contratación enterprise. La ampliación Muster Cloud sí incluye sync alojado, panel multiusuario, facturación y permisos del servicio.
 - Windows nativo (WSL2 sí entra).
 - Sincronizar la memoria de los agentes entre máquinas.
 - Catálogo o marketplace público de plugins de terceros.
