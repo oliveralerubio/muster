@@ -180,7 +180,11 @@ jobs:
           cache-targets: false
 
       - name: Build service binary and library for the drill
-        run: cargo build --locked -p muster --lib -p muster-cloud
+        run: |
+          set -eu
+          cargo build --locked -p muster --lib
+          cargo build --locked -p muster-cloud --bin muster-cloud
+          test -x "${CARGO_TARGET_DIR:-target}/debug/muster-cloud"
 
       # The drill composes deploy/pg-test.sh (ephemeral socket-only cluster),
       # deploy/pg-backup.sh, deploy/pg-restore.sh and the rustc-built harness
