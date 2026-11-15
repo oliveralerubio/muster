@@ -1,9 +1,13 @@
 //! Git storage for workspaces: one bare repository per workspace under
 //! `MUSTER_REPO_ROOT`.
 //!
-//! Durability order (see the implementation contract): an upload's objects
-//! and an immutable ref `refs/muster/uploads/<id>` are written **before** the
-//! PostgreSQL transaction that may accept it. PostgreSQL is the only
+//! Durability order (see the implementation contract): an upload is first
+//! unpacked in private staging ([`RepoStore::stage`]), measured and
+//! verified there; only an upload the service keeps (accepted, or retained
+//! as a proposal) has its objects and an immutable ref
+//! `refs/muster/uploads/<id>` moved into the workspace repository, and that
+//! happens **before** the PostgreSQL transaction that records it commits.
+//! Refused uploads leave nothing behind. PostgreSQL is the only
 //! authority on the accepted head; `refs/heads/main` is a derived ref that is
 //! repaired to the PostgreSQL head before it is served. Upload refs are never
 //! deleted, so retained proposals (and every accepted state) survive `git gc`.
@@ -44,6 +48,9 @@ fn git(dir: &Path, args: &[&str]) -> Result<Output, AppError> {
         .arg("-C")
         .arg(dir)
         .args(["-c", "core.hooksPath=/dev/null"])
+        // No automatic gc/maintenance: it runs detached after a fetch and
+        // would repack staged objects while they are measured and moved.
+        .args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"])
         .args(args)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -67,6 +74,51 @@ fn is_sha(s: &str) -> bool {
     s.len() == 40
         && s.bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Size of a loose ref file (40 hex digits and a newline). Bare
+/// repositories keep no reflog by default.
+pub const REF_FILE_BYTES: u64 = 41;
+
+/// An upload unpacked in private staging, not yet part of the workspace.
+/// Dropping it discards every byte it holds.
+pub struct Staged {
+    _dir: tempfile::TempDir,
+    repo: PathBuf,
+    id: uuid::Uuid,
+    pub tip: String,
+}
+
+impl Staged {
+    pub fn path(&self) -> &Path {
+        &self.repo
+    }
+
+    /// `(path relative to objects/, size)` of every staged object file
+    /// (packs, indexes, loose objects; not `info/` or `.keep` markers).
+    fn object_files(&self) -> Result<Vec<(PathBuf, u64)>, AppError> {
+        fn walk(base: &Path, dir: &Path, out: &mut Vec<(PathBuf, u64)>) -> std::io::Result<()> {
+            for entry in fs::read_dir(dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                let meta = entry.metadata()?;
+                if meta.is_dir() {
+                    if path != base.join("info") {
+                        walk(base, &path, out)?;
+                    }
+                } else if path.extension().is_none_or(|e| e != "keep") {
+                    let rel = path.strip_prefix(base).map_err(std::io::Error::other)?;
+                    out.push((rel.to_path_buf(), meta.len()));
+                }
+            }
+            Ok(())
+        }
+        let base = self.repo.join("objects");
+        let mut out = Vec::new();
+        walk(&base, &base, &mut out)
+            .map_err(|e| AppError::internal(format!("listing staged objects: {e}")))?;
+        Ok(out)
+    }
 }
 
 impl RepoStore {
@@ -119,23 +171,37 @@ impl RepoStore {
         walk(&repo).map_err(AppError::internal)
     }
 
-    /// Stores the bundle's objects and pins its tip under
-    /// [`upload_ref`]`(id)`. The bundle must carry exactly one ref,
-    /// `refs/heads/main`, and its prerequisites must already be stored.
-    /// Returns the tip commit.
-    pub fn ingest(
-        &self,
-        ws: uuid::Uuid,
-        bundle: &[u8],
-        id: uuid::Uuid,
-    ) -> Result<String, AppError> {
+    /// Unpacks an upload into a private staging repository that borrows the
+    /// workspace's objects (`objects/info/alternates`) for the bundle's
+    /// prerequisites, so only the upload's **new** objects land in staging,
+    /// as one pack. Nothing is written to the workspace repository: dropping
+    /// the returned [`Staged`] discards the upload completely. The bundle
+    /// must carry exactly one ref, `refs/heads/main`.
+    pub fn stage(&self, ws: uuid::Uuid, bundle: &[u8], id: uuid::Uuid) -> Result<Staged, AppError> {
         let repo = self.ensure(ws)?;
-        let scratch = self.scratch()?;
-        let file = scratch.path().join("upload.bundle");
+        let dir = self.scratch()?;
+        let stage = dir.path().join("stage.git");
+        let stage_str = stage.to_str().ok_or_else(|| AppError::internal("path"))?;
+        git_ok(
+            dir.path(),
+            &["init", "--quiet", "--bare", "--template=", stage_str],
+        )?;
+        let objects = repo.join("objects");
+        let objects = objects
+            .canonicalize()
+            .map_err(|e| AppError::internal(format!("workspace objects: {e}")))?;
+        fs::create_dir_all(stage.join("objects/info")).map_err(AppError::internal)?;
+        fs::write(
+            stage.join("objects/info/alternates"),
+            format!("{}\n", objects.display()),
+        )
+        .map_err(AppError::internal)?;
+
+        let file = dir.path().join("upload.bundle");
         fs::write(&file, bundle).map_err(AppError::internal)?;
         let file_str = file.to_str().ok_or_else(|| AppError::internal("path"))?;
 
-        let heads = git(&repo, &["bundle", "list-heads", file_str])?;
+        let heads = git(&stage, &["bundle", "list-heads", file_str])?;
         if !heads.status.success() {
             return Err(invalid("bad_bundle", "body is not a readable git bundle"));
         }
@@ -158,7 +224,7 @@ impl RepoStore {
                 ))
             }
         };
-        let verify = git(&repo, &["bundle", "verify", "--quiet", file_str])?;
+        let verify = git(&stage, &["bundle", "verify", "--quiet", file_str])?;
         if !verify.status.success() {
             return Err(invalid(
                 "missing_prerequisites",
@@ -167,8 +233,21 @@ impl RepoStore {
         }
         let refspec = format!("{SYNC_REF}:{}", upload_ref(id));
         let fetched = git(
-            &repo,
-            &["fetch", "--quiet", "--no-tags", file_str, &refspec],
+            &stage,
+            &[
+                "-c",
+                "transfer.fsckObjects=true",
+                "-c",
+                "transfer.unpackLimit=1",
+                "-c",
+                "fetch.unpackLimit=1",
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "--no-write-fetch-head",
+                file_str,
+                &refspec,
+            ],
         )?;
         if !fetched.status.success() {
             return Err(invalid(
@@ -179,20 +258,74 @@ impl RepoStore {
                 ),
             ));
         }
-        Ok(tip)
+        fs::remove_file(&file).map_err(AppError::internal)?;
+        Ok(Staged {
+            _dir: dir,
+            repo: stage,
+            id,
+            tip,
+        })
     }
 
-    /// A private checkout of `rev` (which must be reachable from a stored
-    /// upload ref) with its complete history, for the trust verifier.
-    pub fn checkout(
-        &self,
-        ws: uuid::Uuid,
-        upload: uuid::Uuid,
-    ) -> Result<tempfile::TempDir, AppError> {
-        let repo = self.repo(ws);
+    /// Bytes committing `staged` adds to the workspace repository: its new
+    /// object files plus the refs it will create (the upload ref, and
+    /// `refs/heads/main` when `creates_main`).
+    pub fn added_bytes(&self, staged: &Staged, creates_main: bool) -> Result<u64, AppError> {
+        let mut total = 0;
+        for (_, meta_len) in staged.object_files()? {
+            total += meta_len;
+        }
+        let refs = 1 + u64::from(creates_main);
+        Ok(total + refs * REF_FILE_BYTES)
+    }
+
+    /// Moves the staged objects into the workspace repository and pins the
+    /// tip under [`upload_ref`]. Pack data is moved before its index, so Git
+    /// never sees an index without its pack; files already present (same
+    /// name, same content) are left alone. Nothing existing is deleted.
+    pub fn commit_staged(&self, ws: uuid::Uuid, staged: Staged) -> Result<(), AppError> {
+        let repo = self.ensure(ws)?;
+        let target = repo.join("objects");
+        let mut files = staged.object_files()?;
+        files.sort_by_key(|(rel, _)| rel.extension().is_some_and(|e| e == "idx"));
+        let durable = |e: std::io::Error| AppError::internal(format!("syncing objects: {e}"));
+        let mut dirs = std::collections::BTreeSet::new();
+        for (rel, _) in files {
+            let dest = target.join(&rel);
+            if dest.exists() {
+                continue;
+            }
+            let src = staged.repo.join("objects").join(&rel);
+            // Content on disk before it becomes visible in the workspace.
+            fs::File::open(&src)
+                .and_then(|f| f.sync_all())
+                .map_err(durable)?;
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent).map_err(AppError::internal)?;
+                dirs.insert(parent.to_path_buf());
+            }
+            fs::rename(&src, &dest)
+                .map_err(|e| AppError::internal(format!("moving staged {}: {e}", rel.display())))?;
+        }
+        // The new directory entries too, before the PostgreSQL commit that
+        // will refer to these objects.
+        for dir in dirs {
+            fs::File::open(&dir)
+                .and_then(|f| f.sync_all())
+                .map_err(durable)?;
+        }
+        git_ok(&repo, &["update-ref", &upload_ref(staged.id), &staged.tip]).map(|_| ())
+    }
+
+    /// A private checkout of the staged upload with its complete history,
+    /// for the trust verifier.
+    pub fn checkout(&self, staged: &Staged) -> Result<tempfile::TempDir, AppError> {
         let dir = self.scratch()?;
         let path = dir.path();
-        let repo_str = repo.to_str().ok_or_else(|| AppError::internal("path"))?;
+        let repo_str = staged
+            .repo
+            .to_str()
+            .ok_or_else(|| AppError::internal("path"))?;
         git_ok(path, &["init", "--quiet"])?;
         git_ok(
             path,
@@ -201,7 +334,7 @@ impl RepoStore {
                 "--quiet",
                 "--no-tags",
                 repo_str,
-                &upload_ref(upload),
+                &upload_ref(staged.id),
             ],
         )?;
         git_ok(path, &["checkout", "--quiet", "--detach", "FETCH_HEAD"])?;

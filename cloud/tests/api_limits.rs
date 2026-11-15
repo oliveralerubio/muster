@@ -4,12 +4,13 @@
 mod support;
 
 use muster_cloud::protocol::{
-    canonical_link_v1, error_codes, AccountToken, ApiError, CreateInvitation, CreateProposal,
-    CreatedInvitation, Device, DeviceStatus, LinkDeviceRequest, ProposalKind, Role,
-    WorkspaceBilling,
+    canonical_link_v1, error_codes, AccountToken, ApiError, CheckoutSession, CreateCheckout,
+    CreateInvitation, CreateProposal, CreatedInvitation, Device, DeviceStatus, LinkDeviceRequest,
+    PlanStatus, ProposalKind, Role, WorkspaceBilling,
 };
 use support::fleet::{account_token, create_workspace, link, FleetRepo, MachineKey};
-use support::{http, stack, stack_with_env, Stack, UserSession};
+use support::paddle_fixture::PaddleFixture;
+use support::{http, stack, stack_with_env, stack_with_paddle, Stack, UserSession};
 
 async fn billing_of(s: &Stack, u: &UserSession, ws: &str) -> WorkspaceBilling {
     let resp = http()
@@ -474,4 +475,305 @@ async fn proposals_past_the_declared_storage_limit_are_refused() {
     );
     assert_eq!(billing_of(&s, &alice, &ws).await.storage_used_bytes, before);
     assert_eq!(pulled_head(&s, &dev).await, head);
+}
+
+/// A candidate the verifier refuses (422) does not keep consuming storage:
+/// usage is unchanged and the accepted head is intact.
+#[tokio::test]
+async fn an_invalid_candidate_consumes_no_storage() {
+    let s = stack().await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let key = MachineKey::new("node-0");
+    let (ws, dev, repo) = genesis_workspace(&s, &alice, &key).await;
+    let head = repo.head();
+    let before = billing_of(&s, &alice, &ws).await.storage_used_bytes;
+
+    // An unrelated history (another fleet's genesis) carrying 512 KiB.
+    let outsider = MachineKey::new("outsider");
+    let alien = FleetRepo::genesis(&outsider);
+    std::fs::write(alien.config.join("x.bin"), noise(512 * 1024, 8)).unwrap();
+    alien.commit("x");
+    let resp = dev
+        .send(&s, &dev.push(alien.bundle(None), Some(&head)))
+        .await;
+    assert_eq!(resp.status(), 422);
+    assert_eq!(billing_of(&s, &alice, &ws).await.storage_used_bytes, before);
+    assert_eq!(pulled_head(&s, &dev).await, head);
+}
+
+/// The storage guard counts the bytes really kept (pack, index, refs), not
+/// the request body: with exactly `bundle.len()` bytes free the push does
+/// not fit, is refused with 507, and nothing is stored. With room for what
+/// is really stored, it is accepted and usage stays within the limit.
+#[tokio::test]
+async fn the_storage_guard_counts_bytes_really_stored_not_the_body() {
+    let mut s = stack().await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let key = MachineKey::new("node-0");
+    let (ws, dev, repo) = genesis_workspace(&s, &alice, &key).await;
+    let head = repo.head();
+    let used = billing_of(&s, &alice, &ws).await.storage_used_bytes;
+
+    std::fs::write(repo.config.join("a.bin"), noise(256 * 1024, 9)).unwrap();
+    let next = repo.commit("a");
+    let bundle = repo.bundle(Some(&head));
+    let limit = used + bundle.len() as u64;
+    s.restart_with_env(&[("MUSTER_DEV_STORAGE_LIMIT_BYTES", limit.to_string())])
+        .await;
+    let resp = dev.send(&s, &dev.push(bundle.clone(), Some(&head))).await;
+    assert_eq!(resp.status(), 507);
+    let billing = billing_of(&s, &alice, &ws).await;
+    assert_eq!(billing.storage_used_bytes, used);
+    assert_eq!(pulled_head(&s, &dev).await, head);
+
+    let limit = used + 2 * bundle.len() as u64;
+    s.restart_with_env(&[("MUSTER_DEV_STORAGE_LIMIT_BYTES", limit.to_string())])
+        .await;
+    let resp = dev.send(&s, &dev.push(bundle, Some(&head))).await;
+    assert_eq!(resp.status(), 200);
+    let billing = billing_of(&s, &alice, &ws).await;
+    assert!(billing.storage_used_bytes > used + 256 * 1024);
+    assert!(billing.storage_used_bytes <= billing.max_storage_bytes);
+    assert_eq!(pulled_head(&s, &dev).await, next);
+}
+
+/// A proposal is measured as it is stored and counted (PostgreSQL's JSON
+/// text, which spaces separators), not as compact JSON: with only its
+/// compact size free it does not fit and is refused with 507.
+#[tokio::test]
+async fn the_proposal_guard_counts_the_size_it_is_stored_with() {
+    let mut s = stack().await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let key = MachineKey::new("node-0");
+    let (ws, dev, repo) = genesis_workspace(&s, &alice, &key).await;
+    let head = repo.head();
+    let used = billing_of(&s, &alice, &ws).await.storage_used_bytes;
+
+    // Many short array items: the stored text form is clearly larger.
+    let mut proposal = restore_proposal(&head, 0);
+    proposal.payload["note"] = serde_json::json!(vec![0u8; 20_000]);
+    let compact = serde_json::to_vec(&proposal.payload).unwrap().len() as u64;
+    s.restart_with_env(&[(
+        "MUSTER_DEV_STORAGE_LIMIT_BYTES",
+        (used + compact).to_string(),
+    )])
+    .await;
+    let path = format!("/v1/workspaces/{ws}/proposals");
+    let resp = dev.send(&s, &dev.post_json(&path, &proposal)).await;
+    assert_eq!(resp.status(), 507);
+    let billing = billing_of(&s, &alice, &ws).await;
+    assert_eq!(billing.storage_used_bytes, used);
+    assert!(billing.storage_used_bytes <= billing.max_storage_bytes);
+}
+
+/// More simultaneous pushes than the service has database connections, at
+/// the storage limit: every request gets a definite answer (accepted,
+/// retained conflict or 507; never a 500 from a starved or deadlocked
+/// pool), usage ends within the limit, and head, pull and export hold.
+#[tokio::test]
+async fn concurrent_pushes_at_the_storage_limit_stay_within_it() {
+    const PUSHES: usize = 24;
+    let mut s = stack().await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let key = MachineKey::new("node-0");
+    let (ws, dev, repo) = genesis_workspace(&s, &alice, &key).await;
+    let head = repo.head();
+    let used = billing_of(&s, &alice, &ws).await.storage_used_bytes;
+    // Room for about five of the pushes below.
+    let limit = used + 5 * 70 * 1024;
+    s.restart_with_env(&[("MUSTER_DEV_STORAGE_LIMIT_BYTES", limit.to_string())])
+        .await;
+
+    let bundle = repo.bundle(None);
+    let mut requests = Vec::new();
+    let mut tips = Vec::new();
+    for i in 0..PUSHES {
+        let fork = FleetRepo::clone_from_bundle(&bundle);
+        git_reset(&fork, &head);
+        std::fs::write(fork.config.join("f.bin"), noise(64 * 1024, 100 + i as u64)).unwrap();
+        tips.push(fork.commit(&format!("f{i}")));
+        requests.push(dev.push(fork.bundle(Some(&head)), Some(&head)));
+    }
+    let responses = futures::future::join_all(requests.iter().map(|r| dev.send(&s, r))).await;
+    let mut counts = std::collections::BTreeMap::new();
+    for resp in responses {
+        *counts.entry(resp.status().as_u16()).or_insert(0) += 1;
+    }
+    assert!(
+        counts.keys().all(|c| [200, 409, 507].contains(c)),
+        "statuses: {counts:?}"
+    );
+    assert_eq!(counts.get(&200), Some(&1), "statuses: {counts:?}");
+    assert!(counts.contains_key(&507), "statuses: {counts:?}");
+
+    let billing = billing_of(&s, &alice, &ws).await;
+    assert!(
+        billing.storage_used_bytes <= billing.max_storage_bytes,
+        "{} > {}",
+        billing.storage_used_bytes,
+        billing.max_storage_bytes
+    );
+    let pulled = pulled_head(&s, &dev).await;
+    assert!(tips.contains(&pulled));
+    let resp = http()
+        .get(s.url(&format!("/v1/workspaces/{ws}/export")))
+        .header("Cookie", format!("__Host-mc_session={}", alice.cookie))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+/// Simultaneous proposals at the storage limit: exactly as many as fit are
+/// kept, the rest get 507, and usage ends within the limit.
+#[tokio::test]
+async fn concurrent_proposals_at_the_storage_limit_keep_exactly_what_fits() {
+    const FIT: u64 = 4;
+    let mut s = stack().await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let key = MachineKey::new("node-0");
+    let (ws, dev, repo) = genesis_workspace(&s, &alice, &key).await;
+    let head = repo.head();
+    let path = format!("/v1/workspaces/{ws}/proposals");
+    let proposal = restore_proposal(&head, 32 * 1024);
+
+    // The stored size of one such proposal, measured through the API.
+    let before = billing_of(&s, &alice, &ws).await.storage_used_bytes;
+    let resp = dev.send(&s, &dev.post_json(&path, &proposal)).await;
+    assert_eq!(resp.status(), 201);
+    let used = billing_of(&s, &alice, &ws).await.storage_used_bytes;
+    let each = used - before;
+
+    let limit = used + FIT * each + each / 2;
+    s.restart_with_env(&[("MUSTER_DEV_STORAGE_LIMIT_BYTES", limit.to_string())])
+        .await;
+    const ATTEMPTS: u64 = 32;
+    let requests: Vec<_> = (0..ATTEMPTS)
+        .map(|_| dev.post_json(&path, &proposal))
+        .collect();
+    let responses = futures::future::join_all(requests.iter().map(|r| dev.send(&s, r))).await;
+    let mut counts = std::collections::BTreeMap::new();
+    for resp in responses {
+        *counts.entry(resp.status().as_u16()).or_insert(0u64) += 1;
+    }
+    assert_eq!(counts.get(&201), Some(&FIT), "statuses: {counts:?}");
+    assert_eq!(
+        counts.get(&507),
+        Some(&(ATTEMPTS - FIT)),
+        "statuses: {counts:?}"
+    );
+    let billing = billing_of(&s, &alice, &ws).await;
+    assert_eq!(billing.storage_used_bytes, used + FIT * each);
+    assert!(billing.storage_used_bytes <= billing.max_storage_bytes);
+    assert_eq!(pulled_head(&s, &dev).await, head);
+}
+
+/// Subscribes `ws` to `plan` the way a customer does: server-created
+/// checkout, payment at Paddle (fixture over HTTP), signed webhook.
+async fn subscribe(
+    s: &Stack,
+    paddle: &PaddleFixture,
+    u: &UserSession,
+    ws: &str,
+    plan: &str,
+    seats: u32,
+) -> WorkspaceBilling {
+    let resp = session_send(
+        s,
+        u,
+        reqwest::Method::POST,
+        &format!("/v1/workspaces/{ws}/billing/checkout"),
+        &serde_json::to_value(CreateCheckout {
+            plan: plan.into(),
+            seats,
+        })
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let txn = resp.json::<CheckoutSession>().await.unwrap().transaction_id;
+    let sub = format!("sub_{}", uuid::Uuid::new_v4().simple());
+    let customer = format!("ctm_{}", uuid::Uuid::new_v4().simple());
+    let event = paddle.complete_checkout(&txn, &sub, &customer);
+    let bytes = serde_json::to_vec(&event).unwrap();
+    let sig = paddle.sign_webhook(&bytes, time::OffsetDateTime::now_utc().unix_timestamp());
+    let resp = http()
+        .post(s.url("/v1/billing/webhook"))
+        .header("Paddle-Signature", sig)
+        .body(bytes)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let billing = billing_of(s, u, ws).await;
+    assert_eq!(
+        (billing.plan.as_str(), billing.plan_status),
+        (plan, PlanStatus::Active)
+    );
+    billing
+}
+
+/// Links machines until the declared limit, then expects `507`.
+async fn fill_machine_limit(s: &Stack, token: &AccountToken, ws: &str, already: usize, max: usize) {
+    let keys: Vec<MachineKey> = (already..max)
+        .map(|i| MachineKey::new(&format!("node-{i}")))
+        .collect();
+    for key in &keys {
+        assert_eq!(try_link(s, token, ws, key).await.status(), 201);
+    }
+    let extra = MachineKey::new("one-too-many");
+    let resp = try_link(s, token, ws, &extra).await;
+    assert_eq!(resp.status(), 507);
+    assert_eq!(
+        resp.json::<ApiError>().await.unwrap().error.code,
+        error_codes::QUOTA_EXCEEDED
+    );
+    assert_eq!(devices_of(s, token, ws).await.len(), max);
+}
+
+/// A paid personal plan gets its own declared limits, enforced: its machine
+/// limit, and pushes up to its larger bundle limit that the trial refuses.
+#[tokio::test]
+async fn a_personal_subscription_enforces_the_personal_limits() {
+    let paddle = support::paddle_fixture::start().await;
+    let s = stack_with_paddle(&paddle).await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let token = account_token(&s, &alice).await;
+    let key = MachineKey::new("node-0");
+    let (ws, dev, repo) = genesis_workspace(&s, &alice, &key).await;
+    let trial = billing_of(&s, &alice, &ws).await;
+    let billing = subscribe(&s, &paddle, &alice, &ws, "personal", 1).await;
+    assert!(billing.max_devices > trial.max_devices);
+    assert!(billing.max_bundle_bytes > trial.max_bundle_bytes);
+
+    // A push over the trial's per-push limit is within personal's.
+    let head = repo.head();
+    std::fs::write(
+        repo.config.join("big.bin"),
+        noise(trial.max_bundle_bytes + 1024 * 1024, 11),
+    )
+    .unwrap();
+    let next = repo.commit("big");
+    let bundle = repo.bundle(Some(&head));
+    assert!(bundle.len() > trial.max_bundle_bytes && bundle.len() <= billing.max_bundle_bytes);
+    let resp = dev.send(&s, &dev.push(bundle, Some(&head))).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(pulled_head(&s, &dev).await, next);
+
+    fill_machine_limit(&s, &token, &ws, 1, billing.max_devices as usize).await;
+}
+
+/// A paid team plan's machine limit follows its seats.
+#[tokio::test]
+async fn a_team_subscription_enforces_its_per_seat_machine_limit() {
+    let paddle = support::paddle_fixture::start().await;
+    let s = stack_with_paddle(&paddle).await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let token = account_token(&s, &alice).await;
+    let ws = create_workspace(&s, &alice, "Team").await;
+    let trial = billing_of(&s, &alice, &ws.id).await;
+    let billing = subscribe(&s, &paddle, &alice, &ws.id, "team", 1).await;
+    assert_eq!(billing.seats, 1);
+    assert!(billing.max_devices > trial.max_devices);
+    fill_machine_limit(&s, &token, &ws.id, 0, billing.max_devices as usize).await;
 }

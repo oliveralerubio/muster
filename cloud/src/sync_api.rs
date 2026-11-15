@@ -20,6 +20,7 @@ use crate::protocol::{
     error_codes, HeadRef, ProposalKind, ProposalStatus, SyncAccepted, SyncHeld, BASE_REVISION_NONE,
     GIT_BUNDLE_MEDIA_TYPE, HEADER_BASE_REVISION, HEADER_EPOCH, HEADER_REVISION,
 };
+use crate::repo_store::Staged;
 use crate::state::AppState;
 
 /// Maximum sync body (25 MB).
@@ -85,16 +86,25 @@ pub(crate) enum Verdict {
     },
 }
 
-/// Verifies the complete history of upload `id` against `anchor`.
+/// Moves a staged upload the service keeps into the workspace repository
+/// (objects, then its immutable ref), before the PostgreSQL commit.
+async fn keep(state: &AppState, ws: uuid::Uuid, staged: Staged) -> Result<(), AppError> {
+    let repos = state.repos.clone();
+    tokio::task::spawn_blocking(move || repos.commit_staged(ws, staged))
+        .await
+        .map_err(AppError::internal)?
+}
+
+/// Verifies the complete history of a staged upload against `anchor`;
+/// hands the upload back with the verdict (an error drops it).
 pub(crate) async fn verify_upload(
     state: &AppState,
-    ws: uuid::Uuid,
-    id: uuid::Uuid,
+    staged: Staged,
     anchor: Option<TrustAnchor>,
-) -> Result<Verdict, AppError> {
+) -> Result<(Staged, Verdict), AppError> {
     let repos = state.repos.clone();
     tokio::task::spawn_blocking(move || {
-        let checkout = repos.checkout(ws, id)?;
+        let checkout = repos.checkout(&staged)?;
         let dir = checkout.path();
         let Some(fleet) =
             FleetState::load(dir).map_err(|e| invalid("unreadable_state", e.to_string()))?
@@ -130,6 +140,7 @@ pub(crate) async fn verify_upload(
         .inspect(|_| {
             let _ = &fleet;
         })
+        .map(|verdict| (staged, verdict))
     })
     .await
     .map_err(AppError::internal)?
@@ -299,21 +310,28 @@ pub async fn post_sync(
         })));
     }
 
-    // Storage counts everything kept, retained conflicts and proposals
-    // included, so a push that would only be retained is refused too. The
-    // workspace lock serialises this check with the write below.
-    crate::billing::ensure_storage_fits(&state, &mut tx, ws_id, body.len() as u64).await?;
-
-    // Objects and an immutable upload ref before any PG commit, but only
-    // once the plan allows the push: a refused push stores nothing.
+    // The upload is unpacked in private staging first: a push refused from
+    // here on (quota, invalid history, authorization) leaves nothing in the
+    // workspace repository.
     let upload = uuid::Uuid::new_v4();
     let repos = state.repos.clone();
     let bundle = body.clone();
-    let tip = tokio::task::spawn_blocking(move || repos.ingest(ws_id, &bundle, upload))
-        .await
-        .map_err(AppError::internal)??;
+    let (staged, object_bytes) = tokio::task::spawn_blocking(move || {
+        let staged = repos.stage(ws_id, &bundle, upload)?;
+        let bytes = repos.added_bytes(&staged, false)?;
+        Ok::<_, AppError>((staged, bytes))
+    })
+    .await
+    .map_err(AppError::internal)??;
+    let tip = staged.tip.clone();
 
     let head = load_head(&mut tx, ws_id).await?;
+
+    // Storage counts the bytes keeping this upload really adds (object
+    // files plus refs), retained conflicts and proposals included. The
+    // workspace lock serialises this check with the move below.
+    let added = object_bytes + u64::from(head.is_none()) * crate::repo_store::REF_FILE_BYTES;
+    crate::billing::ensure_storage_fits(&state, &mut tx, ws_id, added).await?;
 
     let anchor = head.as_ref().map(|h| h.anchor.clone());
     let conflict = match &head {
@@ -331,6 +349,7 @@ pub async fn post_sync(
     };
     if let Some(accepted_head) = conflict {
         let proposal_id = upload;
+        keep(&state, ws_id, staged).await?;
         sqlx::query(
             "INSERT INTO proposals (id, workspace_id, device_id, kind, status, base_revision, revision, epoch)
              VALUES ($1, $2, $3, 'conflict', 'open', $4, $5, NULL)",
@@ -357,7 +376,7 @@ pub async fn post_sync(
         .with_details(serde_json::to_value(details).unwrap()));
     }
 
-    let verdict = verify_upload(&state, ws_id, upload, anchor).await?;
+    let (staged, verdict) = verify_upload(&state, staged, anchor).await?;
     let (epoch, signer, new_anchor, manifest) = match verdict {
         Verdict::Accepted {
             epoch,
@@ -368,6 +387,7 @@ pub async fn post_sync(
         Verdict::Pending { epoch } => {
             // Same id as the upload: its anti-GC ref keeps the proposal.
             let proposal_id = upload;
+            keep(&state, ws_id, staged).await?;
             sqlx::query(
                 "INSERT INTO proposals (id, workspace_id, device_id, kind, status, base_revision, revision, epoch)
                  VALUES ($1, $2, $3, 'pending_quorum', 'open', $4, $5, $6)",
@@ -409,6 +429,7 @@ pub async fn post_sync(
         ));
     }
 
+    keep(&state, ws_id, staged).await?;
     let anchor_json = serde_json::to_value(&new_anchor).map_err(AppError::internal)?;
     sqlx::query(
         "INSERT INTO workspace_heads (workspace_id, head_revision, epoch, payload_hash, anchor)

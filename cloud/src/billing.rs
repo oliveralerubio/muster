@@ -152,8 +152,15 @@ pub(crate) async fn workspace_limits<'e>(
 }
 
 /// What the workspace consumes against `max_storage_bytes`: its Git
-/// storage plus what declarative proposals keep in the database.
-pub(crate) async fn storage_used(state: &AppState, ws: Uuid) -> Result<u64, AppError> {
+/// storage plus what declarative proposals keep in the database. `db` is
+/// the caller's connection: a guard holding the workspace lock must not
+/// wait for a second pool connection (others may hold them all while
+/// waiting for that lock).
+pub(crate) async fn storage_used<'e>(
+    state: &AppState,
+    db: impl sqlx::PgExecutor<'e>,
+    ws: Uuid,
+) -> Result<u64, AppError> {
     let repos = state.repos.clone();
     let git = tokio::task::spawn_blocking(move || repos.usage(ws))
         .await
@@ -163,7 +170,7 @@ pub(crate) async fn storage_used(state: &AppState, ws: Uuid) -> Result<u64, AppE
            FROM proposals WHERE workspace_id = $1",
     )
     .bind(ws)
-    .fetch_one(&state.db)
+    .fetch_one(db)
     .await?;
     Ok(git.saturating_add(proposals.max(0) as u64))
 }
@@ -183,7 +190,7 @@ pub(crate) async fn ensure_storage_fits(
         .execute(&mut **tx)
         .await?;
     let limits = workspace_limits(&state.config, &mut **tx, ws).await?;
-    let used = storage_used(state, ws).await?;
+    let used = storage_used(state, &mut **tx, ws).await?;
     if used.saturating_add(extra) > limits.max_storage_bytes {
         return Err(AppError::new(
             StatusCode::INSUFFICIENT_STORAGE,
@@ -221,7 +228,7 @@ pub async fn get_billing(
 
     let sub = current_subscription(&state.db, ws).await?;
     let limits = limits_for(&state.config, sub.as_ref());
-    let storage_used = storage_used(&state, ws).await?;
+    let storage_used = storage_used(&state, &state.db, ws).await?;
 
     let billing = match sub {
         Some((plan, status_str, seats, period_end, cancel_at_end)) => {

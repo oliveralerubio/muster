@@ -260,6 +260,15 @@ impl Stack {
         self.cloud.kill().await;
         self.cloud = spawn_cloud(&self.env).await;
     }
+
+    /// [`Stack::restart`] with `extra` settings added or replaced: an
+    /// explicit configuration precondition set between steps of a test.
+    pub async fn restart_with_env(&mut self, extra: &[(&'static str, String)]) {
+        self.env
+            .retain(|(name, _)| !extra.iter().any(|(new, _)| new == name));
+        self.env.extend(extra.iter().cloned());
+        self.restart().await;
+    }
 }
 
 impl Cloud {

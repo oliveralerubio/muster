@@ -319,9 +319,17 @@ pub async fn bundle(
     Ok(resp)
 }
 
-/// Approximate bytes a proposal payload adds to storage use.
-fn stored_size(payload: &serde_json::Value) -> u64 {
-    serde_json::to_vec(payload).map_or(0, |v| v.len() as u64)
+/// Bytes a proposal payload adds to storage use, computed by PostgreSQL
+/// with the same expression `billing::storage_used` counts with.
+async fn stored_size(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    payload: &serde_json::Value,
+) -> Result<u64, AppError> {
+    let size: i64 = sqlx::query_scalar("SELECT octet_length(($1::jsonb)::text)::int8")
+        .bind(payload)
+        .fetch_one(&mut **tx)
+        .await?;
+    Ok(size.max(0) as u64)
 }
 
 /// `POST /v1/workspaces/{ws}/proposals`: creates a declarative proposal
@@ -395,8 +403,8 @@ pub async fn create(
             }
 
             let mut tx = state.db.begin().await?;
-            crate::billing::ensure_storage_fits(&state, &mut tx, ws, stored_size(&req.payload))
-                .await?;
+            let size = stored_size(&mut tx, &req.payload).await?;
+            crate::billing::ensure_storage_fits(&state, &mut tx, ws, size).await?;
             let id = Uuid::new_v4();
             sqlx::query(
                 "INSERT INTO proposals (id, workspace_id, device_id, kind, status, base_revision, revision, epoch, payload, has_bundle)
@@ -444,8 +452,8 @@ pub async fn create(
             }
 
             let mut tx = state.db.begin().await?;
-            crate::billing::ensure_storage_fits(&state, &mut tx, ws, stored_size(&req.payload))
-                .await?;
+            let size = stored_size(&mut tx, &req.payload).await?;
+            crate::billing::ensure_storage_fits(&state, &mut tx, ws, size).await?;
             let id = Uuid::new_v4();
             let (dev_id, user_id) = match &caller {
                 Caller::Device(d) => (Some(d.id), None),
