@@ -4,7 +4,7 @@ Welcome to the Muster documentation directory. Below is the index of available d
 
 ## Guides
 
-- [Inspect or remove a local Cloud link](guides/cloud.md). Available local commands while Cloud implementation is in progress.
+- [Connect a machine to Muster Cloud](guides/cloud.md). Account login, linking, verified sync, the workspace console and local cleanup in the development service.
 - [Guía del Modo Equipo (Team Mode)](guides/team-mode.md) — Guía paso a paso para configurar repositorios compartidos, flujos de invitación, enrolamiento de máquinas, quórum de administradores, revocación y rotación de secretos.
 
 ## Security
