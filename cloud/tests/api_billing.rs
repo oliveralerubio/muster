@@ -740,3 +740,130 @@ async fn past_due_and_paused_follow_paddle_and_agree_with_the_sync_gate() {
     assert_eq!(resp.status(), 402, "paused push");
     assert_eq!(dev.send(&s, &dev.get(&dev.sync_path())).await.status(), 200);
 }
+
+/// Double clicks, client retries and two admins racing on the same workspace
+/// produce one checkout: the same Paddle transaction for everyone, and only
+/// one transaction created at Paddle.
+#[tokio::test]
+async fn concurrent_checkouts_for_the_same_plan_share_one_paddle_transaction() {
+    let paddle = start_paddle().await;
+    let s = stack_with_paddle(&paddle).await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let ws = create_workspace(&s, &alice, "Race WS").await;
+
+    let attempts = (0..8).map(|_| checkout(&s, &alice, &ws.id, "team", 3));
+    let txns = futures::future::join_all(attempts).await;
+
+    assert!(txns.iter().all(|t| t == &txns[0]), "{txns:?}");
+    assert_eq!(paddle.calls("create_transaction"), 1);
+}
+
+/// A paid checkout is never offered again: after its subscription ends, a
+/// new checkout of the same plan gets a new Paddle transaction.
+#[tokio::test]
+async fn a_paid_checkout_is_not_offered_again() {
+    let paddle = start_paddle().await;
+    let s = stack_with_paddle(&paddle).await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let ws = create_workspace(&s, &alice, "Paid WS").await;
+    let sub_id = "sub_01h8vzp8f4kek3yd4g1paidonc";
+    let first_txn = checkout(&s, &alice, &ws.id, "personal", 1).await;
+    let created = paddle.complete_checkout(&first_txn, sub_id, "ctm_01h8vzp8f4kek3yd4g1paidonc");
+    assert_eq!(post_webhook(&s, &paddle, &created).await, 200);
+    let canceled = paddle.update_subscription(sub_id, "subscription.canceled", |sub| {
+        sub["status"] = "canceled".into();
+    });
+    assert_eq!(post_webhook(&s, &paddle, &canceled).await, 200);
+
+    let second_txn = checkout(&s, &alice, &ws.id, "personal", 1).await;
+    assert_ne!(second_txn, first_txn);
+    assert_eq!(paddle.calls("create_transaction"), 2);
+}
+
+/// Asking for a different plan while a checkout is open cancels the old
+/// transaction at Paddle first, so its payment link can no longer be paid.
+#[tokio::test]
+async fn changing_plan_before_paying_cancels_the_previous_transaction_at_paddle() {
+    let paddle = start_paddle().await;
+    let s = stack_with_paddle(&paddle).await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let ws = create_workspace(&s, &alice, "Switch WS").await;
+
+    let personal = checkout(&s, &alice, &ws.id, "personal", 1).await;
+    let team = checkout(&s, &alice, &ws.id, "team", 3).await;
+    assert_ne!(personal, team);
+    assert_eq!(paddle.transaction(&personal).unwrap()["status"], "canceled");
+    assert_eq!(paddle.transaction(&team).unwrap()["status"], "draft");
+    assert_eq!(paddle.calls("cancel_transaction"), 1);
+
+    // The new choice is now the one reused.
+    assert_eq!(checkout(&s, &alice, &ws.id, "team", 3).await, team);
+}
+
+/// The open checkout was already paid but Paddle's webhook has not arrived:
+/// Paddle refuses to cancel it, so no second transaction is created, and the
+/// late webhook still grants the plan through the kept association.
+#[tokio::test]
+async fn a_checkout_paid_before_its_webhook_blocks_a_second_checkout() {
+    let paddle = start_paddle().await;
+    let s = stack_with_paddle(&paddle).await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let ws = create_workspace(&s, &alice, "Inflight WS").await;
+
+    let paid = checkout(&s, &alice, &ws.id, "personal", 1).await;
+    let created = paddle.complete_checkout(
+        &paid,
+        "sub_01h8vzp8f4kek3yd4g1inflt01",
+        "ctm_01h8vzp8f4kek3yd4g1inflt01",
+    );
+
+    let (status, resp) = session_post(
+        &s,
+        &alice,
+        &format!("/v1/workspaces/{}/billing/checkout", ws.id),
+        &CreateCheckout {
+            plan: "team".into(),
+            seats: 5,
+        },
+    )
+    .await;
+    assert_eq!(status, 409);
+    assert_eq!(
+        resp.json::<ApiError>().await.unwrap().error.code,
+        error_codes::SUBSCRIPTION_EXISTS
+    );
+    assert_eq!(paddle.calls("create_transaction"), 1);
+
+    assert_eq!(post_webhook(&s, &paddle, &created).await, 200);
+    let billing = billing_of(&s, &alice, &ws.id).await;
+    assert_eq!(billing.plan, "personal");
+    assert_eq!(billing.plan_status, PlanStatus::Active);
+}
+
+/// Concurrent requests for different plans on one workspace: every request
+/// gets an answer, and at the end exactly one transaction is still payable
+/// at Paddle, the one the server offers now.
+#[tokio::test]
+async fn concurrent_checkouts_for_different_plans_leave_one_payable_transaction() {
+    let paddle = start_paddle().await;
+    let s = stack_with_paddle(&paddle).await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let ws = create_workspace(&s, &alice, "Flip WS").await;
+
+    let attempts = (0..8).map(|i| {
+        let (plan, seats) = if i % 2 == 0 {
+            ("personal", 1)
+        } else {
+            ("team", 2)
+        };
+        checkout(&s, &alice, &ws.id, plan, seats)
+    });
+    futures::future::join_all(attempts).await;
+
+    let payable = paddle.payable_transactions();
+    assert_eq!(payable.len(), 1, "{payable:?}");
+    let offered_now = checkout(&s, &alice, &ws.id, "team", 2).await;
+    let offered_again = checkout(&s, &alice, &ws.id, "team", 2).await;
+    assert_eq!(offered_now, offered_again);
+    assert_eq!(paddle.payable_transactions(), vec![offered_now]);
+}

@@ -214,6 +214,21 @@ impl PaddleFixture {
             .cloned()
     }
 
+    /// The transaction entity as Paddle holds it.
+    pub fn transaction(&self, txn_id: &str) -> Option<serde_json::Value> {
+        self.inner.lock().unwrap().transactions.get(txn_id).cloned()
+    }
+
+    /// Transactions a customer could still pay (not canceled, not paid).
+    pub fn payable_transactions(&self) -> Vec<String> {
+        let g = self.inner.lock().unwrap();
+        g.transactions
+            .iter()
+            .filter(|(_, t)| matches!(t["status"].as_str(), Some("draft" | "ready")))
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
     /// How many times the service called endpoint `name`.
     pub fn calls(&self, name: &str) -> usize {
         *self.inner.lock().unwrap().calls.get(name).unwrap_or(&0)
@@ -257,6 +272,10 @@ pub async fn start() -> PaddleFixture {
 
     let app = Router::new()
         .route("/transactions", post(create_transaction))
+        .route(
+            "/transactions/{transaction_id}",
+            get(get_transaction).patch(update_transaction),
+        )
         .route(
             "/customers/{customer_id}/portal-sessions",
             post(create_portal_session),
@@ -460,4 +479,58 @@ async fn update_subscription(
     }
     touch(sub);
     Json(serde_json::json!({ "data": sub.clone() })).into_response()
+}
+
+/// `PATCH /transactions/{id}`: only cancellation is modelled. Paddle:
+/// "You can cancel transactions that are draft, ready, billed, or past_due";
+/// "billed and completed transactions ... can't be changed";
+/// "When canceling, only include status in your request."
+async fn update_transaction(
+    State(inner): State<Shared>,
+    Path(txn_id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    count(&inner, "cancel_transaction");
+    if !authorized(&headers) {
+        return unauthorized();
+    }
+    let only_status = body.as_object().is_some_and(|o| o.len() == 1)
+        && body["status"].as_str() == Some("canceled");
+    if !only_status {
+        return (StatusCode::BAD_REQUEST, "only status=canceled is supported").into_response();
+    }
+    let mut g = inner.lock().unwrap();
+    let Some(txn) = g.transactions.get_mut(&txn_id) else {
+        return not_found();
+    };
+    match txn["status"].as_str().unwrap_or_default() {
+        "draft" | "ready" | "billed" | "past_due" => {
+            txn["status"] = "canceled".into();
+            Json(serde_json::json!({ "data": txn.clone() })).into_response()
+        }
+        "canceled" => Json(serde_json::json!({ "data": txn.clone() })).into_response(),
+        _ => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": { "type": "request_error", "code": "transaction_immutable" }
+            })),
+        )
+            .into_response(),
+    }
+}
+
+async fn get_transaction(
+    State(inner): State<Shared>,
+    Path(txn_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    count(&inner, "get_transaction");
+    if !authorized(&headers) {
+        return unauthorized();
+    }
+    match inner.lock().unwrap().transactions.get(&txn_id) {
+        Some(txn) => Json(serde_json::json!({ "data": txn })).into_response(),
+        None => not_found(),
+    }
 }

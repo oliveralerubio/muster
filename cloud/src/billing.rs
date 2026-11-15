@@ -186,7 +186,24 @@ pub async fn create_checkout(
     };
 
     let req: CreateCheckout = parse_json(&body)?;
-    if current_subscription(&state.db, ws)
+    let is_team = req.plan == "team";
+    let plan = if is_team { "team" } else { "personal" };
+    let seats = if is_team { req.seats.max(1) } else { 1 };
+    let price_id = if is_team {
+        &paddle.price_team_seat
+    } else {
+        &paddle.price_personal
+    };
+
+    // One checkout decision at a time per workspace: concurrent requests
+    // and retries see the same open checkout instead of each creating a
+    // payable Paddle transaction.
+    let mut tx = state.db.begin().await?;
+    sqlx::query("SELECT id FROM workspaces WHERE id = $1 FOR UPDATE")
+        .bind(ws)
+        .fetch_one(&mut *tx)
+        .await?;
+    if current_subscription(&mut *tx, ws)
         .await?
         .is_some_and(|(_, status, ..)| status != "canceled")
     {
@@ -196,22 +213,80 @@ pub async fn create_checkout(
             "workspace already has a live subscription",
         ));
     }
-    let is_team = req.plan == "team";
-    let seats = if is_team { req.seats.max(1) } else { 1 };
-    let price_id = if is_team {
-        &paddle.price_team_seat
-    } else {
-        &paddle.price_personal
-    };
+
+    type OpenCheckout = (String, String, i32, Option<String>);
+    let open: Option<OpenCheckout> = sqlx::query_as(
+        "SELECT transaction_id, plan, seats, checkout_url FROM billing_checkouts
+          WHERE workspace_id = $1 AND status = 'open'",
+    )
+    .bind(ws)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some((txn_id, open_plan, open_seats, Some(url))) = &open {
+        if open_plan == plan && *open_seats == seats as i32 {
+            tx.commit().await?;
+            return Ok(Json(CheckoutSession {
+                checkout_url: url.clone(),
+                transaction_id: txn_id.clone(),
+            }));
+        }
+    }
+    if let Some((txn_id, ..)) = &open {
+        // A different plan: the old payment link must stop being payable
+        // before a new one exists (Paddle: PATCH status=canceled, alone).
+        let resp = crate::billing_reconcile::paddle_http()
+            .patch(format!("{}/transactions/{txn_id}", paddle.base_url))
+            .bearer_auth(&paddle.api_key)
+            .json(&serde_json::json!({ "status": "canceled" }))
+            .send()
+            .await
+            .map_err(|e| {
+                AppError::internal(format!(
+                    "paddle transaction cancel error: {}",
+                    e.without_url()
+                ))
+            })?;
+        if !resp.status().is_success() {
+            // Paddle does not name the refusal; read the transaction instead.
+            let paid = transaction_status(paddle, txn_id)
+                .await
+                .is_some_and(|st| st == "completed" || st == "billed");
+            if paid {
+                // Paid: its subscription is on the way and the association
+                // stays; never offer this link again nor a second checkout.
+                sqlx::query(
+                    "UPDATE billing_checkouts SET status = 'completed', updated_at = now()
+                      WHERE transaction_id = $1",
+                )
+                .bind(txn_id)
+                .execute(&mut *tx)
+                .await?;
+                tx.commit().await?;
+                return Err(AppError::new(
+                    StatusCode::CONFLICT,
+                    error_codes::SUBSCRIPTION_EXISTS,
+                    "the open checkout was already paid; its subscription is being set up",
+                ));
+            }
+            return Err(AppError::internal(format!(
+                "paddle refused to cancel the open checkout with {}",
+                resp.status()
+            )));
+        }
+        sqlx::query(
+            "UPDATE billing_checkouts SET status = 'canceled', updated_at = now()
+              WHERE transaction_id = $1",
+        )
+        .bind(txn_id)
+        .execute(&mut *tx)
+        .await?;
+    }
 
     let customer_row: Option<(String,)> =
         sqlx::query_as("SELECT customer_id FROM billing_customers WHERE workspace_id = $1")
             .bind(ws)
-            .fetch_optional(&state.db)
+            .fetch_optional(&mut *tx)
             .await?;
-
-    let client = reqwest::Client::new();
-    let url = format!("{}/transactions", paddle.base_url);
 
     let mut payload = serde_json::json!({
         "items": [
@@ -223,34 +298,35 @@ pub async fn create_checkout(
         "custom_data": {
             "workspace_id": ws.to_string(),
             "user_id": account.user_id.to_string(),
-            "plan": req.plan
+            "plan": plan
         }
     });
-
     if let Some((cust_id,)) = customer_row {
         payload["customer_id"] = serde_json::Value::String(cust_id);
     }
 
-    let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", paddle.api_key))
+    let resp = crate::billing_reconcile::paddle_http()
+        .post(format!("{}/transactions", paddle.base_url))
+        .bearer_auth(&paddle.api_key)
         .json(&payload)
         .send()
         .await
-        .map_err(|e| AppError::internal(format!("paddle transactions api error: {e}")))?;
-
+        .map_err(|e| {
+            AppError::internal(format!(
+                "paddle transactions api error: {}",
+                e.without_url()
+            ))
+        })?;
     if !resp.status().is_success() {
-        let err_text = resp.text().await.unwrap_or_default();
         return Err(AppError::internal(format!(
-            "paddle rejected transaction: {err_text}"
+            "paddle rejected transaction with {}",
+            resp.status()
         )));
     }
-
     let resp_json: serde_json::Value = resp
         .json()
         .await
-        .map_err(|e| AppError::internal(format!("invalid paddle json: {e}")))?;
-
+        .map_err(|e| AppError::internal(format!("invalid paddle json: {}", e.without_url())))?;
     let data = resp_json
         .get("data")
         .ok_or_else(|| AppError::internal("no data in paddle resp"))?;
@@ -269,22 +345,41 @@ pub async fn create_checkout(
 
     // The association that lets `subscription.created` grant rights.
     sqlx::query(
-        "INSERT INTO billing_checkouts (transaction_id, workspace_id, created_by, plan, seats, price_id)
-         VALUES ($1, $2, $3, $4, $5, $6)",
+        "INSERT INTO billing_checkouts
+                (transaction_id, workspace_id, created_by, plan, seats, price_id, status, checkout_url)
+         VALUES ($1, $2, $3, $4, $5, $6, 'open', $7)",
     )
     .bind(&txn_id)
     .bind(ws)
     .bind(account.user_id)
-    .bind(if is_team { "team" } else { "personal" })
+    .bind(plan)
     .bind(seats as i32)
     .bind(price_id)
-    .execute(&state.db)
+    .bind(&checkout_url)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
 
     Ok(Json(CheckoutSession {
         checkout_url,
         transaction_id: txn_id,
     }))
+}
+
+/// Paddle's current status of transaction `txn_id` (`GET /transactions/{id}`),
+/// `None` when it cannot be read.
+async fn transaction_status(paddle: &crate::config::PaddleConfig, txn_id: &str) -> Option<String> {
+    let resp = crate::billing_reconcile::paddle_http()
+        .get(format!("{}/transactions/{txn_id}", paddle.base_url))
+        .bearer_auth(&paddle.api_key)
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let body: serde_json::Value = resp.json().await.ok()?;
+    body["data"]["status"].as_str().map(str::to_string)
 }
 
 /// `POST /v1/workspaces/{ws}/billing/portal`: customer portal session.
@@ -645,6 +740,20 @@ pub async fn handle_webhook(
     };
     if let Some((sub, ws)) = &sub_to_reconcile {
         crate::billing_reconcile::enqueue(&mut tx, sub, *ws).await?;
+    }
+    // Paddle paid this checkout (it names it as the origin of a subscription):
+    // never offer its payment link again.
+    if let Some(txn) = data
+        .and_then(|d| d.get("transaction_id"))
+        .and_then(|v| v.as_str())
+    {
+        sqlx::query(
+            "UPDATE billing_checkouts SET status = 'completed', updated_at = now()
+              WHERE transaction_id = $1 AND status <> 'completed'",
+        )
+        .bind(txn)
+        .execute(&mut *tx)
+        .await?;
     }
     tx.commit().await?;
 
