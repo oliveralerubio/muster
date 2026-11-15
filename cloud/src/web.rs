@@ -20,6 +20,7 @@ pub fn routes() -> Router<AppState> {
         .route("/workspaces", get(index))
         .route("/workspaces/{ws}", get(index))
         .route("/device", get(index))
+        .route("/invitations/{token}", get(index))
         .route("/assets/app.css", get(css))
         .route("/assets/app.js", get(js))
 }

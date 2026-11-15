@@ -19,11 +19,28 @@
     devices: null,
     loadingDevices: false,
     devicesError: null,
+    members: null,
+    loadingMembers: false,
+    membersError: null,
+    memberActionError: null,
+    removingMemberId: null,
+    invitations: null,
+    loadingInvitations: false,
+    invitationsError: null,
+    inviteEmail: '',
+    inviteRole: 'member',
+    inviteFieldError: null,
+    inviteSubmitError: null,
+    inviteInFlight: false,
+    createdInvite: null,
     deviceUserCode: '',
     deviceFieldError: null,
     deviceSubmitError: null,
     deviceInFlight: false,
     deviceResult: null,
+    acceptInFlight: false,
+    acceptError: null,
+    acceptResult: null,
     signOutInFlight: false,
     signOutError: null,
   };
@@ -125,6 +142,11 @@
     return pathname === '/device';
   }
 
+  function parseInvitationTokenFromPath(pathname = window.location.pathname) {
+    const match = /^\/invitations\/([^/]+)$/.exec(pathname);
+    return match ? decodeURIComponent(match[1]) : null;
+  }
+
   function syncDeviceCodeFromUrl() {
     const params = new URLSearchParams(window.location.search);
     const code = params.get('user_code');
@@ -136,6 +158,9 @@
   function currentReturnTo() {
     if (isDeviceRoute()) {
       return window.location.pathname + window.location.search;
+    }
+    if (parseInvitationTokenFromPath()) {
+      return window.location.pathname;
     }
     return '/';
   }
@@ -190,6 +215,20 @@
       state.workspaces = null;
       state.activeWorkspace = null;
       state.detailError = null;
+      state.members = null;
+      state.membersError = null;
+      state.memberActionError = null;
+      state.removingMemberId = null;
+      state.invitations = null;
+      state.invitationsError = null;
+      state.createdInvite = null;
+      state.inviteEmail = '';
+      state.inviteRole = 'member';
+      state.inviteFieldError = null;
+      state.inviteSubmitError = null;
+      state.acceptInFlight = false;
+      state.acceptError = null;
+      state.acceptResult = null;
       window.history.pushState({}, '', '/');
       renderShell();
     } catch (_err) {
@@ -204,6 +243,20 @@
     state.detailError = null;
     state.devices = null;
     state.devicesError = null;
+    state.members = null;
+    state.membersError = null;
+    state.memberActionError = null;
+    state.removingMemberId = null;
+    state.invitations = null;
+    state.invitationsError = null;
+    state.createdInvite = null;
+    state.inviteEmail = '';
+    state.inviteRole = 'member';
+    state.inviteFieldError = null;
+    state.inviteSubmitError = null;
+    state.acceptInFlight = false;
+    state.acceptError = null;
+    state.acceptResult = null;
     state.deviceResult = null;
     state.deviceSubmitError = null;
     state.deviceFieldError = null;
@@ -216,19 +269,29 @@
   }
 
   function navigateToWorkspace(id) {
+    state.acceptInFlight = false;
+    state.acceptError = null;
+    state.acceptResult = null;
     window.history.pushState({}, '', `/workspaces/${encodeURIComponent(id)}`);
     loadWorkspaceDetail(id);
   }
 
   function renderSignedOut() {
     const returnTo = encodeURIComponent(currentReturnTo());
+    const inviteToken = parseInvitationTokenFromPath();
     const deviceNotice = isDeviceRoute()
       ? el('p', {
           className: 'muted',
           textContent:
             'Sign in to review and confirm the CLI login request. Only approve codes from a CLI login you started.',
         })
-      : null;
+      : inviteToken
+        ? el('p', {
+            className: 'muted',
+            textContent:
+              'Sign in to review and accept the workspace invitation using the verified email address that was invited.',
+          })
+        : null;
     return el('section', { className: 'card hero-card stack-md' }, [
       el('div', { className: 'stack-sm' }, [
         el('h1', { textContent: 'Muster Cloud' }),
@@ -442,6 +505,415 @@
     ]);
   }
 
+  function canManageInvites(ws) {
+    return Boolean(ws && (ws.role === 'owner' || ws.role === 'admin'));
+  }
+
+  function validateInviteEmail(raw) {
+    const email = raw.trim().toLowerCase();
+    if (email.length < 3 || email.length > 255 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return { ok: false, error: 'Enter a valid email address.' };
+    }
+    return { ok: true, email };
+  }
+
+  function formatInvitationStatus(inv) {
+    if (inv.accepted_at) {
+      return { label: 'Accepted', badgeClass: 'badge badge-trialing' };
+    }
+    const exp = Date.parse(inv.expires_at);
+    if (!Number.isNaN(exp) && exp <= Date.now()) {
+      return { label: 'Expired', badgeClass: 'badge badge-warn' };
+    }
+    return { label: 'Pending', badgeClass: 'badge badge-neutral' };
+  }
+
+  async function handleCreateInvitation(e, ws) {
+    e.preventDefault();
+    if (state.inviteInFlight || !state.me) return;
+
+    const check = validateInviteEmail(state.inviteEmail);
+    if (!check.ok) {
+      state.inviteFieldError = check.error;
+      state.inviteSubmitError = null;
+      renderShell();
+      const input = document.getElementById('invite-email');
+      if (input) input.focus();
+      return;
+    }
+
+    const allowedRoles = ws.role === 'owner' ? ['member', 'admin'] : ['member'];
+    const role = allowedRoles.includes(state.inviteRole) ? state.inviteRole : 'member';
+
+    state.inviteFieldError = null;
+    state.inviteSubmitError = null;
+    state.inviteInFlight = true;
+    renderShell();
+
+    try {
+      const resp = await fetch(`/v1/workspaces/${encodeURIComponent(ws.id)}/invitations`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          'X-CSRF-Token': state.me.csrf_token,
+        },
+        credentials: 'same-origin',
+        body: JSON.stringify({ email: check.email, role }),
+      });
+      if (resp.status === 401) {
+        state.me = null;
+        state.inviteInFlight = false;
+        renderShell();
+        return;
+      }
+      const data = await resp.json().catch(() => null);
+      if (!resp.ok) {
+        state.inviteSubmitError =
+          (data && data.error && data.error.message) ||
+          'Could not create the invitation. Please try again.';
+        state.inviteInFlight = false;
+        renderShell();
+        return;
+      }
+
+      state.inviteInFlight = false;
+      state.inviteEmail = '';
+      state.inviteRole = 'member';
+      state.createdInvite = {
+        email: data.invitation.email,
+        role: data.invitation.role,
+        shareUrl: `${window.location.origin}/invitations/${encodeURIComponent(data.token)}`,
+      };
+      state.invitations = [data.invitation, ...(state.invitations || [])];
+      renderShell();
+    } catch (_err) {
+      state.inviteInFlight = false;
+      state.inviteSubmitError = 'Connection failed while creating the invitation. Please try again.';
+      renderShell();
+    }
+  }
+
+  function renderInviteControls(ws) {
+    if (!canManageInvites(ws)) return null;
+
+    const hasFieldError = Boolean(state.inviteFieldError);
+    const roleOptions = ws.role === 'owner' ? ['member', 'admin'] : ['member'];
+    const selectedRole = roleOptions.includes(state.inviteRole) ? state.inviteRole : 'member';
+
+    const blocks = [
+      el('form', {
+        className: 'stack-md invite-form',
+        noValidate: true,
+        onSubmit: (e) => handleCreateInvitation(e, ws),
+      }, [
+        el('h3', { textContent: 'Invite a member' }),
+        state.inviteSubmitError
+          ? el('div', { className: 'alert', role: 'alert' }, [
+              el('span', { textContent: state.inviteSubmitError }),
+            ])
+          : null,
+        el('div', { className: 'invite-grid' }, [
+          el('div', { className: 'field' }, [
+            el('label', { for: 'invite-email', textContent: 'Invite email' }),
+            el('input', {
+              id: 'invite-email',
+              name: 'email',
+              type: 'email',
+              className: 'input',
+              autocomplete: 'off',
+              placeholder: 'teammate@example.com',
+              value: state.inviteEmail,
+              'aria-invalid': hasFieldError ? 'true' : null,
+              'aria-describedby': hasFieldError ? 'invite-email-error' : null,
+              onInput: (e) => {
+                state.inviteEmail = e.target.value;
+                state.inviteFieldError = null;
+                state.inviteSubmitError = null;
+              },
+            }),
+            hasFieldError
+              ? el('p', {
+                  id: 'invite-email-error',
+                  className: 'field-error',
+                  role: 'alert',
+                  textContent: state.inviteFieldError,
+                })
+              : null,
+          ]),
+          el('div', { className: 'field' }, [
+            el('label', { for: 'invite-role', textContent: 'Cloud role' }),
+            el(
+              'select',
+              {
+                id: 'invite-role',
+                name: 'role',
+                className: 'input',
+                onChange: (e) => {
+                  state.inviteRole = e.target.value;
+                },
+              },
+              roleOptions.map((r) =>
+                el('option', {
+                  value: r,
+                  selected: selectedRole === r,
+                  textContent: r,
+                })
+              )
+            ),
+          ]),
+        ]),
+        el('div', {}, [
+          el('button', {
+            type: 'submit',
+            className: 'btn btn-primary btn-sm',
+            disabled: state.inviteInFlight,
+            textContent: state.inviteInFlight ? 'Sending…' : 'Send invite',
+          }),
+        ]),
+      ]),
+    ];
+
+    if (state.createdInvite) {
+      blocks.push(
+        el('div', { className: 'share-box stack-sm' }, [
+          el('div', { className: 'row-between' }, [
+            el('p', {
+              textContent: `One-time shareable link ready for ${state.createdInvite.email} (${state.createdInvite.role}).`,
+            }),
+            el('button', {
+              type: 'button',
+              className: 'btn btn-secondary btn-sm',
+              onClick: () => {
+                state.createdInvite = null;
+                renderShell();
+              },
+              textContent: 'Dismiss',
+            }),
+          ]),
+          el('div', { className: 'field' }, [
+            el('label', { for: 'invite-share-link', textContent: 'Shareable invite link' }),
+            el('input', {
+              id: 'invite-share-link',
+              type: 'text',
+              className: 'input mono',
+              readonly: true,
+              value: state.createdInvite.shareUrl,
+            }),
+          ]),
+          el('p', {
+            className: 'muted',
+            textContent:
+              'This link is shown once. The invited person must sign in with their verified email and explicitly accept.',
+          }),
+        ])
+      );
+    }
+
+    if (state.loadingInvitations) {
+      blocks.push(el('p', { className: 'muted', textContent: 'Loading invitations…' }));
+    } else if (state.invitationsError) {
+      blocks.push(
+        el('div', { className: 'alert', role: 'alert' }, [
+          el('span', { textContent: state.invitationsError }),
+          el('button', {
+            type: 'button',
+            className: 'btn btn-secondary btn-sm',
+            onClick: () => loadWorkspaceInvitations(ws.id),
+            textContent: 'Retry',
+          }),
+        ])
+      );
+    } else if (state.invitations && state.invitations.length > 0) {
+      blocks.push(
+        el('div', { className: 'stack-sm' }, [
+          el('h3', { textContent: 'Invitations' }),
+          el(
+            'div',
+            { className: 'member-list' },
+            state.invitations.map((inv) => {
+              const st = formatInvitationStatus(inv);
+              return el('article', { className: 'member-card stack-sm' }, [
+                el('div', { className: 'row-between' }, [
+                  el('strong', { className: 'member-email', textContent: inv.email }),
+                  el('div', { className: 'badge-row' }, [
+                    el('span', { className: formatRoleBadge(inv.role), textContent: inv.role }),
+                    el('span', { className: st.badgeClass, textContent: st.label }),
+                  ]),
+                ]),
+                el('dl', { className: 'meta-list' }, [
+                  el('div', { className: 'meta-item' }, [
+                    el('dt', { textContent: 'Expires' }),
+                    el('dd', { textContent: formatDate(inv.expires_at) }),
+                  ]),
+                ]),
+              ]);
+            })
+          ),
+        ])
+      );
+    }
+
+    return el('div', { className: 'stack-md invite-controls' }, blocks);
+  }
+
+  function formatRoleBadge(role) {
+    switch (role) {
+      case 'owner':
+        return 'badge badge-trialing';
+      case 'admin':
+        return 'badge badge-warn';
+      default:
+        return 'badge badge-neutral';
+    }
+  }
+
+  function canRemoveMember(ws, m) {
+    if (!ws || !state.me) return false;
+    if (m.user_id === state.me.id) return true;
+    if (ws.role === 'owner') return true;
+    if (ws.role === 'admin') return m.role === 'member';
+    return false;
+  }
+
+  async function handleRemoveMember(ws, m) {
+    if (state.removingMemberId || !state.me) return;
+    state.removingMemberId = m.user_id;
+    state.memberActionError = null;
+    renderShell();
+    try {
+      const resp = await fetch(
+        `/v1/workspaces/${encodeURIComponent(ws.id)}/members/${encodeURIComponent(m.user_id)}`,
+        {
+          method: 'DELETE',
+          headers: {
+            Accept: 'application/json',
+            'X-CSRF-Token': state.me.csrf_token,
+          },
+          credentials: 'same-origin',
+        }
+      );
+      if (resp.status === 401) {
+        state.me = null;
+        state.removingMemberId = null;
+        renderShell();
+        return;
+      }
+      if (!resp.ok) {
+        const data = await resp.json().catch(() => null);
+        state.removingMemberId = null;
+        state.memberActionError =
+          (data && data.error && data.error.message) ||
+          'Could not remove this member. Please try again.';
+        renderShell();
+        return;
+      }
+      state.removingMemberId = null;
+      if (m.user_id === state.me.id) {
+        state.workspaces = null;
+        navigateToList();
+        return;
+      }
+      state.members = (state.members || []).filter((item) => item.user_id !== m.user_id);
+      renderShell();
+      await loadWorkspaceDevices(ws.id);
+    } catch (_err) {
+      state.removingMemberId = null;
+      state.memberActionError = 'Connection failed while removing the member. Please try again.';
+      renderShell();
+    }
+  }
+
+  function renderMembersSection(ws) {
+    const heading = el('h2', { id: 'members-heading', textContent: 'Members' });
+    const notice = el('p', {
+      className: 'muted',
+      textContent:
+        'Cloud roles control console access and billing only. They do not grant fleet signing keys or signed fleet approval. Removing a member revokes transport tokens of machines they linked in this workspace; it does not change signed fleet governance or erase secrets already delivered.',
+    });
+
+    if (state.loadingMembers) {
+      return el(
+        'section',
+        { className: 'card stack-sm', 'aria-labelledby': 'members-heading', 'aria-live': 'polite' },
+        [heading, notice, el('p', { className: 'muted', textContent: 'Loading members…' })]
+      );
+    }
+
+    if (state.membersError) {
+      return el('section', { className: 'card stack-md', 'aria-labelledby': 'members-heading' }, [
+        heading,
+        notice,
+        el('div', { className: 'alert', role: 'alert' }, [
+          el('span', { textContent: state.membersError }),
+          el('button', {
+            type: 'button',
+            className: 'btn btn-secondary btn-sm',
+            onClick: () => loadWorkspaceMembers(ws.id),
+            textContent: 'Retry',
+          }),
+        ]),
+      ]);
+    }
+
+    const members = state.members || [];
+    return el('section', { className: 'card stack-md', 'aria-labelledby': 'members-heading' }, [
+      heading,
+      notice,
+      state.memberActionError
+        ? el('div', { className: 'alert', role: 'alert' }, [
+            el('span', { textContent: state.memberActionError }),
+          ])
+        : null,
+      el(
+        'div',
+        { className: 'member-list' },
+        members.map((m) => {
+          const isSelf = Boolean(state.me && m.user_id === state.me.id);
+          const badges = [
+            el('span', { className: formatRoleBadge(m.role), textContent: m.role }),
+          ];
+          if (isSelf) {
+            badges.push(el('span', { className: 'badge badge-neutral', textContent: 'You' }));
+          }
+          const showRemove = canRemoveMember(ws, m);
+          const busy = state.removingMemberId === m.user_id;
+          return el('article', { className: 'member-card stack-sm' }, [
+            el('div', { className: 'row-between' }, [
+              el('strong', { className: 'member-email', textContent: m.email }),
+              el('div', { className: 'badge-row' }, badges),
+            ]),
+            el('div', { className: 'row-between' }, [
+              el('dl', { className: 'meta-list' }, [
+                el('div', { className: 'meta-item' }, [
+                  el('dt', { textContent: 'Joined' }),
+                  el('dd', { textContent: formatDate(m.joined_at) }),
+                ]),
+              ]),
+              showRemove
+                ? el('button', {
+                    type: 'button',
+                    className: 'btn btn-danger btn-sm',
+                    disabled: Boolean(state.removingMemberId),
+                    'aria-label': isSelf ? 'Leave workspace' : `Remove ${m.email}`,
+                    onClick: () => handleRemoveMember(ws, m),
+                    textContent: busy
+                      ? isSelf
+                        ? 'Leaving…'
+                        : 'Removing…'
+                      : isSelf
+                        ? 'Leave workspace'
+                        : 'Remove',
+                  })
+                : null,
+            ]),
+          ]);
+        })
+      ),
+      renderInviteControls(ws),
+    ]);
+  }
+
   function renderMachinesSection(ws) {
     if (state.loadingDevices) {
       return el('section', { className: 'card stack-sm', 'aria-live': 'polite' }, [
@@ -607,8 +1079,13 @@
       state.workspaces = [...(state.workspaces || []).filter((w) => w.id !== data.id), data];
       state.activeWorkspace = data;
       state.devices = [];
+      state.members = null;
+      state.invitations = [];
+      state.invitationsError = null;
+      state.createdInvite = null;
       window.history.pushState({}, '', `/workspaces/${data.id}`);
       renderShell();
+      await loadWorkspaceMembers(data.id);
     } catch (_err) {
       state.createInFlight = false;
       state.submitError = 'Connection failed while creating the workspace. Click Create workspace to retry safely.';
@@ -663,9 +1140,134 @@
     ]);
   }
 
+  async function handleAcceptInvitation(token) {
+    if (state.acceptInFlight || !state.me) return;
+    state.acceptInFlight = true;
+    state.acceptError = null;
+    renderShell();
+    try {
+      const resp = await fetch(`/v1/invitations/${encodeURIComponent(token)}/accept`, {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json',
+          'X-CSRF-Token': state.me.csrf_token,
+        },
+        credentials: 'same-origin',
+      });
+      if (resp.status === 401) {
+        state.me = null;
+        state.acceptInFlight = false;
+        renderShell();
+        return;
+      }
+      const data = await resp.json().catch(() => null);
+      if (!resp.ok) {
+        state.acceptInFlight = false;
+        if (resp.status === 404) {
+          state.acceptError = 'This invitation link is invalid, expired, or has already been used.';
+        } else if (resp.status === 403 && data && data.error && data.error.code === 'invitation_mismatch') {
+          state.acceptError =
+            `${data.error.message}. Sign out and sign in with the verified email address that was invited.`;
+        } else {
+          state.acceptError =
+            (data && data.error && data.error.message) ||
+            'Could not accept this invitation. Please try again.';
+        }
+        renderShell();
+        return;
+      }
+      state.acceptInFlight = false;
+      state.acceptResult = data;
+      state.workspaces = null;
+      renderShell();
+    } catch (_err) {
+      state.acceptInFlight = false;
+      state.acceptError = 'Connection failed while accepting the invitation. Please try again.';
+      renderShell();
+    }
+  }
+
+  function renderInvitationAccept(token) {
+    if (state.acceptResult) {
+      const wsId = state.acceptResult.workspace_id;
+      const role = state.acceptResult.role;
+      return el('section', { className: 'card hero-card stack-md' }, [
+        el('div', { className: 'row-between' }, [
+          el('h1', { textContent: 'Invitation accepted' }),
+          el('span', { className: formatRoleBadge(role), textContent: role }),
+        ]),
+        el('p', {
+          textContent: `You joined this workspace as ${role}.`,
+        }),
+        el('p', {
+          className: 'muted',
+          textContent:
+            'Cloud roles control console access only. They do not grant fleet signing keys or signed fleet approval.',
+        }),
+        el('div', { className: 'btn-row' }, [
+          el('a', {
+            href: `/workspaces/${encodeURIComponent(wsId)}`,
+            className: 'btn btn-primary',
+            onClick: (e) => {
+              e.preventDefault();
+              navigateToWorkspace(wsId);
+            },
+            textContent: 'Open workspace',
+          }),
+          el('a', {
+            href: '/',
+            className: 'btn btn-secondary',
+            onClick: (e) => {
+              e.preventDefault();
+              navigateToList();
+            },
+            textContent: 'All workspaces',
+          }),
+        ]),
+      ]);
+    }
+
+    return el('section', { className: 'card hero-card stack-md' }, [
+      el('div', { className: 'stack-sm' }, [
+        el('h1', { textContent: 'Accept workspace invitation' }),
+        el('p', {
+          className: 'muted',
+          textContent: `Signed in as ${state.me.email}. Accepting grants your account a Cloud role in this workspace; it does not share fleet signing keys or approve a machine in the signed fleet.`,
+        }),
+      ]),
+      state.acceptError
+        ? el('div', { className: 'alert', role: 'alert' }, [
+            el('span', { textContent: state.acceptError }),
+          ])
+        : null,
+      el('div', { className: 'btn-row' }, [
+        el('button', {
+          type: 'button',
+          className: 'btn btn-primary',
+          disabled: state.acceptInFlight,
+          onClick: () => handleAcceptInvitation(token),
+          textContent: state.acceptInFlight ? 'Accepting…' : 'Accept invitation',
+        }),
+        el('a', {
+          href: '/',
+          className: 'btn btn-secondary',
+          onClick: (e) => {
+            e.preventDefault();
+            navigateToList();
+          },
+          textContent: 'All workspaces',
+        }),
+      ]),
+    ]);
+  }
+
   function renderSignedIn() {
     if (isDeviceRoute()) {
       return renderDeviceAuth();
+    }
+    const inviteToken = parseInvitationTokenFromPath();
+    if (inviteToken) {
+      return renderInvitationAccept(inviteToken);
     }
 
     if (state.signOutError) {
@@ -761,6 +1363,7 @@
           ]),
         ]),
         renderMachinesSection(ws),
+        renderMembersSection(ws),
       ]);
     }
 
@@ -840,6 +1443,64 @@
     ]);
   }
 
+  async function loadWorkspaceInvitations(id) {
+    state.loadingInvitations = true;
+    state.invitationsError = null;
+    state.invitations = null;
+    renderShell();
+    try {
+      const resp = await fetch(`/v1/workspaces/${encodeURIComponent(id)}/invitations`, {
+        headers: { Accept: 'application/json' },
+        credentials: 'same-origin',
+      });
+      if (resp.status === 401) {
+        state.me = null;
+        state.loadingInvitations = false;
+        renderShell();
+        return;
+      }
+      if (!resp.ok) {
+        throw new Error(`HTTP ${resp.status}`);
+      }
+      state.invitations = await resp.json();
+      state.loadingInvitations = false;
+      renderShell();
+    } catch (_err) {
+      state.loadingInvitations = false;
+      state.invitationsError = 'Could not load invitations. Please try again.';
+      renderShell();
+    }
+  }
+
+  async function loadWorkspaceMembers(id) {
+    state.loadingMembers = true;
+    state.membersError = null;
+    state.members = null;
+    renderShell();
+    try {
+      const resp = await fetch(`/v1/workspaces/${encodeURIComponent(id)}/members`, {
+        headers: { Accept: 'application/json' },
+        credentials: 'same-origin',
+      });
+      if (resp.status === 401) {
+        state.me = null;
+        state.loadingMembers = false;
+        renderShell();
+        return;
+      }
+      if (!resp.ok) {
+        throw new Error(`HTTP ${resp.status}`);
+      }
+      state.members = await resp.json();
+      state.loadingMembers = false;
+      renderShell();
+    } catch (_err) {
+      state.loadingMembers = false;
+      state.membersError = 'Could not load workspace members. Please try again.';
+      renderShell();
+    }
+  }
+
   async function loadWorkspaceDevices(id) {
     state.loadingDevices = true;
     state.devicesError = null;
@@ -875,6 +1536,17 @@
     state.activeWorkspace = null;
     state.devices = null;
     state.devicesError = null;
+    state.members = null;
+    state.membersError = null;
+    state.memberActionError = null;
+    state.removingMemberId = null;
+    state.invitations = null;
+    state.invitationsError = null;
+    state.createdInvite = null;
+    state.inviteEmail = '';
+    state.inviteRole = 'member';
+    state.inviteFieldError = null;
+    state.inviteSubmitError = null;
     renderShell();
     try {
       const resp = await fetch(`/v1/workspaces/${encodeURIComponent(id)}`, {
@@ -903,7 +1575,11 @@
       state.activeWorkspace = await resp.json();
       state.loadingDetail = false;
       renderShell();
-      await loadWorkspaceDevices(id);
+      const loaders = [loadWorkspaceDevices(id), loadWorkspaceMembers(id)];
+      if (canManageInvites(state.activeWorkspace)) {
+        loaders.push(loadWorkspaceInvitations(id));
+      }
+      await Promise.all(loaders);
     } catch (_err) {
       state.loadingDetail = false;
       state.detailError = {
@@ -972,7 +1648,7 @@
       }
       state.me = await resp.json();
       const wsId = parseWorkspaceIdFromPath(window.location.pathname);
-      if (isDeviceRoute()) {
+      if (isDeviceRoute() || parseInvitationTokenFromPath()) {
         renderShell();
       } else if (wsId) {
         await loadWorkspaceDetail(wsId);
@@ -998,7 +1674,10 @@
     syncDeviceCodeFromUrl();
     if (!state.me) return;
     const wsId = parseWorkspaceIdFromPath(window.location.pathname);
-    if (isDeviceRoute()) {
+    state.acceptInFlight = false;
+    state.acceptError = null;
+    state.acceptResult = null;
+    if (isDeviceRoute() || parseInvitationTokenFromPath()) {
       state.activeWorkspace = null;
       state.detailError = null;
       renderShell();

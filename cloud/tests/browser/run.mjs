@@ -180,7 +180,7 @@ async function journey4DetailReloadAndLogout(browser) {
 
   await page.waitForURL(/\/workspaces\/[0-9a-f-]{36}$/, { timeout: 5000 });
   await page.getByRole('heading', { name: 'Prod Fleet' }).waitFor({ timeout: 5000 });
-  await page.getByText(/owner/i).waitFor({ timeout: 5000 });
+  await page.locator('.meta-list').first().getByText(/owner/i).waitFor({ timeout: 5000 });
   await page.getByText(/14-day trial|Trialing/i).first().waitFor({ timeout: 5000 });
   await saveScreenshot(page, '06-workspace-detail');
 
@@ -513,6 +513,297 @@ async function journey8WorkspaceDevicesList(browser) {
   await context.close();
 }
 
+
+async function journey9TeamMembersVisible(browser) {
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  const page = await context.newPage();
+  const pageErrors = [];
+  page.on('pageerror', (err) => pageErrors.push(err.message));
+
+  await page.goto(`${baseUrl}/`, { waitUntil: 'networkidle' });
+  await signInViaIdp(page, { subject: 'ivan-sub-1', email: 'ivan@example.com' });
+
+  await page.getByLabel(/Workspace name/i).fill('Team Alpha');
+  await page.getByRole('button', { name: /Create workspace/i }).click();
+  await page.waitForURL(/\/workspaces\/([0-9a-f-]{36})$/, { timeout: 5000 });
+
+  const membersSection = page.getByRole('region', { name: /Members/i });
+  await membersSection.waitFor({ timeout: 3000 });
+  await membersSection.getByText('ivan@example.com', { exact: true }).waitFor({ timeout: 3000 });
+  await membersSection.locator('.badge-row').getByText('owner', { exact: true }).waitFor({ timeout: 3000 });
+  await membersSection.getByText(/Cloud roles control console access/i).waitFor({ timeout: 3000 });
+  await membersSection.getByText(/do not grant fleet signing keys or signed fleet approval/i).waitFor({ timeout: 3000 });
+
+  await saveScreenshot(page, '17-team-members-visible');
+  assert.deepEqual(pageErrors, [], `unexpected page errors: ${pageErrors.join('; ')}`);
+  await context.close();
+}
+
+
+async function journey10InviteMemberAndRoleLimits(browser) {
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  const page = await context.newPage();
+  const pageErrors = [];
+  page.on('pageerror', (err) => pageErrors.push(err.message));
+
+  await page.goto(`${baseUrl}/`, { waitUntil: 'networkidle' });
+  await signInViaIdp(page, { subject: 'jack-sub-1', email: 'jack@example.com' });
+
+  await page.getByLabel(/Workspace name/i).fill('Team Beta');
+  await page.getByRole('button', { name: /Create workspace/i }).click();
+  await page.waitForURL(/\/workspaces\/([0-9a-f-]{36})$/, { timeout: 5000 });
+
+  const membersSection = page.getByRole('region', { name: /Members/i });
+  await membersSection.waitFor({ timeout: 5000 });
+
+  // Owner sees Invite form with member + admin options, never owner
+  const emailInput = membersSection.getByLabel(/Invite email/i);
+  const roleSelect = membersSection.getByLabel(/Cloud role/i);
+  const inviteBtn = membersSection.getByRole('button', { name: /Send invite/i });
+  await emailInput.waitFor({ timeout: 3000 });
+
+  const roleValues = await roleSelect.locator('option').evaluateAll((opts) => opts.map((o) => o.value));
+  assert.deepEqual(roleValues, ['member', 'admin']);
+
+  // Validation on invalid email
+  await emailInput.fill('not-an-email');
+  await inviteBtn.click();
+  await membersSection.locator('[role="alert"]').waitFor({ timeout: 3000 });
+  assert.equal(await emailInput.getAttribute('aria-invalid'), 'true');
+
+  // Owner invites bob.team@example.com as admin
+  await emailInput.fill('bob.team@example.com');
+  await roleSelect.selectOption('admin');
+  await inviteBtn.click();
+
+  // Shareable one-time link is displayed (not persisted in localStorage or URL)
+  const shareInput = membersSection.getByLabel(/Shareable invite link/i);
+  await shareInput.waitFor({ timeout: 5000 });
+  const shareUrl = await shareInput.inputValue();
+  assert.match(shareUrl, /^http:\/\/localhost:\d+\/invitations\/[A-Za-z0-9_-]+$/);
+  const inviteToken = shareUrl.split('/').pop();
+
+  const storageDump = await page.evaluate(() => JSON.stringify(localStorage));
+  assert.ok(!storageDump.includes(inviteToken), 'invite token must not be saved in localStorage');
+  assert.ok(!page.url().includes(inviteToken), 'invite token must not appear in workspace URL');
+
+  // Pending invitation appears in Pending invitations list without exposing token
+  await membersSection.getByText('bob.team@example.com', { exact: true }).waitFor({ timeout: 5000 });
+  await membersSection.getByText('Pending', { exact: true }).waitFor({ timeout: 5000 });
+  await saveScreenshot(page, '18-team-invite-created');
+
+  // Reload clears one-time token from DOM while pending invitation remains
+  await page.reload({ waitUntil: 'networkidle' });
+  await membersSection.getByText('bob.team@example.com', { exact: true }).waitFor({ timeout: 5000 });
+  assert.equal(await membersSection.getByLabel(/Shareable invite link/i).count(), 0);
+  const htmlAfterReload = await page.evaluate(() => document.documentElement.innerHTML);
+  assert.ok(!htmlAfterReload.includes(inviteToken), 'one-time token must not persist after reload');
+
+  assert.deepEqual(pageErrors, [], `unexpected page errors: ${pageErrors.join('; ')}`);
+  await context.close();
+}
+
+
+async function journey11AcceptInvitationExplicitAndMismatch(browser) {
+  // Context 1: Owner creates workspace and invites kate@example.com as member
+  const ownerCtx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  const ownerPage = await ownerCtx.newPage();
+  const ownerErrors = [];
+  ownerPage.on('pageerror', (err) => ownerErrors.push(err.message));
+
+  await ownerPage.goto(`${baseUrl}/`, { waitUntil: 'networkidle' });
+  await signInViaIdp(ownerPage, { subject: 'judy-sub-1', email: 'judy@example.com' });
+  await ownerPage.getByLabel(/Workspace name/i).fill('Team Gamma');
+  await ownerPage.getByRole('button', { name: /Create workspace/i }).click();
+  await ownerPage.waitForURL(/\/workspaces\/([0-9a-f-]{36})$/, { timeout: 5000 });
+  const wsId = new URL(ownerPage.url()).pathname.split('/').pop();
+
+  const ownerMembers = ownerPage.getByRole('region', { name: /Members/i });
+  await ownerMembers.getByLabel(/Invite email/i).fill('kate@example.com');
+  await ownerMembers.getByLabel(/Cloud role/i).selectOption('member');
+  await ownerMembers.getByRole('button', { name: /Send invite/i }).click();
+
+  const shareUrl = await ownerMembers.getByLabel(/Shareable invite link/i).inputValue();
+
+  // Context 2: Wrong account visits invite link -> no auto-accept, signs in via IdP, gets honest mismatch alert
+  const wrongCtx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  const wrongPage = await wrongCtx.newPage();
+  const wrongErrors = [];
+  wrongPage.on('pageerror', (err) => wrongErrors.push(err.message));
+
+  await wrongPage.goto(shareUrl, { waitUntil: 'networkidle' });
+  await wrongPage.getByText(/Sign in to review and accept/i).waitFor({ timeout: 3000 });
+
+  // Verify GET did not alter membership
+  const countBefore = await ownerPage.evaluate(async (id) => {
+    const r = await fetch(`/v1/workspaces/${id}/members`, { credentials: 'same-origin' });
+    return (await r.json()).length;
+  }, wsId);
+  assert.equal(countBefore, 1, 'visiting invite link unauthenticated must not alter membership');
+
+  await signInViaIdp(wrongPage, { subject: 'wrong-sub-1', email: 'wrong@example.com' });
+  await wrongPage.waitForURL((u) => new URL(u).pathname.startsWith('/invitations/'), { timeout: 5000 });
+
+  // Explicit accept as wrong email -> 403 invitation_mismatch shown honestly
+  await wrongPage.getByRole('button', { name: /Accept invitation/i }).click();
+  const mismatchAlert = wrongPage.locator('[role="alert"]');
+  await mismatchAlert.waitFor({ timeout: 5000 });
+  const mismatchText = await mismatchAlert.innerText();
+  assert.match(mismatchText, /another email/i);
+  await saveScreenshot(wrongPage, '19-invite-wrong-email');
+
+  // Context 3: Invited user (kate@example.com, verified via IdP) visits invite link and explicitly accepts
+  const kateCtx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  const katePage = await kateCtx.newPage();
+  const kateErrors = [];
+  const kateUnexpected = [];
+  katePage.on('pageerror', (err) => kateErrors.push(err.message));
+  katePage.on('response', (res) => {
+    const u = new URL(res.url());
+    if (u.origin === new URL(baseUrl).origin && !(u.pathname === '/v1/me' && res.status() === 401) && res.status() >= 400) {
+      kateUnexpected.push(`${res.status()} ${u.pathname}`);
+    }
+  });
+
+  await katePage.goto(shareUrl, { waitUntil: 'networkidle' });
+  await signInViaIdp(katePage, { subject: 'kate-sub-1', email: 'kate@example.com' });
+  await katePage.waitForURL((u) => new URL(u).pathname.startsWith('/invitations/'), { timeout: 5000 });
+  await saveScreenshot(katePage, '20-invite-confirm');
+
+  // Still not accepted on GET after login!
+  const countBeforeClick = await ownerPage.evaluate(async (id) => {
+    const r = await fetch(`/v1/workspaces/${id}/members`, { credentials: 'same-origin' });
+    return (await r.json()).length;
+  }, wsId);
+  assert.equal(countBeforeClick, 1, 'loading invite page after login must not auto-accept');
+
+  await katePage.getByRole('button', { name: /Accept invitation/i }).click();
+  await katePage.getByRole('heading', { name: /Invitation accepted/i }).waitFor({ timeout: 5000 });
+  await saveScreenshot(katePage, '21-invite-accepted');
+
+  // Open workspace and verify kate sees both members and no invite controls (member role)
+  await katePage.getByRole('link', { name: /Open workspace/i }).click();
+  await katePage.waitForURL(new RegExp(`/workspaces/${wsId}$`), { timeout: 5000 });
+  const kateMembers = katePage.getByRole('region', { name: /Members/i });
+  await kateMembers.getByText('judy@example.com', { exact: true }).waitFor({ timeout: 5000 });
+  await kateMembers.getByText('kate@example.com', { exact: true }).waitFor({ timeout: 5000 });
+  assert.equal(await kateMembers.getByLabel(/Invite email/i).count(), 0, 'member must not see invite form');
+  assert.deepEqual(kateUnexpected, [], `member should not trigger 403/4xx requests: ${kateUnexpected.join('; ')}`);
+
+  // Reusing accepted invite link gives honest error
+  await katePage.goto(shareUrl, { waitUntil: 'networkidle' });
+  await katePage.getByRole('button', { name: /Accept invitation/i }).click();
+  await katePage.locator('[role="alert"]').waitFor({ timeout: 5000 });
+
+  assert.deepEqual(ownerErrors, [], `owner page errors: ${ownerErrors.join('; ')}`);
+  assert.deepEqual(wrongErrors, [], `wrong page errors: ${wrongErrors.join('; ')}`);
+  assert.deepEqual(kateErrors, [], `kate page errors: ${kateErrors.join('; ')}`);
+  await ownerCtx.close();
+  await wrongCtx.close();
+  await kateCtx.close();
+}
+
+
+async function acceptInviteInNewContext(browser, shareUrl, { subject, email }) {
+  const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  const page = await ctx.newPage();
+  const errors = [];
+  page.on('pageerror', (err) => errors.push(err.message));
+
+  await page.goto(shareUrl, { waitUntil: 'networkidle' });
+  await signInViaIdp(page, { subject, email });
+  await page.waitForURL((u) => new URL(u).pathname.startsWith('/invitations/'), { timeout: 5000 });
+  await page.getByRole('button', { name: /Accept invitation/i }).click();
+  await page.getByRole('heading', { name: /Invitation accepted/i }).waitFor({ timeout: 5000 });
+  return { ctx, page, errors };
+}
+
+async function journey12RemoveMemberAndLastOwnerGuard(browser) {
+  const ownerCtx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  const ownerPage = await ownerCtx.newPage();
+  const ownerErrors = [];
+  ownerPage.on('pageerror', (err) => ownerErrors.push(err.message));
+
+  await ownerPage.goto(`${baseUrl}/`, { waitUntil: 'networkidle' });
+  await signInViaIdp(ownerPage, { subject: 'leo-sub-1', email: 'leo@example.com' });
+  await ownerPage.getByLabel(/Workspace name/i).fill('Team Delta');
+  await ownerPage.getByRole('button', { name: /Create workspace/i }).click();
+  await ownerPage.waitForURL(/\/workspaces\/([0-9a-f-]{36})$/, { timeout: 5000 });
+  const wsId = new URL(ownerPage.url()).pathname.split('/').pop();
+
+  const ownerMembers = ownerPage.getByRole('region', { name: /Members/i });
+  await ownerMembers.getByLabel(/Invite email/i).fill('mia@example.com');
+  await ownerMembers.getByLabel(/Cloud role/i).selectOption('member');
+  await ownerMembers.getByRole('button', { name: /Send invite/i }).click();
+  const miaShareUrl = await ownerMembers.getByLabel(/Shareable invite link/i).inputValue();
+  await ownerMembers.getByRole('button', { name: /Dismiss/i }).click();
+
+  await ownerMembers.getByLabel(/Invite email/i).fill('noah@example.com');
+  await ownerMembers.getByLabel(/Cloud role/i).selectOption('admin');
+  await ownerMembers.getByRole('button', { name: /Send invite/i }).click();
+  const noahShareUrl = await ownerMembers.getByLabel(/Shareable invite link/i).inputValue();
+
+  const mia = await acceptInviteInNewContext(browser, miaShareUrl, {
+    subject: 'mia-sub-1',
+    email: 'mia@example.com',
+  });
+  const noah = await acceptInviteInNewContext(browser, noahShareUrl, {
+    subject: 'noah-sub-1',
+    email: 'noah@example.com',
+  });
+
+  // Owner reloads to view all 3 members + honest removal boundary
+  await ownerPage.reload({ waitUntil: 'networkidle' });
+  const ownerMemberList = ownerMembers.locator('.member-list').first();
+  await ownerMemberList.getByText('mia@example.com', { exact: true }).waitFor({ timeout: 5000 });
+  await ownerMemberList.getByText('noah@example.com', { exact: true }).waitFor({ timeout: 5000 });
+  await ownerMembers.getByText(/revokes transport tokens of machines they linked/i).waitFor({ timeout: 3000 });
+  await ownerMembers.getByText(/does not change signed fleet governance or erase secrets already delivered/i).waitFor({ timeout: 3000 });
+
+  // Last-owner guard: owner cannot remove/leave while last owner -> 409 last_owner shown honestly
+  await ownerMembers.getByRole('button', { name: /Leave workspace/i }).click();
+  const lastOwnerAlert = ownerMembers.locator('[role="alert"]');
+  await lastOwnerAlert.waitFor({ timeout: 5000 });
+  assert.match(await lastOwnerAlert.innerText(), /last owner/i);
+  await ownerMemberList.getByText('leo@example.com', { exact: true }).waitFor({ timeout: 3000 });
+  await saveScreenshot(ownerPage, '22-team-last-owner-error');
+
+  // Owner removes mia@example.com
+  await ownerMembers.getByRole('button', { name: 'Remove mia@example.com' }).click();
+  await ownerMemberList.getByText('mia@example.com', { exact: true }).waitFor({ state: 'detached', timeout: 5000 });
+  await ownerPage.reload({ waitUntil: 'networkidle' });
+  await ownerMemberList.getByText('noah@example.com', { exact: true }).waitFor({ timeout: 5000 });
+  assert.equal(await ownerMemberList.getByText('mia@example.com', { exact: true }).count(), 0);
+  await saveScreenshot(ownerPage, '23-team-member-removed');
+
+  // Removed member loses workspace access
+  await mia.page.goto(`${baseUrl}/workspaces/${wsId}`, { waitUntil: 'networkidle' });
+  await mia.page.getByRole('heading', { name: /Workspace not found/i }).waitFor({ timeout: 5000 });
+
+  // Admin view: can only invite 'member', cannot remove owner, can leave workspace
+  await noah.page.getByRole('link', { name: /Open workspace/i }).click();
+  await noah.page.waitForURL(new RegExp(`/workspaces/${wsId}$`), { timeout: 5000 });
+  const noahMembers = noah.page.getByRole('region', { name: /Members/i });
+  await noahMembers.getByText('leo@example.com', { exact: true }).waitFor({ timeout: 5000 });
+  const noahRoleOptions = await noahMembers
+    .getByLabel(/Cloud role/i)
+    .locator('option')
+    .evaluateAll((opts) => opts.map((o) => o.value));
+  assert.deepEqual(noahRoleOptions, ['member']);
+  assert.equal(await noahMembers.getByRole('button', { name: 'Remove leo@example.com' }).count(), 0);
+
+  await noahMembers.getByRole('button', { name: /Leave workspace/i }).click();
+  await noah.page.waitForURL((u) => new URL(u).pathname === '/', { timeout: 5000 });
+  await noah.page.getByRole('heading', { name: /No workspaces yet/i }).waitFor({ timeout: 5000 });
+
+  assert.deepEqual(ownerErrors, [], `owner page errors: ${ownerErrors.join('; ')}`);
+  assert.deepEqual(mia.errors, [], `mia page errors: ${mia.errors.join('; ')}`);
+  assert.deepEqual(noah.errors, [], `noah page errors: ${noah.errors.join('; ')}`);
+  await ownerCtx.close();
+  await mia.ctx.close();
+  await noah.ctx.close();
+}
+
 const journeys = [
   ['journey_1_signin_and_account', journey1SignInAndAccount],
   ['journey_2_empty_workspaces', journey2EmptyWorkspaces],
@@ -522,6 +813,10 @@ const journeys = [
   ['journey_6_device_approve_with_login_redirect', journey6DeviceApproveWithLoginRedirect],
   ['journey_7_device_deny_and_error_handling', journey7DeviceDenyAndErrorHandling],
   ['journey_8_workspace_devices_list', journey8WorkspaceDevicesList],
+  ['journey_9_team_members_visible', journey9TeamMembersVisible],
+  ['journey_10_invite_member_and_role_limits', journey10InviteMemberAndRoleLimits],
+  ['journey_11_accept_invitation_explicit_and_mismatch', journey11AcceptInvitationExplicitAndMismatch],
+  ['journey_12_remove_member_and_last_owner_guard', journey12RemoveMemberAndLastOwnerGuard],
 ];
 
 async function main() {
