@@ -123,13 +123,15 @@ pub fn guard(ctx: &mut Context, command: &str, mutating: bool) -> Result<(), Mus
             return Err(MusterError::Security(message));
         }
     };
-    // A Cloud pull that joins another history names the REMOTE signer with
-    // `--expect-signer`. The local scaffold this machine generated for itself
-    // is signed by its own key, so enforcing that expectation here would
-    // reject the join before anything is downloaded. The expectation keeps
-    // being enforced where it belongs: against the staged incoming history
+    // A Cloud pull that joins another history names the REMOTE fleet with
+    // `--expect-signer` / `--expect-state`. The local scaffold this machine
+    // generated for itself is signed by its own key and carries a different
+    // state hash, so enforcing either expectation here would reject the join
+    // before anything is downloaded. They keep being enforced where they
+    // belong: against the staged incoming history
     // (`sync_transport::verify_and_checkout`) and at the post-checkout
-    // pinning — both read `ctx.expect_signer`, restored below.
+    // pinning — both read `ctx.expect_signer` / `ctx.expect_state`, restored
+    // below before the transport runs.
     let joining_cloud_pull = ctx.sync_cloud_pull
         && matches!(
             crate::cloud_client::CloudLink::load(&ctx.state_dir),
@@ -142,12 +144,18 @@ pub fn guard(ctx: &mut Context, command: &str, mutating: bool) -> Result<(), Mus
             ),
             (Ok(Some(state)), Ok(Some(signer))) if signer.public() == state.payload.signer
         );
-    let remote_expect = if joining_cloud_pull {
-        ctx.expect_signer.take()
+    let (remote_signer, remote_state) = if joining_cloud_pull {
+        (ctx.expect_signer.take(), ctx.expect_state.take())
     } else {
-        None
+        (None, None)
     };
-    let verification = match verify(ctx, &manifest, !ctx.dry_run) {
+    // The scaffold is scaffolding: this join is about to replace it with the
+    // remote fleet whose state the user named. Pinning the scaffold here
+    // would only have to be dropped again (and a pin of the machine's own
+    // genesis must never masquerade as an accepted fleet), so the local
+    // verification does not persist one. Content checks are unchanged.
+    let persist = !ctx.dry_run && !joining_cloud_pull;
+    let verification = match verify(ctx, &manifest, persist) {
         // `doctor` reports a failed verification next to its other findings.
         Err(MusterError::Security(message)) if command == "doctor" => {
             ctx.fleet_state_invalid = true;
@@ -160,8 +168,11 @@ pub fn guard(ctx: &mut Context, command: &str, mutating: bool) -> Result<(), Mus
         }
         other => other?,
     };
-    if let Some(expect) = remote_expect {
-        ctx.expect_signer = Some(expect);
+    if remote_signer.is_some() {
+        ctx.expect_signer = remote_signer;
+    }
+    if remote_state.is_some() {
+        ctx.expect_state = remote_state;
     }
     if verification == Verification::Legacy && mutating && !ctx.dry_run {
         migrate_legacy(ctx, manifest)?;
@@ -532,12 +543,82 @@ pub(crate) fn seal_in(
 /// `--remote` on purpose); the old pin then belongs to the discarded fleet and
 /// is dropped for a fresh first-use pin. Otherwise an unrelated history is
 /// refused, so a rewritten remote cannot reset a pinned machine.
+/// Whether the current trust pin covers the fleet state this machine signed
+/// with its own key at GENESIS — the scaffold `init` created — with the local
+/// history rooted in that same genesis. Only such a pin may be dropped on a
+/// signer-confirmed join. A pin over any later state this machine
+/// *legitimately signed* (epoch ≥ 2, `prev` chained) or over a fleet accepted
+/// from elsewhere is the antirollback boundary: an unrelated or old-epoch
+/// history must not replace it on a signer name alone — only `--expect-state`
+/// confirms that deliberately.
+pub(crate) fn pin_covers_own_scaffold(ctx: &Context) -> bool {
+    let Ok(Some(pin)) = TrustAnchor::load(&ctx.state_dir) else {
+        return false;
+    };
+    let Ok(Some(state)) = FleetState::load(&ctx.config_dir) else {
+        return false;
+    };
+    let Ok(Some(signer)) = Signer::load(&ctx.state_dir) else {
+        return false;
+    };
+    if state.payload.signer != signer.public()
+        || pin.payload_hash != state.payload_hash().unwrap_or_default()
+        || state.payload.epoch != 1
+        || state.payload.prev.is_some()
+    {
+        return false;
+    }
+    // The local history must BE that genesis: its root commit already carries
+    // a fleet state signed by this machine's own key. A machine that ever
+    // accepted an external fleet has a foreign-signed root, so its pin — even
+    // when the current state is own-signed — stays the antirollback boundary.
+    let Some(root) = git_root_commit(&ctx.config_dir) else {
+        return false;
+    };
+    let Some(root_state) = git_show_fleet_state(&ctx.config_dir, &root) else {
+        return false;
+    };
+    root_state.payload.signer == signer.public()
+}
+
+fn git_root_commit(config_dir: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .current_dir(config_dir)
+        .args(["rev-list", "--max-parents=0", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout)
+        .ok()?
+        .lines()
+        .next()
+        .map(str::to_owned)
+}
+
+fn git_show_fleet_state(config_dir: &Path, rev: &str) -> Option<FleetState> {
+    let out = std::process::Command::new("git")
+        .current_dir(config_dir)
+        .args(["show", &format!("{rev}:{}", fleet_state::STATE_FILE)])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    serde_json::from_slice(&out.stdout).ok()
+}
+
 pub fn verify_pulled(
     ctx: &mut Context,
     previous: Option<&str>,
     joined: bool,
     rejoin: bool,
+    own_scaffold_pin: bool,
 ) -> Result<(), MusterError> {
+    // Bytes of a pin dropped for this verification; restored if the
+    // verification below fails so the machine never ends unpinned.
+    let mut dropped_pin: Option<Vec<u8>> = None;
     if joined && previous.is_some() {
         if !rejoin {
             let _ = git::restore_after_pull(&ctx.config_dir, previous);
@@ -549,20 +630,55 @@ pub fn verify_pulled(
             ));
         }
         if let Some(old) = TrustAnchor::load(&ctx.state_dir)? {
+            // Erasing a pin is the antirollback boundary. A pin over the
+            // machine's own scaffold (`init` genesis) may be dropped when the
+            // join is signer-confirmed — that is the documented first join.
+            // A pin over a fleet this machine ACCEPTED from elsewhere — or
+            // any state it legitimately signed later (epoch ≥ 2) — keeps the
+            // history anchored: neither an unrelated history nor a matching
+            // `--expect-signer` may replace it; only the exact state hash
+            // confirms the move deliberately.
+            if ctx.expect_state.is_none() && !own_scaffold_pin {
+                let _ = git::restore_after_pull(&ctx.config_dir, previous);
+                return Err(MusterError::Security(format!(
+                    "the pulled history is unrelated to the fleet this machine pinned \
+                     (epoch {}); the pulled changes were discarded and the pin kept. A \
+                     matching --expect-signer alone cannot replace the antirollback pin: \
+                     confirm the other fleet's exact state with `muster sync --pull \
+                     --expect-state <payload hash from `muster trust show` there>`",
+                    old.epoch
+                )));
+            }
+            // The pin leaves the disk only when the replacement is accepted:
+            // keep the bytes so a failed post-drop verification restores the
+            // full state (pin + HEAD), never a machine without its boundary.
+            dropped_pin = std::fs::read(TrustAnchor::path(&ctx.state_dir)).ok();
             let _ = std::fs::remove_file(TrustAnchor::path(&ctx.state_dir));
             ctx.diag(Diagnostic::new(
                 Severity::Warning,
                 "fleet_rejoined",
-                format!(
-                    "joined a different fleet; dropped the pin of the previous one (epoch {})",
-                    old.epoch
-                ),
+                if own_scaffold_pin {
+                    format!(
+                        "replaced this machine's scaffold with the confirmed remote fleet; \
+                         dropped the scaffold pin (epoch {})",
+                        old.epoch
+                    )
+                } else {
+                    format!(
+                        "joined a different fleet confirmed by --expect-state; dropped the \
+                         pin of the previous one (epoch {})",
+                        old.epoch
+                    )
+                },
             ));
         }
     }
     let manifest = Manifest::load(&ctx.config_dir);
     let result = manifest.and_then(|m| verify(ctx, &m, true));
     if let Err(e) = result {
+        if let Some(bytes) = dropped_pin {
+            let _ = std::fs::write(TrustAnchor::path(&ctx.state_dir), bytes);
+        }
         let restored = git::restore_after_pull(&ctx.config_dir, previous);
         let note = match restored {
             Ok(()) => "the pulled changes were discarded and nothing was applied".to_string(),

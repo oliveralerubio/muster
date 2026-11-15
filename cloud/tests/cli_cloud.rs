@@ -468,3 +468,811 @@ async fn denied_login_leaves_no_account() {
     assert!(!String::from_utf8_lossy(&output.stdout).contains("mca_"));
     std::fs::remove_dir_all(home).unwrap();
 }
+
+/// Runs the CLI binary for one machine HOME with a clean environment, the same
+/// isolation every CLI test here uses.
+async fn run_cli(home: &std::path::Path, args: &[&str]) -> std::process::Output {
+    tokio::process::Command::new(
+        std::env::var("MUSTER_CLI_BIN").expect("MUSTER_CLI_BIN must point to the built CLI"),
+    )
+    .env_clear()
+    .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+    .env("HOME", home)
+    .env("XDG_CONFIG_HOME", home.join("config"))
+    .env("XDG_STATE_HOME", home.join("state"))
+    .env("XDG_DATA_HOME", home.join("data"))
+    .env("XDG_CACHE_HOME", home.join("cache"))
+    .args(args)
+    .output()
+    .await
+    .unwrap()
+}
+
+/// Completes a real device-flow login for one machine HOME, approved through
+/// `alice`'s browser session (setup: the only approval channel the service
+/// offers; the behaviors under test run below it).
+async fn device_login(
+    stack: &support::Stack,
+    alice: &support::UserSession,
+    home: &std::path::Path,
+) {
+    let mut child = tokio::process::Command::new(
+        std::env::var("MUSTER_CLI_BIN").expect("MUSTER_CLI_BIN must point to the built CLI"),
+    )
+    .env_clear()
+    .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+    .env("HOME", home)
+    .env("XDG_CONFIG_HOME", home.join("config"))
+    .env("XDG_STATE_HOME", home.join("state"))
+    .env("XDG_DATA_HOME", home.join("data"))
+    .env("XDG_CACHE_HOME", home.join("cache"))
+    .args([
+        "cloud",
+        "login",
+        "--endpoint",
+        &stack.cloud.base,
+        "--no-browser",
+    ])
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .kill_on_drop(true)
+    .spawn()
+    .unwrap();
+    let mut lines = BufReader::new(child.stderr.take().unwrap()).lines();
+    let instruction = tokio::time::timeout(std::time::Duration::from_secs(15), lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("login must display approval instructions");
+    let response = support::http()
+        .post(stack.url("/v1/device/approve"))
+        .header("Cookie", format!("__Host-mc_session={}", alice.cookie))
+        .header("Origin", stack.origin())
+        .header("X-CSRF-Token", &alice.csrf_token)
+        .json(&DeviceApproveRequest {
+            user_code: instruction.split_whitespace().last().unwrap().into(),
+            decision: DeviceDecision::Approve,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let output = tokio::time::timeout(std::time::Duration::from_secs(20), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Creates a workspace through the service API (setup, not the behavior under test).
+async fn create_workspace(
+    stack: &support::Stack,
+    alice: &support::UserSession,
+    name: &str,
+) -> muster_cloud::protocol::Workspace {
+    let created = support::http()
+        .post(stack.url("/v1/workspaces"))
+        .header("Cookie", format!("__Host-mc_session={}", alice.cookie))
+        .header("Origin", stack.origin())
+        .header("X-CSRF-Token", &alice.csrf_token)
+        .header("Idempotency-Key", uuid::Uuid::new_v4().to_string())
+        .json(&serde_json::json!({"name": name}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+    created.json().await.unwrap()
+}
+
+/// A machine with its own scaffold joins a published Cloud fleet by naming the
+/// fleet's exact state hash (`--expect-state`, read over the public CLI from a
+/// trusted machine). A foreign hash must be refused with the scaffold and the
+/// Cloud link intact — the join never replaces local files unconfirmed.
+#[tokio::test]
+async fn expected_state_joins_remote_fleet_and_foreign_hash_is_refused() {
+    let stack = support::stack().await;
+    let alice = stack.login_user("alice", "alice@example.com").await;
+    let workspace = create_workspace(&stack, &alice, "Join by state").await;
+
+    // Machine A bootstraps the workspace fleet and publishes it.
+    let home = std::env::temp_dir().join(format!("muster-cli-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&home).unwrap();
+    device_login(&stack, &alice, &home).await;
+    assert!(run_cli(&home, &["--yes", "init", "--machine", "laptop"])
+        .await
+        .status
+        .success());
+    let link = run_cli(
+        &home,
+        &[
+            "--format",
+            "json",
+            "cloud",
+            "link",
+            "--workspace",
+            &workspace.id,
+        ],
+    )
+    .await;
+    assert!(
+        link.status.success(),
+        "{}",
+        String::from_utf8_lossy(&link.stdout)
+    );
+    let push = run_cli(&home, &["--format", "json", "sync", "--push"]).await;
+    assert!(
+        push.status.success(),
+        "{}",
+        String::from_utf8_lossy(&push.stdout)
+    );
+    let show = run_cli(&home, &["--format", "json", "trust", "show"]).await;
+    assert!(
+        show.status.success(),
+        "{}",
+        String::from_utf8_lossy(&show.stdout)
+    );
+    let shown: serde_json::Value = serde_json::from_slice(&show.stdout).unwrap();
+    eprintln!("DIAG trust show: {}", String::from_utf8_lossy(&show.stdout));
+    let state_hash = shown["result"]["trust_pin"]["payload_hash"]
+        .as_str()
+        .expect("a trusted machine exposes the hash of the state it accepted")
+        .to_string();
+
+    // Machine B has its own scaffold and links to the same workspace.
+    let second = std::env::temp_dir().join(format!("muster-cli-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&second).unwrap();
+    device_login(&stack, &alice, &second).await;
+    assert!(run_cli(&second, &["--yes", "init", "--machine", "second"])
+        .await
+        .status
+        .success());
+    let link_b = run_cli(
+        &second,
+        &[
+            "--format",
+            "json",
+            "cloud",
+            "link",
+            "--workspace",
+            &workspace.id,
+        ],
+    )
+    .await;
+    assert!(
+        link_b.status.success(),
+        "{}",
+        String::from_utf8_lossy(&link_b.stdout)
+    );
+
+    // A foreign hash is refused: the scaffold and the Cloud link survive.
+    let foreign = format!("SHA256:{}", "0".repeat(64));
+    let refused = run_cli(
+        &second,
+        &[
+            "--format",
+            "json",
+            "sync",
+            "--pull",
+            "--expect-state",
+            &foreign,
+        ],
+    )
+    .await;
+    assert!(
+        !refused.status.success(),
+        "a foreign --expect-state must be refused: {}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    let scaffold = std::fs::read_to_string(second.join("config/muster/muster.toml")).unwrap();
+    assert!(
+        scaffold.contains("[machines.second]"),
+        "the refusal must keep the local scaffold: {scaffold}"
+    );
+    assert!(second.join("state/muster/cloud/link.json").exists());
+
+    // The realistic first-use journey: a pull without any confirmation fails
+    // closed and leaves no pin behind — the next pull must still be able to
+    // name the remote state it expects.
+    let unconfirmed = run_cli(&second, &["--format", "json", "sync", "--pull"]).await;
+    assert!(
+        !unconfirmed.status.success(),
+        "first pull must fail closed without --expect-state: {}",
+        String::from_utf8_lossy(&unconfirmed.stdout)
+    );
+    let scaffold = std::fs::read_to_string(second.join("config/muster/muster.toml")).unwrap();
+    assert!(
+        scaffold.contains("[machines.second]"),
+        "the failed pull must keep the local scaffold: {scaffold}"
+    );
+
+    // The correct hash (out-of-band by contract; here over the public CLI)
+    // joins: the scaffold is replaced by the remote fleet manifest.
+    let pull = run_cli(
+        &second,
+        &[
+            "--format",
+            "json",
+            "sync",
+            "--pull",
+            "--expect-state",
+            &state_hash,
+        ],
+    )
+    .await;
+    assert!(
+        pull.status.success(),
+        "{}",
+        String::from_utf8_lossy(&pull.stdout)
+    );
+    let joined: serde_json::Value = serde_json::from_slice(&pull.stdout).unwrap();
+    assert_eq!(joined["result"]["joined"], true, "{joined}");
+    let joined_manifest =
+        std::fs::read_to_string(second.join("config/muster/muster.toml")).unwrap();
+    assert!(
+        joined_manifest.contains("[machines.laptop]"),
+        "pull must replace the scaffold with the fleet manifest: {joined_manifest}"
+    );
+
+    std::fs::remove_dir_all(home).unwrap();
+    std::fs::remove_dir_all(second).unwrap();
+}
+
+/// A machine that already accepted a Cloud fleet keeps its antirollback pin
+/// when the remote serves an unrelated history: a matching `--expect-signer`
+/// alone cannot erase the pin, because an old-epoch signer must never
+/// authorize a rewritten history. Rejoining another fleet on purpose still
+/// works by naming that fleet's exact state hash.
+#[tokio::test]
+async fn unrelated_remote_history_keeps_pin_without_expected_state() {
+    let stack = support::stack().await;
+    let alice = stack.login_user("alice", "alice@example.com").await;
+    let ws1 = create_workspace(&stack, &alice, "Fleet one").await;
+    let ws2 = create_workspace(&stack, &alice, "Fleet two").await;
+
+    // Machine A bootstraps fleet one and publishes it.
+    let home = std::env::temp_dir().join(format!("muster-cli-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&home).unwrap();
+    device_login(&stack, &alice, &home).await;
+    assert!(run_cli(&home, &["--yes", "init", "--machine", "laptop"])
+        .await
+        .status
+        .success());
+    let link_a = run_cli(
+        &home,
+        &["--format", "json", "cloud", "link", "--workspace", &ws1.id],
+    )
+    .await;
+    assert!(
+        link_a.status.success(),
+        "{}",
+        String::from_utf8_lossy(&link_a.stdout)
+    );
+    assert!(run_cli(&home, &["--format", "json", "sync", "--push"])
+        .await
+        .status
+        .success());
+    let show_a: serde_json::Value = serde_json::from_slice(
+        &run_cli(&home, &["--format", "json", "trust", "show"])
+            .await
+            .stdout,
+    )
+    .unwrap();
+    let signer = show_a["result"]["fleet_state"]["signer"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let h1 = show_a["result"]["trust_pin"]["payload_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Machine B joins fleet one: it now holds a real antirollback pin.
+    let second = std::env::temp_dir().join(format!("muster-cli-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&second).unwrap();
+    device_login(&stack, &alice, &second).await;
+    assert!(run_cli(&second, &["--yes", "init", "--machine", "second"])
+        .await
+        .status
+        .success());
+    let link_b = run_cli(
+        &second,
+        &["--format", "json", "cloud", "link", "--workspace", &ws1.id],
+    )
+    .await;
+    assert!(
+        link_b.status.success(),
+        "{}",
+        String::from_utf8_lossy(&link_b.stdout)
+    );
+    let join = run_cli(
+        &second,
+        &[
+            "--format",
+            "json",
+            "sync",
+            "--pull",
+            "--expect-signer",
+            &signer,
+        ],
+    )
+    .await;
+    assert!(
+        join.status.success(),
+        "{}",
+        String::from_utf8_lossy(&join.stdout)
+    );
+    let b_show: serde_json::Value = serde_json::from_slice(
+        &run_cli(&second, &["--format", "json", "trust", "show"])
+            .await
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(b_show["result"]["trust_pin"]["payload_hash"], h1);
+
+    // Fleet two is a DIFFERENT fleet with its own unrelated history (machine
+    // C bootstraps it with its own key). From B's point of view the remote
+    // now serves an unrelated history whose signer it does not pin — the
+    // same code path a rewritten same-signer history would take, and the
+    // hardening below is signer-agnostic by construction.
+    let third = std::env::temp_dir().join(format!("muster-cli-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&third).unwrap();
+    device_login(&stack, &alice, &third).await;
+    assert!(run_cli(&third, &["--yes", "init", "--machine", "laptop2"])
+        .await
+        .status
+        .success());
+    let link_c = run_cli(
+        &third,
+        &["--format", "json", "cloud", "link", "--workspace", &ws2.id],
+    )
+    .await;
+    assert!(
+        link_c.status.success(),
+        "{}",
+        String::from_utf8_lossy(&link_c.stdout)
+    );
+    assert!(run_cli(&third, &["--format", "json", "sync", "--push"])
+        .await
+        .status
+        .success());
+    let show_c: serde_json::Value = serde_json::from_slice(
+        &run_cli(&third, &["--format", "json", "trust", "show"])
+            .await
+            .stdout,
+    )
+    .unwrap();
+    let h2 = show_c["result"]["trust_pin"]["payload_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let signer2 = show_c["result"]["fleet_state"]["signer"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(h1, h2, "both fleets must be distinct states");
+
+    // B moves to fleet two and pulls its unrelated history with the signer
+    // expectation only: this must NOT erase the fleet-one pin.
+    assert!(run_cli(&second, &["--format", "json", "cloud", "unlink"])
+        .await
+        .status
+        .success());
+    let link_b2 = run_cli(
+        &second,
+        &["--format", "json", "cloud", "link", "--workspace", &ws2.id],
+    )
+    .await;
+    assert!(
+        link_b2.status.success(),
+        "{}",
+        String::from_utf8_lossy(&link_b2.stdout)
+    );
+    let pulled = run_cli(
+        &second,
+        &[
+            "--format",
+            "json",
+            "sync",
+            "--pull",
+            "--expect-signer",
+            &signer2,
+        ],
+    )
+    .await;
+    assert!(
+        !pulled.status.success(),
+        "a matching --expect-signer alone must not replace the antirollback pin: {}",
+        String::from_utf8_lossy(&pulled.stdout)
+    );
+    let b_show2: serde_json::Value = serde_json::from_slice(
+        &run_cli(&second, &["--format", "json", "trust", "show"])
+            .await
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(
+        b_show2["result"]["trust_pin"]["payload_hash"], h1,
+        "the fleet-one pin must survive the refused pull"
+    );
+    assert!(second.join("state/muster/cloud/link.json").exists());
+
+    // Naming fleet two's exact state hash joins it on purpose.
+    let rejoined = run_cli(
+        &second,
+        &["--format", "json", "sync", "--pull", "--expect-state", &h2],
+    )
+    .await;
+    assert!(
+        rejoined.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rejoined.stdout)
+    );
+    let joined: serde_json::Value = serde_json::from_slice(&rejoined.stdout).unwrap();
+    assert_eq!(joined["result"]["joined"], true, "{joined}");
+    let b_show3: serde_json::Value = serde_json::from_slice(
+        &run_cli(&second, &["--format", "json", "trust", "show"])
+            .await
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(
+        b_show3["result"]["trust_pin"]["payload_hash"], h2,
+        "the deliberate rejoin must pin fleet two"
+    );
+
+    std::fs::remove_dir_all(home).unwrap();
+    std::fs::remove_dir_all(second).unwrap();
+    std::fs::remove_dir_all(third).unwrap();
+}
+
+/// A machine that legitimately SIGNED its own fleet after genesis (here: the
+/// author re-signs after a local edit, epoch 2 with a `prev` chain) holds an
+/// antirollback pin, not a scaffold: an unrelated history must not replace it
+/// on a matching signer name alone — only its exact state hash confirms the
+/// move deliberately.
+#[tokio::test]
+async fn own_signed_fleet_refuses_unrelated_history_without_expected_state() {
+    let stack = support::stack().await;
+    let alice = stack.login_user("alice", "alice@example.com").await;
+    let ws1 = create_workspace(&stack, &alice, "Author fleet").await;
+    let ws2 = create_workspace(&stack, &alice, "Other fleet").await;
+
+    // Machine A bootstraps and publishes fleet one.
+    let home = std::env::temp_dir().join(format!("muster-cli-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&home).unwrap();
+    device_login(&stack, &alice, &home).await;
+    assert!(run_cli(&home, &["--yes", "init", "--machine", "laptop"])
+        .await
+        .status
+        .success());
+    assert!(run_cli(
+        &home,
+        &["--format", "json", "cloud", "link", "--workspace", &ws1.id]
+    )
+    .await
+    .status
+    .success());
+    assert!(run_cli(&home, &["--format", "json", "sync", "--push"])
+        .await
+        .status
+        .success());
+
+    // A legitimate local edit, re-signed by the author: the fleet state is
+    // now epoch ≥ 2 with a `prev` chain, still signed by A's own key.
+    let manifest_path = home.join("config/muster/muster.toml");
+    let edited = std::fs::read_to_string(&manifest_path).unwrap()
+        + "[secrets.\"env://MUSTER_TEST_DRIFT\"]\nallow = []\n";
+    std::fs::write(&manifest_path, edited).unwrap();
+    let resign = run_cli(&home, &["--yes", "trust", "resign"]).await;
+    assert!(
+        resign.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&resign.stdout),
+        String::from_utf8_lossy(&resign.stderr)
+    );
+    let show: serde_json::Value = serde_json::from_slice(
+        &run_cli(&home, &["--format", "json", "trust", "show"])
+            .await
+            .stdout,
+    )
+    .unwrap();
+    assert!(
+        show["result"]["fleet_state"]["prev"].is_string(),
+        "the resigned fleet state must carry the prev chain: {show}"
+    );
+    let h1 = show["result"]["trust_pin"]["payload_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Machine C: an unrelated fleet with its own git history.
+    let third = std::env::temp_dir().join(format!("muster-cli-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&third).unwrap();
+    device_login(&stack, &alice, &third).await;
+    assert!(run_cli(&third, &["--yes", "init", "--machine", "laptop3"])
+        .await
+        .status
+        .success());
+    assert!(run_cli(
+        &third,
+        &["--format", "json", "cloud", "link", "--workspace", &ws2.id]
+    )
+    .await
+    .status
+    .success());
+    assert!(run_cli(&third, &["--format", "json", "sync", "--push"])
+        .await
+        .status
+        .success());
+    let show_c: serde_json::Value = serde_json::from_slice(
+        &run_cli(&third, &["--format", "json", "trust", "show"])
+            .await
+            .stdout,
+    )
+    .unwrap();
+    let signer_c = show_c["result"]["fleet_state"]["signer"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let h3 = show_c["result"]["trust_pin"]["payload_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(h1, h3);
+
+    // Pulling that unrelated history with the signer name alone is refused:
+    // A's pin is over a fleet it signed and accepted — the antirollback
+    // boundary — not over a scaffold.
+    assert!(run_cli(&home, &["--format", "json", "cloud", "unlink"])
+        .await
+        .status
+        .success());
+    let pulled = run_cli(
+        &home,
+        &[
+            "--format",
+            "json",
+            "sync",
+            "--pull",
+            "--remote",
+            &format!("file://{}", third.join("config/muster").display()),
+            "--expect-signer",
+            &signer_c,
+        ],
+    )
+    .await;
+    assert!(
+        !pulled.status.success(),
+        "signer-only must not replace the pin over a fleet this machine signed: {}",
+        String::from_utf8_lossy(&pulled.stdout)
+    );
+    let show2: serde_json::Value = serde_json::from_slice(
+        &run_cli(&home, &["--format", "json", "trust", "show"])
+            .await
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(
+        show2["result"]["trust_pin"]["payload_hash"], h1,
+        "the author's pin must survive the refused pull"
+    );
+    let kept = std::fs::read_to_string(&manifest_path).unwrap();
+    assert!(
+        kept.contains("[secrets.\"env://MUSTER_TEST_DRIFT\"]"),
+        "HEAD must be restored: {kept}"
+    );
+
+    // Naming the other fleet's exact state hash joins it deliberately.
+    let joined = run_cli(
+        &home,
+        &[
+            "--format",
+            "json",
+            "sync",
+            "--pull",
+            "--remote",
+            &format!("file://{}", third.join("config/muster").display()),
+            "--expect-state",
+            &h3,
+        ],
+    )
+    .await;
+    assert!(
+        joined.status.success(),
+        "{}",
+        String::from_utf8_lossy(&joined.stdout)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&joined.stdout).unwrap();
+    assert_eq!(result["result"]["joined"], true, "{result}");
+
+    std::fs::remove_dir_all(home).unwrap();
+    std::fs::remove_dir_all(third).unwrap();
+}
+
+/// A refused `--remote` join with a wrong `--expect-state` restores the full
+/// pre-pull state: HEAD and the antirollback pin. The pin is dropped for the
+/// verification, but a failed verification must never leave the machine
+/// without its boundary.
+#[tokio::test]
+async fn remote_join_with_wrong_expected_state_preserves_pin() {
+    let stack = support::stack().await;
+    let alice = stack.login_user("alice", "alice@example.com").await;
+    let ws1 = create_workspace(&stack, &alice, "Pinned fleet").await;
+    let ws2 = create_workspace(&stack, &alice, "Remote fleet").await;
+
+    // Machine A bootstraps fleet one.
+    let home = std::env::temp_dir().join(format!("muster-cli-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&home).unwrap();
+    device_login(&stack, &alice, &home).await;
+    assert!(run_cli(&home, &["--yes", "init", "--machine", "laptop"])
+        .await
+        .status
+        .success());
+    assert!(run_cli(
+        &home,
+        &["--format", "json", "cloud", "link", "--workspace", &ws1.id]
+    )
+    .await
+    .status
+    .success());
+    assert!(run_cli(&home, &["--format", "json", "sync", "--push"])
+        .await
+        .status
+        .success());
+
+    // Machine B joins fleet one over Cloud: it holds a real pin.
+    let second = std::env::temp_dir().join(format!("muster-cli-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&second).unwrap();
+    device_login(&stack, &alice, &second).await;
+    assert!(run_cli(&second, &["--yes", "init", "--machine", "second"])
+        .await
+        .status
+        .success());
+    assert!(run_cli(
+        &second,
+        &["--format", "json", "cloud", "link", "--workspace", &ws1.id]
+    )
+    .await
+    .status
+    .success());
+    let signer = {
+        let show_a: serde_json::Value = serde_json::from_slice(
+            &run_cli(&home, &["--format", "json", "trust", "show"])
+                .await
+                .stdout,
+        )
+        .unwrap();
+        show_a["result"]["fleet_state"]["signer"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let joined = run_cli(
+        &second,
+        &[
+            "--format",
+            "json",
+            "sync",
+            "--pull",
+            "--expect-signer",
+            &signer,
+        ],
+    )
+    .await;
+    assert!(
+        joined.status.success(),
+        "{}",
+        String::from_utf8_lossy(&joined.stdout)
+    );
+    let show_b: serde_json::Value = serde_json::from_slice(
+        &run_cli(&second, &["--format", "json", "trust", "show"])
+            .await
+            .stdout,
+    )
+    .unwrap();
+    let h1 = show_b["result"]["trust_pin"]["payload_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Machine C: an unrelated fleet served to B over a plain git remote.
+    let third = std::env::temp_dir().join(format!("muster-cli-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&third).unwrap();
+    device_login(&stack, &alice, &third).await;
+    assert!(run_cli(&third, &["--yes", "init", "--machine", "laptop3"])
+        .await
+        .status
+        .success());
+    assert!(run_cli(
+        &third,
+        &["--format", "json", "cloud", "link", "--workspace", &ws2.id]
+    )
+    .await
+    .status
+    .success());
+    assert!(run_cli(&third, &["--format", "json", "sync", "--push"])
+        .await
+        .status
+        .success());
+    let show_c: serde_json::Value = serde_json::from_slice(
+        &run_cli(&third, &["--format", "json", "trust", "show"])
+            .await
+            .stdout,
+    )
+    .unwrap();
+    let h3 = show_c["result"]["trust_pin"]["payload_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // A wrong --expect-state must be refused AND keep B's pin: the drop
+    // happened for the verification, so the failure must restore it.
+    assert!(run_cli(&second, &["--format", "json", "cloud", "unlink"])
+        .await
+        .status
+        .success());
+    let foreign = format!("SHA256:{}", "f".repeat(64));
+    let refused = run_cli(
+        &second,
+        &[
+            "--format",
+            "json",
+            "sync",
+            "--pull",
+            "--remote",
+            &format!("file://{}", third.join("config/muster").display()),
+            "--expect-state",
+            &foreign,
+        ],
+    )
+    .await;
+    assert!(
+        !refused.status.success(),
+        "a wrong --expect-state must be refused: {}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    let show_b2: serde_json::Value = serde_json::from_slice(
+        &run_cli(&second, &["--format", "json", "trust", "show"])
+            .await
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(
+        show_b2["result"]["trust_pin"]["payload_hash"], h1,
+        "the failed verification must restore the pin: {show_b2}"
+    );
+    let kept = std::fs::read_to_string(second.join("config/muster/muster.toml")).unwrap();
+    assert!(
+        kept.contains("[machines.laptop]"),
+        "HEAD must be restored to fleet one: {kept}"
+    );
+
+    // The exact hash joins deliberately.
+    let rejoined = run_cli(
+        &second,
+        &[
+            "--format",
+            "json",
+            "sync",
+            "--pull",
+            "--remote",
+            &format!("file://{}", third.join("config/muster").display()),
+            "--expect-state",
+            &h3,
+        ],
+    )
+    .await;
+    assert!(
+        rejoined.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rejoined.stdout)
+    );
+
+    std::fs::remove_dir_all(home).unwrap();
+    std::fs::remove_dir_all(second).unwrap();
+    std::fs::remove_dir_all(third).unwrap();
+}

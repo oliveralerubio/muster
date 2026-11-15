@@ -125,13 +125,30 @@ impl CloudLink {
 }
 
 pub fn unlink(state_dir: &Path) -> Result<(), MusterError> {
-    match std::fs::remove_file(CloudLink::path(state_dir)) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(_) => Err(MusterError::Operational(
-            "cannot remove local Cloud link".into(),
-        )),
+    // Everything in state_dir/cloud that is scoped to the LINK goes with it:
+    // the accepted revision and any pending publication belong to the old
+    // (workspace, device) pair and would block or misdirect a relink to
+    // another workspace. The account (login) and the fleet repository are
+    // untouched — unlink is local and reversible by linking again.
+    let dir = state_dir.join("cloud");
+    for name in [
+        "link.json",
+        "accepted.json",
+        "push-intent.json",
+        "push-intent.bundle",
+        "pull.bundle",
+    ] {
+        match std::fs::remove_file(dir.join(name)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                return Err(MusterError::Operational(
+                    "cannot remove local Cloud link state".into(),
+                ))
+            }
+        }
     }
+    Ok(())
 }
 pub fn save_account(
     state_dir: &Path,

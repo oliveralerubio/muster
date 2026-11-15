@@ -350,6 +350,10 @@ fn transport(
     if do_pull {
         ctx.progress("Pulling config repo…");
         let previous = git::head_commit_opt(&ctx.config_dir);
+        // Snapshot BEFORE the pull: whether the pre-pull pin covered this
+        // machine's own scaffold (documented first join) or a fleet accepted
+        // from elsewhere (antirollback boundary).
+        let own_scaffold_pin = crate::trust::pin_covers_own_scaffold(ctx);
         let pull_result = git::pull(&ctx.config_dir)?;
         // Refuse (and undo) a pull that rolls the fleet back, forges its vault or
         // changes its governance without a valid signature from an authorized signer.
@@ -359,6 +363,7 @@ fn transport(
             previous.as_deref(),
             joined,
             params.get_string("remote").is_some(),
+            own_scaffold_pin,
         )?;
         pulled = match pull_result {
             Pulled::Empty => json!("remote_empty"),

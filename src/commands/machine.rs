@@ -386,9 +386,10 @@ fn add(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     // Verify what the pull brought in before trusting any of it (the remote
     // can serve a forged request or fleet state).
     let previous = crate::git::head_commit_opt(&ctx.config_dir);
+    let own_scaffold_pin = crate::trust::pin_covers_own_scaffold(ctx);
     let pulled = crate::git::pull(&ctx.config_dir)?;
     let joined = matches!(pulled, crate::git::Pulled::Joined { .. });
-    crate::trust::verify_pulled(ctx, previous.as_deref(), joined, false)?;
+    crate::trust::verify_pulled(ctx, previous.as_deref(), joined, false, own_scaffold_pin)?;
     let request = EnrollmentRequest::load(&ctx.config_dir, &name)?;
     if request.recipient != recipient {
         return Err(MusterError::Security(format!(

@@ -244,6 +244,10 @@ fn verify_and_checkout(
             "the Cloud history is not a signed fleet state; legacy repositories are refused".into(),
         );
     }
+    // Snapshot BEFORE the checkout replaces the working tree: whether the
+    // pre-pull pin covered this machine's own scaffold (first join) or a
+    // fleet accepted from elsewhere (antirollback boundary).
+    let own_scaffold_pin = crate::trust::pin_covers_own_scaffold(ctx);
     // Checkout: the chain is verified, nothing unverified reaches the
     // working repository.
     if !related {
@@ -280,7 +284,8 @@ fn verify_and_checkout(
     }
     // Pin bookkeeping and first-use confirmation on the real repository; a
     // failure here restores the previous HEAD (nothing was applied yet).
-    crate::trust::verify_pulled(ctx, previous, !related, true).map_err(|e| e.to_string())?;
+    crate::trust::verify_pulled(ctx, previous, !related, true, own_scaffold_pin)
+        .map_err(|e| e.to_string())?;
     Ok(if related {
         PullOutcome::Updated
     } else {
