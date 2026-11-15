@@ -319,6 +319,11 @@ pub async fn bundle(
     Ok(resp)
 }
 
+/// Approximate bytes a proposal payload adds to storage use.
+fn stored_size(payload: &serde_json::Value) -> u64 {
+    serde_json::to_vec(payload).map_or(0, |v| v.len() as u64)
+}
+
 /// `POST /v1/workspaces/{ws}/proposals`: creates a declarative proposal
 /// (enrollment request, restore).
 pub async fn create(
@@ -389,6 +394,9 @@ pub async fn create(
                 return Ok((StatusCode::OK, Json(to_dto(row)?)));
             }
 
+            let mut tx = state.db.begin().await?;
+            crate::billing::ensure_storage_fits(&state, &mut tx, ws, stored_size(&req.payload))
+                .await?;
             let id = Uuid::new_v4();
             sqlx::query(
                 "INSERT INTO proposals (id, workspace_id, device_id, kind, status, base_revision, revision, epoch, payload, has_bundle)
@@ -399,8 +407,9 @@ pub async fn create(
             .bind(dev.id)
             .bind(&req.base_revision)
             .bind(&req.payload)
-            .execute(&state.db)
+            .execute(&mut *tx)
             .await?;
+            tx.commit().await?;
 
             let row: ProposalRow = sqlx::query_as(&format!("{SELECT_PROPOSAL} WHERE id = $1"))
                 .bind(id)
@@ -434,6 +443,9 @@ pub async fn create(
                 );
             }
 
+            let mut tx = state.db.begin().await?;
+            crate::billing::ensure_storage_fits(&state, &mut tx, ws, stored_size(&req.payload))
+                .await?;
             let id = Uuid::new_v4();
             let (dev_id, user_id) = match &caller {
                 Caller::Device(d) => (Some(d.id), None),
@@ -450,8 +462,9 @@ pub async fn create(
             .bind(user_id)
             .bind(&req.base_revision)
             .bind(&req.payload)
-            .execute(&state.db)
+            .execute(&mut *tx)
             .await?;
+            tx.commit().await?;
 
             let row: ProposalRow = sqlx::query_as(&format!("{SELECT_PROPOSAL} WHERE id = $1"))
                 .bind(id)

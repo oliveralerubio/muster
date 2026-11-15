@@ -33,6 +33,10 @@ pub struct Config {
     /// Absolute directory holding one bare Git repository per workspace.
     pub repo_root: std::path::PathBuf,
     pub paddle: Option<PaddleConfig>,
+    /// Development only (`MUSTER_DEV_STORAGE_LIMIT_BYTES`): replaces every
+    /// plan's `max_storage_bytes`, in `GET /billing` and in the guard alike,
+    /// so tests can reach the limit. Refused in production.
+    pub dev_storage_limit: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -206,6 +210,20 @@ impl Config {
             None => None,
         };
 
+        let dev_storage_limit = match get("MUSTER_DEV_STORAGE_LIMIT_BYTES") {
+            None => None,
+            Some(_) if env.is_production() => {
+                return Err(ConfigError::Invalid {
+                    name: "MUSTER_DEV_STORAGE_LIMIT_BYTES",
+                    reason: "is a development-only setting; plan limits apply in production".into(),
+                })
+            }
+            Some(v) => Some(v.parse::<u64>().map_err(|e| ConfigError::Invalid {
+                name: "MUSTER_DEV_STORAGE_LIMIT_BYTES",
+                reason: e.to_string(),
+            })?),
+        };
+
         Ok(Self {
             env,
             bind,
@@ -216,6 +234,7 @@ impl Config {
             oidc_client_secret,
             repo_root,
             paddle,
+            dev_storage_limit,
         })
     }
 

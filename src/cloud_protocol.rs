@@ -1003,6 +1003,11 @@ pub struct WorkspaceBilling {
     pub max_devices: u32,
     pub max_bundle_bytes: usize,
     pub max_storage_bytes: u64,
+    /// Storage the workspace consumes against `max_storage_bytes`: every Git
+    /// object the service keeps (accepted history, retained proposals and
+    /// conflicts, refused-but-stored uploads), ciphertext included.
+    #[serde(default)]
+    pub storage_used_bytes: u64,
 }
 
 fn default_one() -> u32 {

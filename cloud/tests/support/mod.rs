@@ -177,12 +177,17 @@ fn free_port() -> u16 {
 }
 
 pub async fn stack() -> Stack {
+    stack_with_env(&[]).await
+}
+
+/// [`stack`] with extra service configuration (explicit test preconditions).
+pub async fn stack_with_env(extra: &[(&'static str, String)]) -> Stack {
     let idp = oidc_fixture::start().await;
     let database_url = fresh_database().await;
     let port = free_port();
     let public = format!("http://127.0.0.1:{port}");
     let repos = tempfile::tempdir().expect("repo root");
-    let env: Env = vec![
+    let mut env: Env = vec![
         ("MUSTER_ENV", "development".into()),
         ("MUSTER_REPO_ROOT", repos.path().display().to_string()),
         ("MUSTER_BIND", format!("127.0.0.1:{port}")),
@@ -195,6 +200,7 @@ pub async fn stack() -> Stack {
             oidc_fixture::CLIENT_SECRET.into(),
         ),
     ];
+    env.extend(extra.iter().cloned());
     let cloud = spawn_cloud(&env).await;
     Stack {
         cloud,

@@ -201,6 +201,27 @@ pub async fn link_device(
             ));
         }
 
+        // The declared machine limit; the workspace row lock above makes the
+        // count and the insert atomic against concurrent links.
+        let limits = crate::billing::workspace_limits(&state.config, &mut *tx, ws_id).await?;
+        let active: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM devices WHERE workspace_id = $1 AND status <> 'revoked'",
+        )
+        .bind(ws_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if active >= i64::from(limits.max_devices) {
+            return Err(AppError::new(
+                StatusCode::INSUFFICIENT_STORAGE,
+                error_codes::QUOTA_EXCEEDED,
+                "the workspace plan's machine limit is reached",
+            )
+            .with_details(serde_json::json!({
+                "limit": "max_devices",
+                "max_devices": limits.max_devices,
+            })));
+        }
+
         // Atomic bootstrap check: if empty workspace and caller is owner, check if any device holds bootstrap
         let is_bootstrap = if !has_history && role == "owner" {
             let existing_bootstrap: Option<uuid::Uuid> = sqlx::query_scalar(

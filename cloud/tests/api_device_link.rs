@@ -266,12 +266,22 @@ async fn concurrent_links_claim_bootstrap_exactly_once() {
         async move { req.send().await.unwrap() }
     });
     let responses = futures::future::join_all(futures).await;
+    // More links than the trial's declared machine limit: the excess is
+    // refused with 507 (see api_limits); the claim is still taken once.
     let mut claims = 0;
+    let mut linked_count = 0;
     for resp in responses {
-        assert_eq!(resp.status(), 201);
-        let linked: LinkedDevice = resp.json().await.unwrap();
-        claims += usize::from(linked.bootstrap);
+        match resp.status().as_u16() {
+            201 => {
+                let linked: LinkedDevice = resp.json().await.unwrap();
+                linked_count += 1;
+                claims += usize::from(linked.bootstrap);
+            }
+            507 => {}
+            other => panic!("unexpected link status {other}"),
+        }
     }
+    assert!(linked_count >= 1);
     assert_eq!(claims, 1, "exactly one machine holds the bootstrap claim");
 }
 

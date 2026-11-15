@@ -95,6 +95,30 @@ impl RepoStore {
         Ok(path)
     }
 
+    /// Bytes the workspace repository occupies on disk: every object the
+    /// service keeps (accepted, retained proposals, stored-but-refused
+    /// uploads) plus refs. Zero before the first upload.
+    pub fn usage(&self, ws: uuid::Uuid) -> Result<u64, AppError> {
+        fn walk(dir: &Path) -> std::io::Result<u64> {
+            let mut total = 0;
+            for entry in fs::read_dir(dir)? {
+                let entry = entry?;
+                let meta = entry.metadata()?;
+                if meta.is_dir() {
+                    total += walk(&entry.path())?;
+                } else {
+                    total += meta.len();
+                }
+            }
+            Ok(total)
+        }
+        let repo = self.repo(ws);
+        if !repo.exists() {
+            return Ok(0);
+        }
+        walk(&repo).map_err(AppError::internal)
+    }
+
     /// Stores the bundle's objects and pins its tip under
     /// [`upload_ref`]`(id)`. The bundle must carry exactly one ref,
     /// `refs/heads/main`, and its prerequisites must already be stored.

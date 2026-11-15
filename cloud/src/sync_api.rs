@@ -23,7 +23,9 @@ use crate::protocol::{
 use crate::state::AppState;
 
 /// Maximum sync body (25 MB).
-pub const MAX_BUNDLE_BYTES: usize = 25 * 1024 * 1024;
+/// Request body cap for `POST /sync`: the largest per-push limit any plan
+/// declares (each plan's own limit is enforced in the handler).
+pub const MAX_BUNDLE_BYTES: usize = crate::billing::MAX_PLAN_BUNDLE_BYTES;
 
 pub(crate) fn invalid(reason: &str, message: impl Into<String>) -> AppError {
     AppError::new(
@@ -219,14 +221,6 @@ pub async fn post_sync(
     let device = device(&state, &method, &uri, &ws, &headers, &body).await?;
     let ws_id = device.workspace_id;
 
-    // Objects and an immutable upload ref first (before any PG commit).
-    let upload = uuid::Uuid::new_v4();
-    let repos = state.repos.clone();
-    let bundle = body.clone();
-    let tip = tokio::task::spawn_blocking(move || repos.ingest(ws_id, &bundle, upload))
-        .await
-        .map_err(AppError::internal)??;
-
     let mut tx = state.db.begin().await?;
     // Serialise mutations carrying the same key for this device.
     let idem_key = crate::tenancy::idempotency_key(&headers)?;
@@ -269,6 +263,7 @@ pub async fn post_sync(
     // Check plan entitlements (paid subscriptions or active trial).
     let sub = crate::billing::current_subscription(&mut *tx, ws_id).await?;
 
+    let limits = crate::billing::limits_for(&state.config, sub.as_ref());
     let can_push = match sub {
         Some((_, status, ..)) => crate::billing::subscription_entitlement(&status).1,
         None => {
@@ -291,6 +286,32 @@ pub async fn post_sync(
             "workspace plan is inactive or expired; renew subscription to publish changes",
         ));
     }
+
+    if body.len() > limits.max_bundle_bytes {
+        return Err(AppError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            error_codes::PAYLOAD_TOO_LARGE,
+            "the bundle is larger than the workspace plan allows per push",
+        )
+        .with_details(serde_json::json!({
+            "limit": "max_bundle_bytes",
+            "max_bundle_bytes": limits.max_bundle_bytes,
+        })));
+    }
+
+    // Storage counts everything kept, retained conflicts and proposals
+    // included, so a push that would only be retained is refused too. The
+    // workspace lock serialises this check with the write below.
+    crate::billing::ensure_storage_fits(&state, &mut tx, ws_id, body.len() as u64).await?;
+
+    // Objects and an immutable upload ref before any PG commit, but only
+    // once the plan allows the push: a refused push stores nothing.
+    let upload = uuid::Uuid::new_v4();
+    let repos = state.repos.clone();
+    let bundle = body.clone();
+    let tip = tokio::task::spawn_blocking(move || repos.ingest(ws_id, &bundle, upload))
+        .await
+        .map_err(AppError::internal)??;
 
     let head = load_head(&mut tx, ws_id).await?;
 

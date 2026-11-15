@@ -90,6 +90,115 @@ pub(crate) fn subscription_entitlement(status: &str) -> (PlanStatus, bool) {
     }
 }
 
+/// The limits a workspace's plan declares in `GET /billing`. The single
+/// source for that view and for every guard that enforces them.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PlanLimits {
+    pub max_devices: u32,
+    pub max_bundle_bytes: usize,
+    pub max_storage_bytes: u64,
+}
+
+const MIB: u64 = 1024 * 1024;
+const GIB: u64 = 1024 * MIB;
+/// The largest `max_bundle_bytes` of any plan.
+pub(crate) const MAX_PLAN_BUNDLE_BYTES: usize = (25 * MIB) as usize;
+
+/// Limits for the subscription that decides entitlements (see
+/// [`current_subscription`]); no subscription means the trial.
+fn plan_limits(sub: Option<&SubRow>) -> PlanLimits {
+    match sub {
+        Some((plan, _, seats, _, _)) if plan == "team" => {
+            let seats = *seats as u32;
+            PlanLimits {
+                max_devices: seats * 50,
+                max_bundle_bytes: MAX_PLAN_BUNDLE_BYTES,
+                max_storage_bytes: seats as u64 * 100 * GIB,
+            }
+        }
+        Some(_) => PlanLimits {
+            max_devices: 10,
+            max_bundle_bytes: MAX_PLAN_BUNDLE_BYTES,
+            max_storage_bytes: 10 * GIB,
+        },
+        None => PlanLimits {
+            max_devices: 3,
+            max_bundle_bytes: (10 * MIB) as usize,
+            max_storage_bytes: GIB,
+        },
+    }
+}
+
+/// The limits in force: [`plan_limits`] plus the development-only storage
+/// override. Every view and guard goes through here.
+pub(crate) fn limits_for(config: &crate::config::Config, sub: Option<&SubRow>) -> PlanLimits {
+    let mut limits = plan_limits(sub);
+    if let Some(bytes) = config.dev_storage_limit {
+        limits.max_storage_bytes = bytes;
+    }
+    limits
+}
+
+/// [`limits_for`] the workspace's current subscription.
+pub(crate) async fn workspace_limits<'e>(
+    config: &crate::config::Config,
+    db: impl sqlx::PgExecutor<'e>,
+    ws: Uuid,
+) -> Result<PlanLimits, AppError> {
+    Ok(limits_for(
+        config,
+        current_subscription(db, ws).await?.as_ref(),
+    ))
+}
+
+/// What the workspace consumes against `max_storage_bytes`: its Git
+/// storage plus what declarative proposals keep in the database.
+pub(crate) async fn storage_used(state: &AppState, ws: Uuid) -> Result<u64, AppError> {
+    let repos = state.repos.clone();
+    let git = tokio::task::spawn_blocking(move || repos.usage(ws))
+        .await
+        .map_err(AppError::internal)??;
+    let proposals: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(sum(octet_length(payload::text)), 0)::int8
+           FROM proposals WHERE workspace_id = $1",
+    )
+    .bind(ws)
+    .fetch_one(&state.db)
+    .await?;
+    Ok(git.saturating_add(proposals.max(0) as u64))
+}
+
+/// Refuses with `507 quota_exceeded` when storing `extra` more bytes would
+/// take the workspace past its `max_storage_bytes`. Locks the workspace row
+/// first, so concurrent writers that all check here cannot overshoot
+/// together; the caller writes within the same transaction or lock.
+pub(crate) async fn ensure_storage_fits(
+    state: &AppState,
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ws: Uuid,
+    extra: u64,
+) -> Result<(), AppError> {
+    sqlx::query("SELECT id FROM workspaces WHERE id = $1 FOR UPDATE")
+        .bind(ws)
+        .execute(&mut **tx)
+        .await?;
+    let limits = workspace_limits(&state.config, &mut **tx, ws).await?;
+    let used = storage_used(state, ws).await?;
+    if used.saturating_add(extra) > limits.max_storage_bytes {
+        return Err(AppError::new(
+            StatusCode::INSUFFICIENT_STORAGE,
+            error_codes::QUOTA_EXCEEDED,
+            "the workspace plan's storage limit would be exceeded",
+        )
+        .with_details(serde_json::json!({
+            "limit": "max_storage_bytes",
+            "max_storage_bytes": limits.max_storage_bytes,
+            "storage_used_bytes": used,
+        })));
+    }
+    Ok(())
+}
+
 /// `GET /v1/workspaces/{ws}/billing`: plan, trial, limits, and capabilities.
 pub async fn get_billing(
     State(state): State<AppState>,
@@ -111,18 +220,12 @@ pub async fn get_billing(
     let billing_configured = state.config.paddle.is_some();
 
     let sub = current_subscription(&state.db, ws).await?;
+    let limits = limits_for(&state.config, sub.as_ref());
+    let storage_used = storage_used(&state, ws).await?;
 
     let billing = match sub {
         Some((plan, status_str, seats, period_end, cancel_at_end)) => {
             let (plan_status, can_push) = subscription_entitlement(&status_str);
-            let (max_devices, max_storage) = if plan == "team" {
-                (
-                    (seats as u32) * 50,
-                    (seats as u64) * 100 * 1024 * 1024 * 1024,
-                )
-            } else {
-                (10, 10 * 1024 * 1024 * 1024)
-            };
             WorkspaceBilling {
                 workspace_id: ws.to_string(),
                 billing_configured,
@@ -135,9 +238,10 @@ pub async fn get_billing(
                 can_push,
                 can_pull: true,
                 can_export: true,
-                max_devices,
-                max_bundle_bytes: 25 * 1024 * 1024,
-                max_storage_bytes: max_storage,
+                max_devices: limits.max_devices,
+                max_bundle_bytes: limits.max_bundle_bytes,
+                max_storage_bytes: limits.max_storage_bytes,
+                storage_used_bytes: storage_used,
             }
         }
         None => {
@@ -159,9 +263,10 @@ pub async fn get_billing(
                 can_push: is_trialing,
                 can_pull: true,
                 can_export: true,
-                max_devices: 3,
-                max_bundle_bytes: 10 * 1024 * 1024,
-                max_storage_bytes: 1024 * 1024 * 1024,
+                max_devices: limits.max_devices,
+                max_bundle_bytes: limits.max_bundle_bytes,
+                max_storage_bytes: limits.max_storage_bytes,
+                storage_used_bytes: storage_used,
             }
         }
     };

@@ -287,3 +287,26 @@ async fn startup_log_redacts_paddle_credentials() {
         "credential leaked"
     );
 }
+
+/// The small storage limit tests use is development-only: production refuses
+/// to start with it, so plan limits can never be replaced there.
+#[tokio::test]
+async fn production_refuses_the_development_storage_limit() {
+    let (code, output) = run_cloud_expecting_exit(&[
+        ("MUSTER_ENV", "production".into()),
+        ("MUSTER_BIND", "127.0.0.1:0".into()),
+        ("MUSTER_REPO_ROOT", "/nonexistent/muster-repos".into()),
+        ("MUSTER_PUBLIC_URL", "https://cloud.example.com".into()),
+        ("MUSTER_DATABASE_URL", "postgres://localhost/db".into()),
+        ("MUSTER_OIDC_ISSUER", "https://idp.example.com".into()),
+        ("MUSTER_OIDC_CLIENT_ID", "client_123".into()),
+        ("MUSTER_OIDC_CLIENT_SECRET", "secret_123".into()),
+        ("MUSTER_DEV_STORAGE_LIMIT_BYTES", "1024".into()),
+    ])
+    .await;
+    assert_eq!(code, Some(78), "output: {output}");
+    assert!(
+        output.contains("MUSTER_DEV_STORAGE_LIMIT_BYTES is invalid"),
+        "output: {output}"
+    );
+}
