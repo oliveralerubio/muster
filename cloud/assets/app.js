@@ -13,6 +13,7 @@
     createInFlight: false,
     createIdempotencyKey: null,
     createIntentBody: null,
+    workspaceEpoch: 0,
     activeWorkspace: null,
     loadingDetail: false,
     detailError: null,
@@ -83,6 +84,46 @@
     signOutInFlight: false,
     signOutError: null,
   };
+
+  function resetBillingState() {
+    state.billing = null;
+    state.loadingBilling = false;
+    state.billingError = null;
+    state.billingActionError = null;
+    state.billingNotice = null;
+    state.checkoutPlan = 'personal';
+    state.checkoutSeats = '2';
+    state.checkoutFieldError = null;
+    state.checkoutInFlight = false;
+    state.checkoutSession = null;
+    state.portalInFlight = false;
+    state.portalUrl = null;
+    state.updatePlanChoice = 'personal';
+    state.updateSeats = '2';
+    state.updatePlanFieldError = null;
+    state.confirmingPlanChange = null;
+    state.updatePlanInFlight = false;
+    state.confirmingCancel = false;
+    state.cancelInFlight = false;
+  }
+
+  function captureBillingContext(wsId) {
+    return {
+      epoch: state.workspaceEpoch,
+      wsId,
+      accountId: state.me ? state.me.id : null,
+    };
+  }
+
+  function isCurrentBillingContext(ctx) {
+    return (
+      Boolean(ctx && ctx.accountId) &&
+      state.workspaceEpoch === ctx.epoch &&
+      Boolean(state.me && state.me.id === ctx.accountId) &&
+      Boolean(state.activeWorkspace && state.activeWorkspace.id === ctx.wsId) &&
+      parseWorkspaceIdFromPath(window.location.pathname) === ctx.wsId
+    );
+  }
 
   function el(tag, attrs = {}, children = []) {
     const node = document.createElement(tag);
@@ -288,25 +329,8 @@
       state.restoreSubmitError = null;
       state.restoreInFlight = false;
       state.restoreCreatedMessage = null;
-      state.billing = null;
-      state.loadingBilling = false;
-      state.billingError = null;
-      state.billingActionError = null;
-      state.billingNotice = null;
-      state.checkoutPlan = 'personal';
-      state.checkoutSeats = '2';
-      state.checkoutFieldError = null;
-      state.checkoutInFlight = false;
-      state.checkoutSession = null;
-      state.portalInFlight = false;
-      state.portalUrl = null;
-      state.updatePlanChoice = 'personal';
-      state.updateSeats = '2';
-      state.updatePlanFieldError = null;
-      state.confirmingPlanChange = null;
-      state.updatePlanInFlight = false;
-      state.confirmingCancel = false;
-      state.cancelInFlight = false;
+      state.workspaceEpoch += 1;
+      resetBillingState();
       window.history.pushState({}, '', '/');
       renderShell();
     } catch (_err) {
@@ -358,16 +382,8 @@
     state.restoreSubmitError = null;
     state.restoreInFlight = false;
     state.restoreCreatedMessage = null;
-    state.billing = null;
-    state.loadingBilling = false;
-    state.billingError = null;
-    state.billingActionError = null;
-    state.billingNotice = null;
-    state.checkoutPlan = 'personal';
-    state.checkoutSeats = '2';
-    state.checkoutFieldError = null;
-    state.checkoutInFlight = false;
-    state.checkoutSession = null;
+    state.workspaceEpoch += 1;
+    resetBillingState();
     window.history.pushState({}, '', '/');
     if (!state.workspaces) {
       loadWorkspaces();
@@ -1678,6 +1694,8 @@
   }
 
   async function loadWorkspaceBilling(id) {
+    const ctx = captureBillingContext(id);
+    if (!ctx.accountId) return;
     state.loadingBilling = true;
     state.billingError = null;
     if (!state.billing || state.billing.workspace_id !== id) {
@@ -1689,35 +1707,38 @@
         `/v1/workspaces/${encodeURIComponent(id)}/billing`,
         { headers: { Accept: 'application/json' }, credentials: 'same-origin' }
       );
+      if (!isCurrentBillingContext(ctx)) return;
       if (resp.status === 401) {
+        state.workspaceEpoch += 1;
         state.me = null;
-        state.loadingBilling = false;
+        resetBillingState();
         renderShell();
         return;
       }
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const billing = await resp.json();
+      if (!isCurrentBillingContext(ctx)) return;
       state.billing = billing;
       state.loadingBilling = false;
       if (billing.plan !== 'trial' && billing.plan_status !== 'canceled') {
         state.checkoutSession = null;
-      state.portalInFlight = false;
-      state.portalUrl = null;
-      state.updatePlanChoice = 'personal';
-      state.updateSeats = '2';
-      state.updatePlanFieldError = null;
-      state.confirmingPlanChange = null;
-      state.updatePlanInFlight = false;
-      state.confirmingCancel = false;
-      state.cancelInFlight = false;
         if (!state.confirmingPlanChange && !state.updatePlanInFlight) {
           state.updatePlanChoice = billing.plan === 'team' ? 'team' : 'personal';
           state.updateSeats = String(billing.seats || 1);
         }
+        if (billing.cancel_at_period_end && !state.cancelInFlight) {
+          state.confirmingCancel = false;
+        }
       } else {
-        state.portalUrl = null;
-        state.confirmingPlanChange = null;
-        state.confirmingCancel = false;
+        if (!state.portalInFlight) {
+          state.portalUrl = null;
+        }
+        if (!state.updatePlanInFlight) {
+          state.confirmingPlanChange = null;
+        }
+        if (!state.cancelInFlight) {
+          state.confirmingCancel = false;
+        }
       }
       if (
         billing.billing_configured &&
@@ -1729,6 +1750,7 @@
       }
       renderShell();
     } catch (_err) {
+      if (!isCurrentBillingContext(ctx)) return;
       state.loadingBilling = false;
       state.billingError = 'Could not load workspace billing details. Please try again.';
       renderShell();
@@ -1738,6 +1760,8 @@
   async function handleStartCheckout(e, wsId) {
     e.preventDefault();
     if (state.checkoutInFlight || !state.me) return;
+    const ctx = captureBillingContext(wsId);
+    if (!isCurrentBillingContext(ctx)) return;
 
     const plan = state.checkoutPlan === 'team' ? 'team' : 'personal';
     let seats = 1;
@@ -1770,13 +1794,16 @@
         credentials: 'same-origin',
         body: JSON.stringify({ plan, seats }),
       });
+      if (!isCurrentBillingContext(ctx)) return;
       if (resp.status === 401) {
+        state.workspaceEpoch += 1;
         state.me = null;
-        state.checkoutInFlight = false;
+        resetBillingState();
         renderShell();
         return;
       }
       const data = await resp.json().catch(() => null);
+      if (!isCurrentBillingContext(ctx)) return;
       if (!resp.ok) {
         state.billingActionError =
           (data && data.error && data.error.message) ||
@@ -1795,6 +1822,7 @@
       state.checkoutInFlight = false;
       renderShell();
     } catch (_err) {
+      if (!isCurrentBillingContext(ctx)) return;
       state.checkoutInFlight = false;
       state.billingActionError =
         'Connection failed while creating the checkout session. Please retry.';
@@ -1804,6 +1832,8 @@
 
   async function handleOpenPortal(wsId) {
     if (state.portalInFlight || !state.me) return;
+    const ctx = captureBillingContext(wsId);
+    if (!isCurrentBillingContext(ctx)) return;
     state.portalInFlight = true;
     state.billingActionError = null;
     renderShell();
@@ -1818,13 +1848,16 @@
         credentials: 'same-origin',
         body: '{}',
       });
+      if (!isCurrentBillingContext(ctx)) return;
       if (resp.status === 401) {
+        state.workspaceEpoch += 1;
         state.me = null;
-        state.portalInFlight = false;
+        resetBillingState();
         renderShell();
         return;
       }
       const data = await resp.json().catch(() => null);
+      if (!isCurrentBillingContext(ctx)) return;
       if (!resp.ok) {
         state.billingActionError =
           (data && data.error && data.error.message) ||
@@ -1837,6 +1870,7 @@
       state.portalInFlight = false;
       renderShell();
     } catch (_err) {
+      if (!isCurrentBillingContext(ctx)) return;
       state.portalInFlight = false;
       state.billingActionError =
         'Connection failed while requesting a billing portal session. Please retry.';
@@ -1876,6 +1910,8 @@
 
   async function handleConfirmPlanChange(wsId) {
     if (!state.confirmingPlanChange || state.updatePlanInFlight || !state.me) return;
+    const ctx = captureBillingContext(wsId);
+    if (!isCurrentBillingContext(ctx)) return;
     const { plan, seats } = state.confirmingPlanChange;
     state.updatePlanInFlight = true;
     state.billingActionError = null;
@@ -1891,14 +1927,17 @@
         credentials: 'same-origin',
         body: JSON.stringify({ plan, seats }),
       });
+      if (!isCurrentBillingContext(ctx)) return;
       if (resp.status === 401) {
+        state.workspaceEpoch += 1;
         state.me = null;
-        state.updatePlanInFlight = false;
+        resetBillingState();
         renderShell();
         return;
       }
       if (!resp.ok) {
         const data = await resp.json().catch(() => null);
+        if (!isCurrentBillingContext(ctx)) return;
         state.billingActionError =
           (data && data.error && data.error.message) ||
           'Could not update the subscription plan. Please try again.';
@@ -1911,6 +1950,7 @@
       state.billingNotice = 'Subscription updated cleanly with Paddle.';
       await loadWorkspaceBilling(wsId);
     } catch (_err) {
+      if (!isCurrentBillingContext(ctx)) return;
       state.updatePlanInFlight = false;
       state.billingActionError =
         'Connection failed while updating the subscription plan. Please retry.';
@@ -1920,6 +1960,8 @@
 
   async function handleConfirmCancel(wsId) {
     if (!state.confirmingCancel || state.cancelInFlight || !state.me) return;
+    const ctx = captureBillingContext(wsId);
+    if (!isCurrentBillingContext(ctx)) return;
     state.cancelInFlight = true;
     state.billingActionError = null;
     renderShell();
@@ -1934,14 +1976,17 @@
         credentials: 'same-origin',
         body: '{}',
       });
+      if (!isCurrentBillingContext(ctx)) return;
       if (resp.status === 401) {
+        state.workspaceEpoch += 1;
         state.me = null;
-        state.cancelInFlight = false;
+        resetBillingState();
         renderShell();
         return;
       }
       if (!resp.ok) {
         const data = await resp.json().catch(() => null);
+        if (!isCurrentBillingContext(ctx)) return;
         state.billingActionError =
           (data && data.error && data.error.message) ||
           'Could not cancel the subscription. Please try again.';
@@ -1955,6 +2000,7 @@
         'Subscription cancellation scheduled for the end of the current billing period.';
       await loadWorkspaceBilling(wsId);
     } catch (_err) {
+      if (!isCurrentBillingContext(ctx)) return;
       state.cancelInFlight = false;
       state.billingActionError =
         'Connection failed while canceling the subscription. Please retry.';
@@ -2052,7 +2098,7 @@
         el('dt', { textContent: 'Machines limit' }),
         el('dd', {
           textContent: Array.isArray(state.devices)
-            ? `${state.devices.length} / ${b.max_devices}`
+            ? `${state.devices.filter((d) => d.status !== 'revoked').length} / ${b.max_devices}`
             : `${b.max_devices} max`,
         }),
       ]),
@@ -2827,6 +2873,7 @@
       state.createIdempotencyKey = null;
       state.createIntentBody = null;
       state.workspaces = [...(state.workspaces || []).filter((w) => w.id !== data.id), data];
+      state.workspaceEpoch += 1;
       state.activeWorkspace = data;
       state.devices = [];
       state.members = null;
@@ -2837,9 +2884,7 @@
       state.revisionsError = null;
       state.proposals = [];
       state.proposalsError = null;
-      state.billing = null;
-      state.loadingBilling = false;
-      state.billingError = null;
+      resetBillingState();
       window.history.pushState({}, '', `/workspaces/${data.id}`);
       renderShell();
       const createLoaders = [
@@ -3272,6 +3317,8 @@
   }
 
   async function loadWorkspaceDevices(id) {
+    const ctx = captureBillingContext(id);
+    if (!ctx.accountId) return;
     state.loadingDevices = true;
     state.devicesError = null;
     state.devices = null;
@@ -3281,19 +3328,25 @@
         headers: { Accept: 'application/json' },
         credentials: 'same-origin',
       });
+      if (!isCurrentBillingContext(ctx)) return;
       if (resp.status === 401) {
+        state.workspaceEpoch += 1;
         state.me = null;
         state.loadingDevices = false;
+        resetBillingState();
         renderShell();
         return;
       }
       if (!resp.ok) {
         throw new Error(`HTTP ${resp.status}`);
       }
-      state.devices = await resp.json();
+      const devices = await resp.json();
+      if (!isCurrentBillingContext(ctx)) return;
+      state.devices = devices;
       state.loadingDevices = false;
       renderShell();
     } catch (_err) {
+      if (!isCurrentBillingContext(ctx)) return;
       state.loadingDevices = false;
       state.devicesError = 'Could not load linked machines. Please try again.';
       renderShell();
@@ -3337,18 +3390,22 @@
     state.restoreSubmitError = null;
     state.restoreInFlight = false;
     state.restoreCreatedMessage = null;
-    state.billing = null;
-    state.loadingBilling = false;
-    state.billingError = null;
+    state.workspaceEpoch += 1;
+    const epoch = state.workspaceEpoch;
+    const accountId = state.me ? state.me.id : null;
+    resetBillingState();
     renderShell();
     try {
       const resp = await fetch(`/v1/workspaces/${encodeURIComponent(id)}`, {
         headers: { Accept: 'application/json' },
         credentials: 'same-origin',
       });
+      if (state.workspaceEpoch !== epoch || (state.me ? state.me.id : null) !== accountId) return;
       if (resp.status === 401) {
+        state.workspaceEpoch += 1;
         state.me = null;
         state.loadingDetail = false;
+        resetBillingState();
         renderShell();
         return;
       }
@@ -3365,7 +3422,9 @@
       if (!resp.ok) {
         throw new Error(`HTTP ${resp.status}`);
       }
-      state.activeWorkspace = await resp.json();
+      const ws = await resp.json();
+      if (state.workspaceEpoch !== epoch || (state.me ? state.me.id : null) !== accountId) return;
+      state.activeWorkspace = ws;
       state.loadingDetail = false;
       renderShell();
       const loaders = [loadWorkspaceDevices(id), loadWorkspaceMembers(id), loadWorkspaceRevisions(id), loadWorkspaceProposals(id), loadWorkspaceBilling(id)];
@@ -3374,6 +3433,7 @@
       }
       await Promise.all(loaders);
     } catch (_err) {
+      if (state.workspaceEpoch !== epoch || (state.me ? state.me.id : null) !== accountId) return;
       state.loadingDetail = false;
       state.detailError = {
         title: 'Could not load workspace',
@@ -3471,14 +3531,18 @@
     state.acceptError = null;
     state.acceptResult = null;
     if (isDeviceRoute() || parseInvitationTokenFromPath()) {
+      state.workspaceEpoch += 1;
       state.activeWorkspace = null;
       state.detailError = null;
+      resetBillingState();
       renderShell();
     } else if (wsId) {
       loadWorkspaceDetail(wsId);
     } else {
+      state.workspaceEpoch += 1;
       state.activeWorkspace = null;
       state.detailError = null;
+      resetBillingState();
       if (!state.workspaces) {
         loadWorkspaces();
       } else {

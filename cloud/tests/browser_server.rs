@@ -54,6 +54,8 @@ struct BrowserFixtures {
     quorum_workspace_name: String,
     pending_quorum_proposal_id: String,
     pending_quorum_revision: String,
+    quota_workspace_id: String,
+    quota_workspace_name: String,
 }
 
 struct Session {
@@ -315,7 +317,9 @@ async fn signed_post_json(
 async fn seed_browser_fixtures(base: &str) -> BrowserFixtures {
     let olivia = login_user(base, "olivia-sub-1", "olivia@example.com").await;
     let peter = login_user(base, "peter-sub-1", "peter@example.com").await;
+    let quinn = login_user(base, "quinn-sub-1", "quinn@example.com").await;
     let olivia_token = account_token(base, &olivia).await;
+    let quinn_token = account_token(base, &quinn).await;
 
     // 1. History & Export workspace: genesis -> sealed config+vault commit -> conflict -> enrollment
     let ws_name = "History & Export Fleet";
@@ -414,6 +418,23 @@ async fn seed_browser_fixtures(base: &str) -> BrowserFixtures {
     assert_eq!(q_push2.status(), 202);
     let held: SyncHeld = q_push2.json().await.unwrap();
 
+    // 3. Quota revocation workspace: owner machine + member machine -> removing member revokes their machine
+    let quota_name = "Quota Revocation Fleet";
+    let quota_ws = create_workspace(base, &olivia, quota_name).await;
+    invite_and_accept(
+        base,
+        &olivia,
+        &quota_ws.id,
+        &quinn,
+        "quinn@example.com",
+        muster_cloud::protocol::Role::Member,
+    )
+    .await;
+    let owner_key = MachineKey::new("owner-box");
+    let _owner_dev = link_device(base, &olivia_token, &quota_ws.id, &owner_key).await;
+    let quinn_key = MachineKey::new("quinn-box");
+    let _quinn_dev = link_device(base, &quinn_token, &quota_ws.id, &quinn_key).await;
+
     BrowserFixtures {
         history_workspace_id: ws.id,
         history_workspace_name: ws_name.into(),
@@ -439,6 +460,8 @@ async fn seed_browser_fixtures(base: &str) -> BrowserFixtures {
         quorum_workspace_name: q_name.into(),
         pending_quorum_proposal_id: held.proposal_id,
         pending_quorum_revision: pending_rev,
+        quota_workspace_id: quota_ws.id,
+        quota_workspace_name: quota_name.into(),
     }
 }
 

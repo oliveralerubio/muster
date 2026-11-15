@@ -1507,7 +1507,7 @@ async function journey20BillingProviderFailureRetryRolesAndMobile(browser) {
   await billingSection.getByRole('link', { name: /Continue to billing portal/i }).waitFor({ timeout: 5000 });
   assert.equal(await billingSection.locator('[role="alert"]').count(), 0);
 
-  // 3. Provider outage on plan update -> honest alert, retry confirms Team (3 seats)
+  // 3. Provider outage on plan update -> honest alert, retry confirms Team \(3 seats\)
   await billingSection.getByLabel(/Change plan/i).selectOption('team');
   await billingSection.getByLabel(/Update seats/i).fill('3');
   await billingSection.getByRole('button', { name: /Review plan change/i }).click();
@@ -1588,6 +1588,335 @@ async function journey20BillingProviderFailureRetryRolesAndMobile(browser) {
   await memberCtx.close();
 }
 
+async function journey21BillingNavigationIsolationAndStaleResponseGuard(browser) {
+  assert.ok(billingUrl, 'MUSTER_BILLING_CLOUD_URL is required');
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  const page = await context.newPage();
+  const pageErrors = [];
+  page.on('pageerror', (err) => pageErrors.push(err.message));
+
+  await page.goto(`${billingUrl}/`, { waitUntil: 'networkidle' });
+  await signInViaIdp(page, { subject: 'olivia-iso-1', email: 'olivia@example.com' });
+
+  // Create wsA, wsB, wsC
+  await page.getByLabel(/Workspace name/i).fill('Iso Fleet A');
+  await page.getByRole('button', { name: /Create workspace/i }).click();
+  await page.waitForURL(/\/workspaces\/([0-9a-f-]{36})$/, { timeout: 5000 });
+  const wsAId = page.url().match(/\/workspaces\/([0-9a-f-]{36})$/)[1];
+
+  await page.getByRole('link', { name: /All workspaces/i }).click();
+  await page.getByLabel(/Workspace name/i).fill('Iso Fleet B');
+  await page.getByRole('button', { name: /Create workspace/i }).click();
+  await page.waitForURL(/\/workspaces\/([0-9a-f-]{36})$/, { timeout: 5000 });
+  const wsBId = page.url().match(/\/workspaces\/([0-9a-f-]{36})$/)[1];
+
+  await page.getByRole('link', { name: /All workspaces/i }).click();
+  await page.getByLabel(/Workspace name/i).fill('Iso Fleet C');
+  await page.getByRole('button', { name: /Create workspace/i }).click();
+  await page.waitForURL(/\/workspaces\/([0-9a-f-]{36})$/, { timeout: 5000 });
+  const wsCId = page.url().match(/\/workspaces\/([0-9a-f-]{36})$/)[1];
+
+  // Open wsA, activate Personal subscription, open portal + review plan + review cancel
+  await page.getByRole('link', { name: /All workspaces/i }).click();
+  await page.getByRole('link', { name: /Iso Fleet A/i }).click();
+  await page.waitForURL(new RegExp(`/workspaces/${wsAId}$`), { timeout: 5000 });
+
+  const billingA = page.getByRole('region', { name: /^Billing$/i });
+  await billingA.getByLabel(/^Plan$/i).selectOption('personal');
+  await billingA.getByRole('button', { name: /Continue to checkout/i }).click();
+  const checkoutLinkA = billingA.getByRole('link', { name: /Open Paddle checkout/i });
+  await checkoutLinkA.waitFor({ timeout: 5000 });
+  const txnA = (await checkoutLinkA.getAttribute('href')).split('/').pop();
+
+  // Switching to wsB must NOT leak wsA's pending checkoutSession
+  await page.getByRole('link', { name: /All workspaces/i }).click();
+  await page.getByRole('link', { name: /Iso Fleet B/i }).click();
+  await page.waitForURL(new RegExp(`/workspaces/${wsBId}$`), { timeout: 5000 });
+  const billingB = page.getByRole('region', { name: /^Billing$/i });
+  await billingB.locator('dd', { hasText: /^Trial$/i }).waitFor({ timeout: 5000 });
+  assert.equal(
+    await billingB.getByRole('link', { name: /Open Paddle checkout/i }).count(),
+    0,
+    'wsB must not show wsA checkout link'
+  );
+
+  // Browser Back -> Forward must not leak wsA state into wsB
+  await page.goBack({ waitUntil: 'networkidle' });
+  await page.goBack({ waitUntil: 'networkidle' });
+  await page.waitForURL(new RegExp(`/workspaces/${wsAId}$`), { timeout: 5000 });
+  await paddleControl('POST', '/complete-checkout', {
+    transaction_id: txnA,
+    subscription_id: 'sub_01browseriso000000000001',
+    customer_id: 'ctm_01browseriso000000000001',
+  });
+  await billingA.getByRole('button', { name: /Refresh billing status/i }).click();
+  await billingA.locator('dd', { hasText: /^Personal$/i }).waitFor({ timeout: 5000 });
+
+  await billingA.getByRole('button', { name: /Open billing portal/i }).click();
+  await billingA.getByRole('link', { name: /Continue to billing portal/i }).waitFor({ timeout: 5000 });
+  await billingA.getByLabel(/Change plan/i).selectOption('team');
+  await billingA.getByRole('button', { name: /Review plan change/i }).click();
+  await billingA.getByRole('button', { name: /Confirm plan change/i }).waitFor({ timeout: 3000 });
+  await billingA.getByRole('button', { name: /Cancel subscription/i }).click();
+  await billingA.getByRole('button', { name: /Confirm cancellation/i }).waitFor({ timeout: 3000 });
+
+  // Go forward back to wsB (or navigate to wsB) -> zero portal/confirmations from wsA
+  await page.goForward({ waitUntil: 'networkidle' });
+  await page.goForward({ waitUntil: 'networkidle' });
+  await page.waitForURL(new RegExp(`/workspaces/${wsBId}$`), { timeout: 5000 });
+  await billingB.locator('dd', { hasText: /^Trial$/i }).waitFor({ timeout: 5000 });
+  assert.equal(await billingB.getByRole('link', { name: /Continue to billing portal/i }).count(), 0);
+  assert.equal(await billingB.getByRole('button', { name: /Confirm plan change/i }).count(), 0);
+  assert.equal(await billingB.getByRole('button', { name: /Confirm cancellation/i }).count(), 0);
+
+  // Delayed real POST /checkout on wsB must be discarded after navigating to wsC
+  let releaseHeld = null;
+  let heldDonePromise = null;
+  await page.route(`**/v1/workspaces/${wsBId}/billing/checkout`, async (route) => {
+    heldDonePromise = new Promise((resolve) => {
+      releaseHeld = async () => {
+        await route.continue();
+        resolve();
+      };
+    });
+  });
+
+  await billingB.getByLabel(/^Plan$/i).selectOption('personal');
+  await billingB.getByRole('button', { name: /Continue to checkout/i }).click();
+  await billingB.getByRole('button', { name: /Starting checkout/i }).waitFor({ timeout: 3000 });
+
+  await page.getByRole('link', { name: /All workspaces/i }).click();
+  await page.getByRole('link', { name: /Iso Fleet C/i }).click();
+  await page.waitForURL(new RegExp(`/workspaces/${wsCId}$`), { timeout: 5000 });
+  const billingC = page.getByRole('region', { name: /^Billing$/i });
+  await billingC.locator('dd', { hasText: /^Trial$/i }).waitFor({ timeout: 5000 });
+
+  assert.ok(releaseHeld, 'expected delayed wsB checkout route');
+  const checkoutRespWait = page.waitForResponse(
+    (r) => r.url().includes(`/v1/workspaces/${wsBId}/billing/checkout`) && r.status() === 200
+  );
+  await releaseHeld();
+  await heldDonePromise;
+  await checkoutRespWait;
+  await page.waitForTimeout(100);
+  assert.equal(
+    await billingC.getByRole('link', { name: /Open Paddle checkout/i }).count(),
+    0,
+    'delayed wsB checkout response must not render inside wsC'
+  );
+  await page.unroute(`**/v1/workspaces/${wsBId}/billing/checkout`);
+
+  // Delayed real GET /billing for wsC (Trial) arriving while viewing wsA (Personal Active) must be discarded
+  let releaseGetC = null;
+  await page.route(`**/v1/workspaces/${wsCId}/billing`, async (route) => {
+    await new Promise((resolve) => {
+      releaseGetC = async () => {
+        await route.continue();
+        resolve();
+      };
+    });
+  });
+  await page.getByRole('link', { name: /All workspaces/i }).click();
+  await page.getByRole('link', { name: /Iso Fleet C/i }).click();
+  await page.waitForURL(new RegExp(`/workspaces/${wsCId}$`), { timeout: 5000 });
+  await page.waitForFunction(() => Boolean(document.body), { timeout: 2000 });
+
+  await page.getByRole('link', { name: /All workspaces/i }).click();
+  await page.getByRole('link', { name: /Iso Fleet A/i }).click();
+  await page.waitForURL(new RegExp(`/workspaces/${wsAId}$`), { timeout: 5000 });
+  await billingA.locator('dd', { hasText: /^Personal$/i }).waitFor({ timeout: 5000 });
+
+  assert.ok(releaseGetC, 'expected delayed wsC GET /billing route');
+  const getCRespWait = page.waitForResponse(
+    (r) => r.url().includes(`/v1/workspaces/${wsCId}/billing`) && r.status() === 200
+  );
+  await releaseGetC();
+  await getCRespWait;
+  await page.waitForTimeout(100);
+  await billingA.locator('dd', { hasText: /^Personal$/i }).waitFor({ timeout: 3000 });
+  await billingA.locator('dd', { hasText: /^Active$/i }).waitFor({ timeout: 3000 });
+  await page.unroute(`**/v1/workspaces/${wsCId}/billing`);
+
+  // Delayed request across Sign out must not leak errors/links into signed-out state or Account B
+  let releasePortalA = null;
+  await page.route(`**/v1/workspaces/${wsAId}/billing/portal`, async (route) => {
+    await new Promise((resolve) => {
+      releasePortalA = async () => {
+        await route.continue();
+        resolve();
+      };
+    });
+  });
+  await billingA.getByRole('button', { name: /Open billing portal/i }).click();
+  await billingA.getByRole('button', { name: /Opening billing portal/i }).waitFor({ timeout: 3000 });
+
+  await page.getByRole('button', { name: /Sign out/i }).click();
+  await page.getByRole('link', { name: /Sign in/i }).waitFor({ timeout: 5000 });
+
+  assert.ok(releasePortalA, 'expected delayed portal route across logout');
+  const portalA401Wait = page.waitForResponse((r) =>
+    r.url().includes(`/v1/workspaces/${wsAId}/billing/portal`) && r.status() === 401
+  );
+  await releasePortalA();
+  await portalA401Wait;
+  await page.waitForTimeout(100);
+  await page.getByRole('link', { name: /Sign in/i }).waitFor({ timeout: 3000 });
+  assert.equal(
+    await page.getByRole('link', { name: /Continue to billing portal/i }).count(),
+    0,
+    'delayed portal response after sign out must not render'
+  );
+  await page.unroute(`**/v1/workspaces/${wsAId}/billing/portal`);
+
+  await signInViaIdp(page, { subject: 'bob-iso-2', email: 'bob@example.com' });
+  await page.getByText('bob@example.com', { exact: true }).waitFor({ timeout: 5000 });
+  assert.equal(
+    await page.getByRole('link', { name: /Iso Fleet A/i }).count(),
+    0,
+    'Account B must remain completely isolated from Account A workspaces'
+  );
+
+  // Concurrent Refresh billing status during pending confirmation AND in-flight plan change
+  await page.getByRole('button', { name: /Sign out/i }).click();
+  await signInViaIdp(page, { subject: 'olivia-iso-1', email: 'olivia@example.com' });
+  await page.getByRole('link', { name: /Iso Fleet A/i }).click();
+  await page.waitForURL(new RegExp(`/workspaces/${wsAId}$`), { timeout: 5000 });
+
+  await billingA.getByLabel(/Change plan/i).selectOption('team');
+  await billingA.getByLabel(/Update seats/i).fill('3');
+  await billingA.getByRole('button', { name: /Review plan change/i }).click();
+  const confirmPlanBtn = billingA.getByRole('button', { name: /Confirm plan change/i });
+  await confirmPlanBtn.waitFor({ timeout: 3000 });
+
+  // Concurrent refresh BEFORE confirming keeps pending confirmation intact
+  await Promise.all([
+    page.waitForResponse((r) => r.url().includes(`/v1/workspaces/${wsAId}/billing`) && r.request().method() === 'GET'),
+    billingA.getByRole('button', { name: /Refresh billing status/i }).click(),
+  ]);
+  await confirmPlanBtn.waitFor({ timeout: 3000 });
+  assert.equal(await billingA.getByLabel(/Change plan/i).inputValue(), 'team');
+  assert.equal(await billingA.getByLabel(/Update seats/i).inputValue(), '3');
+
+  // Concurrent refresh WHILE POST /billing/plan is in flight keeps button disabled (no double submit!)
+  let releasePlanUpdate = null;
+  await page.route(`**/v1/workspaces/${wsAId}/billing/plan`, async (route) => {
+    await new Promise((resolve) => {
+      releasePlanUpdate = async () => {
+        await route.continue();
+        resolve();
+      };
+    });
+  });
+  await confirmPlanBtn.click();
+  const updatingBtn = billingA.getByRole('button', { name: /Updating plan/i });
+  await updatingBtn.waitFor({ timeout: 3000 });
+  assert.equal(await updatingBtn.isDisabled(), true);
+
+  await Promise.all([
+    page.waitForResponse((r) => r.url().includes(`/v1/workspaces/${wsAId}/billing`) && r.request().method() === 'GET'),
+    billingA.getByRole('button', { name: /Refresh billing status/i }).click(),
+  ]);
+  assert.equal(
+    await billingA.getByRole('button', { name: /Updating plan/i }).isDisabled(),
+    true,
+    'concurrent refresh must NOT unlock an in-flight plan update'
+  );
+
+  const planRespWait = page.waitForResponse(
+    (r) => r.url().includes(`/v1/workspaces/${wsAId}/billing/plan`) && r.status() === 200
+  );
+  await releasePlanUpdate();
+  await planRespWait;
+  await billingA.locator('dd', { hasText: /^Team \(3 seats\)$/i }).waitFor({ timeout: 5000 });
+  await page.unroute(`**/v1/workspaces/${wsAId}/billing/plan`);
+
+  // Concurrent refresh while POST /billing/cancel is pending confirmation AND in flight keeps button disabled
+  await billingA.getByRole('button', { name: /Cancel subscription/i }).click();
+  const confirmCancelBtn = billingA.getByRole('button', { name: /Confirm cancellation/i });
+  await confirmCancelBtn.waitFor({ timeout: 3000 });
+
+  await Promise.all([
+    page.waitForResponse((r) => r.url().includes(`/v1/workspaces/${wsAId}/billing`) && r.request().method() === 'GET'),
+    billingA.getByRole('button', { name: /Refresh billing status/i }).click(),
+  ]);
+  await confirmCancelBtn.waitFor({ timeout: 3000 });
+
+  let releaseCancel = null;
+  await page.route(`**/v1/workspaces/${wsAId}/billing/cancel`, async (route) => {
+    await new Promise((resolve) => {
+      releaseCancel = async () => {
+        await route.continue();
+        resolve();
+      };
+    });
+  });
+  await confirmCancelBtn.click();
+  const cancelingBtn = billingA.getByRole('button', { name: /Canceling/i });
+  await cancelingBtn.waitFor({ timeout: 3000 });
+  assert.equal(await cancelingBtn.isDisabled(), true);
+
+  await Promise.all([
+    page.waitForResponse((r) => r.url().includes(`/v1/workspaces/${wsAId}/billing`) && r.request().method() === 'GET'),
+    billingA.getByRole('button', { name: /Refresh billing status/i }).click(),
+  ]);
+  assert.equal(
+    await billingA.getByRole('button', { name: /Canceling/i }).isDisabled(),
+    true,
+    'concurrent refresh must NOT unlock an in-flight cancel mutation'
+  );
+
+  const cancelRespWait = page.waitForResponse(
+    (r) => r.url().includes(`/v1/workspaces/${wsAId}/billing/cancel`) && r.status() === 200
+  );
+  await releaseCancel();
+  await cancelRespWait;
+  await billingA.getByText(/Cancels at period end/i).waitFor({ timeout: 5000 });
+  await page.unroute(`**/v1/workspaces/${wsAId}/billing/cancel`);
+
+  await saveScreenshot(page, '33-billing-race-isolation');
+  assert.deepEqual(pageErrors, [], `unexpected page errors: ${pageErrors.join('; ')}`);
+  await context.close();
+}
+
+async function journey22BillingMachinesLimitExcludesRevokedDevices(browser) {
+  const fixtures = loadFixtures();
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  const page = await context.newPage();
+  const pageErrors = [];
+  page.on('pageerror', (err) => pageErrors.push(err.message));
+
+  await page.goto(`${baseUrl}/`, { waitUntil: 'networkidle' });
+  await signInViaIdp(page, { subject: 'olivia-sub-1', email: 'olivia@example.com' });
+
+  await page.getByRole('link', { name: new RegExp(fixtures.quotaWorkspaceName, 'i') }).click();
+  await page.waitForURL(new RegExp(`/workspaces/${fixtures.quotaWorkspaceId}$`), { timeout: 5000 });
+
+  const billingSection = page.getByRole('region', { name: /^Billing$/i });
+  await billingSection.waitFor({ timeout: 5000 });
+  await billingSection.locator('.meta-item', { hasText: /^Machines limit/i }).getByText(/^2 \/ 3$/).waitFor({ timeout: 5000 });
+
+  await page.getByText('owner-box', { exact: true }).waitFor({ timeout: 3000 });
+  await page.getByText('quinn-box', { exact: true }).waitFor({ timeout: 3000 });
+
+  // Remove member Quinn -> backend revokes quinn-box (status='revoked')
+  const membersSection = page.getByRole('region', { name: /^Members$/i });
+  await membersSection.getByRole('button', { name: /^Remove quinn@example\.com$/i }).click();
+
+  // Revoked machine stays visible in Machines list with Revoked badge, while Machines limit drops to 1 / 3
+  const quinnCard = page.locator('.machine-card', { hasText: 'quinn-box' });
+  await quinnCard.getByText(/^Revoked$/i).waitFor({ timeout: 5000 });
+  await billingSection.locator('.meta-item', { hasText: /^Machines limit/i }).getByText(/^1 \/ 3$/).waitFor({ timeout: 5000 });
+
+  // Reloading persists both the revoked machine entry and 1 / 3 quota
+  await page.reload({ waitUntil: 'networkidle' });
+  await page.locator('.machine-card', { hasText: 'quinn-box' }).getByText(/^Revoked$/i).waitFor({ timeout: 5000 });
+  await page.getByRole('region', { name: /^Billing$/i }).locator('.meta-item', { hasText: /^Machines limit/i }).getByText(/^1 \/ 3$/).waitFor({ timeout: 5000 });
+
+  await saveScreenshot(page, '34-billing-revoked-device-quota');
+  assert.deepEqual(pageErrors, [], `unexpected page errors: ${pageErrors.join('; ')}`);
+  await context.close();
+}
+
 const journeys = [
   ['journey_1_signin_and_account', journey1SignInAndAccount],
   ['journey_2_empty_workspaces', journey2EmptyWorkspaces],
@@ -1609,6 +1938,8 @@ const journeys = [
   ['journey_18_billing_checkout_no_duplicates_and_server_reconcile', journey18BillingCheckoutNoDuplicatesAndServerReconcile],
   ['journey_19_billing_team_portal_plan_change_and_explicit_cancel', journey19BillingTeamPortalPlanChangeAndExplicitCancel],
   ['journey_20_billing_provider_failure_retry_roles_and_mobile', journey20BillingProviderFailureRetryRolesAndMobile],
+  ['journey_21_billing_navigation_isolation_and_stale_response_guard', journey21BillingNavigationIsolationAndStaleResponseGuard],
+  ['journey_22_billing_machines_limit_excludes_revoked_devices', journey22BillingMachinesLimitExcludesRevokedDevices],
 ];
 
 async function main() {
