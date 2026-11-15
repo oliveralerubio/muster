@@ -85,7 +85,48 @@
     signOutError: null,
   };
 
-  function resetBillingState() {
+  function resetWorkspaceState() {
+    state.workspaceEpoch += 1;
+    state.activeWorkspace = null;
+    state.loadingDetail = false;
+    state.detailError = null;
+    state.devices = null;
+    state.loadingDevices = false;
+    state.devicesError = null;
+    state.members = null;
+    state.loadingMembers = false;
+    state.membersError = null;
+    state.memberActionError = null;
+    state.removingMemberId = null;
+    state.invitations = null;
+    state.loadingInvitations = false;
+    state.invitationsError = null;
+    state.inviteEmail = '';
+    state.inviteRole = 'member';
+    state.inviteFieldError = null;
+    state.inviteSubmitError = null;
+    state.inviteInFlight = false;
+    state.createdInvite = null;
+    state.revisions = null;
+    state.loadingRevisions = false;
+    state.revisionsError = null;
+    state.loadingMoreRevisions = false;
+    state.hasMoreRevisions = false;
+    state.selectedDiffRev = null;
+    state.diffsByRev = {};
+    state.loadingDiffRev = null;
+    state.diffError = null;
+    state.proposals = null;
+    state.loadingProposals = false;
+    state.proposalsError = null;
+    state.proposalActionError = null;
+    state.rejectingProposalId = null;
+    state.restoreTargetRev = '';
+    state.restorePathsText = '';
+    state.restoreFieldError = null;
+    state.restoreSubmitError = null;
+    state.restoreInFlight = false;
+    state.restoreCreatedMessage = null;
     state.billing = null;
     state.loadingBilling = false;
     state.billingError = null;
@@ -107,7 +148,14 @@
     state.cancelInFlight = false;
   }
 
-  function captureBillingContext(wsId) {
+  function expireSession() {
+    state.me = null;
+    state.workspaces = null;
+    resetWorkspaceState();
+    renderShell();
+  }
+
+  function captureWorkspaceContext(wsId) {
     return {
       epoch: state.workspaceEpoch,
       wsId,
@@ -115,12 +163,12 @@
     };
   }
 
-  function isCurrentBillingContext(ctx) {
+  function isCurrentWorkspaceContext(ctx, requireActive = true) {
     return (
       Boolean(ctx && ctx.accountId) &&
       state.workspaceEpoch === ctx.epoch &&
       Boolean(state.me && state.me.id === ctx.accountId) &&
-      Boolean(state.activeWorkspace && state.activeWorkspace.id === ctx.wsId) &&
+      (!requireActive || Boolean(state.activeWorkspace && state.activeWorkspace.id === ctx.wsId)) &&
       parseWorkspaceIdFromPath(window.location.pathname) === ctx.wsId
     );
   }
@@ -293,44 +341,10 @@
       state.signOutInFlight = false;
       state.me = null;
       state.workspaces = null;
-      state.activeWorkspace = null;
-      state.detailError = null;
-      state.members = null;
-      state.membersError = null;
-      state.memberActionError = null;
-      state.removingMemberId = null;
-      state.invitations = null;
-      state.invitationsError = null;
-      state.createdInvite = null;
-      state.inviteEmail = '';
-      state.inviteRole = 'member';
-      state.inviteFieldError = null;
-      state.inviteSubmitError = null;
       state.acceptInFlight = false;
       state.acceptError = null;
       state.acceptResult = null;
-      state.revisions = null;
-      state.loadingRevisions = false;
-      state.revisionsError = null;
-      state.loadingMoreRevisions = false;
-      state.hasMoreRevisions = false;
-      state.selectedDiffRev = null;
-      state.diffsByRev = {};
-      state.loadingDiffRev = null;
-      state.diffError = null;
-      state.proposals = null;
-      state.loadingProposals = false;
-      state.proposalsError = null;
-      state.proposalActionError = null;
-      state.rejectingProposalId = null;
-      state.restoreTargetRev = '';
-      state.restorePathsText = '';
-      state.restoreFieldError = null;
-      state.restoreSubmitError = null;
-      state.restoreInFlight = false;
-      state.restoreCreatedMessage = null;
-      state.workspaceEpoch += 1;
-      resetBillingState();
+      resetWorkspaceState();
       window.history.pushState({}, '', '/');
       renderShell();
     } catch (_err) {
@@ -341,49 +355,13 @@
   }
 
   function navigateToList() {
-    state.activeWorkspace = null;
-    state.detailError = null;
-    state.devices = null;
-    state.devicesError = null;
-    state.members = null;
-    state.membersError = null;
-    state.memberActionError = null;
-    state.removingMemberId = null;
-    state.invitations = null;
-    state.invitationsError = null;
-    state.createdInvite = null;
-    state.inviteEmail = '';
-    state.inviteRole = 'member';
-    state.inviteFieldError = null;
-    state.inviteSubmitError = null;
     state.acceptInFlight = false;
     state.acceptError = null;
     state.acceptResult = null;
     state.deviceResult = null;
     state.deviceSubmitError = null;
     state.deviceFieldError = null;
-    state.revisions = null;
-    state.loadingRevisions = false;
-    state.revisionsError = null;
-    state.loadingMoreRevisions = false;
-    state.hasMoreRevisions = false;
-    state.selectedDiffRev = null;
-    state.diffsByRev = {};
-    state.loadingDiffRev = null;
-    state.diffError = null;
-    state.proposals = null;
-    state.loadingProposals = false;
-    state.proposalsError = null;
-    state.proposalActionError = null;
-    state.rejectingProposalId = null;
-    state.restoreTargetRev = '';
-    state.restorePathsText = '';
-    state.restoreFieldError = null;
-    state.restoreSubmitError = null;
-    state.restoreInFlight = false;
-    state.restoreCreatedMessage = null;
-    state.workspaceEpoch += 1;
-    resetBillingState();
+    resetWorkspaceState();
     window.history.pushState({}, '', '/');
     if (!state.workspaces) {
       loadWorkspaces();
@@ -655,6 +633,8 @@
   async function handleCreateInvitation(e, ws) {
     e.preventDefault();
     if (state.inviteInFlight || !state.me) return;
+    const ctx = captureWorkspaceContext(ws.id);
+    if (!isCurrentWorkspaceContext(ctx)) return;
 
     const check = validateInviteEmail(state.inviteEmail);
     if (!check.ok) {
@@ -685,13 +665,13 @@
         credentials: 'same-origin',
         body: JSON.stringify({ email: check.email, role }),
       });
+      if (!isCurrentWorkspaceContext(ctx)) return;
       if (resp.status === 401) {
-        state.me = null;
-        state.inviteInFlight = false;
-        renderShell();
+        expireSession();
         return;
       }
       const data = await resp.json().catch(() => null);
+      if (!isCurrentWorkspaceContext(ctx)) return;
       if (!resp.ok) {
         state.inviteSubmitError =
           (data && data.error && data.error.message) ||
@@ -712,6 +692,7 @@
       state.invitations = [data.invitation, ...(state.invitations || [])];
       renderShell();
     } catch (_err) {
+      if (!isCurrentWorkspaceContext(ctx)) return;
       state.inviteInFlight = false;
       state.inviteSubmitError = 'Connection failed while creating the invitation. Please try again.';
       renderShell();
@@ -902,6 +883,8 @@
 
   async function handleRemoveMember(ws, m) {
     if (state.removingMemberId || !state.me) return;
+    const ctx = captureWorkspaceContext(ws.id);
+    if (!isCurrentWorkspaceContext(ctx)) return;
     state.removingMemberId = m.user_id;
     state.memberActionError = null;
     renderShell();
@@ -917,14 +900,14 @@
           credentials: 'same-origin',
         }
       );
+      if (!isCurrentWorkspaceContext(ctx)) return;
       if (resp.status === 401) {
-        state.me = null;
-        state.removingMemberId = null;
-        renderShell();
+        expireSession();
         return;
       }
       if (!resp.ok) {
         const data = await resp.json().catch(() => null);
+        if (!isCurrentWorkspaceContext(ctx)) return;
         state.removingMemberId = null;
         state.memberActionError =
           (data && data.error && data.error.message) ||
@@ -942,6 +925,7 @@
       renderShell();
       await loadWorkspaceDevices(ws.id);
     } catch (_err) {
+      if (!isCurrentWorkspaceContext(ctx)) return;
       state.removingMemberId = null;
       state.memberActionError = 'Connection failed while removing the member. Please try again.';
       renderShell();
@@ -1039,6 +1023,8 @@
   }
 
   async function loadWorkspaceProposals(id) {
+    const ctx = captureWorkspaceContext(id);
+    if (!isCurrentWorkspaceContext(ctx)) return;
     state.loadingProposals = true;
     state.proposalsError = null;
     state.proposals = null;
@@ -1049,17 +1035,19 @@
         `/v1/workspaces/${encodeURIComponent(id)}/proposals`,
         { headers: { Accept: 'application/json' }, credentials: 'same-origin' }
       );
+      if (!isCurrentWorkspaceContext(ctx)) return;
       if (resp.status === 401) {
-        state.me = null;
-        state.loadingProposals = false;
-        renderShell();
+        expireSession();
         return;
       }
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-      state.proposals = await resp.json();
+      const proposals = await resp.json();
+      if (!isCurrentWorkspaceContext(ctx)) return;
+      state.proposals = proposals;
       state.loadingProposals = false;
       renderShell();
     } catch (_err) {
+      if (!isCurrentWorkspaceContext(ctx)) return;
       state.loadingProposals = false;
       state.proposalsError = 'Could not load proposals. Please try again.';
       renderShell();
@@ -1121,6 +1109,8 @@
 
   async function handleRejectProposal(ws, proposal) {
     if (state.rejectingProposalId || !state.me) return;
+    const ctx = captureWorkspaceContext(ws.id);
+    if (!isCurrentWorkspaceContext(ctx)) return;
     state.rejectingProposalId = proposal.id;
     state.proposalActionError = null;
     renderShell();
@@ -1138,13 +1128,13 @@
           body: JSON.stringify({ result_revision: null }),
         }
       );
+      if (!isCurrentWorkspaceContext(ctx)) return;
       if (resp.status === 401) {
-        state.me = null;
-        state.rejectingProposalId = null;
-        renderShell();
+        expireSession();
         return;
       }
       const data = await resp.json().catch(() => null);
+      if (!isCurrentWorkspaceContext(ctx)) return;
       if (!resp.ok) {
         state.rejectingProposalId = null;
         state.proposalActionError =
@@ -1159,6 +1149,7 @@
       );
       renderShell();
     } catch (_err) {
+      if (!isCurrentWorkspaceContext(ctx)) return;
       state.rejectingProposalId = null;
       state.proposalActionError =
         'Connection failed while rejecting the proposal. Please try again.';
@@ -1171,9 +1162,6 @@
     state.restoreFieldError = null;
     state.restoreSubmitError = null;
     state.restoreCreatedMessage = null;
-    state.billing = null;
-    state.loadingBilling = false;
-    state.billingError = null;
     renderShell();
     const input = document.getElementById('restore-paths');
     if (input) {
@@ -1184,6 +1172,8 @@
   async function handleCreateRestoreProposal(e, ws) {
     e.preventDefault();
     if (state.restoreInFlight || !state.me) return;
+    const ctx = captureWorkspaceContext(ws.id);
+    if (!isCurrentWorkspaceContext(ctx)) return;
     const revisions = state.revisions || [];
     if (revisions.length === 0) return;
 
@@ -1233,13 +1223,13 @@
           }),
         }
       );
+      if (!isCurrentWorkspaceContext(ctx)) return;
       if (resp.status === 401) {
-        state.me = null;
-        state.restoreInFlight = false;
-        renderShell();
+        expireSession();
         return;
       }
       const data = await resp.json().catch(() => null);
+      if (!isCurrentWorkspaceContext(ctx)) return;
       if (!resp.ok) {
         state.restoreInFlight = false;
         state.restoreSubmitError =
@@ -1255,6 +1245,7 @@
       state.proposals = [data, ...(state.proposals || [])];
       renderShell();
     } catch (_err) {
+      if (!isCurrentWorkspaceContext(ctx)) return;
       state.restoreInFlight = false;
       state.restoreSubmitError =
         'Connection failed while creating the restore proposal. Please try again.';
@@ -1531,6 +1522,8 @@
   const REVISIONS_PAGE_SIZE = 20;
 
   async function loadWorkspaceRevisions(id) {
+    const ctx = captureWorkspaceContext(id);
+    if (!isCurrentWorkspaceContext(ctx)) return;
     state.loadingRevisions = true;
     state.revisionsError = null;
     state.revisions = null;
@@ -1541,19 +1534,20 @@
         `/v1/workspaces/${encodeURIComponent(id)}/revisions?limit=${REVISIONS_PAGE_SIZE}`,
         { headers: { Accept: 'application/json' }, credentials: 'same-origin' }
       );
+      if (!isCurrentWorkspaceContext(ctx)) return;
       if (resp.status === 401) {
-        state.me = null;
-        state.loadingRevisions = false;
-        renderShell();
+        expireSession();
         return;
       }
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const list = await resp.json();
+      if (!isCurrentWorkspaceContext(ctx)) return;
       state.revisions = list;
       state.hasMoreRevisions = list.length === REVISIONS_PAGE_SIZE;
       state.loadingRevisions = false;
       renderShell();
     } catch (_err) {
+      if (!isCurrentWorkspaceContext(ctx)) return;
       state.loadingRevisions = false;
       state.revisionsError = 'Could not load revision history. Please try again.';
       renderShell();
@@ -1562,6 +1556,8 @@
 
   async function loadMoreRevisions(id) {
     if (state.loadingMoreRevisions || !state.revisions || state.revisions.length === 0) return;
+    const ctx = captureWorkspaceContext(id);
+    if (!isCurrentWorkspaceContext(ctx)) return;
     const oldest = state.revisions[state.revisions.length - 1];
     state.loadingMoreRevisions = true;
     renderShell();
@@ -1570,19 +1566,20 @@
         `/v1/workspaces/${encodeURIComponent(id)}/revisions?before=${encodeURIComponent(oldest.revision)}&limit=${REVISIONS_PAGE_SIZE}`,
         { headers: { Accept: 'application/json' }, credentials: 'same-origin' }
       );
+      if (!isCurrentWorkspaceContext(ctx)) return;
       if (resp.status === 401) {
-        state.me = null;
-        state.loadingMoreRevisions = false;
-        renderShell();
+        expireSession();
         return;
       }
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const older = await resp.json();
+      if (!isCurrentWorkspaceContext(ctx)) return;
       state.revisions = [...state.revisions, ...older];
       state.hasMoreRevisions = older.length === REVISIONS_PAGE_SIZE;
       state.loadingMoreRevisions = false;
       renderShell();
     } catch (_err) {
+      if (!isCurrentWorkspaceContext(ctx)) return;
       state.loadingMoreRevisions = false;
       state.revisionsError = 'Could not load older revisions. Please try again.';
       renderShell();
@@ -1590,6 +1587,8 @@
   }
 
   async function toggleRevisionDiff(wsId, rev) {
+    const ctx = captureWorkspaceContext(wsId);
+    if (!isCurrentWorkspaceContext(ctx)) return;
     if (state.selectedDiffRev === rev) {
       state.selectedDiffRev = null;
       state.diffError = null;
@@ -1609,18 +1608,20 @@
         `/v1/workspaces/${encodeURIComponent(wsId)}/revisions/${encodeURIComponent(rev)}/diff`,
         { headers: { Accept: 'application/json' }, credentials: 'same-origin' }
       );
+      if (!isCurrentWorkspaceContext(ctx)) return;
       if (resp.status === 401) {
-        state.me = null;
-        state.loadingDiffRev = null;
-        renderShell();
+        expireSession();
         return;
       }
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-      state.diffsByRev[rev] = await resp.json();
-      state.loadingDiffRev = null;
+      const diff = await resp.json();
+      if (!isCurrentWorkspaceContext(ctx)) return;
+      state.diffsByRev[rev] = diff;
+      if (state.loadingDiffRev === rev) state.loadingDiffRev = null;
       renderShell();
     } catch (_err) {
-      state.loadingDiffRev = null;
+      if (!isCurrentWorkspaceContext(ctx)) return;
+      if (state.loadingDiffRev === rev) state.loadingDiffRev = null;
       state.diffError = 'Could not load diff for this revision. Please try again.';
       renderShell();
     }
@@ -1694,8 +1695,8 @@
   }
 
   async function loadWorkspaceBilling(id) {
-    const ctx = captureBillingContext(id);
-    if (!ctx.accountId) return;
+    const ctx = captureWorkspaceContext(id);
+    if (!isCurrentWorkspaceContext(ctx)) return;
     state.loadingBilling = true;
     state.billingError = null;
     if (!state.billing || state.billing.workspace_id !== id) {
@@ -1707,17 +1708,14 @@
         `/v1/workspaces/${encodeURIComponent(id)}/billing`,
         { headers: { Accept: 'application/json' }, credentials: 'same-origin' }
       );
-      if (!isCurrentBillingContext(ctx)) return;
+      if (!isCurrentWorkspaceContext(ctx)) return;
       if (resp.status === 401) {
-        state.workspaceEpoch += 1;
-        state.me = null;
-        resetBillingState();
-        renderShell();
+        expireSession();
         return;
       }
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const billing = await resp.json();
-      if (!isCurrentBillingContext(ctx)) return;
+      if (!isCurrentWorkspaceContext(ctx)) return;
       state.billing = billing;
       state.loadingBilling = false;
       if (billing.plan !== 'trial' && billing.plan_status !== 'canceled') {
@@ -1750,7 +1748,7 @@
       }
       renderShell();
     } catch (_err) {
-      if (!isCurrentBillingContext(ctx)) return;
+      if (!isCurrentWorkspaceContext(ctx)) return;
       state.loadingBilling = false;
       state.billingError = 'Could not load workspace billing details. Please try again.';
       renderShell();
@@ -1760,8 +1758,8 @@
   async function handleStartCheckout(e, wsId) {
     e.preventDefault();
     if (state.checkoutInFlight || !state.me) return;
-    const ctx = captureBillingContext(wsId);
-    if (!isCurrentBillingContext(ctx)) return;
+    const ctx = captureWorkspaceContext(wsId);
+    if (!isCurrentWorkspaceContext(ctx)) return;
 
     const plan = state.checkoutPlan === 'team' ? 'team' : 'personal';
     let seats = 1;
@@ -1794,16 +1792,13 @@
         credentials: 'same-origin',
         body: JSON.stringify({ plan, seats }),
       });
-      if (!isCurrentBillingContext(ctx)) return;
+      if (!isCurrentWorkspaceContext(ctx)) return;
       if (resp.status === 401) {
-        state.workspaceEpoch += 1;
-        state.me = null;
-        resetBillingState();
-        renderShell();
+        expireSession();
         return;
       }
       const data = await resp.json().catch(() => null);
-      if (!isCurrentBillingContext(ctx)) return;
+      if (!isCurrentWorkspaceContext(ctx)) return;
       if (!resp.ok) {
         state.billingActionError =
           (data && data.error && data.error.message) ||
@@ -1822,7 +1817,7 @@
       state.checkoutInFlight = false;
       renderShell();
     } catch (_err) {
-      if (!isCurrentBillingContext(ctx)) return;
+      if (!isCurrentWorkspaceContext(ctx)) return;
       state.checkoutInFlight = false;
       state.billingActionError =
         'Connection failed while creating the checkout session. Please retry.';
@@ -1832,8 +1827,8 @@
 
   async function handleOpenPortal(wsId) {
     if (state.portalInFlight || !state.me) return;
-    const ctx = captureBillingContext(wsId);
-    if (!isCurrentBillingContext(ctx)) return;
+    const ctx = captureWorkspaceContext(wsId);
+    if (!isCurrentWorkspaceContext(ctx)) return;
     state.portalInFlight = true;
     state.billingActionError = null;
     renderShell();
@@ -1848,16 +1843,13 @@
         credentials: 'same-origin',
         body: '{}',
       });
-      if (!isCurrentBillingContext(ctx)) return;
+      if (!isCurrentWorkspaceContext(ctx)) return;
       if (resp.status === 401) {
-        state.workspaceEpoch += 1;
-        state.me = null;
-        resetBillingState();
-        renderShell();
+        expireSession();
         return;
       }
       const data = await resp.json().catch(() => null);
-      if (!isCurrentBillingContext(ctx)) return;
+      if (!isCurrentWorkspaceContext(ctx)) return;
       if (!resp.ok) {
         state.billingActionError =
           (data && data.error && data.error.message) ||
@@ -1870,7 +1862,7 @@
       state.portalInFlight = false;
       renderShell();
     } catch (_err) {
-      if (!isCurrentBillingContext(ctx)) return;
+      if (!isCurrentWorkspaceContext(ctx)) return;
       state.portalInFlight = false;
       state.billingActionError =
         'Connection failed while requesting a billing portal session. Please retry.';
@@ -1910,8 +1902,8 @@
 
   async function handleConfirmPlanChange(wsId) {
     if (!state.confirmingPlanChange || state.updatePlanInFlight || !state.me) return;
-    const ctx = captureBillingContext(wsId);
-    if (!isCurrentBillingContext(ctx)) return;
+    const ctx = captureWorkspaceContext(wsId);
+    if (!isCurrentWorkspaceContext(ctx)) return;
     const { plan, seats } = state.confirmingPlanChange;
     state.updatePlanInFlight = true;
     state.billingActionError = null;
@@ -1927,17 +1919,14 @@
         credentials: 'same-origin',
         body: JSON.stringify({ plan, seats }),
       });
-      if (!isCurrentBillingContext(ctx)) return;
+      if (!isCurrentWorkspaceContext(ctx)) return;
       if (resp.status === 401) {
-        state.workspaceEpoch += 1;
-        state.me = null;
-        resetBillingState();
-        renderShell();
+        expireSession();
         return;
       }
       if (!resp.ok) {
         const data = await resp.json().catch(() => null);
-        if (!isCurrentBillingContext(ctx)) return;
+        if (!isCurrentWorkspaceContext(ctx)) return;
         state.billingActionError =
           (data && data.error && data.error.message) ||
           'Could not update the subscription plan. Please try again.';
@@ -1950,7 +1939,7 @@
       state.billingNotice = 'Subscription updated cleanly with Paddle.';
       await loadWorkspaceBilling(wsId);
     } catch (_err) {
-      if (!isCurrentBillingContext(ctx)) return;
+      if (!isCurrentWorkspaceContext(ctx)) return;
       state.updatePlanInFlight = false;
       state.billingActionError =
         'Connection failed while updating the subscription plan. Please retry.';
@@ -1960,8 +1949,8 @@
 
   async function handleConfirmCancel(wsId) {
     if (!state.confirmingCancel || state.cancelInFlight || !state.me) return;
-    const ctx = captureBillingContext(wsId);
-    if (!isCurrentBillingContext(ctx)) return;
+    const ctx = captureWorkspaceContext(wsId);
+    if (!isCurrentWorkspaceContext(ctx)) return;
     state.cancelInFlight = true;
     state.billingActionError = null;
     renderShell();
@@ -1976,17 +1965,14 @@
         credentials: 'same-origin',
         body: '{}',
       });
-      if (!isCurrentBillingContext(ctx)) return;
+      if (!isCurrentWorkspaceContext(ctx)) return;
       if (resp.status === 401) {
-        state.workspaceEpoch += 1;
-        state.me = null;
-        resetBillingState();
-        renderShell();
+        expireSession();
         return;
       }
       if (!resp.ok) {
         const data = await resp.json().catch(() => null);
-        if (!isCurrentBillingContext(ctx)) return;
+        if (!isCurrentWorkspaceContext(ctx)) return;
         state.billingActionError =
           (data && data.error && data.error.message) ||
           'Could not cancel the subscription. Please try again.';
@@ -2000,7 +1986,7 @@
         'Subscription cancellation scheduled for the end of the current billing period.';
       await loadWorkspaceBilling(wsId);
     } catch (_err) {
-      if (!isCurrentBillingContext(ctx)) return;
+      if (!isCurrentWorkspaceContext(ctx)) return;
       state.cancelInFlight = false;
       state.billingActionError =
         'Connection failed while canceling the subscription. Please retry.';
@@ -2873,18 +2859,12 @@
       state.createIdempotencyKey = null;
       state.createIntentBody = null;
       state.workspaces = [...(state.workspaces || []).filter((w) => w.id !== data.id), data];
-      state.workspaceEpoch += 1;
+      resetWorkspaceState();
       state.activeWorkspace = data;
       state.devices = [];
-      state.members = null;
       state.invitations = [];
-      state.invitationsError = null;
-      state.createdInvite = null;
       state.revisions = [];
-      state.revisionsError = null;
       state.proposals = [];
-      state.proposalsError = null;
-      resetBillingState();
       window.history.pushState({}, '', `/workspaces/${data.id}`);
       renderShell();
       const createLoaders = [
@@ -3259,6 +3239,8 @@
   }
 
   async function loadWorkspaceInvitations(id) {
+    const ctx = captureWorkspaceContext(id);
+    if (!isCurrentWorkspaceContext(ctx)) return;
     state.loadingInvitations = true;
     state.invitationsError = null;
     state.invitations = null;
@@ -3268,19 +3250,21 @@
         headers: { Accept: 'application/json' },
         credentials: 'same-origin',
       });
+      if (!isCurrentWorkspaceContext(ctx)) return;
       if (resp.status === 401) {
-        state.me = null;
-        state.loadingInvitations = false;
-        renderShell();
+        expireSession();
         return;
       }
       if (!resp.ok) {
         throw new Error(`HTTP ${resp.status}`);
       }
-      state.invitations = await resp.json();
+      const invitations = await resp.json();
+      if (!isCurrentWorkspaceContext(ctx)) return;
+      state.invitations = invitations;
       state.loadingInvitations = false;
       renderShell();
     } catch (_err) {
+      if (!isCurrentWorkspaceContext(ctx)) return;
       state.loadingInvitations = false;
       state.invitationsError = 'Could not load invitations. Please try again.';
       renderShell();
@@ -3288,6 +3272,8 @@
   }
 
   async function loadWorkspaceMembers(id) {
+    const ctx = captureWorkspaceContext(id);
+    if (!isCurrentWorkspaceContext(ctx)) return;
     state.loadingMembers = true;
     state.membersError = null;
     state.members = null;
@@ -3297,19 +3283,21 @@
         headers: { Accept: 'application/json' },
         credentials: 'same-origin',
       });
+      if (!isCurrentWorkspaceContext(ctx)) return;
       if (resp.status === 401) {
-        state.me = null;
-        state.loadingMembers = false;
-        renderShell();
+        expireSession();
         return;
       }
       if (!resp.ok) {
         throw new Error(`HTTP ${resp.status}`);
       }
-      state.members = await resp.json();
+      const members = await resp.json();
+      if (!isCurrentWorkspaceContext(ctx)) return;
+      state.members = members;
       state.loadingMembers = false;
       renderShell();
     } catch (_err) {
+      if (!isCurrentWorkspaceContext(ctx)) return;
       state.loadingMembers = false;
       state.membersError = 'Could not load workspace members. Please try again.';
       renderShell();
@@ -3317,8 +3305,8 @@
   }
 
   async function loadWorkspaceDevices(id) {
-    const ctx = captureBillingContext(id);
-    if (!ctx.accountId) return;
+    const ctx = captureWorkspaceContext(id);
+    if (!isCurrentWorkspaceContext(ctx)) return;
     state.loadingDevices = true;
     state.devicesError = null;
     state.devices = null;
@@ -3328,25 +3316,21 @@
         headers: { Accept: 'application/json' },
         credentials: 'same-origin',
       });
-      if (!isCurrentBillingContext(ctx)) return;
+      if (!isCurrentWorkspaceContext(ctx)) return;
       if (resp.status === 401) {
-        state.workspaceEpoch += 1;
-        state.me = null;
-        state.loadingDevices = false;
-        resetBillingState();
-        renderShell();
+        expireSession();
         return;
       }
       if (!resp.ok) {
         throw new Error(`HTTP ${resp.status}`);
       }
       const devices = await resp.json();
-      if (!isCurrentBillingContext(ctx)) return;
+      if (!isCurrentWorkspaceContext(ctx)) return;
       state.devices = devices;
       state.loadingDevices = false;
       renderShell();
     } catch (_err) {
-      if (!isCurrentBillingContext(ctx)) return;
+      if (!isCurrentWorkspaceContext(ctx)) return;
       state.loadingDevices = false;
       state.devicesError = 'Could not load linked machines. Please try again.';
       renderShell();
@@ -3354,59 +3338,18 @@
   }
 
   async function loadWorkspaceDetail(id) {
+    resetWorkspaceState();
     state.loadingDetail = true;
-    state.detailError = null;
-    state.activeWorkspace = null;
-    state.devices = null;
-    state.devicesError = null;
-    state.members = null;
-    state.membersError = null;
-    state.memberActionError = null;
-    state.removingMemberId = null;
-    state.invitations = null;
-    state.invitationsError = null;
-    state.createdInvite = null;
-    state.inviteEmail = '';
-    state.inviteRole = 'member';
-    state.inviteFieldError = null;
-    state.inviteSubmitError = null;
-    state.revisions = null;
-    state.loadingRevisions = false;
-    state.revisionsError = null;
-    state.loadingMoreRevisions = false;
-    state.hasMoreRevisions = false;
-    state.selectedDiffRev = null;
-    state.diffsByRev = {};
-    state.loadingDiffRev = null;
-    state.diffError = null;
-    state.proposals = null;
-    state.loadingProposals = false;
-    state.proposalsError = null;
-    state.proposalActionError = null;
-    state.rejectingProposalId = null;
-    state.restoreTargetRev = '';
-    state.restorePathsText = '';
-    state.restoreFieldError = null;
-    state.restoreSubmitError = null;
-    state.restoreInFlight = false;
-    state.restoreCreatedMessage = null;
-    state.workspaceEpoch += 1;
-    const epoch = state.workspaceEpoch;
-    const accountId = state.me ? state.me.id : null;
-    resetBillingState();
+    const ctx = captureWorkspaceContext(id);
     renderShell();
     try {
       const resp = await fetch(`/v1/workspaces/${encodeURIComponent(id)}`, {
         headers: { Accept: 'application/json' },
         credentials: 'same-origin',
       });
-      if (state.workspaceEpoch !== epoch || (state.me ? state.me.id : null) !== accountId) return;
+      if (!isCurrentWorkspaceContext(ctx, false)) return;
       if (resp.status === 401) {
-        state.workspaceEpoch += 1;
-        state.me = null;
-        state.loadingDetail = false;
-        resetBillingState();
-        renderShell();
+        expireSession();
         return;
       }
       if (resp.status === 404) {
@@ -3423,7 +3366,7 @@
         throw new Error(`HTTP ${resp.status}`);
       }
       const ws = await resp.json();
-      if (state.workspaceEpoch !== epoch || (state.me ? state.me.id : null) !== accountId) return;
+      if (!isCurrentWorkspaceContext(ctx, false)) return;
       state.activeWorkspace = ws;
       state.loadingDetail = false;
       renderShell();
@@ -3433,7 +3376,7 @@
       }
       await Promise.all(loaders);
     } catch (_err) {
-      if (state.workspaceEpoch !== epoch || (state.me ? state.me.id : null) !== accountId) return;
+      if (!isCurrentWorkspaceContext(ctx, false)) return;
       state.loadingDetail = false;
       state.detailError = {
         title: 'Could not load workspace',
@@ -3531,18 +3474,12 @@
     state.acceptError = null;
     state.acceptResult = null;
     if (isDeviceRoute() || parseInvitationTokenFromPath()) {
-      state.workspaceEpoch += 1;
-      state.activeWorkspace = null;
-      state.detailError = null;
-      resetBillingState();
+      resetWorkspaceState();
       renderShell();
     } else if (wsId) {
       loadWorkspaceDetail(wsId);
     } else {
-      state.workspaceEpoch += 1;
-      state.activeWorkspace = null;
-      state.detailError = null;
-      resetBillingState();
+      resetWorkspaceState();
       if (!state.workspaces) {
         loadWorkspaces();
       } else {

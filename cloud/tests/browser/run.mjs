@@ -1917,6 +1917,300 @@ async function journey22BillingMachinesLimitExcludesRevokedDevices(browser) {
   await context.close();
 }
 
+async function journey23WorkspaceAsyncIsolationMembersHistoryProposalsInvites(browser) {
+  const fixtures = loadFixtures();
+  const wsAId = fixtures.historyWorkspaceId;
+  const wsAName = fixtures.historyWorkspaceName;
+  const wsBId = fixtures.quorumWorkspaceId;
+  const wsBName = fixtures.quorumWorkspaceName;
+  const head2 = fixtures.revisions[0].revision;
+
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  const page = await context.newPage();
+  const pageErrors = [];
+  page.on('pageerror', (err) => pageErrors.push(err.message));
+
+  await page.goto(`${baseUrl}/`, { waitUntil: 'networkidle' });
+  await signInViaIdp(page, { subject: 'olivia-sub-1', email: 'olivia@example.com' });
+
+  // 1. Hold real GET /members, /revisions, /proposals for wsA while navigating wsA -> wsB
+  let releaseMembersA = null;
+  let releaseRevisionsA = null;
+  let releaseProposalsA = null;
+  await page.route(`**/v1/workspaces/${wsAId}/members`, async (route) => {
+    await new Promise((resolve) => {
+      releaseMembersA = async () => {
+        await route.continue();
+        resolve();
+      };
+    });
+  });
+  await page.route(`**/v1/workspaces/${wsAId}/revisions*`, async (route) => {
+    if (route.request().url().includes('/diff')) {
+      await route.continue();
+      return;
+    }
+    await new Promise((resolve) => {
+      releaseRevisionsA = async () => {
+        await route.continue();
+        resolve();
+      };
+    });
+  });
+  await page.route(`**/v1/workspaces/${wsAId}/proposals`, async (route) => {
+    if (route.request().method() !== 'GET') {
+      await route.continue();
+      return;
+    }
+    await new Promise((resolve) => {
+      releaseProposalsA = async () => {
+        await route.continue();
+        resolve();
+      };
+    });
+  });
+
+  await page.getByRole('link', { name: new RegExp(wsAName, 'i') }).click();
+  await page.waitForURL(new RegExp(`/workspaces/${wsAId}$`), { timeout: 5000 });
+  await page.waitForFunction(() => true);
+  await page.getByText(/Loading members/i).waitFor({ timeout: 3000 });
+  assert.ok(releaseMembersA && releaseRevisionsA && releaseProposalsA, 'expected all three wsA GETs to be held');
+
+  await page.getByRole('link', { name: /All workspaces/i }).click();
+  await page.getByRole('link', { name: new RegExp(wsBName, 'i') }).click();
+  await page.waitForURL(new RegExp(`/workspaces/${wsBId}$`), { timeout: 5000 });
+
+  const membersB = page.getByRole('region', { name: /^Members$/i });
+  const historyB = page.getByRole('region', { name: /^History$/i });
+  const proposalsB = page.getByRole('region', { name: /^Proposals$/i });
+  await membersB.getByText('olivia@example.com', { exact: true }).waitFor({ timeout: 5000 });
+  await proposalsB.locator('article', { hasText: fixtures.pendingQuorumRevision.slice(0, 8) }).waitFor({ timeout: 5000 });
+
+  // Release held wsA GET responses while viewing wsB -> none may overwrite wsB
+  const respMembersA = page.waitForResponse((r) => r.url().includes(`/v1/workspaces/${wsAId}/members`) && r.status() === 200);
+  const respRevisionsA = page.waitForResponse((r) => r.url().includes(`/v1/workspaces/${wsAId}/revisions`) && r.status() === 200);
+  const respProposalsA = page.waitForResponse((r) => r.url().includes(`/v1/workspaces/${wsAId}/proposals`) && r.status() === 200);
+  await releaseMembersA();
+  await releaseRevisionsA();
+  await releaseProposalsA();
+  await Promise.all([respMembersA, respRevisionsA, respProposalsA]);
+  await page.waitForTimeout(100);
+
+  assert.equal(await membersB.getByText('peter@example.com').count(), 0, 'stale wsA members leaked into wsB');
+  assert.equal(await historyB.getByText(/update config and vault/i).count(), 0, 'stale wsA revisions leaked into wsB');
+  assert.equal(await proposalsB.getByText(/beta-box/i).count(), 0, 'stale wsA proposals leaked into wsB');
+  await page.unroute(`**/v1/workspaces/${wsAId}/members`);
+  await page.unroute(`**/v1/workspaces/${wsAId}/revisions*`);
+  await page.unroute(`**/v1/workspaces/${wsAId}/proposals`);
+
+  // 2. Hold real GET /diff for wsA while navigating back to wsB via browser Back
+  await page.getByRole('link', { name: /All workspaces/i }).click();
+  await page.getByRole('link', { name: new RegExp(wsAName, 'i') }).click();
+  await page.waitForURL(new RegExp(`/workspaces/${wsAId}$`), { timeout: 5000 });
+  const historyA = page.getByRole('region', { name: /^History$/i });
+  await historyA.getByText(/update config and vault/i).waitFor({ timeout: 5000 });
+
+  let releaseDiffA = null;
+  await page.route(`**/v1/workspaces/${wsAId}/revisions/${head2}/diff`, async (route) => {
+    await new Promise((resolve) => {
+      releaseDiffA = async () => {
+        await route.continue();
+        resolve();
+      };
+    });
+  });
+  await historyA.locator('article', { hasText: 'update config and vault' }).getByRole('button', { name: /View diff/i }).click();
+  await historyA.getByText(/Loading diff/i).waitFor({ timeout: 3000 });
+  assert.ok(releaseDiffA, 'expected wsA diff GET to be held');
+
+  await page.goBack({ waitUntil: 'networkidle' });
+  await page.goBack({ waitUntil: 'networkidle' });
+  await page.waitForURL(new RegExp(`/workspaces/${wsBId}$`), { timeout: 5000 });
+  await proposalsB.locator('article', { hasText: fixtures.pendingQuorumRevision.slice(0, 8) }).waitFor({ timeout: 5000 });
+
+  const respDiffA = page.waitForResponse((r) => r.url().includes(`/v1/workspaces/${wsAId}/revisions/${head2}/diff`) && r.status() === 200);
+  await releaseDiffA();
+  await respDiffA;
+  await page.waitForTimeout(100);
+  assert.equal(await historyB.getByText('settings.toml').count(), 0, 'stale wsA diff leaked into wsB');
+  await page.unroute(`**/v1/workspaces/${wsAId}/revisions/${head2}/diff`);
+
+  // 3. Hold real POST /invitations (returns shareable invite token) in wsA while navigating wsA -> wsB
+  await page.goForward({ waitUntil: 'networkidle' });
+  await page.goForward({ waitUntil: 'networkidle' });
+  await page.waitForURL(new RegExp(`/workspaces/${wsAId}$`), { timeout: 5000 });
+  const membersA = page.getByRole('region', { name: /^Members$/i });
+  await membersA.getByLabel(/Invite email/i).waitFor({ timeout: 5000 });
+
+  let releaseInviteCreateA = null;
+  await page.route(`**/v1/workspaces/${wsAId}/invitations`, async (route) => {
+    if (route.request().method() !== 'POST') {
+      await route.continue();
+      return;
+    }
+    await new Promise((resolve) => {
+      releaseInviteCreateA = async () => {
+        await route.continue();
+        resolve();
+      };
+    });
+  });
+
+  await membersA.getByLabel(/Invite email/i).fill('delayed-invite@example.com');
+  await membersA.getByRole('button', { name: /Send invite/i }).click();
+  await membersA.getByRole('button', { name: /Sending/i }).waitFor({ timeout: 3000 });
+  assert.ok(releaseInviteCreateA, 'expected POST /invitations on wsA to be held');
+
+  await page.getByRole('link', { name: /All workspaces/i }).click();
+  await page.getByRole('link', { name: new RegExp(wsBName, 'i') }).click();
+  await page.waitForURL(new RegExp(`/workspaces/${wsBId}$`), { timeout: 5000 });
+  await membersB.getByLabel(/Invite email/i).waitFor({ timeout: 5000 });
+  assert.equal(
+    await membersB.getByRole('button', { name: /Send invite/i }).isDisabled(),
+    false,
+    'Send invite in wsB must not stay locked by in-flight invite on wsA'
+  );
+
+  const respInviteA = page.waitForResponse((r) => r.url().includes(`/v1/workspaces/${wsAId}/invitations`) && r.status() === 201);
+  await releaseInviteCreateA();
+  await respInviteA;
+  await page.waitForTimeout(100);
+  assert.equal(
+    await membersB.getByLabel(/Shareable invite link/i).count(),
+    0,
+    'stale wsA invitation token/link must not render inside wsB'
+  );
+  assert.equal(
+    await membersB.getByText('delayed-invite@example.com').count(),
+    0,
+    'stale wsA invitation row must not render inside wsB'
+  );
+  await page.unroute(`**/v1/workspaces/${wsAId}/invitations`);
+
+  // 4. Stale real 409 error from wsA (last-owner Leave workspace) must not show alert in wsB
+  await page.getByRole('link', { name: /All workspaces/i }).click();
+  await page.getByRole('link', { name: new RegExp(wsAName, 'i') }).click();
+  await page.waitForURL(new RegExp(`/workspaces/${wsAId}$`), { timeout: 5000 });
+  await membersA.getByRole('button', { name: /Leave workspace/i }).waitFor({ timeout: 5000 });
+
+  let releaseMemberErrA = null;
+  await page.route(`**/v1/workspaces/${wsAId}/members/*`, async (route) => {
+    if (route.request().method() !== 'DELETE') {
+      await route.continue();
+      return;
+    }
+    await new Promise((resolve) => {
+      releaseMemberErrA = async () => {
+        await route.continue();
+        resolve();
+      };
+    });
+  });
+
+  await membersA.getByRole('button', { name: /Leave workspace/i }).click();
+  await membersA.locator('button', { hasText: /Leaving/i }).waitFor({ timeout: 3000 });
+  assert.ok(releaseMemberErrA, 'expected 409 DELETE /members/* on wsA to be held');
+
+  await page.getByRole('link', { name: /All workspaces/i }).click();
+  await page.getByRole('link', { name: new RegExp(wsBName, 'i') }).click();
+  await page.waitForURL(new RegExp(`/workspaces/${wsBId}$`), { timeout: 5000 });
+  await membersB.getByText('olivia@example.com', { exact: true }).waitFor({ timeout: 5000 });
+
+  const respMemberErrA = page.waitForResponse((r) => r.url().includes(`/v1/workspaces/${wsAId}/members/`) && r.status() === 409);
+  await releaseMemberErrA();
+  await respMemberErrA;
+  await page.waitForTimeout(100);
+  assert.equal(await page.locator('[role="alert"]').count(), 0, 'stale 409 error from wsA must not render in wsB');
+  await page.unroute(`**/v1/workspaces/${wsAId}/members/*`);
+
+  // 4b. Hold real POST /proposals (restore proposal) on wsA while navigating wsA -> wsB
+  await page.getByRole('link', { name: /All workspaces/i }).click();
+  await page.getByRole('link', { name: new RegExp(wsAName, 'i') }).click();
+  await page.waitForURL(new RegExp(`/workspaces/${wsAId}$`), { timeout: 5000 });
+  const proposalsA = page.getByRole('region', { name: /^Proposals$/i });
+  await proposalsA.getByLabel(/Paths to restore/i).waitFor({ timeout: 5000 });
+
+  let releaseRestoreA = null;
+  await page.route(`**/v1/workspaces/${wsAId}/proposals`, async (route) => {
+    if (route.request().method() !== 'POST') {
+      await route.continue();
+      return;
+    }
+    await new Promise((resolve) => {
+      releaseRestoreA = async () => {
+        await route.continue();
+        resolve();
+      };
+    });
+  });
+
+  await proposalsA.getByLabel(/Paths to restore/i).fill('settings.toml');
+  await proposalsA.getByRole('button', { name: /Create restore proposal/i }).click();
+  await proposalsA.getByRole('button', { name: /Creating proposal/i }).waitFor({ timeout: 3000 });
+  assert.ok(releaseRestoreA, 'expected POST /proposals (restore) on wsA to be held');
+
+  await page.getByRole('link', { name: /All workspaces/i }).click();
+  await page.getByRole('link', { name: new RegExp(wsBName, 'i') }).click();
+  await page.waitForURL(new RegExp(`/workspaces/${wsBId}$`), { timeout: 5000 });
+  await proposalsB.locator('article', { hasText: fixtures.pendingQuorumRevision.slice(0, 8) }).waitFor({ timeout: 5000 });
+
+  const respRestoreA = page.waitForResponse((r) => r.url().includes(`/v1/workspaces/${wsAId}/proposals`) && r.request().method() === 'POST' && r.status() === 201);
+  await releaseRestoreA();
+  await respRestoreA;
+  await page.waitForTimeout(100);
+  assert.equal(
+    await page.getByText(/Restore proposal created \(unsigned\)/i).count(),
+    0,
+    'stale wsA restore confirmation must not render inside wsB'
+  );
+  assert.equal(
+    await proposalsB.getByText(/^Restore$/i).count(),
+    0,
+    'stale wsA restore proposal card must not render inside wsB'
+  );
+  await page.unroute(`**/v1/workspaces/${wsAId}/proposals`);
+
+  // 5. Stale real 401 across Sign out -> must not leak error banner or corrupt signed-out state
+  await page.getByRole('link', { name: /All workspaces/i }).click();
+  await page.getByRole('link', { name: new RegExp(wsAName, 'i') }).click();
+  await page.waitForURL(new RegExp(`/workspaces/${wsAId}$`), { timeout: 5000 });
+  await membersA.getByLabel(/Invite email/i).waitFor({ timeout: 5000 });
+
+  let releaseInvite401A = null;
+  await page.route(`**/v1/workspaces/${wsAId}/invitations`, async (route) => {
+    if (route.request().method() !== 'POST') {
+      await route.continue();
+      return;
+    }
+    await new Promise((resolve) => {
+      releaseInvite401A = async () => {
+        await route.continue();
+        resolve();
+      };
+    });
+  });
+
+  await membersA.getByLabel(/Invite email/i).fill('stale-401@example.com');
+  await membersA.getByRole('button', { name: /Send invite/i }).click();
+  await membersA.getByRole('button', { name: /Sending/i }).waitFor({ timeout: 3000 });
+  assert.ok(releaseInvite401A, 'expected 401 POST /invitations on wsA to be held');
+
+  await page.getByRole('button', { name: /Sign out/i }).click();
+  await page.getByRole('link', { name: /Sign in/i }).waitFor({ timeout: 5000 });
+
+  const respInvite401 = page.waitForResponse((r) => r.url().includes(`/v1/workspaces/${wsAId}/invitations`) && r.status() === 401);
+  await releaseInvite401A();
+  await respInvite401;
+  await page.waitForTimeout(100);
+  await page.getByRole('link', { name: /Sign in/i }).waitFor({ timeout: 3000 });
+  assert.equal(await page.locator('[role="alert"]').count(), 0, 'stale 401 after sign out must not render error alert');
+  await page.unroute(`**/v1/workspaces/${wsAId}/invitations`);
+
+  await saveScreenshot(page, '35-workspace-async-isolation');
+  assert.deepEqual(pageErrors, [], `unexpected page errors: ${pageErrors.join('; ')}`);
+  await context.close();
+}
+
 const journeys = [
   ['journey_1_signin_and_account', journey1SignInAndAccount],
   ['journey_2_empty_workspaces', journey2EmptyWorkspaces],
@@ -1940,6 +2234,7 @@ const journeys = [
   ['journey_20_billing_provider_failure_retry_roles_and_mobile', journey20BillingProviderFailureRetryRolesAndMobile],
   ['journey_21_billing_navigation_isolation_and_stale_response_guard', journey21BillingNavigationIsolationAndStaleResponseGuard],
   ['journey_22_billing_machines_limit_excludes_revoked_devices', journey22BillingMachinesLimitExcludesRevokedDevices],
+  ['journey_23_workspace_async_isolation_members_history_proposals_invites', journey23WorkspaceAsyncIsolationMembersHistoryProposalsInvites],
 ];
 
 async function main() {
