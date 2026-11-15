@@ -21,11 +21,13 @@ fn free_port() -> u16 {
 async fn browser_journeys() {
     let idp = support::oidc_fixture::start().await;
     let database_url = support::fresh_database().await;
+    let repo_root = tempfile::tempdir().expect("repo root");
     let port = free_port();
     let public_url = format!("http://localhost:{port}");
 
     let cloud = support::spawn_cloud(&[
         ("MUSTER_ENV", "development".into()),
+        ("MUSTER_REPO_ROOT", repo_root.path().display().to_string()),
         ("MUSTER_BIND", format!("127.0.0.1:{port}")),
         ("MUSTER_PUBLIC_URL", public_url.clone()),
         ("MUSTER_DATABASE_URL", database_url),
@@ -61,9 +63,10 @@ async fn browser_journeys() {
         .await
         .expect("failed to execute node browser suite (is Node.js installed?)");
 
-    // Keep `cloud` and `idp` alive across the entire browser run.
+    // Keep `cloud`, `idp`, and `repo_root` alive across the entire browser run.
     drop(cloud);
     drop(idp);
+    drop(repo_root);
 
     assert!(
         status.success(),

@@ -328,7 +328,7 @@ async function journey6DeviceApproveWithLoginRedirect(browser) {
 
   // Explicit Approve
   await page.getByRole('button', { name: /Approve/i }).click();
-  await page.getByText(/Approved/i).waitFor({ timeout: 5000 });
+  await page.getByRole('heading', { name: /CLI login approved/i }).waitFor({ timeout: 5000 });
   await page.getByText('laptop-cli').waitFor({ timeout: 5000 });
   await saveScreenshot(page, '11-device-approved');
 
@@ -482,7 +482,7 @@ async function journey8WorkspaceDevicesList(browser) {
   // Reload workspace detail and verify machine appears with accurate status
   await page.reload({ waitUntil: 'networkidle' });
   await page.getByRole('heading', { name: 'edge-node-1' }).waitFor({ timeout: 5000 });
-  await page.getByText('Linked', { exact: true }).waitFor({ timeout: 5000 });
+  await page.locator('.badge-row').getByText('Linked', { exact: true }).waitFor({ timeout: 5000 });
   await page.getByText('Bootstrap claim', { exact: true }).waitFor({ timeout: 5000 });
   await page.getByText(/not yet approved by signed fleet governance/i).waitFor({ timeout: 5000 });
   await page.getByText(machine.signingKey).waitFor({ timeout: 5000 });
