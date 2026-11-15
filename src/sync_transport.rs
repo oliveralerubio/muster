@@ -150,8 +150,9 @@ pub fn pull(ctx: &mut Context, link: &CloudLink) -> Result<PullOutcome, MusterEr
         .map_err(|_| failure("invalid Cloud bundle response"))?;
     crate::vault::write_atomic(&bundle, &bytes)
         .map_err(|_| failure("cannot save Cloud download"))?;
-    let bundle_str =
-        bundle.to_str().ok_or_else(|| failure("invalid Cloud state path"))?;
+    let bundle_str = bundle
+        .to_str()
+        .ok_or_else(|| failure("invalid Cloud state path"))?;
     let staging = dir.join(format!("pull-verify-{}", random_hex()?));
     std::fs::create_dir(&staging).map_err(|_| failure("cannot prepare Cloud staging"))?;
     let staging_str = staging
@@ -184,12 +185,15 @@ fn verify_and_checkout(
 ) -> Result<PullOutcome, String> {
     // Fetch the incoming tip without touching the working tree, then decide
     // whether it continues this machine's history or is another fleet.
-    if !git_bool(&ctx.config_dir, &[
-        "fetch",
-        "--quiet",
-        bundle,
-        &format!("refs/heads/main:{PULL_REF}"),
-    ]) {
+    if !git_bool(
+        &ctx.config_dir,
+        &[
+            "fetch",
+            "--quiet",
+            bundle,
+            &format!("refs/heads/main:{PULL_REF}"),
+        ],
+    ) {
         return Err("cannot read the Cloud bundle".into());
     }
     let related = previous.is_some()
@@ -204,7 +208,13 @@ fn verify_and_checkout(
     // only `refs/heads/main` (no HEAD), so a plain clone checks out nothing:
     // init, fetch and check the branch out explicitly.
     if stage(&["init", "--quiet"]).is_err()
-        || stage(&["fetch", "--quiet", bundle, "refs/heads/main:refs/heads/main"]).is_err()
+        || stage(&[
+            "fetch",
+            "--quiet",
+            bundle,
+            "refs/heads/main:refs/heads/main",
+        ])
+        .is_err()
         || stage(&["checkout", "--quiet", "main"]).is_err()
     {
         return Err("cannot stage the Cloud bundle for verification".into());
@@ -231,8 +241,7 @@ fn verify_and_checkout(
     .map_err(|e| e.to_string())?;
     if matches!(verification, crate::fleet_state::Verification::Legacy) {
         return Err(
-            "the Cloud history is not a signed fleet state; legacy repositories are refused"
-                .into(),
+            "the Cloud history is not a signed fleet state; legacy repositories are refused".into(),
         );
     }
     // Checkout: the chain is verified, nothing unverified reaches the
@@ -243,18 +252,21 @@ fn verify_and_checkout(
         }
         work(&["reset", "--quiet", "--hard", PULL_REF])
             .map_err(|_| "cannot check out the Cloud history".to_string())?;
-    } else if git_bool(&ctx.config_dir, &[
-        "merge-base",
-        "--is-ancestor",
-        "HEAD",
-        PULL_REF,
-    ]) {
+    } else if git_bool(
+        &ctx.config_dir,
+        &["merge-base", "--is-ancestor", "HEAD", PULL_REF],
+    ) {
         work(&["reset", "--quiet", "--hard", PULL_REF])
             .map_err(|_| "cannot check out the Cloud history".to_string())?;
     } else {
         let mut args: Vec<&str> = Vec::new();
         if !git_bool(&ctx.config_dir, &["config", "user.email"]) {
-            args.extend(["-c", "user.name=Muster", "-c", "user.email=muster@localhost"]);
+            args.extend([
+                "-c",
+                "user.name=Muster",
+                "-c",
+                "user.email=muster@localhost",
+            ]);
         }
         args.extend(["rebase", "--quiet", PULL_REF]);
         if work(&args).is_err() {
@@ -268,8 +280,7 @@ fn verify_and_checkout(
     }
     // Pin bookkeeping and first-use confirmation on the real repository; a
     // failure here restores the previous HEAD (nothing was applied yet).
-    crate::trust::verify_pulled(ctx, previous, !related, true)
-        .map_err(|e| e.to_string())?;
+    crate::trust::verify_pulled(ctx, previous, !related, true).map_err(|e| e.to_string())?;
     Ok(if related {
         PullOutcome::Updated
     } else {

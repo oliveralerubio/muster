@@ -366,9 +366,7 @@ async fn login_approves_real_device_flow_and_stores_account_privately() {
         .unwrap();
     eprintln!(
         "DIAG pull: status={} revisions0.signer={} revisions1.signer={}",
-        pull.status,
-        revisions[0].signer,
-        revisions[1].signer
+        pull.status, revisions[0].signer, revisions[1].signer
     );
     assert!(
         pull.status.success(),

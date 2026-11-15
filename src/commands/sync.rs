@@ -316,8 +316,7 @@ fn transport(
         }
         if !only_pull && !only_push {
             return Err(MusterError::Operational(
-                "Cloud sync needs an explicit --pull (download) or --push (publish)"
-                    .into(),
+                "Cloud sync needs an explicit --pull (download) or --push (publish)".into(),
             ));
         }
         let committed = git::commit_if_configured(&ctx.config_dir, "chore(muster): sync")?;

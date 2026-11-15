@@ -32,7 +32,10 @@ async fn browser_journeys() {
         ("MUSTER_PUBLIC_URL", public_url.clone()),
         ("MUSTER_DATABASE_URL", database_url),
         ("MUSTER_OIDC_ISSUER", idp.issuer.clone()),
-        ("MUSTER_OIDC_CLIENT_ID", support::oidc_fixture::CLIENT_ID.into()),
+        (
+            "MUSTER_OIDC_CLIENT_ID",
+            support::oidc_fixture::CLIENT_ID.into(),
+        ),
         (
             "MUSTER_OIDC_CLIENT_SECRET",
             support::oidc_fixture::CLIENT_SECRET.into(),
