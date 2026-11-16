@@ -2845,6 +2845,212 @@ async function journey24SessionAccountOwnershipAndReset(browser) {
   await context.close();
 }
 
+async function extractHistoryRows(historySection) {
+  return historySection.locator('article').evaluateAll((articles) =>
+    articles.map((article) => ({
+      message: article.querySelector('strong')?.textContent?.trim() || '',
+      shortRev: article.querySelector('.badge.mono')?.textContent?.trim() || '',
+    }))
+  );
+}
+
+async function journey25HistoryPaginationAndIsolation(browser) {
+  const fixtures = loadFixtures();
+  assert.equal(fixtures.paginationRevisions.length, 22);
+  assert.equal(
+    new Set(fixtures.paginationRevisions.map((r) => r.revision)).size,
+    22,
+    'expected 22 distinct pagination revisions'
+  );
+  const expectedFirst20 = fixtures.paginationRevisions.slice(0, 20).map((r) => ({
+    message: r.message,
+    shortRev: r.revision.slice(0, 8),
+  }));
+  const expectedAll22 = fixtures.paginationRevisions.map((r) => ({
+    message: r.message,
+    shortRev: r.revision.slice(0, 8),
+  }));
+  const expectedDestRows = fixtures.revisions.map((r) => ({
+    message: r.message,
+    shortRev: r.revision.slice(0, 8),
+  }));
+
+  const pageTwoNonGenesis = fixtures.paginationRevisions[20];
+  assert.equal(pageTwoNonGenesis.message, 'touch rev-02.toml');
+  assert.equal(fixtures.paginationRevisions[21].message, 'genesis');
+
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  const page = await context.newPage();
+  const pageErrors = [];
+  page.on('pageerror', (err) => pageErrors.push(err.message));
+
+  let releaseSecondPage = null;
+  let releasedSecondPage = false;
+  const revisionsRoutePattern = `**/v1/workspaces/${fixtures.paginationWorkspaceId}/revisions*`;
+  let interceptNextSecondPage = false;
+  let resolveSecondPageHeld = null;
+  const secondPageHeld = new Promise((r) => {
+    resolveSecondPageHeld = r;
+  });
+
+  const routeHandler = async (route) => {
+    const req = route.request();
+    const url = new URL(req.url());
+    if (
+      interceptNextSecondPage &&
+      req.method() === 'GET' &&
+      url.pathname === `/v1/workspaces/${fixtures.paginationWorkspaceId}/revisions` &&
+      url.searchParams.get('before') === fixtures.paginationRevisions[19].revision &&
+      url.searchParams.get('limit') === '20'
+    ) {
+      interceptNextSecondPage = false;
+      const response = await route.fetch();
+      assert.equal(response.status(), 200);
+      await new Promise((resolve) => {
+        releaseSecondPage = async () => {
+          try {
+            await route.fulfill({ response });
+          } finally {
+            resolve();
+          }
+        };
+        resolveSecondPageHeld();
+      });
+      return;
+    }
+    await route.continue();
+  };
+
+  try {
+    await page.goto(`${baseUrl}/`, { waitUntil: 'networkidle' });
+    await signInViaIdp(page, { subject: 'olivia-sub-1', email: 'olivia@example.com' });
+
+    // Open pagination workspace -> page 1 shows newest 20 revisions and "Load older revisions"
+    await page.getByRole('link', { name: new RegExp(fixtures.paginationWorkspaceName, 'i') }).click();
+    await page.waitForURL(new RegExp(`/workspaces/${fixtures.paginationWorkspaceId}$`), { timeout: 5000 });
+
+    const historySection = page.getByRole('region', { name: /^History$/i });
+    await historySection.waitFor({ timeout: 5000 });
+    await historySection.getByText(expectedFirst20[0].message, { exact: true }).waitFor({ timeout: 5000 });
+    const loadOlderBtn = historySection.getByRole('button', { name: /Load older revisions/i });
+    await loadOlderBtn.waitFor({ timeout: 5000 });
+    assert.deepEqual(
+      await extractHistoryRows(historySection),
+      expectedFirst20,
+      'initial history page must match newest 20 revisions in exact order'
+    );
+
+    // Load older revisions -> all 22 rows in order including genesis, controls disappear
+    await loadOlderBtn.click();
+    await historySection.getByText('genesis', { exact: true }).waitFor({ timeout: 5000 });
+    assert.equal(
+      await historySection.getByRole('button', { name: /Load older revisions/i }).count(),
+      0,
+      'Load older revisions button must disappear after loading final page'
+    );
+    assert.equal(
+      await historySection.getByRole('button', { name: /Loading/i }).count(),
+      0,
+      'Loading control must disappear after loading final page'
+    );
+    assert.equal(
+      await historySection.getByText(/Loading/i).count(),
+      0,
+      'Loading indicator must not linger after pagination completes'
+    );
+    assert.deepEqual(
+      await extractHistoryRows(historySection),
+      expectedAll22,
+      'loaded history must match all 22 revisions in exact acceptance order'
+    );
+
+    // Open a non-genesis revision from the second page and verify known file + patch
+    const olderCard = historySection.locator('article', {
+      hasText: pageTwoNonGenesis.revision.slice(0, 8),
+    });
+    await olderCard.getByRole('button', { name: /View diff/i }).click();
+    await olderCard.getByText('rev-02.toml', { exact: true }).waitFor({ timeout: 5000 });
+    await olderCard.getByText(/marker = "page-marker-02"/).waitFor({ timeout: 5000 });
+
+    // Revisit pagination workspace via in-app links to restore page one
+    await page.getByRole('link', { name: /All workspaces/i }).click();
+    await page.getByRole('link', { name: new RegExp(fixtures.paginationWorkspaceName, 'i') }).click();
+    await page.waitForURL(new RegExp(`/workspaces/${fixtures.paginationWorkspaceId}$`), { timeout: 5000 });
+
+    await historySection.getByText(expectedFirst20[0].message, { exact: true }).waitFor({ timeout: 5000 });
+    await loadOlderBtn.waitFor({ timeout: 5000 });
+    assert.deepEqual(await extractHistoryRows(historySection), expectedFirst20);
+
+    // Hold second-page GET (?before=...&limit=20) with actual upstream response, navigate away, release
+    await page.route(revisionsRoutePattern, routeHandler);
+    interceptNextSecondPage = true;
+
+    await loadOlderBtn.click();
+    await historySection.getByRole('button', { name: /Loading/i }).waitFor({ timeout: 5000 });
+    await secondPageHeld;
+    assert.ok(releaseSecondPage, 'expected second-page revisions GET with before+limit to be held');
+
+    // Navigate via in-app links to History & Export Fleet
+    await page.getByRole('link', { name: /All workspaces/i }).click();
+    await page.getByRole('link', { name: new RegExp(fixtures.historyWorkspaceName, 'i') }).click();
+    await page.waitForURL(new RegExp(`/workspaces/${fixtures.historyWorkspaceId}$`), { timeout: 5000 });
+
+    const destHistory = page.getByRole('region', { name: /^History$/i });
+    await destHistory.getByText(expectedDestRows[0].message, { exact: true }).waitFor({ timeout: 5000 });
+    await destHistory.getByText(expectedDestRows[1].message, { exact: true }).waitFor({ timeout: 5000 });
+
+    // Verify destination history before releasing held second-page response
+    assert.deepEqual(
+      await extractHistoryRows(destHistory),
+      expectedDestRows,
+      'destination history before release must contain only destination revisions'
+    );
+    assert.equal(await destHistory.getByRole('button', { name: /Load older revisions/i }).count(), 0);
+    assert.equal(await destHistory.getByRole('button', { name: /Loading/i }).count(), 0);
+    assert.equal(await destHistory.getByText(/Loading history/i).count(), 0);
+    assert.equal(await destHistory.locator('[role="alert"]').count(), 0);
+
+    // Release unchanged upstream second-page response and wait for completion + browser processing
+    const secondPageRespPromise = page.waitForResponse((r) => {
+      const u = new URL(r.url());
+      return (
+        r.request().method() === 'GET' &&
+        u.pathname === `/v1/workspaces/${fixtures.paginationWorkspaceId}/revisions` &&
+        u.searchParams.get('before') === fixtures.paginationRevisions[19].revision &&
+        u.searchParams.get('limit') === '20' &&
+        r.status() === 200
+      );
+    });
+    releasedSecondPage = true;
+    await releaseSecondPage();
+    await secondPageRespPromise;
+    await page.evaluate(() => new Promise((r) => setTimeout(r, 100)));
+
+    // Verify destination history after release: no stale rows, no lingering loading, no errors
+    assert.deepEqual(
+      await extractHistoryRows(destHistory),
+      expectedDestRows,
+      'stale second-page response must not alter destination workspace history'
+    );
+    assert.equal(await destHistory.getByText(/rev-\d{2}\.toml|touch rev-/).count(), 0);
+    assert.equal(await destHistory.getByRole('button', { name: /Load older revisions/i }).count(), 0);
+    assert.equal(await destHistory.getByRole('button', { name: /Loading/i }).count(), 0);
+    assert.equal(await destHistory.getByText(/Loading history/i).count(), 0);
+    assert.equal(await destHistory.locator('[role="alert"]').count(), 0);
+    assert.equal(await page.locator('[role="alert"]').count(), 0);
+
+    await saveScreenshot(page, '37-history-pagination-isolation');
+    assert.deepEqual(pageErrors, [], `unexpected page errors: ${pageErrors.join('; ')}`);
+  } finally {
+    if (releaseSecondPage && !releasedSecondPage) {
+      releasedSecondPage = true;
+      await releaseSecondPage().catch(() => {});
+    }
+    await page.unroute(revisionsRoutePattern, routeHandler).catch(() => {});
+    await context.close();
+  }
+}
+
 const journeys = [
   ['journey_1_signin_and_account', journey1SignInAndAccount],
   ['journey_2_empty_workspaces', journey2EmptyWorkspaces],
@@ -2870,6 +3076,7 @@ const journeys = [
   ['journey_22_billing_machines_limit_excludes_revoked_devices', journey22BillingMachinesLimitExcludesRevokedDevices],
   ['journey_23_workspace_async_isolation_members_history_proposals_invites', journey23WorkspaceAsyncIsolationMembersHistoryProposalsInvites],
   ['journey_24_session_account_ownership_and_reset', journey24SessionAccountOwnershipAndReset],
+  ['journey_25_history_pagination_and_isolation', journey25HistoryPaginationAndIsolation],
 ];
 
 async function main() {

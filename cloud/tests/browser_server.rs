@@ -56,6 +56,9 @@ struct BrowserFixtures {
     pending_quorum_revision: String,
     quota_workspace_id: String,
     quota_workspace_name: String,
+    pagination_workspace_id: String,
+    pagination_workspace_name: String,
+    pagination_revisions: Vec<SeedingRevision>,
 }
 
 struct Session {
@@ -435,6 +438,50 @@ async fn seed_browser_fixtures(base: &str) -> BrowserFixtures {
     let quinn_key = MachineKey::new("quinn-box");
     let _quinn_dev = link_device(base, &quinn_token, &quota_ws.id, &quinn_key).await;
 
+    // 4. Pagination workspace: 22 distinct accepted revisions (genesis + 21 signed HTTP pushes)
+    let page_ws_name = "Pagination Fleet";
+    let page_ws = create_workspace(base, &olivia, page_ws_name).await;
+    let page_key = MachineKey::new("page-box");
+    let page_dev = link_device(base, &olivia_token, &page_ws.id, &page_key).await;
+
+    let page_repo = FleetRepo::genesis(&page_key);
+    let page_head1 = page_repo.head();
+    let page_push1 = push_bundle(base, &page_dev, page_repo.bundle(None), None).await;
+    assert_eq!(page_push1.status(), 200);
+
+    let mut page_revisions = vec![SeedingRevision {
+        revision: page_head1.clone(),
+        message: "genesis".into(),
+        epoch: 1,
+        signer: page_key.public(),
+    }];
+    let mut prev_page_head = page_head1;
+    for i in 2..=22usize {
+        let file = format!("rev-{i:02}.toml");
+        let content = format!("revision = {i}\nmarker = \"page-marker-{i:02}\"\n");
+        let next_head = page_repo.touch(&file, &content);
+        let push = push_bundle(
+            base,
+            &page_dev,
+            page_repo.bundle(Some(&prev_page_head)),
+            Some(&prev_page_head),
+        )
+        .await;
+        assert_eq!(push.status(), 200);
+        page_revisions.push(SeedingRevision {
+            revision: next_head.clone(),
+            message: format!("touch {file}"),
+            epoch: 1,
+            signer: page_key.public(),
+        });
+        prev_page_head = next_head;
+    }
+    page_revisions.reverse();
+    assert_eq!(page_revisions.len(), 22);
+    let unique_revs: std::collections::HashSet<&str> =
+        page_revisions.iter().map(|r| r.revision.as_str()).collect();
+    assert_eq!(unique_revs.len(), 22);
+
     BrowserFixtures {
         history_workspace_id: ws.id,
         history_workspace_name: ws_name.into(),
@@ -462,6 +509,9 @@ async fn seed_browser_fixtures(base: &str) -> BrowserFixtures {
         pending_quorum_revision: pending_rev,
         quota_workspace_id: quota_ws.id,
         quota_workspace_name: quota_name.into(),
+        pagination_workspace_id: page_ws.id,
+        pagination_workspace_name: page_ws_name.into(),
+        pagination_revisions: page_revisions,
     }
 }
 
