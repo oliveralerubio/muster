@@ -129,7 +129,10 @@ async fn webhook_reconciliation_entitlements_and_portal_lifecycle() {
     let created = paddle.complete_checkout(&txn, sub_id, cust_id);
     assert_eq!(post_webhook(&s, &paddle, &created).await, 200);
 
-    let billing = billing_of(&s, &alice, &ws.id).await;
+    let billing = billing_when(&s, &alice, &ws.id, "personal plan active", |b| {
+        b.plan == "personal" && b.plan_status == PlanStatus::Active
+    })
+    .await;
     assert_eq!(billing.plan, "personal");
     assert_eq!(billing.plan_status, PlanStatus::Active);
     assert_eq!(billing.seats, 1);
@@ -166,7 +169,10 @@ async fn webhook_reconciliation_entitlements_and_portal_lifecycle() {
     let (status, _) = session_post(&s, &alice, &cancel_path, &serde_json::json!({})).await;
     assert_eq!(status, 200);
 
-    let billing = billing_of(&s, &alice, &ws.id).await;
+    let billing = billing_when(&s, &alice, &ws.id, "cancel at period end", |b| {
+        b.cancel_at_period_end
+    })
+    .await;
     assert!(billing.cancel_at_period_end);
     assert_eq!(billing.plan_status, PlanStatus::Active);
     assert!(billing.can_push);
@@ -179,7 +185,10 @@ async fn webhook_reconciliation_entitlements_and_portal_lifecycle() {
     });
     assert_eq!(post_webhook(&s, &paddle, &canceled).await, 200);
 
-    let billing = billing_of(&s, &alice, &ws.id).await;
+    let billing = billing_when(&s, &alice, &ws.id, "canceled", |b| {
+        b.plan_status == PlanStatus::Canceled
+    })
+    .await;
     assert_eq!(billing.plan_status, PlanStatus::Canceled);
     assert!(!billing.can_push);
     assert!(billing.can_pull);
@@ -294,6 +303,31 @@ async fn billing_of(s: &Stack, u: &UserSession, ws_id: &str) -> WorkspaceBilling
     billing.unwrap()
 }
 
+/// Entitlements are eventually consistent: a webhook (or cancel/plan change)
+/// returns once the reconcile job is queued, and when the background worker
+/// already holds the job lease it applies the newest state on its next tick.
+/// Poll until `done` holds; on timeout fail with the last observed state.
+async fn billing_when(
+    s: &Stack,
+    u: &UserSession,
+    ws_id: &str,
+    what: &str,
+    done: impl Fn(&WorkspaceBilling) -> bool,
+) -> WorkspaceBilling {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let billing = billing_of(s, u, ws_id).await;
+        if done(&billing) {
+            return billing;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "billing never reached `{what}`; last observed {billing:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 /// Entitlements come from the subscription Paddle returns on
 /// `GET /subscriptions/{id}`, with the plan derived from the configured
 /// price ids, not from the (possibly stale) event payload or custom_data.
@@ -316,7 +350,10 @@ async fn billing_follows_canonical_subscription_not_event_payload() {
 
     assert!(paddle.calls("get_subscription") >= 1);
     let canonical = paddle.subscription(sub_id).unwrap();
-    let billing = billing_of(&s, &alice, &ws.id).await;
+    let billing = billing_when(&s, &alice, &ws.id, "team plan active", |b| {
+        b.plan == "team" && b.plan_status == PlanStatus::Active
+    })
+    .await;
     assert_eq!(billing.plan, "team");
     assert_eq!(billing.seats, 3);
     assert_eq!(billing.plan_status, PlanStatus::Active);
@@ -357,7 +394,10 @@ async fn out_of_order_and_equal_timestamp_events_converge_on_canonical_state() {
     assert_eq!(post_webhook(&s, &paddle, &created).await, 200);
     assert_eq!(post_webhook(&s, &paddle, &updated).await, 200);
 
-    let billing = billing_of(&s, &alice, &ws.id).await;
+    let billing = billing_when(&s, &alice, &ws.id, "canceled team plan, 4 seats", |b| {
+        b.plan_status == PlanStatus::Canceled && b.plan == "team" && b.seats == 4
+    })
+    .await;
     assert_eq!(billing.plan_status, PlanStatus::Canceled);
     assert_eq!(billing.plan, "team");
     assert_eq!(billing.seats, 4);
@@ -388,10 +428,10 @@ async fn subscription_of_a_foreign_customer_grants_nothing() {
         },
     );
     assert_eq!(post_webhook(&s, &paddle, &canceled).await, 200);
-    assert_eq!(
-        billing_of(&s, &alice, &ws.id).await.plan_status,
-        PlanStatus::Canceled
-    );
+    billing_when(&s, &alice, &ws.id, "canceled", |b| {
+        b.plan_status == PlanStatus::Canceled
+    })
+    .await;
 
     // Someone else pays a checkout of this workspace with their own customer.
     let txn2 = checkout(&s, &alice, &ws.id, "team", 10).await;
@@ -427,16 +467,19 @@ async fn resubscribing_after_cancellation_restores_entitlements() {
         sub["status"] = "canceled".into();
     });
     assert_eq!(post_webhook(&s, &paddle, &canceled).await, 200);
-    assert_eq!(
-        billing_of(&s, &alice, &ws.id).await.plan_status,
-        PlanStatus::Canceled
-    );
+    billing_when(&s, &alice, &ws.id, "canceled", |b| {
+        b.plan_status == PlanStatus::Canceled
+    })
+    .await;
 
     let txn2 = checkout(&s, &alice, &ws.id, "team", 3).await;
     let again = paddle.complete_checkout(&txn2, "sub_01h8vzp8f4kek3yd4g1again02", customer);
     assert_eq!(post_webhook(&s, &paddle, &again).await, 200);
 
-    let billing = billing_of(&s, &alice, &ws.id).await;
+    let billing = billing_when(&s, &alice, &ws.id, "team plan active, 3 seats", |b| {
+        b.plan_status == PlanStatus::Active && b.plan == "team" && b.seats == 3
+    })
+    .await;
     assert_eq!(billing.plan_status, PlanStatus::Active);
     assert_eq!(billing.plan, "team");
     assert_eq!(billing.seats, 3);
@@ -507,10 +550,10 @@ async fn active_subscription(
     let customer = format!("ctm_{}", &sub_id[4..]);
     let created = paddle.complete_checkout(&txn, sub_id, &customer);
     assert_eq!(post_webhook(s, paddle, &created).await, 200);
-    assert_eq!(
-        billing_of(s, u, ws_id).await.plan_status,
-        PlanStatus::Active
-    );
+    billing_when(s, u, ws_id, "active", |b| {
+        b.plan_status == PlanStatus::Active
+    })
+    .await;
 }
 
 /// Cancelling asks Paddle once, keeps the paid-through period from Paddle's
@@ -533,7 +576,10 @@ async fn cancel_is_confirmed_by_paddle_and_idempotent() {
 
     let canonical = paddle.subscription(sub_id).unwrap();
     assert_eq!(canonical["scheduled_change"]["action"], "cancel");
-    let billing = billing_of(&s, &alice, &ws.id).await;
+    let billing = billing_when(&s, &alice, &ws.id, "cancel at period end", |b| {
+        b.cancel_at_period_end
+    })
+    .await;
     assert!(billing.cancel_at_period_end);
     assert_eq!(billing.plan_status, PlanStatus::Active);
     assert!(billing.can_push);
@@ -573,7 +619,10 @@ async fn plan_change_is_applied_from_paddle_without_waiting_for_a_webhook() {
     assert_eq!(status, 200);
     assert_eq!(paddle.calls("update"), 1);
 
-    let billing = billing_of(&s, &alice, &ws.id).await;
+    let billing = billing_when(&s, &alice, &ws.id, "team plan, 4 seats", |b| {
+        b.plan == "team" && b.seats == 4
+    })
+    .await;
     assert_eq!(billing.plan, "team");
     assert_eq!(billing.seats, 4);
 }
@@ -715,7 +764,10 @@ async fn past_due_and_paused_follow_paddle_and_agree_with_the_sync_gate() {
         sub["current_billing_period"]["ends_at"] = past.clone().into();
     });
     assert_eq!(post_webhook(&s, &paddle, &past_due).await, 200);
-    let billing = billing_of(&s, &alice, &ws.id).await;
+    let billing = billing_when(&s, &alice, &ws.id, "past due", |b| {
+        b.plan_status == PlanStatus::PastDue
+    })
+    .await;
     assert_eq!(billing.plan_status, PlanStatus::PastDue);
     assert!(billing.can_push);
     let next = repo.touch("dunning.txt", "still paying");
@@ -729,7 +781,10 @@ async fn past_due_and_paused_follow_paddle_and_agree_with_the_sync_gate() {
         sub["status"] = "paused".into();
     });
     assert_eq!(post_webhook(&s, &paddle, &paused).await, 200);
-    let billing = billing_of(&s, &alice, &ws.id).await;
+    let billing = billing_when(&s, &alice, &ws.id, "restricted", |b| {
+        b.plan_status == PlanStatus::Restricted
+    })
+    .await;
     assert_eq!(billing.plan_status, PlanStatus::Restricted);
     assert!(!billing.can_push);
     assert!(billing.can_pull && billing.can_export);
@@ -835,7 +890,10 @@ async fn a_checkout_paid_before_its_webhook_blocks_a_second_checkout() {
     assert_eq!(paddle.calls("create_transaction"), 1);
 
     assert_eq!(post_webhook(&s, &paddle, &created).await, 200);
-    let billing = billing_of(&s, &alice, &ws.id).await;
+    let billing = billing_when(&s, &alice, &ws.id, "personal plan active", |b| {
+        b.plan == "personal" && b.plan_status == PlanStatus::Active
+    })
+    .await;
     assert_eq!(billing.plan, "personal");
     assert_eq!(billing.plan_status, PlanStatus::Active);
 }
