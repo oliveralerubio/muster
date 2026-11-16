@@ -127,6 +127,10 @@ pub async fn create(
         if method != "POST" || prev_path != path || prev_hash != body_hash {
             return Err(AppError::idempotency_mismatch());
         }
+        // The workspace was purged: its cached creation is gone with it.
+        if status == 404 {
+            return Err(AppError::not_found());
+        }
         let status = StatusCode::from_u16(status as u16).map_err(AppError::internal)?;
         return Ok((status, Json(response)));
     }

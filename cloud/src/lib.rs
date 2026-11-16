@@ -17,6 +17,7 @@ pub mod error;
 pub mod history;
 pub mod lifecycle;
 pub mod lifecycle_provider;
+pub mod lifecycle_purge;
 pub mod members;
 pub mod proposals;
 pub mod receipts;
@@ -174,6 +175,16 @@ async fn readyz(State(state): State<AppState>) -> Result<Json<HealthResponse>, A
             tracing::warn!(error = %err, "readiness: lifecycle authority");
             AppError::not_ready(err.to_string())
         })?;
+    // A purged workspace whose rows or files came back (restore) is not
+    // ready until the purge worker erases them again.
+    let resurrected = lifecycle_purge::resurrected_present(&state.db, &state.config.repo_root)
+        .await
+        .map_err(|e| AppError::not_ready(format!("purge check: {e}")))?;
+    if resurrected {
+        return Err(AppError::not_ready(
+            "a purged workspace has restored data still being erased",
+        ));
+    }
     Ok(Json(HealthResponse {
         status: "ready".into(),
     }))

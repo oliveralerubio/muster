@@ -95,6 +95,28 @@ async fn main() -> ExitCode {
         oidc,
         repos,
     };
+    // Before serving: tombstoned workspaces with residue (a database or root
+    // restored from before their purge, or a purge cut short) are erased
+    // now. Whatever cannot be erased yet keeps /readyz at 503 and is retried
+    // by the worker below; access to it is already refused.
+    match muster_cloud::lifecycle_purge::reconcile_before_serving(&state.purge_ctx()).await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(
+            workspaces = n,
+            "purge: restored residue erased before serving"
+        ),
+        Err(err) => tracing::warn!(error = %err, "purge: residue left for the worker; not ready"),
+    }
+    // Purges deletion requests whose grace has expired, retrying with
+    // backoff (including purges left unfinished by a previous process).
+    tokio::spawn(muster_cloud::lifecycle_purge::worker(
+        state.purge_ctx(),
+        if state.config.env.is_production() {
+            Duration::from_secs(60)
+        } else {
+            Duration::from_secs(1)
+        },
+    ));
     if state.config.paddle.is_some() {
         // Retries billing reconciliations left pending, including by a
         // previous process.

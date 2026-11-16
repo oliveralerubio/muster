@@ -362,3 +362,289 @@ async fn a_restored_older_backup_still_carries_a_later_deletion_request() {
         requested["deletion"]["export_until"]
     );
 }
+
+/// A device request sent to another service base (a restored instance).
+async fn send_at(
+    base: &str,
+    dev: &support::fleet::Device<'_>,
+    req: &support::fleet::Signed,
+) -> reqwest::Response {
+    use muster_cloud::protocol::*;
+    let url = format!("{base}{}", req.path_and_query);
+    let client = http();
+    let mut b = match req.method {
+        "GET" => client.get(url),
+        _ => client.post(url).body(req.body.clone()),
+    };
+    b = b
+        .header("Authorization", format!("Bearer {}", dev.token))
+        .header(HEADER_DEVICE_ID, &dev.id)
+        .header(HEADER_TIMESTAMP, req.timestamp.to_string())
+        .header(HEADER_NONCE, &req.nonce)
+        .header(HEADER_CONTENT_SHA256, body_sha256_hex(&req.body))
+        .header(HEADER_SIGNATURE, dev.signature(req));
+    if let Some(base) = &req.base {
+        b = b.header(HEADER_BASE_REVISION, base);
+    }
+    if let Some(key) = &req.idempotency_key {
+        b = b.header(HEADER_IDEMPOTENCY_KEY, key);
+    }
+    b.send().await.unwrap()
+}
+
+/// The purge of tenant A is journaled outside the database: restoring a
+/// backup taken BEFORE A's deletion request, the service on the restored
+/// targets reapplies the request, the tombstone and the erasure before it
+/// is ready. A stays gone (rows, repository, cached requests); tenant B,
+/// in the same backup, keeps its exact head, the shared session and
+/// accepts a new signed push.
+#[tokio::test]
+async fn a_pre_request_backup_restores_without_resurrecting_a_purged_tenant() {
+    use support::fleet::{account_token, create_workspace, link, FleetRepo, MachineKey};
+    let s = support::stack_with_env(&[("MUSTER_DEV_DELETION_GRACE_SECS", "1".into())]).await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let token = account_token(&s, &alice).await;
+    let (ka, kb) = (MachineKey::new("a-node"), MachineKey::new("b-node"));
+    let a = create_workspace(&s, &alice, "Purged A").await;
+    let b = create_workspace(&s, &alice, "Kept B").await;
+    let dev_a = link(&s, &token, &a.id, &ka).await;
+    let dev_b = link(&s, &token, &b.id, &kb).await;
+    let repo_a = FleetRepo::genesis(&ka);
+    let repo_b = FleetRepo::genesis(&kb);
+    assert_eq!(
+        dev_a
+            .send(&s, &dev_a.push(repo_a.bundle(None), None))
+            .await
+            .status(),
+        200
+    );
+    assert_eq!(
+        dev_b
+            .send(&s, &dev_b.push(repo_b.bundle(None), None))
+            .await
+            .status(),
+        200
+    );
+    let b_head = repo_b.head();
+
+    let bk_dir = tempfile::tempdir().unwrap();
+    let bk = backup(&s, bk_dir.path()).await;
+
+    // Delete A and wait for the purge on the live instance.
+    let resp = http()
+        .delete(s.url(&format!("/v1/workspaces/{}", a.id)))
+        .header("Cookie", format!("__Host-mc_session={}", alice.cookie))
+        .header("Origin", s.origin())
+        .header("X-CSRF-Token", &alice.csrf_token)
+        .header("Idempotency-Key", uuid::Uuid::new_v4().to_string())
+        .json(&serde_json::json!({"confirm_workspace_id": a.id, "confirm_workspace_name": "Purged A"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 202);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let v: serde_json::Value = http()
+            .get(s.url(&format!("/v1/workspaces/{}/lifecycle", a.id)))
+            .header("Cookie", format!("__Host-mc_session={}", alice.cookie))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if v["deletion"]["primary"]["status"] == "purged" {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "{v}");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    // Restore the PRE-request backup into fresh targets.
+    let t = new_target();
+    let out = restore(&bk, &t, Some(&s.env)).await;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(
+        t.repos.join(format!("{}.git", a.id)).exists(),
+        "the backup does hold A"
+    );
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let env = with(
+        &with(
+            &with(
+                &with(&s.env, "MUSTER_DATABASE_URL", &t.url),
+                "MUSTER_REPO_ROOT",
+                &t.repos.display().to_string(),
+            ),
+            "MUSTER_BIND",
+            &format!("127.0.0.1:{port}"),
+        ),
+        "MUSTER_PUBLIC_URL",
+        &format!("http://127.0.0.1:{port}"),
+    );
+    let cloud = spawn_cloud(&env).await;
+    let ready = http()
+        .get(format!("{}/readyz", cloud.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ready.status(), 200);
+
+    // A: erased before the restored service served anything.
+    assert!(
+        !t.repos.join(format!("{}.git", a.id)).exists(),
+        "A's repository resurrected"
+    );
+    let out = run_ops(&env, &["lifecycle-report", "--workspace", &a.id]).await;
+    assert!(out.status.success(), "{}", text(&out));
+    let r: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(r["residue"], false, "{r}");
+    assert_eq!(r["lifecycle"]["primary"], "purged", "{r}");
+    let get = |path: String| {
+        let cookie = alice.cookie.clone();
+        let base = cloud.base.clone();
+        async move {
+            http()
+                .get(format!("{base}{path}"))
+                .header("Cookie", format!("__Host-mc_session={cookie}"))
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+    let list: serde_json::Value = get("/v1/workspaces".into()).await.json().await.unwrap();
+    let ids: Vec<&str> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec![b.id.as_str()], "{list}");
+    assert_eq!(get(format!("/v1/workspaces/{}", a.id)).await.status(), 404);
+    assert_eq!(
+        get(format!("/v1/workspaces/{}/export", a.id))
+            .await
+            .status(),
+        404
+    );
+    let pull_a = send_at(&cloud.base, &dev_a, &dev_a.get(&dev_a.sync_path())).await;
+    assert!(
+        matches!(pull_a.status().as_u16(), 401 | 404),
+        "{}",
+        pull_a.status()
+    );
+
+    // B: same head, session works, new signed push accepted.
+    let resp = send_at(&cloud.base, &dev_b, &dev_b.get(&dev_b.sync_path())).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()[muster_cloud::protocol::HEADER_REVISION]
+            .to_str()
+            .unwrap(),
+        b_head
+    );
+    let next = repo_b.touch("after-restore.txt", "kept");
+    let push = dev_b.push(repo_b.bundle(Some(&b_head)), Some(&b_head));
+    let resp = send_at(&cloud.base, &dev_b, &push).await;
+    assert_eq!(resp.status(), 200);
+    let resp = send_at(&cloud.base, &dev_b, &dev_b.get(&dev_b.sync_path())).await;
+    assert_eq!(
+        resp.headers()[muster_cloud::protocol::HEADER_REVISION]
+            .to_str()
+            .unwrap(),
+        next
+    );
+}
+
+/// Review F5: on a database restored from before the request, the
+/// operator commands reapply the external journal themselves (no service
+/// started): `lifecycle-report` reports what the journal says (purged)
+/// with the restored residue, and `purge-due` erases it.
+#[tokio::test]
+async fn ops_reapply_the_journal_on_a_pre_request_restore_without_the_service() {
+    use support::fleet::{account_token, create_workspace, link, FleetRepo, MachineKey};
+    let s = support::stack_with_env(&[("MUSTER_DEV_DELETION_GRACE_SECS", "1".into())]).await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let token = account_token(&s, &alice).await;
+    let ka = MachineKey::new("a-node");
+    let a = create_workspace(&s, &alice, "Purged A").await;
+    let dev_a = link(&s, &token, &a.id, &ka).await;
+    let repo_a = FleetRepo::genesis(&ka);
+    assert_eq!(
+        dev_a
+            .send(&s, &dev_a.push(repo_a.bundle(None), None))
+            .await
+            .status(),
+        200
+    );
+    let bk_dir = tempfile::tempdir().unwrap();
+    let bk = backup(&s, bk_dir.path()).await;
+
+    let resp = http()
+        .delete(s.url(&format!("/v1/workspaces/{}", a.id)))
+        .header("Cookie", format!("__Host-mc_session={}", alice.cookie))
+        .header("Origin", s.origin())
+        .header("X-CSRF-Token", &alice.csrf_token)
+        .header("Idempotency-Key", uuid::Uuid::new_v4().to_string())
+        .json(&serde_json::json!({"confirm_workspace_id": a.id, "confirm_workspace_name": "Purged A"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 202);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let v: serde_json::Value = http()
+            .get(s.url(&format!("/v1/workspaces/{}/lifecycle", a.id)))
+            .header("Cookie", format!("__Host-mc_session={}", alice.cookie))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if v["deletion"]["primary"]["status"] == "purged" {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "{v}");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    let t = new_target();
+    let out = restore(&bk, &t, Some(&s.env)).await;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let env = with(
+        &with(&s.env, "MUSTER_DATABASE_URL", &t.url),
+        "MUSTER_REPO_ROOT",
+        &t.repos.display().to_string(),
+    );
+    let report = |env: Vec<(&'static str, String)>| {
+        let ws = a.id.clone();
+        async move {
+            let out = run_ops(&env, &["lifecycle-report", "--workspace", &ws]).await;
+            assert!(out.status.success(), "{}", text(&out));
+            serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()
+        }
+    };
+    let before = report(env.clone()).await;
+    assert_eq!(before["lifecycle"]["primary"], "purged", "{before}");
+    assert_eq!(before["residue"], true, "{before}");
+
+    let out = run_ops(&env, &["purge-due"]).await;
+    assert!(out.status.success(), "{}", text(&out));
+    let ran: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        ran["workspaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["workspace_id"] == a.id.as_str() && w["state"] == "purged"),
+        "{ran}"
+    );
+    let after = report(env.clone()).await;
+    assert_eq!(after["residue"], false, "{after}");
+    assert!(!t.repos.join(format!("{}.git", a.id)).exists());
+}

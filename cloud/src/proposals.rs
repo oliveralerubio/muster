@@ -294,6 +294,8 @@ pub async fn bundle(
     let ws = Uuid::parse_str(&ws_str).map_err(|_| AppError::not_found())?;
     let id = Uuid::parse_str(&id_str).map_err(|_| AppError::not_found())?;
     let _ = caller;
+    // Shared hold on the Git storage, before any row lock: a purge drains it.
+    let _access = state.repo_access(ws).await?;
 
     let row: Option<(bool,)> =
         sqlx::query_as("SELECT has_bundle FROM proposals WHERE workspace_id = $1 AND id = $2")
@@ -523,6 +525,8 @@ pub async fn resolve(
     require_reviewer(&state, ws, &caller, "resolve proposals").await?;
 
     let req: ResolveProposal = parse_json(&body)?;
+    // Shared hold on the Git storage, before any row lock: a purge drains it.
+    let _access = state.repo_access(ws).await?;
 
     let mut tx = state.db.begin().await?;
     crate::lifecycle::lock_writable(&mut tx, ws, false).await?;

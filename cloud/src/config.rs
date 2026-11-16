@@ -45,6 +45,10 @@ pub struct Config {
     /// `after_witness`): abort while journaling a deletion request, to test
     /// replay. Refused in production.
     pub dev_lifecycle_crash: Option<crate::control::CrashPoint>,
+    /// Development only (`MUSTER_DEV_PURGE_CRASH`): aborts the process at a
+    /// purge step (`after_tombstone`, `after_rename`, `after_db`,
+    /// `after_trash`). Refused in production.
+    pub dev_purge_crash: Option<crate::lifecycle_purge::PurgeCrash>,
     /// Lifecycle authority (`crate::control`): journal directory and its
     /// independent witness file. Mandatory everywhere; never created by
     /// the service.
@@ -269,6 +273,25 @@ impl Config {
                 })?),
             };
 
+        let dev_purge_crash = match get("MUSTER_DEV_PURGE_CRASH") {
+            None => None,
+            Some(_) if env.is_production() => {
+                return Err(ConfigError::Invalid {
+                    name: "MUSTER_DEV_PURGE_CRASH",
+                    reason: "is a development-only crash injection".into(),
+                })
+            }
+            Some(v) => Some(
+                crate::lifecycle_purge::PurgeCrash::parse(&v).ok_or_else(|| {
+                    ConfigError::Invalid {
+                        name: "MUSTER_DEV_PURGE_CRASH",
+                        reason: "expected after_tombstone, after_rename, after_db or after_trash"
+                            .into(),
+                    }
+                })?,
+            ),
+        };
+
         let control = control_paths(&get, &repo_root)?;
 
         Ok(Self {
@@ -284,6 +307,7 @@ impl Config {
             dev_storage_limit,
             dev_deletion_grace_secs,
             dev_lifecycle_crash,
+            dev_purge_crash,
             control,
         })
     }

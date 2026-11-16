@@ -9,6 +9,9 @@
 //! muster-cloud-ops activate --incarnation ID --database-url URL
 //! muster-cloud-ops restore-check [--database-url URL] read-only restore gate
 //!                     (URL from MUSTER_DATABASE_URL when the flag is absent)
+//! muster-cloud-ops purge-due [--database-url URL]     one purge pass (due deletions)
+//! muster-cloud-ops lifecycle-report --workspace ID [--database-url URL]
+//!                     read-only residue report: counts and presence, never data
 //! ```
 //!
 //! Environment: `MUSTER_CONTROL_DIR`, `MUSTER_CONTROL_WITNESS`,
@@ -108,6 +111,10 @@ async fn main() -> ExitCode {
         Err(e) => return config_error(e.to_string()),
     };
 
+    if command == "purge-due" || command == "lifecycle-report" {
+        return lifecycle_command(&command, flag, &paths, repo_root, production).await;
+    }
+
     let result: Result<serde_json::Value, ControlError> = async {
         let db_url = flag("--database-url");
         let status = match command.as_str() {
@@ -199,4 +206,70 @@ async fn main() -> ExitCode {
             ExitCode::from(e.exit_code())
         }
     }
+}
+
+/// `purge-due` and `lifecycle-report` (database URL from `--database-url`
+/// or `MUSTER_DATABASE_URL`).
+async fn lifecycle_command(
+    command: &str,
+    flag: impl Fn(&str) -> Option<String>,
+    paths: &muster_cloud::control::ControlPaths,
+    repo_root: std::path::PathBuf,
+    production: bool,
+) -> ExitCode {
+    use muster_cloud::lifecycle_purge as purge;
+    let Some(url) = flag("--database-url").or_else(|| env("MUSTER_DATABASE_URL")) else {
+        return usage("--database-url (or MUSTER_DATABASE_URL) is required");
+    };
+    let fail = |e: String| {
+        eprintln!("muster-cloud-ops: {e}");
+        ExitCode::from(74)
+    };
+    let json = if command == "purge-due" {
+        let db = match connect(&url, DbAccess::Existing).await {
+            Ok(db) => db,
+            Err(e) => return fail(e.to_string()),
+        };
+        // Reapply the journal first (a database restored from before a
+        // request, or a crash after journaling): the purge reads the
+        // projection.
+        let bound = match Authority::open(paths) {
+            Ok(authority) => authority.bind_db(&db, false).await.map(|_| ()),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = bound {
+            eprintln!("muster-cloud-ops: {e}");
+            return ExitCode::from(e.exit_code());
+        }
+        let ctx = purge::PurgeCtx {
+            db,
+            control: paths.clone(),
+            repo_root,
+            crash: None,
+            drain_wait: std::time::Duration::from_secs(if production { 30 } else { 2 }),
+        };
+        serde_json::json!({ "workspaces": purge::run_due(&ctx).await })
+    } else {
+        let Some(ws) = flag("--workspace").and_then(|s| uuid::Uuid::parse_str(&s).ok()) else {
+            return usage("--workspace <uuid> is required");
+        };
+        let db = match connect(&url, DbAccess::ReadOnly).await {
+            Ok(db) => db,
+            Err(e) => return fail(e.to_string()),
+        };
+        // Read-only: the journal is read, never projected, by the report.
+        let journal = match Authority::open(paths) {
+            Ok(authority) => purge::JournalState::of(&authority, ws),
+            Err(e) => {
+                eprintln!("muster-cloud-ops: {e}");
+                return ExitCode::from(e.exit_code());
+            }
+        };
+        match purge::report(&db, &repo_root, ws, journal).await {
+            Ok(v) => v,
+            Err(e) => return fail(e),
+        }
+    };
+    println!("{json}");
+    ExitCode::SUCCESS
 }

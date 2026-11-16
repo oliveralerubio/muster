@@ -137,7 +137,30 @@ pub enum Record {
         item: ProviderItem,
         provider_id: String,
     },
+    /// Irreversible: the workspace's primary data is being purged. Every
+    /// access ends here (projection), live or replayed into any restored
+    /// database; erasure follows and is never undone.
+    WorkspaceTombstoned {
+        workspace_id: Uuid,
+        request_id: Uuid,
+        tombstoned_at_us: i64,
+    },
+    /// The purge of the tombstoned workspace was completed and verified.
+    WorkspacePurged {
+        workspace_id: Uuid,
+        request_id: Uuid,
+        purged_at_us: i64,
+    },
 }
+
+/// Redacts the cached account-level responses that name `ws` (creation,
+/// links, deletion): a replay of one of them answers 404 and no payload
+/// (device tokens, workspace names) remains. Idempotent.
+pub const REDACT_ACCOUNT_IDEMPOTENCY: &str = "UPDATE account_idempotency
+    SET status = 404, response = '{\"purged\": true}'::jsonb
+  WHERE (path LIKE '/v1/workspaces/' || $1::text || '%'
+         OR (path = '/v1/workspaces' AND response->>'id' = $1::text))
+    AND response <> '{\"purged\": true}'::jsonb";
 
 /// Kind of provider object a deletion request cancels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -226,6 +249,50 @@ async fn project(tx: &mut Transaction<'_, Postgres>, entry: &Entry) -> Result<()
                 .execute(&mut **tx)
                 .await
                 .map_err(db_err)?;
+        }
+        Record::WorkspaceTombstoned {
+            workspace_id,
+            tombstoned_at_us,
+            ..
+        } => {
+            sqlx::query(
+                "UPDATE workspace_lifecycle SET purge_committed_at = COALESCE(purge_committed_at, $2)
+                  WHERE workspace_id = $1",
+            )
+            .bind(workspace_id)
+            .bind(from_us(*tombstoned_at_us)?)
+            .execute(&mut **tx)
+            .await
+            .map_err(db_err)?;
+            // Access ends with the tombstone (tenant data is erased later,
+            // after live Git access drains).
+            for sql in [
+                "DELETE FROM memberships WHERE workspace_id = $1",
+                "DELETE FROM invitations WHERE workspace_id = $1",
+                "UPDATE devices SET status = 'revoked' WHERE workspace_id = $1 AND status <> 'revoked'",
+                REDACT_ACCOUNT_IDEMPOTENCY,
+            ] {
+                sqlx::query(sql)
+                    .bind(workspace_id)
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(db_err)?;
+            }
+        }
+        Record::WorkspacePurged {
+            workspace_id,
+            purged_at_us,
+            ..
+        } => {
+            sqlx::query(
+                "UPDATE workspace_lifecycle SET purged_at = COALESCE(purged_at, $2), purge_last_error = NULL
+                  WHERE workspace_id = $1",
+            )
+            .bind(workspace_id)
+            .bind(from_us(*purged_at_us)?)
+            .execute(&mut **tx)
+            .await
+            .map_err(db_err)?;
         }
     }
     Ok(())
@@ -611,12 +678,32 @@ impl Authority {
     ) -> Result<u64, ControlError> {
         // One deletion request per workspace, enforced here as well: its
         // deadlines can never be replaced by a second record.
-        if let Record::WorkspaceDeletionRequested { workspace_id, .. } = &record {
-            if self.deletion_request(*workspace_id).is_some() {
+        match &record {
+            Record::WorkspaceDeletionRequested { workspace_id, .. } => {
+                if self.deletion_request(*workspace_id).is_some() {
+                    return Err(ControlError::Usage(format!(
+                        "workspace {workspace_id} already has a deletion request"
+                    )));
+                }
+            }
+            // A tombstone needs the request, once; `purged` needs the
+            // tombstone, once.
+            Record::WorkspaceTombstoned { workspace_id, .. }
+                if self.deletion_request(*workspace_id).is_none()
+                    || self.tombstoned(*workspace_id) =>
+            {
                 return Err(ControlError::Usage(format!(
-                    "workspace {workspace_id} already has a deletion request"
+                    "workspace {workspace_id} has no deletion request or is already tombstoned"
                 )));
             }
+            Record::WorkspacePurged { workspace_id, .. }
+                if !self.tombstoned(*workspace_id) || self.purged(*workspace_id) =>
+            {
+                return Err(ControlError::Usage(format!(
+                    "workspace {workspace_id} is not tombstoned or is already purged"
+                )));
+            }
+            _ => {}
         }
         let (head, prev) = self.journal.head();
         let entry = Entry {
@@ -782,6 +869,20 @@ impl Authority {
     pub fn deletion_request(&self, workspace_id: Uuid) -> Option<&Record> {
         self.journal.entries.iter().map(|e| &e.record).find(|r| {
             matches!(r, Record::WorkspaceDeletionRequested { workspace_id: w, .. } if *w == workspace_id)
+        })
+    }
+
+    /// Whether `workspace_id` has an irreversible tombstone.
+    pub fn tombstoned(&self, workspace_id: Uuid) -> bool {
+        self.journal.entries.iter().any(|e| {
+            matches!(e.record, Record::WorkspaceTombstoned { workspace_id: w, .. } if w == workspace_id)
+        })
+    }
+
+    /// Whether the purge of `workspace_id` is journaled as complete.
+    pub fn purged(&self, workspace_id: Uuid) -> bool {
+        self.journal.entries.iter().any(|e| {
+            matches!(e.record, Record::WorkspacePurged { workspace_id: w, .. } if w == workspace_id)
         })
     }
 

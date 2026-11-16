@@ -215,6 +215,9 @@ pub async fn get_billing(
     account.require_scope(scopes::WORKSPACES_READ)?;
     let ws = parse_uuid(&ws_str)?;
     let _ = check_role(&state, ws, account.user_id).await?;
+    // Storage usage reads the Git storage: hold it shared like every Git
+    // access, so a purge drains this request too.
+    let _access = state.repo_access(ws).await?;
 
     let ws_row: Option<(OffsetDateTime,)> =
         sqlx::query_as("SELECT trial_ends_at FROM workspaces WHERE id = $1")
@@ -830,6 +833,39 @@ pub async fn handle_webhook(
 
     let data = event.get("data");
     let ws_id = associated_workspace(&mut tx, data).await?;
+    // An event about a tombstoned workspace (associated with it, naming it in
+    // `custom_data`, or about one of its provider objects) is kept for dedup
+    // with an empty payload.
+    let ids: Vec<String> = ["id", "transaction_id", "subscription_id"]
+        .iter()
+        .filter_map(|k| data.and_then(|d| d.get(*k)).and_then(|v| v.as_str()))
+        .map(str::to_string)
+        .collect();
+    let tombstoned: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM workspace_lifecycle l
+                         WHERE l.purge_committed_at IS NOT NULL
+                           AND (l.workspace_id = $1
+                                OR l.workspace_id::text = $3
+                                OR EXISTS (SELECT 1 FROM lifecycle_provider_items i
+                                            WHERE i.workspace_id = l.workspace_id
+                                              AND i.provider_id = ANY($2))
+                                OR EXISTS (SELECT 1 FROM lifecycle_purged_provider_ids p
+                                            WHERE p.workspace_id = l.workspace_id
+                                              AND p.provider_id = ANY($2))))",
+    )
+    .bind(ws_id)
+    .bind(&ids)
+    .bind(
+        data.and_then(|d| d.pointer("/custom_data/workspace_id"))
+            .and_then(|v| v.as_str()),
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    let stored = if tombstoned {
+        serde_json::json!({})
+    } else {
+        event.clone()
+    };
 
     sqlx::query(
         "INSERT INTO billing_events (event_id, event_type, workspace_id, occurred_at, payload, processed_at)
@@ -839,7 +875,7 @@ pub async fn handle_webhook(
     .bind(event_type)
     .bind(ws_id)
     .bind(occurred_at)
-    .bind(&event)
+    .bind(&stored)
     .execute(&mut *tx)
     .await?;
 

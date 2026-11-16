@@ -179,6 +179,8 @@ pub async fn get_sync(
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
     let device = device(&state, &method, &uri, &ws, &headers, &[]).await?;
+    // Shared hold on the Git storage, before any row lock: a purge drains it.
+    let _access = state.repo_access(device.workspace_id).await?;
     let mut conn = state.db.acquire().await?;
     let Some(head) = load_head(&mut conn, device.workspace_id).await? else {
         return Ok(StatusCode::NO_CONTENT.into_response());
@@ -231,6 +233,9 @@ pub async fn post_sync(
         .to_string();
     let device = device(&state, &method, &uri, &ws, &headers, &body).await?;
     let ws_id = device.workspace_id;
+    // Shared hold on the Git storage, before any row lock: a purge drains it.
+    // Held until this push's transaction ends.
+    let _access = state.repo_access(ws_id).await?;
 
     let mut tx = state.db.begin().await?;
     // Serialise mutations carrying the same key for this device.

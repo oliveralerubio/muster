@@ -71,15 +71,18 @@ pub async fn deny_if_scheduled(
     tx: &mut Transaction<'_, Postgres>,
     ws: Uuid,
 ) -> Result<(), AppError> {
-    let row: Option<(Uuid, OffsetDateTime)> = sqlx::query_as(
-        "SELECT request_id, primary_purge_at FROM workspace_lifecycle WHERE workspace_id = $1",
+    let row: Option<(Uuid, OffsetDateTime, bool)> = sqlx::query_as(
+        "SELECT request_id, primary_purge_at, purge_committed_at IS NOT NULL
+           FROM workspace_lifecycle WHERE workspace_id = $1",
     )
     .bind(ws)
     .fetch_optional(&mut **tx)
     .await?;
     match row {
         None => Ok(()),
-        Some((request_id, purge_at)) => Err(AppError::new(
+        // Tombstoned: the workspace no longer exists for anyone.
+        Some((_, _, true)) => Err(AppError::not_found()),
+        Some((request_id, purge_at, false)) => Err(AppError::new(
             StatusCode::CONFLICT,
             error_codes::WORKSPACE_DELETION_SCHEDULED,
             "this workspace is scheduled for deletion; only pull and export remain available",
@@ -105,7 +108,13 @@ pub async fn lock_writable(
     } else {
         "SELECT id FROM workspaces WHERE id = $1 FOR SHARE"
     };
-    sqlx::query(query).bind(ws).execute(&mut **tx).await?;
+    let found = sqlx::query(query)
+        .bind(ws)
+        .fetch_optional(&mut **tx)
+        .await?;
+    if found.is_none() {
+        return Err(AppError::not_found());
+    }
     deny_if_scheduled(tx, ws).await
 }
 
@@ -118,25 +127,43 @@ type ItemRow = (
     Option<String>,
 );
 
+/// `(request_id, requested_at, primary_purge_at, backup_cap_at, now,
+/// purge_committed_at, purged_at, purge_last_error)`.
+type LifecycleRow = (
+    Uuid,
+    OffsetDateTime,
+    OffsetDateTime,
+    OffsetDateTime,
+    OffsetDateTime,
+    Option<OffsetDateTime>,
+    Option<OffsetDateTime>,
+    Option<String>,
+);
+
 /// The lifecycle of `ws` as the API reports it.
 pub async fn view<'e, E>(db: E, ws: Uuid) -> Result<WorkspaceLifecycle, AppError>
 where
     E: sqlx::PgExecutor<'e> + Copy,
 {
-    let row: Option<(
-        Uuid,
-        OffsetDateTime,
-        OffsetDateTime,
-        OffsetDateTime,
-        OffsetDateTime,
-    )> = sqlx::query_as(
-        "SELECT request_id, requested_at, primary_purge_at, backup_cap_at, now()
+    let row: Option<LifecycleRow> = sqlx::query_as(
+        "SELECT request_id, requested_at, primary_purge_at, backup_cap_at, now(),
+                purge_committed_at, purged_at, purge_last_error
                FROM workspace_lifecycle WHERE workspace_id = $1",
     )
     .bind(ws)
     .fetch_optional(db)
     .await?;
-    let Some((request_id, requested_at, purge_at, cap_at, now)) = row else {
+    let Some((
+        request_id,
+        requested_at,
+        purge_at,
+        cap_at,
+        now,
+        committed_at,
+        purged_at,
+        last_error,
+    )) = row
+    else {
         return Ok(WorkspaceLifecycle {
             workspace_id: ws.to_string(),
             state: LifecycleState::Active,
@@ -178,9 +205,23 @@ where
             requested_at: rfc3339(requested_at)?,
             export_until: rfc3339(purge_at)?,
             primary: PrimaryPurge {
-                status: if now < purge_at { "scheduled" } else { "due" }.into(),
+                // `due` only reads the clock; only the journal says more.
+                status: match (committed_at, purged_at) {
+                    (_, Some(_)) => "purged",
+                    (Some(_), None) => "purge_committed",
+                    _ if now < purge_at => "scheduled",
+                    _ => "due",
+                }
+                .into(),
                 purge_at: rfc3339(purge_at)?,
-                purged_at: None,
+                purge_committed_at: committed_at.map(rfc3339).transpose()?,
+                purged_at: purged_at.map(rfc3339).transpose()?,
+                // Only while unfinished: an operational reason, no data.
+                last_error: if purged_at.is_none() {
+                    last_error
+                } else {
+                    None
+                },
             },
             backups: BackupPurge {
                 status: "unknown".into(),
@@ -194,13 +235,15 @@ where
                 items,
             },
             writes_allowed: false,
-            pull_allowed: true,
-            export_allowed: true,
+            pull_allowed: committed_at.is_none(),
+            export_allowed: committed_at.is_none(),
         }),
     })
 }
 
-/// `GET /v1/workspaces/{ws}/lifecycle`: any member.
+/// `GET /v1/workspaces/{ws}/lifecycle`: any member, and the account that
+/// requested the deletion (kept outside the tenant rows, so it can follow
+/// the purge to the end after its membership is gone).
 pub async fn get_lifecycle(
     State(state): State<AppState>,
     account: crate::auth::account::Account,
@@ -214,7 +257,16 @@ pub async fn get_lifecycle(
             .bind(account.user_id)
             .fetch_optional(&state.db)
             .await?;
-    member.ok_or_else(AppError::not_found)?;
+    if member.is_none() {
+        let requester: Option<(Uuid,)> = sqlx::query_as(
+            "SELECT request_id FROM workspace_lifecycle WHERE workspace_id = $1 AND requested_by = $2",
+        )
+        .bind(id)
+        .bind(account.user_id)
+        .fetch_optional(&state.db)
+        .await?;
+        requester.ok_or_else(AppError::not_found)?;
+    }
     view(&state.db, id).await.map(Json)
 }
 

@@ -350,10 +350,19 @@ pub struct DeletionStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PrimaryPurge {
-    /// `scheduled` before `purge_at`, `due` after it until purged, `purged`.
+    /// `scheduled` before `purge_at`; `due` after it (the purge may run, it
+    /// has not); `purge_committed` once the irreversible tombstone is
+    /// recorded (access has ended, erasure in progress); `purged` once the
+    /// erasure is verified.
     pub status: String,
     pub purge_at: String,
+    /// When the tombstone was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purge_committed_at: Option<String>,
     pub purged_at: Option<String>,
+    /// Why the purge is not progressing (e.g. live Git access draining).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

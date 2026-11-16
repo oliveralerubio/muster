@@ -134,6 +134,7 @@ pub async fn diff_revision(
     account.require_scope(scopes::WORKSPACES_READ)?;
     let ws = parse_uuid(&ws_str)?;
     check_member(&state, ws, account.user_id).await?;
+    let _access = state.repo_access(ws).await?;
 
     let row: Option<(Option<String>,)> = sqlx::query_as(
         "SELECT parent_revision FROM accepted_revisions WHERE workspace_id = $1 AND revision = $2",
@@ -169,6 +170,7 @@ pub async fn export_bundle(
     account.require_scope(scopes::WORKSPACES_READ)?;
     let ws = parse_uuid(&ws_str)?;
     check_member(&state, ws, account.user_id).await?;
+    let _access = state.repo_access(ws).await?;
 
     type HeadRow = (String, i64, String);
     let head_row: Option<HeadRow> = sqlx::query_as(
