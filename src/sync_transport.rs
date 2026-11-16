@@ -136,7 +136,19 @@ pub fn pull(ctx: &mut Context, link: &CloudLink) -> Result<PullOutcome, MusterEr
         .header(protocol::HEADER_SIGNATURE, &signature)
         .call()
         .map_err(|_| failure("Cloud download failed; retry muster sync --pull"))?;
+    // The service names the accepted head it served; after the verified
+    // checkout this becomes this machine's base revision for its next
+    // publication (a machine that joined by pulling could otherwise never
+    // publish: its recorded base would stay "none").
+    let tip = response
+        .headers()
+        .get(protocol::HEADER_REVISION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
     if response.status().as_u16() == 204 {
+        if let Some(revision) = tip {
+            record_accepted(link, &dir, &revision)?;
+        }
         return Ok(PullOutcome::UpToDate);
     }
     if response.status().as_u16() != 200 {
@@ -168,10 +180,26 @@ pub fn pull(ctx: &mut Context, link: &CloudLink) -> Result<PullOutcome, MusterEr
     match outcome {
         Ok(outcome) => {
             let _ = std::fs::remove_file(&bundle);
+            if let Some(revision) = tip {
+                record_accepted(link, &dir, &revision)?;
+            }
             Ok(outcome)
         }
         Err(message) => Err(failure(&message)),
     }
+}
+
+/// Records the verified, checked-out head as this machine's accepted base
+/// revision, mirroring what a successful publication stores.
+fn record_accepted(link: &CloudLink, dir: &Path, revision: &str) -> Result<(), MusterError> {
+    let state = serde_json::to_vec(&serde_json::json!({
+        "workspace": link.workspace,
+        "device": link.device,
+        "revision": revision,
+    }))
+    .map_err(|_| failure("cannot encode Cloud revision"))?;
+    crate::vault::write_atomic(&dir.join("accepted.json"), &state)
+        .map_err(|_| failure("cannot save accepted Cloud revision"))
 }
 
 /// Staging verification and the checkout it guards. The error is a plain
@@ -196,23 +224,51 @@ fn verify_and_checkout(
     ) {
         return Err("cannot read the Cloud bundle".into());
     }
-    let related = previous.is_some()
-        && git_bool(
-            &ctx.config_dir,
-            &["merge-base", "--quiet", "HEAD", PULL_REF],
-        );
+    // Whether the served tip shares history with this machine's HEAD decides
+    // between a plain update and a confirmed join. `git merge-base A B`
+    // exits 0 with a common ancestor and 1 without; anything else (>1) is an
+    // operational error that must surface as such — never as "unrelated".
+    // There is no --quiet flag for merge-base (unknown options exit 129,
+    // which used to make every pull look like an unrelated join).
+    let related = previous.is_some() && {
+        let out = std::process::Command::new("git")
+            .current_dir(&ctx.config_dir)
+            .args(["merge-base", "HEAD", PULL_REF])
+            .output()
+            .map_err(|e| format!("cannot run git merge-base: {e}"))?;
+        match out.status.code() {
+            Some(0) => true,
+            Some(1) => false,
+            code => {
+                return Err(format!(
+                    "cannot relate the Cloud history to this machine's HEAD (git merge-base \
+                     exit {:?}): {}",
+                    code,
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
+        }
+    };
     let work = |args: &[&str]| git(&ctx.config_dir, args);
     let stage = |args: &[&str]| git(Path::new(staging), args);
     // The staging working tree gives the pure history verifier a complete
-    // checkout while the user's repository stays untouched. Bundles carry
-    // only `refs/heads/main` (no HEAD), so a plain clone checks out nothing:
-    // init, fetch and check the branch out explicitly.
+    // checkout while the user's repository stays untouched. The tip was
+    // already fetched into this repository as `PULL_REF` — staging fetches
+    // from THERE, not from the bundle file: the service serves incremental
+    // bundles when the requesting revision is a known ancestor, and a fresh
+    // staging clone lacks the parent objects an incremental bundle assumes.
+    // Bundles carry only `refs/heads/main` (no HEAD), so a plain clone
+    // checks out nothing: init, fetch and check the branch out explicitly.
+    let source = ctx
+        .config_dir
+        .to_str()
+        .ok_or_else(|| "invalid repository path; cannot stage the Cloud bundle".to_string())?;
     if stage(&["init", "--quiet"]).is_err()
         || stage(&[
             "fetch",
             "--quiet",
-            bundle,
-            "refs/heads/main:refs/heads/main",
+            source,
+            &format!("{PULL_REF}:refs/heads/main"),
         ])
         .is_err()
         || stage(&["checkout", "--quiet", "main"]).is_err()
@@ -417,10 +473,30 @@ pub fn push(ctx: &Context, link: &CloudLink) -> Result<(), MusterError> {
         .header("Content-Type", protocol::GIT_BUNDLE_MEDIA_TYPE)
         .send(body.as_slice())
         .map_err(|_| failure("Cloud publication failed; retry muster sync --push"))?;
-    if response.status().as_u16() != 200 {
-        return Err(failure(
-            "Cloud did not accept the publication; local history is preserved",
-        ));
+    let status = response.status().as_u16();
+    if status != 200 {
+        // Surface the server's own error body: the refusal reason (conflict,
+        // authorization, quota) is information the operator needs; the local
+        // history is preserved either way.
+        let detail = response.body_mut().read_to_string().unwrap_or_default();
+        let detail = detail.trim();
+        // A definitive client-side refusal (4xx) invalidates the pending
+        // publication: its base revision and bytes describe a state the
+        // server will not accept, and keeping them would poison every later
+        // push with a stale base. Network-level failures keep the intent so
+        // the same key and bytes can be retried.
+        if (400..500).contains(&status) {
+            let _ = std::fs::remove_file(&meta);
+            let _ = std::fs::remove_file(&bundle);
+        }
+        return Err(failure(&format!(
+            "Cloud did not accept the publication (HTTP {status}){}; local history is preserved",
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {detail}")
+            }
+        )));
     }
     let accepted: protocol::SyncAccepted = response
         .body_mut()

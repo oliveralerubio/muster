@@ -1276,3 +1276,273 @@ async fn remote_join_with_wrong_expected_state_preserves_pin() {
     std::fs::remove_dir_all(second).unwrap();
     std::fs::remove_dir_all(third).unwrap();
 }
+
+/// Runs the CLI binary with a value on stdin (for `secret add --value-stdin`).
+async fn run_cli_stdin(
+    home: &std::path::Path,
+    args: &[&str],
+    value: &[u8],
+) -> std::process::Output {
+    let mut child = tokio::process::Command::new(
+        std::env::var("MUSTER_CLI_BIN").expect("MUSTER_CLI_BIN must point to the built CLI"),
+    )
+    .env_clear()
+    .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+    .env("HOME", home)
+    .env("XDG_CONFIG_HOME", home.join("config"))
+    .env("XDG_STATE_HOME", home.join("state"))
+    .env("XDG_DATA_HOME", home.join("data"))
+    .env("XDG_CACHE_HOME", home.join("cache"))
+    .args(args)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+    use tokio::io::AsyncWriteExt;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(value).await.unwrap();
+        stdin.shutdown().await.unwrap();
+    }
+    child.wait_with_output().await.unwrap()
+}
+
+/// Enrollment over the Cloud transport: the second machine joins the
+/// transport (device approved by the owner's session — authorization for the
+/// pipe, never for governance), pins the fleet, and CANNOT publish fleet
+/// content before enrollment. Its signed enrollment request is published to
+/// the fleet, approved LOCALLY by the author machine with its own signing
+/// key (the Cloud session never signs governance), and only then the
+/// enrolled machine publishes content that the author receives.
+#[tokio::test]
+async fn enrolled_second_machine_publishes_after_local_signed_approval() {
+    let stack = support::stack().await;
+    let alice = stack.login_user("alice", "alice@example.com").await;
+    let ws1 = create_workspace(&stack, &alice, "Enrollment fleet").await;
+
+    // Machine A bootstraps fleet one and publishes it.
+    let home = std::env::temp_dir().join(format!("muster-cli-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&home).unwrap();
+    device_login(&stack, &alice, &home).await;
+    assert!(run_cli(&home, &["--yes", "init", "--machine", "laptop"])
+        .await
+        .status
+        .success());
+    assert!(run_cli(
+        &home,
+        &["--format", "json", "cloud", "link", "--workspace", &ws1.id]
+    )
+    .await
+    .status
+    .success());
+    assert!(run_cli(&home, &["--format", "json", "sync", "--push"])
+        .await
+        .status
+        .success());
+    let show_a: serde_json::Value = serde_json::from_slice(
+        &run_cli(&home, &["--format", "json", "trust", "show"])
+            .await
+            .stdout,
+    )
+    .unwrap();
+    let signer = show_a["result"]["fleet_state"]["signer"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Machine B links the transport and pins fleet one.
+    let second = std::env::temp_dir().join(format!("muster-cli-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&second).unwrap();
+    device_login(&stack, &alice, &second).await;
+    assert!(run_cli(&second, &["--yes", "init", "--machine", "second"])
+        .await
+        .status
+        .success());
+    assert!(run_cli(
+        &second,
+        &["--format", "json", "cloud", "link", "--workspace", &ws1.id]
+    )
+    .await
+    .status
+    .success());
+    let joined = run_cli(
+        &second,
+        &[
+            "--format",
+            "json",
+            "sync",
+            "--pull",
+            "--expect-signer",
+            &signer,
+        ],
+    )
+    .await;
+    assert!(
+        joined.status.success(),
+        "{}",
+        String::from_utf8_lossy(&joined.stdout)
+    );
+
+    // BEFORE enrollment: B's signing key is not a fleet writer, so a content
+    // change is refused — the Cloud link grants no signing authority.
+    let unauthorized = run_cli_stdin(
+        &second,
+        &[
+            "--format",
+            "json",
+            "secret",
+            "add",
+            "app/token",
+            "--value-stdin",
+        ],
+        b"too-early",
+    )
+    .await;
+    assert!(
+        !unauthorized.status.success(),
+        "an unenrolled machine must not sign fleet state: {}",
+        String::from_utf8_lossy(&unauthorized.stdout)
+    );
+
+    // B proposes its enrollment (signed request): the CLI submits it as an
+    // OPEN enrollment proposal on the linked workspace — the only channel a
+    // non-member can publish through. A full bundle push stays forbidden.
+    let enroll = run_cli(&second, &["--format", "json", "enroll", "--name", "second"]).await;
+    assert!(
+        enroll.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&enroll.stdout),
+        String::from_utf8_lossy(&enroll.stderr)
+    );
+    let enrolled: serde_json::Value = serde_json::from_slice(&enroll.stdout).unwrap();
+    assert!(
+        enrolled["result"]["proposal"].is_string(),
+        "enroll must hand the request to the transport as a proposal: {enrolled}"
+    );
+    let still_forbidden = run_cli(&second, &["--format", "json", "sync", "--push"]).await;
+    assert!(
+        !still_forbidden.status.success(),
+        "an unenrolled machine must not publish bundles: {}",
+        String::from_utf8_lossy(&still_forbidden.stdout)
+    );
+
+    // A receives the request and approves LOCALLY with its own signing key;
+    // the Cloud session never signs governance.
+    assert!(run_cli(&home, &["--format", "json", "sync", "--pull"])
+        .await
+        .status
+        .success());
+    let approve = run_cli(&home, &["--yes", "approve", "second"]).await;
+    assert!(
+        approve.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&approve.stdout),
+        String::from_utf8_lossy(&approve.stderr)
+    );
+    assert!(run_cli(&home, &["--format", "json", "sync", "--push"])
+        .await
+        .status
+        .success());
+
+    // B receives the approval: the fleet state advanced, still signed by the
+    // author's key (never by anything derived from a Cloud session), and B
+    // is now a writer.
+    let pull_v2 = run_cli(&second, &["--format", "json", "sync", "--pull"]).await;
+    assert!(
+        pull_v2.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&pull_v2.stdout),
+        String::from_utf8_lossy(&pull_v2.stderr)
+    );
+    let show_b: serde_json::Value = serde_json::from_slice(
+        &run_cli(&second, &["--format", "json", "trust", "show"])
+            .await
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(
+        show_b["result"]["fleet_state"]["signer"],
+        signer.as_str(),
+        "governance stays signed by the author's local key"
+    );
+    assert!(
+        show_b["result"]["fleet_state"]["epoch"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 2,
+        "the approval must advance the fleet state: {show_b}"
+    );
+    // B's local unpublished sibling commit (the enrollment request) survived
+    // the pull as a normal pull (no expect bypass needed beyond the join),
+    // and the accepted remote approval is now part of B's history: siblings,
+    // not one replacing the other; user data preserved.
+    let git_log = tokio::process::Command::new("git")
+        .current_dir(second.join("config/muster"))
+        .args(["log", "--oneline"])
+        .output()
+        .await
+        .unwrap();
+    let history = String::from_utf8_lossy(&git_log.stdout);
+    assert!(
+        history.contains("enrollment request for second"),
+        "the local unpublished enrollment request must survive the pull: {history}"
+    );
+    assert!(
+        history.contains("approve machine second"),
+        "the accepted remote approval must be in B's history: {history}"
+    );
+
+    // The enrolled machine publishes content, and A receives it.
+    let add = run_cli_stdin(
+        &second,
+        &[
+            "--format",
+            "json",
+            "secret",
+            "add",
+            "app/token",
+            "--value-stdin",
+        ],
+        b"post-enrollment-value",
+    )
+    .await;
+    assert!(
+        add.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&add.stdout),
+        String::from_utf8_lossy(&add.stderr)
+    );
+    let content_push = run_cli(&second, &["--format", "json", "sync", "--push"]).await;
+    assert!(
+        content_push.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&content_push.stdout),
+        String::from_utf8_lossy(&content_push.stderr)
+    );
+    let pull_back = run_cli(&home, &["--format", "json", "sync", "--pull"]).await;
+    assert!(
+        pull_back.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&pull_back.stdout),
+        String::from_utf8_lossy(&pull_back.stderr)
+    );
+    let show_a2: serde_json::Value = serde_json::from_slice(
+        &run_cli(&home, &["--format", "json", "trust", "show"])
+            .await
+            .stdout,
+    )
+    .unwrap();
+    let groups = show_a2["result"]["fleet_state"]["vault_groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert!(
+        groups.iter().any(|g| g == "app"),
+        "A must have received B's published vault group (secret path app/token): {show_a2}"
+    );
+
+    std::fs::remove_dir_all(home).unwrap();
+    std::fs::remove_dir_all(second).unwrap();
+}

@@ -227,11 +227,12 @@ fn confirm_typed(
 /// state, and nothing named its signer. The signer must come from
 /// `--expect-signer`, a typed confirmation on a terminal, or be this
 /// machine's own key.
-fn confirm_first_use(ctx: &Context) -> Result<(), MusterError> {
-    if ctx.expect_signer.is_some()
-        || ctx.expect_state.is_some()
-        || TrustAnchor::load(&ctx.state_dir)?.is_some()
-    {
+fn confirm_first_use(ctx: &Context, has_pin: bool) -> Result<(), MusterError> {
+    // `has_pin` reflects the EFFECTIVE anchor of this verification, not the
+    // disk file: when a confirmed join replaces an old fleet, the pin being
+    // replaced is not the fleet being confirmed, so first-use rules apply to
+    // the incoming history exactly as on a machine that never pinned.
+    if ctx.expect_signer.is_some() || ctx.expect_state.is_some() || has_pin {
         return Ok(());
     }
     let Some(state) = FleetState::load(&ctx.config_dir)? else {
@@ -256,20 +257,53 @@ fn confirm_first_use(ctx: &Context) -> Result<(), MusterError> {
 }
 
 /// Verifies the repo against the pin, reporting a first-use pin as an info diagnostic.
+/// How the final verification obtains its trust anchor. `FromDisk` is the
+/// normal path (load the pin from `state_dir`). `Explicit` evaluates against
+/// the given pin — or against nothing (first-use rules) — WITHOUT touching
+/// the pin on disk, so a refused verification can never leave the machine
+/// unpinned and the accepted replacement is published atomically afterwards.
+pub(crate) enum Anchor<'a> {
+    FromDisk,
+    Explicit(Option<&'a TrustAnchor>),
+}
+
 pub fn verify(
     ctx: &mut Context,
     manifest: &Manifest,
     persist: bool,
 ) -> Result<Verification, MusterError> {
+    verify_anchored(ctx, manifest, persist, Anchor::FromDisk)
+}
+
+pub(crate) fn verify_anchored(
+    ctx: &mut Context,
+    manifest: &Manifest,
+    persist: bool,
+    anchor: Anchor<'_>,
+) -> Result<Verification, MusterError> {
     // Whatever the entry point, creating a first pin from someone else's
     // signature needs `--expect-signer` or a typed confirmation.
     if persist {
-        confirm_first_use(ctx)?;
+        let has_pin = match anchor {
+            Anchor::FromDisk => TrustAnchor::load(&ctx.state_dir)?.is_some(),
+            Anchor::Explicit(explicit) => explicit.is_some(),
+        };
+        confirm_first_use(ctx, has_pin)?;
     }
-    let result = fleet_state::verify_with(
+    let loaded;
+    let anchor = match anchor {
+        Anchor::FromDisk => {
+            loaded = TrustAnchor::load(&ctx.state_dir)?;
+            loaded.as_ref()
+        }
+        Anchor::Explicit(explicit) => explicit,
+    };
+    // Pure verification: the pin on disk is never mutated here. The verdict
+    // (and the anchor to adopt, if any) comes back without side effects.
+    let (result, adopt) = fleet_state::verify_against(
         &ctx.config_dir,
-        &ctx.state_dir,
         manifest,
+        anchor,
         &VerifyOptions {
             expect_signer: ctx.expect_signer.as_deref(),
             expect_state: ctx.expect_state.as_deref(),
@@ -277,6 +311,14 @@ pub fn verify(
             check_content: true,
         },
     )?;
+    // Publication is the last step and the ONLY disk mutation: `save` is
+    // atomic (write + rename), so the pin on disk always holds either the
+    // previous boundary or the accepted replacement — never nothing.
+    if persist {
+        if let Some(pin) = adopt {
+            pin.save(&ctx.state_dir)?;
+        }
+    }
     ctx.governance_pending = false;
     if let Verification::Pending {
         epoch,
@@ -616,22 +658,24 @@ pub fn verify_pulled(
     rejoin: bool,
     own_scaffold_pin: bool,
 ) -> Result<(), MusterError> {
-    // Bytes of a pin dropped for this verification; restored if the
-    // verification below fails so the machine never ends unpinned.
-    let mut dropped_pin: Option<Vec<u8>> = None;
+    // The pin is loaded, never pre-deleted: the substitution below is
+    // evaluated against an explicit anchor by the pure verifier and only the
+    // accepted replacement is published (atomically) inside the verification.
+    let pin = TrustAnchor::load(&ctx.state_dir)?;
+    let mut dropping = false;
     if joined && previous.is_some() {
         if !rejoin {
-            let _ = git::restore_after_pull(&ctx.config_dir, previous);
-            return Err(MusterError::Security(
+            let restored = git::restore_after_pull(&ctx.config_dir, previous);
+            return Err(MusterError::Security(rollout_note(
                 "the remote history is unrelated to this machine's pinned fleet (rewritten \
-                 remote?); the pulled changes were discarded. To join another fleet on purpose \
-                 run `muster sync --remote <url> --pull`"
-                    .into(),
-            ));
+                 remote?); to join another fleet on purpose run `muster sync --remote <url> \
+                 --pull`",
+                restored,
+            )));
         }
-        if let Some(old) = TrustAnchor::load(&ctx.state_dir)? {
+        if let Some(old) = &pin {
             // Erasing a pin is the antirollback boundary. A pin over the
-            // machine's own scaffold (`init` genesis) may be dropped when the
+            // machine's own scaffold (`init` genesis) may be replaced when the
             // join is signer-confirmed — that is the documented first join.
             // A pin over a fleet this machine ACCEPTED from elsewhere — or
             // any state it legitimately signed later (epoch ≥ 2) — keeps the
@@ -639,21 +683,20 @@ pub fn verify_pulled(
             // `--expect-signer` may replace it; only the exact state hash
             // confirms the move deliberately.
             if ctx.expect_state.is_none() && !own_scaffold_pin {
-                let _ = git::restore_after_pull(&ctx.config_dir, previous);
-                return Err(MusterError::Security(format!(
-                    "the pulled history is unrelated to the fleet this machine pinned \
-                     (epoch {}); the pulled changes were discarded and the pin kept. A \
-                     matching --expect-signer alone cannot replace the antirollback pin: \
-                     confirm the other fleet's exact state with `muster sync --pull \
-                     --expect-state <payload hash from `muster trust show` there>`",
-                    old.epoch
+                let restored = git::restore_after_pull(&ctx.config_dir, previous);
+                return Err(MusterError::Security(rollout_note(
+                    format!(
+                        "the pulled history is unrelated to the fleet this machine pinned \
+                         (epoch {}); a matching --expect-signer alone cannot replace the \
+                         antirollback pin: confirm the other fleet's exact state with \
+                         `muster sync --pull --expect-state <payload hash from `muster \
+                         trust show` there>`",
+                        old.epoch
+                    ),
+                    restored,
                 )));
             }
-            // The pin leaves the disk only when the replacement is accepted:
-            // keep the bytes so a failed post-drop verification restores the
-            // full state (pin + HEAD), never a machine without its boundary.
-            dropped_pin = std::fs::read(TrustAnchor::path(&ctx.state_dir)).ok();
-            let _ = std::fs::remove_file(TrustAnchor::path(&ctx.state_dir));
+            dropping = true;
             ctx.diag(Diagnostic::new(
                 Severity::Warning,
                 "fleet_rejoined",
@@ -673,23 +716,59 @@ pub fn verify_pulled(
             ));
         }
     }
+    // A confirmed unrelated join evaluates from genesis (first-use rules)
+    // even though the previous pin is still on disk; the pure verifier never
+    // sees the disk pin, so nothing to restore if it refuses. Every other
+    // path keeps the loaded pin.
+    let anchor = if dropping {
+        Anchor::Explicit(None)
+    } else {
+        Anchor::Explicit(pin.as_ref())
+    };
     let manifest = Manifest::load(&ctx.config_dir);
-    let result = manifest.and_then(|m| verify(ctx, &m, true));
+    let result = manifest.and_then(|m| verify_anchored(ctx, &m, true, anchor));
     if let Err(e) = result {
-        if let Some(bytes) = dropped_pin {
-            let _ = std::fs::write(TrustAnchor::path(&ctx.state_dir), bytes);
-        }
         let restored = git::restore_after_pull(&ctx.config_dir, previous);
-        let note = match restored {
-            Ok(()) => "the pulled changes were discarded and nothing was applied".to_string(),
-            Err(re) => format!("could not discard the pulled changes: {re}"),
-        };
-        return Err(match e {
-            MusterError::Security(m) => MusterError::Security(format!("{m}; {note}")),
-            other => other,
-        });
+        return Err(rollout_note_err(e, restored));
     }
     Ok(())
+}
+
+/// Appends the outcome of the HEAD rollback to a refusal message: rollback
+/// failures are reported, never silenced.
+fn rollout_note(message: impl std::fmt::Display, restored: Result<(), MusterError>) -> String {
+    match restored {
+        Ok(()) => format!("{message}; the pulled changes were discarded and nothing was applied"),
+        Err(re) => format!(
+            "{message}; ROLLBACK INCOMPLETE: the pulled changes may still be in the \
+             working repository ({re}); the previous pin was kept"
+        ),
+    }
+}
+
+/// Same, for an already-built error, preserving its kind (and with it the
+/// exit code and diagnostic code).
+fn rollout_note_err(e: MusterError, restored: Result<(), MusterError>) -> MusterError {
+    let Ok(()) = restored else {
+        let re = restored.unwrap_err();
+        return MusterError::Operational(format!(
+            "ROLLBACK INCOMPLETE after a refused pull: the pulled changes may still be in \
+             the working repository ({re}); the previous pin was kept. Original error: {e}"
+        ));
+    };
+    match e {
+        MusterError::Security(m) => MusterError::Security(format!(
+            "{m}; the pulled changes were discarded and nothing was applied"
+        )),
+        MusterError::Operational(m) => MusterError::Operational(format!(
+            "{m}; the pulled changes were discarded and nothing was applied"
+        )),
+        other => {
+            // Rare kinds keep their code; the incomplete-rollback case is
+            // impossible here (restore succeeded), so nothing is silenced.
+            other
+        }
+    }
 }
 
 /// Whether `state_dir` already holds a pin (used by `doctor`).

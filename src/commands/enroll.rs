@@ -175,6 +175,24 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         false
     };
 
+    // Over the Cloud transport a non-member cannot push bundles, so the
+    // signed request travels as an OPEN enrollment proposal on the linked
+    // workspace; the approver fetches it with `approve`. Idempotent: the
+    // service returns the existing open proposal for this device.
+    let mut proposal: Option<String> = None;
+    if let Some(link) = crate::cloud_client::CloudLink::load(&ctx.state_dir)? {
+        let payload = serde_json::to_value(&req)
+            .map_err(|_| MusterError::Operational("cannot encode the enrollment request".into()))?;
+        let id = crate::cloud_client::submit_enrollment_proposal(
+            &ctx.state_dir,
+            &link,
+            &payload,
+            &req.nonce,
+        )
+        .inspect_err(|_| ctx.mark_failed())?;
+        proposal = Some(id);
+    }
+
     Ok(json!({
         "machine": name,
         "recipient": identity.recipient(),
@@ -182,6 +200,7 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         "status": "pending",
         "request_path": path,
         "pushed": pushed,
+        "proposal": proposal,
         "approvals_preserved": req.approvals.len(),
     }))
 }
