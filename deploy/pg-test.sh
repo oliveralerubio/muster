@@ -90,6 +90,42 @@ pg_test_run_as() {
   fi
 }
 
+# Classify only complete, known server messages. Never print log contents:
+# PostgreSQL can put SQL or other caller data in arbitrary log records.
+pg_test_diagnostics() {
+  local pg_test_log="$pg_test_tmpdir/postgres.log"
+  [ -n "$pg_test_tmpdir" ] && [ -r "$pg_test_log" ] || return 0
+  tail -c 65536 -- "$pg_test_log" 2>/dev/null | LC_ALL=C awk '
+    length($0) > 512 { next }
+    !/^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9](\.[0-9]+)? [A-Z]+ \[[0-9]+\] (LOG|FATAL|PANIC):  / { next }
+    {
+      sub(/^[^]]*\] (LOG|FATAL|PANIC):  /, "")
+      label = ""
+      if ($0 ~ /^server process \(PID [0-9]+\) was terminated by signal [0-9]+(: [A-Za-z ]+)?$/) {
+        pid = $0; sub(/^server process \(PID /, "", pid); sub(/\).*$/, "", pid)
+        signal = $0; sub(/^.*signal /, "", signal); sub(/:.*/, "", signal)
+        label = "server process terminated by signal " signal " (PID " pid ")"
+      }
+      else if ($0 == "terminating any other active server processes") label = "terminating active server processes"
+      else if ($0 == "all server processes terminated; reinitializing") label = "reinitializing"
+      else if ($0 ~ /^database system was interrupted; last known up at [0-9-]+ [0-9:.]+ [A-Z]+$/) label = "database system interrupted"
+      else if ($0 == "database system was not properly shut down; automatic recovery in progress") label = "automatic recovery in progress"
+      else if ($0 ~ /^redo starts at [0-9A-F]+\/[0-9A-F]+$/) label = "recovery redo started"
+      else if ($0 ~ /^redo done at [0-9A-F]+\/[0-9A-F]+( system usage: CPU: user: [0-9.]+ s, system: [0-9.]+ s, elapsed: [0-9.]+ s)?$/) label = "recovery redo completed"
+      else if ($0 == "database system is ready to accept connections") label = "ready to accept connections"
+      else if ($0 == "database system is starting up") label = "database system starting up"
+      else if ($0 == "database system is shutting down" || $0 == "database system is shut down") label = "database system shutting down"
+      else if ($0 == "received fast shutdown request" || $0 == "received immediate shutdown request" || $0 == "received smart shutdown request") label = "shutdown requested"
+      else if ($0 == "out of memory") label = "out of memory"
+      if (label != "") records[++count % 20] = label
+    }
+    END {
+      start = count > 20 ? count - 19 : 1
+      for (i = start; i <= count; i++) print "pg-test.sh: PostgreSQL: " records[i % 20] > "/dev/stderr"
+    }
+  ' || true
+}
+
 # Stop only this run's cluster and delete only this run's temp dir. The
 # temp dir is removed ONLY once the cluster stop is confirmed (pg_ctl
 # success, postmaster.pid gone, or its postmaster no longer alive); if the
@@ -100,6 +136,9 @@ pg_test_cleanup() {
   [ -n "$pg_test_cleanup_done" ] && return 0
   pg_test_cleanup_done=1
   trap '' HUP INT TERM EXIT
+  if [ "$pg_test_status" -ne 0 ]; then
+    pg_test_diagnostics
+  fi
   local pg_test_stop_ok=""
   if [ -n "$pg_test_data" ] && [ -f "$pg_test_data/postmaster.pid" ]; then
     if pg_test_run_as "$pg_test_ctl" -D "$pg_test_data" -m fast -t 20 stop >/dev/null 2>&1 \
@@ -249,8 +288,7 @@ PG_TEST_CONF
 
   if ! pg_test_run_as "$pg_test_ctl" -D "$pg_test_data" -l "$pg_test_tmpdir/postgres.log" \
         -w -t 60 start >/dev/null; then
-    tail -n 20 "$pg_test_tmpdir/postgres.log" >&2 2>/dev/null || true
-    pg_test_fail "postgres failed to start (log tail above)" "$PG_TEST_EXIT_START"
+    pg_test_fail "postgres failed to start" "$PG_TEST_EXIT_START"
   fi
 
   local pg_test_isready=""
@@ -260,8 +298,7 @@ PG_TEST_CONF
     for pg_test_i in 1 2 3 4 5; do
       "$pg_test_isready" -d "postgres://postgres@localhost/postgres?host=$pg_test_socket_dir" >/dev/null 2>&1 && break
       if [ "$pg_test_i" = 5 ]; then
-        tail -n 20 "$pg_test_tmpdir/postgres.log" >&2 2>/dev/null || true
-        pg_test_fail "cluster did not accept connections (log tail above)" "$PG_TEST_EXIT_START"
+        pg_test_fail "cluster did not accept connections" "$PG_TEST_EXIT_START"
       fi
       sleep 1
     done
