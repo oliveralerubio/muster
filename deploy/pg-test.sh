@@ -97,26 +97,42 @@ pg_test_diagnostics() {
   [ -n "$pg_test_tmpdir" ] && [ -r "$pg_test_log" ] || return 0
   tail -c 65536 -- "$pg_test_log" 2>/dev/null | LC_ALL=C awk '
     length($0) > 512 { next }
-    !/^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9](\.[0-9]+)? [A-Z]+ \[[0-9]+\] (LOG|FATAL|PANIC):  / { next }
+    !/^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9](\.[0-9]+)? ([A-Z]+|[-+][0-9][0-9](:[0-9][0-9])?) \[[0-9]+\] (LOG|ERROR|FATAL|PANIC):  / { next }
     {
-      sub(/^[^]]*\] (LOG|FATAL|PANIC):  /, "")
+      severity = $0
+      sub(/^[^]]*\] /, "", severity); sub(/:.*/, "", severity)
+      sub(/^[^]]*\] (LOG|ERROR|FATAL|PANIC):  /, "")
       label = ""
-      if ($0 ~ /^server process \(PID [0-9]+\) was terminated by signal [0-9]+(: [A-Za-z ]+)?$/) {
-        pid = $0; sub(/^server process \(PID /, "", pid); sub(/\).*$/, "", pid)
-        signal = $0; sub(/^.*signal /, "", signal); sub(/:.*/, "", signal)
-        label = "server process terminated by signal " signal " (PID " pid ")"
+      role = $0; sub(/ \(PID .*/, "", role)
+      if (role ~ /^(server process|client backend|background writer|checkpointer|WAL writer|walwriter|startup process|archiver process|autovacuum launcher|autovacuum worker|logical replication launcher|logical replication worker|background worker "(logical replication launcher|parallel worker)")$/ &&
+          $0 ~ / \(PID [0-9]+\) (was terminated by signal [0-9]+(: [A-Za-z ]+)?|exited with exit code [0-9]+)$/) {
+        pid = $0; sub(/^.* \(PID /, "", pid); sub(/\).*$/, "", pid)
+        if ($0 ~ / was terminated by signal /) {
+          number = $0; sub(/^.*signal /, "", number); sub(/:.*/, "", number)
+          label = role " terminated by signal " number " (PID " pid ")"
+        } else {
+          number = $0; sub(/^.*exit code /, "", number)
+          label = role " exited with code " number " (PID " pid ")"
+        }
       }
       else if ($0 == "terminating any other active server processes") label = "terminating active server processes"
       else if ($0 == "all server processes terminated; reinitializing") label = "reinitializing"
-      else if ($0 ~ /^database system was interrupted; last known up at [0-9-]+ [0-9:.]+ [A-Z]+$/) label = "database system interrupted"
+      else if ($0 ~ /^database system was interrupted; last known up at [0-9-]+ [0-9:.]+ ([A-Z]+|[-+][0-9][0-9](:[0-9][0-9])?)$/) label = "database system interrupted"
       else if ($0 == "database system was not properly shut down; automatic recovery in progress") label = "automatic recovery in progress"
       else if ($0 ~ /^redo starts at [0-9A-F]+\/[0-9A-F]+$/) label = "recovery redo started"
+      else if ($0 == "redo is not required") label = "recovery redo not required"
       else if ($0 ~ /^redo done at [0-9A-F]+\/[0-9A-F]+( system usage: CPU: user: [0-9.]+ s, system: [0-9.]+ s, elapsed: [0-9.]+ s)?$/) label = "recovery redo completed"
       else if ($0 == "database system is ready to accept connections") label = "ready to accept connections"
       else if ($0 == "database system is starting up") label = "database system starting up"
       else if ($0 == "database system is shutting down" || $0 == "database system is shut down") label = "database system shutting down"
       else if ($0 == "received fast shutdown request" || $0 == "received immediate shutdown request" || $0 == "received smart shutdown request") label = "shutdown requested"
-      else if ($0 == "out of memory") label = "out of memory"
+      else if ($0 == "out of memory" || $0 ~ /: (Out of memory|Cannot allocate memory)$/) label = "out of memory"
+      else if ($0 ~ /: No space left on device$/) label = "no space left on device"
+      else if ($0 ~ /: Disk quota exceeded$/) label = "disk quota exceeded"
+      else if ($0 ~ /: Too many open files$/) label = "process file limit reached"
+      else if ($0 ~ /: Too many open files in system$/) label = "system file limit reached"
+      else if ($0 ~ /: Permission denied$/) label = "permission denied"
+      else if (severity == "FATAL" || severity == "PANIC") label = severity " (unclassified)"
       if (label != "") records[++count % 20] = label
     }
     END {
