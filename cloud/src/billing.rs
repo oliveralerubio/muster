@@ -311,10 +311,8 @@ pub async fn create_checkout(
     // and retries see the same open checkout instead of each creating a
     // payable Paddle transaction.
     let mut tx = state.db.begin().await?;
-    sqlx::query("SELECT id FROM workspaces WHERE id = $1 FOR UPDATE")
-        .bind(ws)
-        .fetch_one(&mut *tx)
-        .await?;
+    // Also serialises with a deletion request: none after it.
+    crate::lifecycle::lock_writable(&mut tx, ws, true).await?;
     if current_subscription(&mut *tx, ws)
         .await?
         .is_some_and(|(_, status, ..)| status != "canceled")
@@ -567,7 +565,9 @@ pub async fn cancel_subscription(
     };
 
     // The row lock serialises concurrent cancels of the same subscription.
+    // After a deletion request the provider work cancels immediately.
     let mut tx = state.db.begin().await?;
+    crate::lifecycle::lock_writable(&mut tx, ws, true).await?;
     let sub_row: Option<(String, String, bool)> = sqlx::query_as(
         "SELECT paddle_subscription_id, status, cancel_at_period_end FROM subscriptions
           WHERE workspace_id = $1
@@ -634,6 +634,10 @@ pub async fn update_plan(
         &paddle.price_personal
     };
 
+    // Under the workspace row lock: serialised with checkouts and with a
+    // deletion request (no plan change after it).
+    let mut tx = state.db.begin().await?;
+    crate::lifecycle::lock_writable(&mut tx, ws, true).await?;
     let sub_row: Option<(String,)> = sqlx::query_as(
         "SELECT paddle_subscription_id FROM subscriptions
           WHERE workspace_id = $1 AND status <> 'canceled'
@@ -641,7 +645,7 @@ pub async fn update_plan(
           LIMIT 1",
     )
     .bind(ws)
-    .fetch_optional(&state.db)
+    .fetch_optional(&mut *tx)
     .await?;
 
     let (sub_id,) = sub_row
@@ -671,7 +675,6 @@ pub async fn update_plan(
     }
 
     // Entitlements follow Paddle's canonical subscription.
-    let mut tx = state.db.begin().await?;
     crate::billing_reconcile::enqueue(&mut tx, &sub_id, ws).await?;
     tx.commit().await?;
     crate::billing_reconcile::run_now(&state, &sub_id).await;

@@ -240,6 +240,10 @@ pub async fn post_sync(
         .bind(idem_key.to_string())
         .execute(&mut *tx)
         .await?;
+    // One publication at a time per workspace, and none (not even a stored
+    // replay) once a deletion request is acknowledged: the lock and the
+    // check come BEFORE the idempotency cache.
+    crate::lifecycle::lock_writable(&mut tx, ws_id, true).await?;
 
     let body_hash = crate::auth::sha256(&body);
     let path = uri.path().to_string();
@@ -264,12 +268,6 @@ pub async fn post_sync(
         }
         return Ok(resp);
     }
-
-    // One publication at a time per workspace.
-    sqlx::query("SELECT id FROM workspaces WHERE id = $1 FOR UPDATE")
-        .bind(ws_id)
-        .execute(&mut *tx)
-        .await?;
 
     // Check plan entitlements (paid subscriptions or active trial).
     let sub = crate::billing::current_subscription(&mut *tx, ws_id).await?;

@@ -21,6 +21,11 @@
 //! ahead of it or divergent fails closed. Nothing here ever creates an
 //! authority implicitly: only [`Authority::init`] (ops, pristine targets).
 //!
+//! Deletion requests (`workspace_deletion_requested`) and the provider
+//! objects they must cancel (`deletion_provider_item`) are journaled here
+//! before they are acknowledged, so restoring an older dump cannot undo a
+//! request or forget what to cancel: replay projects them back.
+//!
 //! Physical assumption: losing or rolling back the journal AND the witness
 //! together, with an equally old database, is undetectable; keep the
 //! witness on a different device than the control directory, and both out
@@ -32,7 +37,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 const JOURNAL: &str = "journal.v1.jsonl";
@@ -110,6 +115,120 @@ pub enum Record {
     IncarnationRegistered { incarnation_id: Uuid },
     /// The incarnation that may serve; every other one is fenced.
     IncarnationActivated { incarnation_id: Uuid },
+    /// An owner-confirmed request to delete a workspace. Deadlines are
+    /// fixed here (Unix microseconds) and never recomputed or extended.
+    WorkspaceDeletionRequested {
+        workspace_id: Uuid,
+        request_id: Uuid,
+        requested_by: Uuid,
+        requested_at_us: i64,
+        primary_purge_at_us: i64,
+        backup_cap_at_us: i64,
+        /// Provider subscriptions to cancel immediately.
+        subscriptions: Vec<String>,
+        /// Open provider checkout transactions to cancel.
+        checkouts: Vec<String>,
+    },
+    /// A provider object found after the request (a checkout paid in the
+    /// meantime, a late subscription) that must be canceled too.
+    DeletionProviderItem {
+        workspace_id: Uuid,
+        request_id: Uuid,
+        item: ProviderItem,
+        provider_id: String,
+    },
+}
+
+/// Kind of provider object a deletion request cancels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderItem {
+    Subscription,
+    Checkout,
+}
+
+impl ProviderItem {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProviderItem::Subscription => "subscription",
+            ProviderItem::Checkout => "checkout",
+        }
+    }
+}
+
+fn from_us(us: i64) -> Result<time::OffsetDateTime, ControlError> {
+    time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(us) * 1000)
+        .map_err(|e| fail(format!("journal timestamp out of range: {e}")))
+}
+
+/// Writes the database projection of one record (idempotent: replaying a
+/// record already projected changes nothing).
+async fn project(tx: &mut Transaction<'_, Postgres>, entry: &Entry) -> Result<(), ControlError> {
+    let insert_item =
+        "INSERT INTO lifecycle_provider_items (item, provider_id, workspace_id, request_id)
+         VALUES ($1, $2, $3, $4) ON CONFLICT (item, provider_id) DO NOTHING";
+    match &entry.record {
+        Record::Genesis { .. }
+        | Record::IncarnationRegistered { .. }
+        | Record::IncarnationActivated { .. } => {}
+        Record::WorkspaceDeletionRequested {
+            workspace_id,
+            request_id,
+            requested_by,
+            requested_at_us,
+            primary_purge_at_us,
+            backup_cap_at_us,
+            subscriptions,
+            checkouts,
+        } => {
+            sqlx::query(
+                "INSERT INTO workspace_lifecycle
+                   (workspace_id, request_id, requested_by, requested_at, primary_purge_at, backup_cap_at, journal_seq)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT DO NOTHING",
+            )
+            .bind(workspace_id)
+            .bind(request_id)
+            .bind(requested_by)
+            .bind(from_us(*requested_at_us)?)
+            .bind(from_us(*primary_purge_at_us)?)
+            .bind(from_us(*backup_cap_at_us)?)
+            .bind(entry.seq as i64)
+            .execute(&mut **tx)
+            .await
+            .map_err(db_err)?;
+            for (item, ids) in [
+                (ProviderItem::Subscription, subscriptions),
+                (ProviderItem::Checkout, checkouts),
+            ] {
+                for id in ids {
+                    sqlx::query(insert_item)
+                        .bind(item.as_str())
+                        .bind(id)
+                        .bind(workspace_id)
+                        .bind(request_id)
+                        .execute(&mut **tx)
+                        .await
+                        .map_err(db_err)?;
+                }
+            }
+        }
+        Record::DeletionProviderItem {
+            workspace_id,
+            request_id,
+            item,
+            provider_id,
+        } => {
+            sqlx::query(insert_item)
+                .bind(item.as_str())
+                .bind(provider_id)
+                .bind(workspace_id)
+                .bind(request_id)
+                .execute(&mut **tx)
+                .await
+                .map_err(db_err)?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,7 +271,7 @@ impl CrashPoint {
 
 fn crash_if(at: Option<CrashPoint>, here: CrashPoint) {
     if at == Some(here) {
-        eprintln!("muster-cloud-ops: injected crash at {here:?}");
+        eprintln!("injected crash at {here:?}");
         std::process::abort();
     }
 }
@@ -490,6 +609,15 @@ impl Authority {
         record: Record,
         crash: Option<CrashPoint>,
     ) -> Result<u64, ControlError> {
+        // One deletion request per workspace, enforced here as well: its
+        // deadlines can never be replaced by a second record.
+        if let Record::WorkspaceDeletionRequested { workspace_id, .. } = &record {
+            if self.deletion_request(*workspace_id).is_some() {
+                return Err(ControlError::Usage(format!(
+                    "workspace {workspace_id} already has a deletion request"
+                )));
+            }
+        }
         let (head, prev) = self.journal.head();
         let entry = Entry {
             v: SCHEMA,
@@ -527,8 +655,29 @@ impl Authority {
     /// Checks the database binding against the journal and, unless
     /// `read_only`, projects the records it is missing.
     pub async fn bind_db(&self, db: &PgPool, read_only: bool) -> Result<DbStatus, ControlError> {
-        let (deployment_id, control_store_id) = self.journal.ids()?;
         let mut tx = db.begin().await.map_err(db_err)?;
+        let status = self.bind_in(&mut tx, read_only).await?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(status)
+    }
+
+    /// [`Authority::bind_db`] (writer) inside the caller's transaction,
+    /// which then holds the binding row lock: records appended with
+    /// [`Authority::append_projected`] are projected in that same
+    /// transaction, before it acknowledges anything.
+    pub async fn bind_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+    ) -> Result<DbStatus, ControlError> {
+        self.bind_in(tx, false).await
+    }
+
+    async fn bind_in(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        read_only: bool,
+    ) -> Result<DbStatus, ControlError> {
+        let (deployment_id, control_store_id) = self.journal.ids()?;
         // A read-only gate takes no row lock (PostgreSQL refuses FOR UPDATE in a
         // read-only transaction); a writer serialises replays with it.
         let query = if read_only {
@@ -539,7 +688,7 @@ impl Authority {
                FROM control_binding WHERE singleton FOR UPDATE"
         };
         let row: Option<(Uuid, Uuid, Uuid, i64, String)> =
-            match sqlx::query_as(query).fetch_optional(&mut *tx).await {
+            match sqlx::query_as(query).fetch_optional(&mut **tx).await {
                 Ok(row) => row,
                 // No binding table at all: a database from before the authority
                 // (or never migrated). Refused like an unbound one, never migrated
@@ -572,26 +721,103 @@ impl Authority {
         let role = self.journal.role_of(incarnation_id)?;
         let mut replayed = 0;
         if applied < head && !read_only {
-            // Unit 1 records carry no tenant projection beyond the applied
-            // position; later record kinds are applied here, in order.
+            for entry in &self.journal.entries[applied as usize..head as usize] {
+                project(tx, entry).await?;
+            }
             sqlx::query(
                 "UPDATE control_binding SET applied_seq = $1, applied_hash = $2, updated_at = now()
                   WHERE singleton",
             )
             .bind(head as i64)
             .bind(&head_hash)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .map_err(db_err)?;
             replayed = head - applied;
         }
-        tx.commit().await.map_err(db_err)?;
         Ok(DbStatus {
             incarnation_id,
             applied_sequence: applied + replayed,
             role,
             replayed,
         })
+    }
+
+    /// Appends `record` and projects it into `tx`, which must have been
+    /// bound with [`Authority::bind_tx`] (binding row locked, projection at
+    /// the journal head). The caller acknowledges only after committing;
+    /// a crash before that commit is repaired by replay.
+    pub async fn append_projected(
+        &mut self,
+        tx: &mut Transaction<'_, Postgres>,
+        record: Record,
+        crash: Option<CrashPoint>,
+    ) -> Result<u64, ControlError> {
+        // Short, bounded file I/O with fsync: keep it off the async workers.
+        let seq = tokio::task::block_in_place(|| self.append(record, crash))?;
+        let entry = self.journal.entries.last().expect("just appended").clone();
+        project(tx, &entry).await?;
+        let (_, hash) = self.journal.head();
+        sqlx::query(
+            "UPDATE control_binding SET applied_seq = $1, applied_hash = $2, updated_at = now()
+              WHERE singleton AND applied_seq = $3",
+        )
+        .bind(seq as i64)
+        .bind(&hash)
+        .bind(seq as i64 - 1)
+        .execute(&mut **tx)
+        .await
+        .map_err(db_err)
+        .and_then(|r| {
+            if r.rows_affected() == 1 {
+                Ok(())
+            } else {
+                Err(fail("database projection moved while appending"))
+            }
+        })?;
+        Ok(seq)
+    }
+
+    /// The deletion request journaled for `workspace_id`, if any.
+    pub fn deletion_request(&self, workspace_id: Uuid) -> Option<&Record> {
+        self.journal.entries.iter().map(|e| &e.record).find(|r| {
+            matches!(r, Record::WorkspaceDeletionRequested { workspace_id: w, .. } if *w == workspace_id)
+        })
+    }
+
+    /// Provider items already journaled for `workspace_id` (at request time
+    /// or later).
+    pub fn deletion_items(&self, workspace_id: Uuid) -> Vec<(ProviderItem, String)> {
+        let mut out = Vec::new();
+        for e in &self.journal.entries {
+            match &e.record {
+                Record::WorkspaceDeletionRequested {
+                    workspace_id: w,
+                    subscriptions,
+                    checkouts,
+                    ..
+                } if *w == workspace_id => {
+                    out.extend(
+                        subscriptions
+                            .iter()
+                            .map(|s| (ProviderItem::Subscription, s.clone())),
+                    );
+                    out.extend(
+                        checkouts
+                            .iter()
+                            .map(|c| (ProviderItem::Checkout, c.clone())),
+                    );
+                }
+                Record::DeletionProviderItem {
+                    workspace_id: w,
+                    item,
+                    provider_id,
+                    ..
+                } if *w == workspace_id => out.push((*item, provider_id.clone())),
+                _ => {}
+            }
+        }
+        out
     }
 
     /// Joins a new, unbound database as a candidate incarnation.
@@ -811,6 +1037,32 @@ fn initial_journal(
         text.push('\n');
     }
     Ok((text, prev))
+}
+
+/// Opens the authority on the blocking pool (it waits on the cross-process
+/// lock for at most `LOCK_WAIT`), for request handlers.
+pub async fn open_async(paths: &ControlPaths) -> Result<Authority, ControlError> {
+    let owned = paths.clone();
+    tokio::task::spawn_blocking(move || Authority::open(&owned))
+        .await
+        .map_err(|e| ControlError::Io(format!("control store task: {e}")))?
+}
+
+/// Opens the authority and binds the caller's transaction as the serving
+/// writer: the projection is caught up in `tx` and this incarnation must be
+/// `active` (a fenced or candidate database never journals).
+pub async fn open_for_write(
+    paths: &ControlPaths,
+    tx: &mut Transaction<'_, Postgres>,
+) -> Result<Authority, ControlError> {
+    let authority = open_async(paths).await?;
+    let status = authority.bind_tx(tx).await?;
+    if status.role != Role::Active {
+        return Err(fail(
+            format!("this database incarnation is {:?}, not active", status.role).to_lowercase(),
+        ));
+    }
+    Ok(authority)
 }
 
 /// What the service runs at startup and on every readiness probe: open and

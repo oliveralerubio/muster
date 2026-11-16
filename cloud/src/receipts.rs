@@ -74,6 +74,8 @@ pub async fn submit_receipt(
     })?;
 
     let mut tx = state.db.begin().await?;
+    // Refused, replays included, once deletion is requested.
+    crate::lifecycle::lock_writable(&mut tx, device.workspace_id, false).await?;
 
     type ExistingRow = (String, i64, String, OffsetDateTime, OffsetDateTime, String);
     let existing: Option<ExistingRow> = sqlx::query_as(

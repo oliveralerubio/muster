@@ -126,6 +126,8 @@ pub async fn create_invitation(
     let now = OffsetDateTime::now_utc();
     let expires_at = now + time::Duration::days(INVITATION_TTL_DAYS);
 
+    let mut tx = state.db.begin().await?;
+    crate::lifecycle::lock_writable(&mut tx, ws, false).await?;
     sqlx::query(
         "INSERT INTO invitations (id, workspace_id, email, role, token_hash, invited_by, created_at, expires_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
@@ -138,8 +140,9 @@ pub async fn create_invitation(
     .bind(account.user_id)
     .bind(now)
     .bind(expires_at)
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
 
     let created = CreatedInvitation {
         invitation: Invitation {
@@ -265,6 +268,7 @@ pub async fn accept_invitation(
         ));
     }
 
+    crate::lifecycle::lock_writable(&mut tx, ws_id, false).await?;
     let role = Role::parse(&role_str).unwrap_or(Role::Member);
     sqlx::query(
         "INSERT INTO memberships (workspace_id, user_id, role)

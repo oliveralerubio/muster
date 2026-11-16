@@ -25,9 +25,11 @@ type WorkspaceRow = (
     OffsetDateTime,
     OffsetDateTime,
     OffsetDateTime,
+    bool,
 );
 
-const SELECT_FOR_MEMBER: &str = "SELECT w.id, w.name, m.role, w.created_at, w.trial_ends_at, now()
+const SELECT_FOR_MEMBER: &str = "SELECT w.id, w.name, m.role, w.created_at, w.trial_ends_at, now(),
+            EXISTS (SELECT 1 FROM workspace_lifecycle l WHERE l.workspace_id = w.id)
      FROM workspaces w JOIN memberships m ON m.workspace_id = w.id AND m.user_id = $1";
 
 fn rfc3339(t: OffsetDateTime) -> Result<String, AppError> {
@@ -35,7 +37,7 @@ fn rfc3339(t: OffsetDateTime) -> Result<String, AppError> {
 }
 
 fn to_dto(
-    (id, name, role, created_at, trial_ends_at, now): WorkspaceRow,
+    (id, name, role, created_at, trial_ends_at, now, deletion_requested): WorkspaceRow,
 ) -> Result<Workspace, AppError> {
     let role =
         Role::parse(&role).ok_or_else(|| AppError::internal(format!("unknown role {role:?}")))?;
@@ -52,6 +54,11 @@ fn to_dto(
         plan_status,
         trial_ends_at: rfc3339(trial_ends_at)?,
         created_at: rfc3339(created_at)?,
+        lifecycle_state: if deletion_requested {
+            crate::protocol::LifecycleState::DeletionScheduled
+        } else {
+            crate::protocol::LifecycleState::Active
+        },
     })
 }
 
@@ -208,82 +215,4 @@ pub async fn detail(
         .fetch_optional(&state.db)
         .await?;
     to_dto(row.ok_or_else(AppError::not_found)?).map(Json)
-}
-
-/// `DELETE /v1/workspaces/{ws}`: scheduled deletion with 30-day export window
-/// and 35-day backup retention. Returns `202 Accepted`.
-pub async fn delete_workspace(
-    State(state): State<AppState>,
-    account: crate::auth::account::Account,
-    Path(ws_str): Path<String>,
-) -> Result<(StatusCode, Json<crate::protocol::DeleteWorkspaceResponse>), AppError> {
-    account.require_scope(crate::protocol::scopes::WORKSPACES_WRITE)?;
-    let id = uuid::Uuid::parse_str(&ws_str).map_err(|_| AppError::not_found())?;
-
-    let mut tx = state.db.begin().await?;
-
-    let role_row: Option<(String,)> = sqlx::query_as(
-        "SELECT role FROM memberships WHERE workspace_id = $1 AND user_id = $2 FOR UPDATE",
-    )
-    .bind(id)
-    .bind(account.user_id)
-    .fetch_optional(&mut *tx)
-    .await?;
-
-    let (role,) = role_row.ok_or_else(AppError::not_found)?;
-    if role != "owner" {
-        return Err(AppError::new(
-            StatusCode::FORBIDDEN,
-            crate::protocol::error_codes::FORBIDDEN_ROLE,
-            "only owners can delete a workspace",
-        ));
-    }
-
-    let now = OffsetDateTime::now_utc();
-    let export_until = now + time::Duration::days(30);
-    let primary_purge = now + time::Duration::days(30);
-    let backups_expire = now + time::Duration::days(35);
-
-    sqlx::query(
-        "UPDATE workspaces
-         SET deleted_at = $1, export_until = $2, primary_purge_at = $3, backups_expire_at = $4
-         WHERE id = $5",
-    )
-    .bind(now)
-    .bind(export_until)
-    .bind(primary_purge)
-    .bind(backups_expire)
-    .bind(id)
-    .execute(&mut *tx)
-    .await?;
-
-    // Revoke transport tokens for devices
-    sqlx::query("UPDATE devices SET status = 'revoked' WHERE workspace_id = $1")
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
-
-    // Cancel active subscriptions
-    sqlx::query(
-        "UPDATE subscriptions
-         SET status = 'canceled', canceled_at = $1
-         WHERE workspace_id = $2 AND status != 'canceled'",
-    )
-    .bind(now)
-    .bind(id)
-    .execute(&mut *tx)
-    .await?;
-
-    tx.commit().await?;
-
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(crate::protocol::DeleteWorkspaceResponse {
-            workspace_id: id.to_string(),
-            status: "scheduled_for_deletion".into(),
-            export_until: rfc3339(export_until)?,
-            primary_purge_at: rfc3339(primary_purge)?,
-            backups_expire_at: rfc3339(backups_expire)?,
-        }),
-    ))
 }

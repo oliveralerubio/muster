@@ -37,6 +37,14 @@ pub struct Config {
     /// plan's `max_storage_bytes`, in `GET /billing` and in the guard alike,
     /// so tests can reach the limit. Refused in production.
     pub dev_storage_limit: Option<u64>,
+    /// Development only (`MUSTER_DEV_DELETION_GRACE_SECS`): primary grace of
+    /// new deletion requests in seconds (backup cap keeps the 30:35 ratio),
+    /// so `due` can be reached in tests. Refused in production.
+    pub dev_deletion_grace_secs: Option<u64>,
+    /// Development only (`MUSTER_DEV_LIFECYCLE_CRASH`, `after_journal` or
+    /// `after_witness`): abort while journaling a deletion request, to test
+    /// replay. Refused in production.
+    pub dev_lifecycle_crash: Option<crate::control::CrashPoint>,
     /// Lifecycle authority (`crate::control`): journal directory and its
     /// independent witness file. Mandatory everywhere; never created by
     /// the service.
@@ -228,6 +236,39 @@ impl Config {
             })?),
         };
 
+        let dev_deletion_grace_secs =
+            match get("MUSTER_DEV_DELETION_GRACE_SECS") {
+                None => None,
+                Some(_) if env.is_production() => return Err(ConfigError::Invalid {
+                    name: "MUSTER_DEV_DELETION_GRACE_SECS",
+                    reason:
+                        "is a development-only setting; the deletion grace is fixed in production"
+                            .into(),
+                }),
+                Some(v) => Some(v.parse::<u64>().ok().filter(|s| *s >= 1).ok_or_else(|| {
+                    ConfigError::Invalid {
+                        name: "MUSTER_DEV_DELETION_GRACE_SECS",
+                        reason: "expected a whole number of seconds, at least 1".into(),
+                    }
+                })?),
+            };
+        let dev_lifecycle_crash =
+            match get("MUSTER_DEV_LIFECYCLE_CRASH") {
+                None => None,
+                Some(_) if env.is_production() => {
+                    return Err(ConfigError::Invalid {
+                        name: "MUSTER_DEV_LIFECYCLE_CRASH",
+                        reason: "is a development-only crash injection".into(),
+                    })
+                }
+                Some(v) => Some(crate::control::CrashPoint::parse(&v).ok_or_else(|| {
+                    ConfigError::Invalid {
+                        name: "MUSTER_DEV_LIFECYCLE_CRASH",
+                        reason: "expected after_journal or after_witness".into(),
+                    }
+                })?),
+            };
+
         let control = control_paths(&get, &repo_root)?;
 
         Ok(Self {
@@ -241,6 +282,8 @@ impl Config {
             repo_root,
             paddle,
             dev_storage_limit,
+            dev_deletion_grace_secs,
+            dev_lifecycle_crash,
             control,
         })
     }

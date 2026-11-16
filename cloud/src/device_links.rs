@@ -95,11 +95,9 @@ pub async fn link_device(
 
     let role = member_role.ok_or_else(AppError::not_found)?;
 
-    // Serialises links (and the bootstrap claim) per workspace.
-    sqlx::query("SELECT id FROM workspaces WHERE id = $1 FOR UPDATE")
-        .bind(ws_id)
-        .execute(&mut *tx)
-        .await?;
+    // Serialises links (and the bootstrap claim) per workspace; no link,
+    // new or replayed, once a deletion request is acknowledged.
+    crate::lifecycle::lock_writable(&mut tx, ws_id, true).await?;
 
     // Lock on idempotency key for this user & workspace
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1::text), hashtext($2::text))")

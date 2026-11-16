@@ -103,6 +103,12 @@ async fn main() -> ExitCode {
             Duration::from_secs(1),
         ));
     }
+    // Retries pending immediate cancellations of deletion requests,
+    // including those left by a previous process.
+    tokio::spawn(muster_cloud::lifecycle_provider::worker(
+        state.clone(),
+        Duration::from_secs(1),
+    ));
     println!("muster-cloud listening on http://{addr}");
     if let Err(err) = axum::serve(listener, muster_cloud::router(state)).await {
         eprintln!("muster-cloud: server error: {err}");

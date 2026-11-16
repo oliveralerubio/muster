@@ -390,19 +390,23 @@ pub async fn create(
                 ));
             }
 
+            let mut tx = state.db.begin().await?;
+            // Refused (replays included) once deletion is requested. FOR
+            // UPDATE: the storage guard below takes it too, and upgrading a
+            // shared lock held by concurrent requests would deadlock.
+            crate::lifecycle::lock_writable(&mut tx, ws, true).await?;
             // Check if there is already an open enrollment proposal for this device.
             let existing: Option<ProposalRow> = sqlx::query_as(&format!(
                 "{SELECT_PROPOSAL} WHERE device_id = $1 AND kind = 'enrollment' AND status = 'open'"
             ))
             .bind(dev.id)
-            .fetch_optional(&state.db)
+            .fetch_optional(&mut *tx)
             .await?;
 
             if let Some(row) = existing {
                 return Ok((StatusCode::OK, Json(to_dto(row)?)));
             }
 
-            let mut tx = state.db.begin().await?;
             let size = stored_size(&mut tx, &req.payload).await?;
             crate::billing::ensure_storage_fits(&state, &mut tx, ws, size).await?;
             let id = Uuid::new_v4();
@@ -452,6 +456,8 @@ pub async fn create(
             }
 
             let mut tx = state.db.begin().await?;
+            // FOR UPDATE, as the storage guard takes (no shared-lock upgrade).
+            crate::lifecycle::lock_writable(&mut tx, ws, true).await?;
             let size = stored_size(&mut tx, &req.payload).await?;
             crate::billing::ensure_storage_fits(&state, &mut tx, ws, size).await?;
             let id = Uuid::new_v4();
@@ -519,6 +525,7 @@ pub async fn resolve(
     let req: ResolveProposal = parse_json(&body)?;
 
     let mut tx = state.db.begin().await?;
+    crate::lifecycle::lock_writable(&mut tx, ws, false).await?;
 
     let row: Option<ProposalRow> = sqlx::query_as(&format!(
         "{SELECT_PROPOSAL} WHERE workspace_id = $1 AND id = $2 FOR UPDATE"

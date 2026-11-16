@@ -15,6 +15,8 @@ pub mod control;
 pub mod device_links;
 pub mod error;
 pub mod history;
+pub mod lifecycle;
+pub mod lifecycle_provider;
 pub mod members;
 pub mod proposals;
 pub mod receipts;
@@ -48,7 +50,11 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             protocol::routes::WORKSPACE,
-            get(tenancy::detail).delete(tenancy::delete_workspace),
+            get(tenancy::detail).delete(lifecycle::request_deletion),
+        )
+        .route(
+            protocol::routes::WORKSPACE_LIFECYCLE,
+            get(lifecycle::get_lifecycle),
         )
         .route(
             protocol::routes::WORKSPACE_MEMBERS,

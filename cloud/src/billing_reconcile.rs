@@ -389,5 +389,12 @@ async fn apply(
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
+    if c.status != "canceled" {
+        // Live after a deletion request (late completion, reactivation):
+        // cancel it immediately too. A failure retries this job.
+        crate::lifecycle_provider::register_live_subscription(state, ws, sub_id)
+            .await
+            .map_err(|e| Failure::Transient(format!("deletion cancellation: {}", e.message)))?;
+    }
     Ok(())
 }

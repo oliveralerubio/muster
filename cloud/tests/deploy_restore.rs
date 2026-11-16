@@ -294,3 +294,71 @@ async fn restore_refuses_a_stale_authority() {
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     assert_restored_serves(&s, &t).await;
 }
+
+/// A deletion request made AFTER the backup survives restoring that older
+/// backup: the record lives in the external journal, and the service on the
+/// restored targets replays it before it is ready.
+#[tokio::test]
+async fn a_restored_older_backup_still_carries_a_later_deletion_request() {
+    let s = stack().await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let ws = support::fleet::create_workspace(&s, &alice, "Kept Gone").await;
+    let bk_dir = tempfile::tempdir().unwrap();
+    let bk = backup(&s, bk_dir.path()).await;
+
+    let resp = http()
+        .delete(s.url(&format!("/v1/workspaces/{}", ws.id)))
+        .header("Cookie", format!("__Host-mc_session={}", alice.cookie))
+        .header("Origin", s.origin())
+        .header("X-CSRF-Token", &alice.csrf_token)
+        .header("Idempotency-Key", uuid::Uuid::new_v4().to_string())
+        .json(&serde_json::json!({
+            "confirm_workspace_id": ws.id,
+            "confirm_workspace_name": "Kept Gone",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 202);
+    let requested: serde_json::Value = resp.json().await.unwrap();
+
+    let t = new_target();
+    let out = restore(&bk, &t, Some(&s.env)).await;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let env = with(
+        &with(
+            &with(
+                &with(&s.env, "MUSTER_DATABASE_URL", &t.url),
+                "MUSTER_REPO_ROOT",
+                &t.repos.display().to_string(),
+            ),
+            "MUSTER_BIND",
+            &format!("127.0.0.1:{port}"),
+        ),
+        "MUSTER_PUBLIC_URL",
+        &format!("http://127.0.0.1:{port}"),
+    );
+    let cloud = spawn_cloud(&env).await;
+    let resp = http()
+        .get(format!("{}/v1/workspaces/{}/lifecycle", cloud.base, ws.id))
+        .header("Cookie", format!("__Host-mc_session={}", alice.cookie))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let seen: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(seen["state"], "deletion_scheduled", "{seen}");
+    assert_eq!(
+        seen["deletion"]["request_id"],
+        requested["deletion"]["request_id"]
+    );
+    assert_eq!(
+        seen["deletion"]["export_until"],
+        requested["deletion"]["export_until"]
+    );
+}

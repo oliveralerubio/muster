@@ -188,42 +188,54 @@ async fn workspace_creation_idempotency_and_mismatch_rejection() {
     assert_eq!(err.error.code, "idempotency_mismatch");
 }
 
+// The deletion request (owner confirmation, idempotency, deadlines, guards,
+// provider cancellation) is covered in `api_lifecycle.rs`.
 #[tokio::test]
-async fn workspace_deletion_lifecycle_and_export_window() {
-    use muster_cloud::protocol::DeleteWorkspaceResponse;
-
+async fn workspace_deletion_is_an_owner_confirmed_request() {
     let s = stack().await;
     let alice = s.login_user("alice", "alice@example.com").await;
     let bob = s.login_user("bob", "bob@example.com").await;
     let client = http();
 
     let ws = support::fleet::create_workspace(&s, &alice, "To Delete").await;
+    let body = serde_json::json!({
+        "confirm_workspace_id": ws.id,
+        "confirm_workspace_name": "To Delete",
+    });
 
-    // Non-owner (Bob) attempting to delete: 404 (not a member).
+    // Not a member (Bob): 404.
     let bob_del = client
         .delete(s.url(&format!("/v1/workspaces/{}", ws.id)))
         .header("Cookie", format!("__Host-mc_session={}", bob.cookie))
         .header("Origin", s.origin())
         .header("X-CSRF-Token", &bob.csrf_token)
+        .header("Idempotency-Key", uuid::Uuid::new_v4().to_string())
+        .json(&body)
         .send()
         .await
         .unwrap();
     assert_eq!(bob_del.status(), 404);
 
-    // Owner (Alice) deletes the workspace: 202 Accepted.
+    // Owner (Alice) with the exact confirmation: 202 with the lifecycle.
     let del_resp = client
         .delete(s.url(&format!("/v1/workspaces/{}", ws.id)))
         .header("Cookie", format!("__Host-mc_session={}", alice.cookie))
         .header("Origin", s.origin())
         .header("X-CSRF-Token", &alice.csrf_token)
+        .header("Idempotency-Key", uuid::Uuid::new_v4().to_string())
+        .json(&body)
         .send()
         .await
         .unwrap();
     assert_eq!(del_resp.status(), 202);
-    let del: DeleteWorkspaceResponse = del_resp.json().await.unwrap();
+    let del: muster_cloud::protocol::WorkspaceLifecycle = del_resp.json().await.unwrap();
     assert_eq!(del.workspace_id, ws.id);
-    assert_eq!(del.status, "scheduled_for_deletion");
-    assert!(!del.export_until.is_empty());
-    assert!(!del.primary_purge_at.is_empty());
-    assert!(!del.backups_expire_at.is_empty());
+    assert_eq!(
+        del.state,
+        muster_cloud::protocol::LifecycleState::DeletionScheduled
+    );
+    let d = del.deletion.expect("deletion status");
+    assert_eq!(d.export_until, d.primary.purge_at);
+    assert_eq!(d.backups.status, "unknown");
+    assert!(d.backups.deadline.is_none());
 }

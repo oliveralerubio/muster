@@ -37,6 +37,8 @@ pub mod routes {
     pub const LOGOUT: &str = "/v1/auth/logout";
     pub const WORKSPACES: &str = "/v1/workspaces";
     pub const WORKSPACE: &str = "/v1/workspaces/{ws}";
+    /// `GET`: lifecycle of the workspace ([`super::WorkspaceLifecycle`]).
+    pub const WORKSPACE_LIFECYCLE: &str = "/v1/workspaces/{ws}/lifecycle";
     pub const DEVICE_AUTHORIZE: &str = "/v1/device/authorize";
     pub const DEVICE_APPROVE: &str = "/v1/device/approve";
     pub const DEVICE_TOKEN: &str = "/v1/device/token";
@@ -182,6 +184,13 @@ pub mod error_codes {
     /// 400, `POST /v1/device/token`: unknown or already redeemed device code,
     /// or wrong `grant_type`.
     pub const INVALID_GRANT: &str = "invalid_grant";
+    /// 400, `DELETE /v1/workspaces/{ws}`: `confirm_workspace_id` and
+    /// `confirm_workspace_name` are not exactly the workspace's id and name.
+    pub const CONFIRMATION_MISMATCH: &str = "confirmation_mismatch";
+    /// 409: the workspace has a deletion request; writes, links, proposals,
+    /// invitations and billing changes are refused (`details.request_id`,
+    /// `details.primary_purge_at`). Pull and export stay available.
+    pub const WORKSPACE_DELETION_SCHEDULED: &str = "workspace_deletion_scheduled";
     /// 409: the signing key is already linked in this workspace by another
     /// account.
     pub const DEVICE_CONFLICT: &str = "device_conflict";
@@ -289,6 +298,92 @@ pub struct Workspace {
     pub plan_status: PlanStatus,
     pub trial_ends_at: String,
     pub created_at: String,
+    /// Absent from older servers: read as active.
+    #[serde(default)]
+    pub lifecycle_state: LifecycleState,
+}
+
+/// Where a workspace is in its lifecycle.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleState {
+    #[default]
+    Active,
+    /// An owner confirmed its deletion: writes are refused, pull and export
+    /// stay available until `export_until`.
+    DeletionScheduled,
+}
+
+/// `DELETE /v1/workspaces/{ws}` body (owner only, with `Idempotency-Key`).
+/// Both fields must equal the workspace's id and current name exactly.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteWorkspaceRequest {
+    pub confirm_workspace_id: String,
+    pub confirm_workspace_name: String,
+}
+
+/// `GET /v1/workspaces/{ws}/lifecycle` (200) and
+/// `DELETE /v1/workspaces/{ws}` (202).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceLifecycle {
+    pub workspace_id: String,
+    pub state: LifecycleState,
+    pub deletion: Option<DeletionStatus>,
+}
+
+/// The single deletion request of a workspace. Every deadline is fixed when
+/// the request is made; retries never move or extend it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeletionStatus {
+    pub request_id: String,
+    pub requested_at: String,
+    /// Pull and export are available until this instant.
+    pub export_until: String,
+    pub primary: PrimaryPurge,
+    pub backups: BackupPurge,
+    pub provider: ProviderCancellation,
+    pub writes_allowed: bool,
+    pub pull_allowed: bool,
+    pub export_allowed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrimaryPurge {
+    /// `scheduled` before `purge_at`, `due` after it until purged, `purged`.
+    pub status: String,
+    pub purge_at: String,
+    pub purged_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackupPurge {
+    /// `unknown` while no backup catalog exists: no deadline is promised.
+    pub status: String,
+    pub deadline: Option<String>,
+    /// Policy cap for catalogued snapshots (request + 35 days).
+    pub cap_at: String,
+    pub purged_at: Option<String>,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderCancellation {
+    /// `none` (nothing to cancel), `pending` (some item not yet confirmed
+    /// canceled by the provider) or `confirmed`.
+    pub status: String,
+    pub items: Vec<ProviderCancellationItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderCancellationItem {
+    /// `subscription` or `checkout`.
+    pub kind: String,
+    pub id: String,
+    /// `pending` or `confirmed`.
+    pub status: String,
+    pub confirmed_at: Option<String>,
+    pub last_error: Option<String>,
 }
 
 /// Maximum workspace name length, in characters.
@@ -1042,14 +1137,4 @@ pub struct CustomerPortalSession {
 pub struct UpdatePlan {
     pub plan: String,
     pub seats: u32,
-}
-
-/// `DELETE /v1/workspaces/{ws}` response (`202 Accepted`).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DeleteWorkspaceResponse {
-    pub workspace_id: String,
-    pub status: String,
-    pub export_until: String,
-    pub primary_purge_at: String,
-    pub backups_expire_at: String,
 }
