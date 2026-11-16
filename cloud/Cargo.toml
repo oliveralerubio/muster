@@ -15,6 +15,12 @@ name = "muster-cloud"
 path = "src/main.rs"
 
 [[bin]]
+# Operator tool for the lifecycle authority (init, status, register,
+# activate, restore-check). Same library as the service.
+name = "muster-cloud-ops"
+path = "src/ops.rs"
+
+[[bin]]
 name = "muster-cloud-drill"
 path = "../deploy/harness/drill.rs"
 required-features = ["backup-drill"]

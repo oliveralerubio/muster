@@ -118,3 +118,18 @@ pg_conn_dbname() {
   pg_conn_db=${pg_conn_db%%/*}
   printf '%s\n' "${pg_conn_db:-postgres}"
 }
+
+# The same connection URL pointing at database <db> (query kept). For
+# passing to a child through the environment, never argv; never printed.
+pg_conn_with_db() {
+  pg_conn_url=$1
+  pg_conn_scheme=${pg_conn_url%%://*}
+  pg_conn_rest=${pg_conn_url#*://}
+  pg_conn_query=""
+  case $pg_conn_rest in
+    *\?*) pg_conn_query=${pg_conn_rest#*\?}; pg_conn_rest=${pg_conn_rest%%\?*} ;;
+  esac
+  pg_conn_authority=${pg_conn_rest%%/*}
+  printf '%s://%s/%s%s\n' "$pg_conn_scheme" "$pg_conn_authority" "$2" \
+    "${pg_conn_query:+?$pg_conn_query}"
+}

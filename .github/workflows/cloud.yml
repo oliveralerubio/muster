@@ -179,14 +179,30 @@ jobs:
           # Separate key from the test job: the drill only needs two artifacts.
           cache-targets: false
 
-      - name: Build service binary for the drill
+      # The drill creates the lifecycle authority with the real ops binary
+      # (explicit init) and pg-restore.sh gates restores through it.
+      - name: Build service and ops binaries for the drill
         run: |
           set -eu
-          cargo build --locked -p muster-cloud --bin muster-cloud
+          cargo build --locked -p muster-cloud --bin muster-cloud --bin muster-cloud-ops
           test -x "${CARGO_TARGET_DIR:-target}/debug/muster-cloud"
+          test -x "${CARGO_TARGET_DIR:-target}/debug/muster-cloud-ops"
 
       # The drill composes deploy/pg-test.sh (ephemeral socket-only cluster),
       # deploy/pg-backup.sh, deploy/pg-restore.sh and the optional Cargo-built
       # drill helper. Its exit status decides the step.
       - name: Backup/restore drill
         run: deploy/backup-drill.sh
+
+      # The production image must carry the ops binary. No Docker daemon on
+      # this pool: build the release artifacts the Dockerfile copies, and
+      # require the Dockerfile to stub, build and copy the ops binary.
+      - name: Release build ships service and ops binaries
+        run: |
+          set -eu
+          cargo build --release --locked -p muster-cloud --bin muster-cloud --bin muster-cloud-ops
+          test -x "${CARGO_TARGET_DIR:-target}/release/muster-cloud"
+          test -x "${CARGO_TARGET_DIR:-target}/release/muster-cloud-ops"
+          grep -qF '> cloud/src/ops.rs' deploy/Dockerfile
+          grep -qF -- '--bin muster-cloud-ops' deploy/Dockerfile
+          grep -qF 'COPY --from=build /usr/local/bin/muster-cloud-ops' deploy/Dockerfile

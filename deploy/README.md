@@ -186,6 +186,60 @@ secret store; never bake them into the image or commit them.
 | `MUSTER_OIDC_CLIENT_ID` | **yes** | OIDC client id. |
 | `MUSTER_OIDC_CLIENT_SECRET` | **yes** | OIDC client secret. Secret — inject via secret store. |
 | `MUSTER_REPO_ROOT` | **yes** | Absolute path of the per-workspace bare Git object store (one `<workspace-id>.git` repo per workspace). There is no default: the service refuses to start without it. Back up this directory together with the database — see `pg-backup.sh` below. |
+| `MUSTER_CONTROL_DIR` | **yes** | Absolute directory of the lifecycle authority's control store (hash-chained journal + lock). Must be disjoint from `MUSTER_REPO_ROOT` (neither inside the other). Not secret. |
+| `MUSTER_CONTROL_WITNESS` | **yes** | Absolute path of the authority's independent witness file; not inside the control dir or the repo root. Put it on a DIFFERENT volume/device than the control dir. Not secret. |
+
+### Lifecycle authority (`muster-cloud-ops`)
+
+The service only serves a database that the deployment's lifecycle authority
+(`cloud/src/control.rs`) recognises as its **active incarnation**. The service
+never creates an authority: create it once, explicitly, on pristine targets
+(empty database without accounts or workspaces, repo root without
+repositories), with the operator tool shipped in the same image:
+
+```
+muster-cloud-ops init        # env: MUSTER_DATABASE_URL, MUSTER_REPO_ROOT,
+                             #      MUSTER_CONTROL_DIR, MUSTER_CONTROL_WITNESS
+muster-cloud-ops status [--database-url URL]
+muster-cloud-ops restore-check [--database-url URL]   # read-only gate
+muster-cloud-ops register --database-url URL          # new candidate incarnation
+muster-cloud-ops activate --incarnation ID --database-url URL
+```
+
+Path policy (service, ops and `pg-restore.sh` alike): the three paths must be
+absolute and are compared by their real filesystem identity, not their
+spelling. `..` components are refused; symbolic links are resolved (the
+longest existing ancestor, so not-yet-created leaves are fine for a first
+`init`), and a dangling symbolic link is refused. The control dir must not be
+inside the repo root nor contain it, and the witness must be in neither, after
+resolution (refusal: exit 78, naming the variable). The service and ops then
+use the resolved paths. `init` creates a missing control dir and witness
+directory.
+
+Database access per command: `init` and `register` apply schema migrations;
+`status` and `activate` work on an already bound database without migrating;
+`restore-check` is strictly read-only (every session transaction is
+read-only, no migrations, no row locks), so it gives its verdict on a
+restored copy or a read-only replica without changing it. A database without
+the binding table (taken before the authority existed) is refused (65).
+
+`init` is idempotent while the targets stay pristine and refuses (exit 66)
+anything with data or an authority in use. Output is versioned JSON (v1) on
+stdout; exit codes 64 usage, 65 authority refused, 66 not pristine, 74 I/O,
+78 configuration.
+
+Suggested volumes (no secrets involved): `/var/lib/muster/control` for
+`MUSTER_CONTROL_DIR` and `/var/lib/muster-witness/witness.json` for
+`MUSTER_CONTROL_WITNESS`, on two persistent volumes on different devices,
+both outside `MUSTER_REPO_ROOT` and **outside backups and restores**. Losing
+or rolling back journal and witness together, along with an equally old
+database, cannot be detected; keeping them apart is what makes rollback,
+divergence or a foreign store detectable.
+
+Known limit (scheduled for the restore/fencing unit): an instance whose
+incarnation is fenced reports `not_ready` and refuses to start, but a process
+that keeps running does not yet refuse direct write requests on its own;
+take fenced instances out of the load balancer.
 
 Billing/provider configuration (price IDs, webhook signing secret, fixture
 IdP) is still being finalized in `cloud/src/config.rs` — placeholders only
@@ -197,7 +251,7 @@ deploying** and do not hardcode credentials anywhere in this directory.
 | Route | Kind | Checks |
 | --- | --- | --- |
 | `GET /healthz` | liveness | Nothing external: returns `{"status":"ok"}` if the process is up. |
-| `GET /readyz` | readiness | Runs `SELECT 1` against PostgreSQL; returns `not_ready` (503) if the database is unreachable. |
+| `GET /readyz` | readiness | Re-verifies the lifecycle authority on every probe (journal, witness, database binding; replays a projection that is behind) and requires the database to be the active incarnation; returns `not_ready` (503) with the reason otherwise, or if the database is unreachable, or if the control store stays locked by another process for over 10 s. |
 
 Wire the load balancer's readiness probe to `/readyz` and liveness to
 `/healthz`.
@@ -283,10 +337,25 @@ appears in argv; the script moves the connection string into the standard
 deploy/pg-restore.sh --backup <backup-dir> \
                      --admin-url <libpq-url-to-maintenance-db> \
                      --new-db <name> --new-repo-root <dir> \
+                     --control-dir <dir> --control-witness <file> \
                      [--age-identity-file <path>]
 ```
 
-(Or export `MUSTER_RESTORE_ADMIN_URL` instead of `--admin-url`.)
+(Or export `MUSTER_RESTORE_ADMIN_URL` instead of `--admin-url`, and
+`MUSTER_CONTROL_DIR`/`MUSTER_CONTROL_WITNESS` instead of the control flags.
+`muster-cloud-ops` is taken from `MUSTER_CLOUD_OPS` or `PATH`.)
+
+- Requires the deployment's EXISTING lifecycle authority and never creates
+  one. Before anything is created, the control store must open cleanly
+  (missing, rolled-back, divergent or foreign journal or witness: exit 73).
+  After `pg_restore`, `muster-cloud-ops restore-check` (read-only on the
+  restored database) must accept the restored binding (same deployment and
+  store, not ahead of the journal, not diverging from it); otherwise the
+  targets are torn down (exit 73). Backups taken before the authority
+  existed carry no binding and are refused.
+- The restored database keeps its source's incarnation; promoting it and
+  fencing the source is the cutover of the restore unit (not yet). Never
+  serve the source and the restore at the same time.
 
 - Creates ONLY new resources: refuses (exit 66) if the database or repo root
   already exist. The active database and repo root are never modified.
@@ -301,7 +370,8 @@ deploy/pg-restore.sh --backup <backup-dir> \
   and never overwrites the running one.
 - Exit codes: 64 usage; 66 target exists; 67 invalid backup; 68 pg_restore
   failed; 69 git fsck failed; 70 head-presence check failed; 71 age decrypt
-  failed; 72 age missing for an encrypted backup.
+  failed; 72 age missing for an encrypted backup; 73 lifecycle authority
+  refused.
 
 ### backup-drill.sh — rehearse recovery end to end
 
@@ -316,7 +386,10 @@ fixture OIDC provider plus a signed-request client
 optional Cargo feature `backup-drill`) seed a
 workspace through the PUBLIC HTTP API (OIDC login, workspace, RFC 8628 device
 flow, machine link with a real link proof, signed genesis + incremental
-pushes). Then: backup → restore into new targets → a SECOND real service
+pushes), after creating the deployment's lifecycle authority with an explicit
+`muster-cloud-ops init`. Then: backup → restore refused with a missing,
+rolled-back and foreign authority (73, nothing left behind) → restore into new
+targets under the unchanged authority → a SECOND real service
 instance starts on the restored data, and recovery is accredited through the
 public API only:
 

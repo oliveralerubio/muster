@@ -42,6 +42,19 @@ async fn main() -> ExitCode {
         eprintln!("muster-cloud: migration error: {err}");
         return ExitCode::from(78);
     }
+    // Lifecycle authority before serving: never created here (explicit
+    // `muster-cloud-ops init`); missing, stale, divergent or fenced refuses.
+    match muster_cloud::control::check_for_service(&config.control, &db).await {
+        Ok(status) => tracing::info!(
+            sequence = status.sequence,
+            replayed = status.db.as_ref().map_or(0, |d| d.replayed),
+            "lifecycle authority verified"
+        ),
+        Err(err) => {
+            eprintln!("muster-cloud: {err}");
+            return ExitCode::from(78);
+        }
+    }
 
     let oidc = match Oidc::discover(&config).await {
         Ok(oidc) => Arc::new(oidc),

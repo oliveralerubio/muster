@@ -52,10 +52,11 @@ RUN set -eux; \
     printf 'fn main() {}\n' > deploy/harness/drill.rs; \
     echo 'pub fn __placeholder() {}' > cloud/src/lib.rs; \
     printf 'fn main() {}\n' > cloud/src/main.rs; \
+    printf 'fn main() {}\n' > cloud/src/ops.rs; \
     echo 'pub fn __placeholder() {}' > src/lib.rs; \
     printf 'fn main() {}\n' > src/main.rs
 
-RUN cargo build --release --locked -p muster-cloud
+RUN cargo build --release --locked -p muster-cloud --bin muster-cloud --bin muster-cloud-ops
 
 # Real workspace sources (context excludes target/, .git/, .hillclimb/ and
 # env/secret files). cloud/src/lib.rs includes ../../src/cloud_protocol.rs,
@@ -71,8 +72,9 @@ RUN set -eux; \
     # forcing a real rebuild from the actual sources. (If a new internal
     # path dependency ever joins the workspace, it must be listed here too.)
     cargo clean --release -p muster-cloud -p muster; \
-    cargo build --release --locked -p muster-cloud; \
-    cp target/release/muster-cloud /usr/local/bin/muster-cloud
+    cargo build --release --locked -p muster-cloud --bin muster-cloud --bin muster-cloud-ops; \
+    cp target/release/muster-cloud /usr/local/bin/muster-cloud; \
+    cp target/release/muster-cloud-ops /usr/local/bin/muster-cloud-ops
 
 # --- runtime stage -------------------------------------------------------
 FROM ${RUNTIME_IMAGE}
@@ -91,6 +93,11 @@ RUN set -eux; \
       --home-dir /var/lib/muster --no-create-home --shell /usr/sbin/nologin muster
 
 COPY --from=build /usr/local/bin/muster-cloud /usr/local/bin/muster-cloud
+# Operator tool for the lifecycle authority (init on pristine targets,
+# status, register, activate, restore-check). Run it in this same image,
+# e.g. `docker run --entrypoint muster-cloud-ops ... init`; pg-restore.sh
+# finds it on PATH.
+COPY --from=build /usr/local/bin/muster-cloud-ops /usr/local/bin/muster-cloud-ops
 
 # Data and Git object stores live under one volume-ready root, owned by the
 # service account with no access for other accounts. Mount a volume here at

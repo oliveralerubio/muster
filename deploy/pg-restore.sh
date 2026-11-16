@@ -4,10 +4,12 @@
 #   deploy/pg-restore.sh --backup <backup-dir> \
 #                        --admin-url <libpq-url-to-existing-maintenance-db> \
 #                        --new-db <name> --new-repo-root <dir> \
+#                        --control-dir <dir> --control-witness <file> \
 #                        [--age-identity-file <path>]
 #
 # (or export MUSTER_RESTORE_ADMIN_URL instead of --admin-url so a password in
-# the URL never appears in argv on multi-user hosts.)
+# the URL never appears in argv on multi-user hosts; MUSTER_CONTROL_DIR and
+# MUSTER_CONTROL_WITNESS may replace the two control flags.)
 #
 # Safety contract:
 #   - Only ever creates NEW resources. Refuses (exit 66) if <new-db> already
@@ -20,6 +22,19 @@
 #     the authority; a head without its Git objects must abort the cutover).
 #     Every restored repo passes `git fsck`. Any failure tears down the
 #     targets created in this run (drop <new-db>, remove <new-repo-root>).
+#   - Lifecycle authority (cloud/src/control.rs, via `muster-cloud-ops`, found
+#     as $MUSTER_CLOUD_OPS or on PATH): the deployment's EXISTING control
+#     store and witness are required. Before anything is created, the store
+#     must open cleanly (missing, rolled-back, divergent or foreign journal or
+#     witness: exit 73). After pg_restore, `muster-cloud-ops restore-check`
+#     (read-only on the restored database) must accept the restored binding:
+#     same deployment and store, not ahead of the journal, not diverging from
+#     it; otherwise the targets are torn down (exit 73). This script never
+#     creates or initialises an authority. A backup taken before the
+#     authority existed has no binding and is refused.
+#   - The restored database keeps the incarnation of its source. Promoting
+#     it to a new incarnation (and fencing the source) is the cutover step of
+#     the restore unit; until then, never serve source and restore at once.
 #   - Cutover itself is a separate, manual step: point MUSTER_DATABASE_URL and
 #     MUSTER_REPO_ROOT of a NEW service instance at these targets. This script
 #     never restarts or reconfigures any service.
@@ -31,7 +46,7 @@
 # Exit codes: 64 usage; 66 target already exists; 67 invalid/missing backup;
 # 68 pg_restore failed; 69 git fsck failed; 70 head-presence check failed;
 # 71 age decrypt failed / identity missing; 72 age missing for encrypted
-# backup.
+# backup; 73 lifecycle authority refused (missing/stale/foreign/ahead).
 
 set -u
 set -o pipefail
@@ -48,6 +63,7 @@ readonly PG_RESTORE_EXIT_FSCK=69
 readonly PG_RESTORE_EXIT_HEAD=70
 readonly PG_RESTORE_EXIT_DECRYPT=71
 readonly PG_RESTORE_EXIT_NOAGE=72
+readonly PG_RESTORE_EXIT_AUTHORITY=73
 
 fail() {
   printf 'pg-restore.sh: %s\n' "$1" >&2
@@ -59,6 +75,8 @@ admin_url=""
 new_db=""
 new_repo_root=""
 age_identity=""
+control_dir="${MUSTER_CONTROL_DIR:-}"
+control_witness="${MUSTER_CONTROL_WITNESS:-}"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -74,6 +92,12 @@ while [ "$#" -gt 0 ]; do
     --new-repo-root)
       [ "$#" -ge 2 ] || fail "--new-repo-root needs a value" "$PG_RESTORE_EXIT_USAGE"
       new_repo_root=$2; shift 2 ;;
+    --control-dir)
+      [ "$#" -ge 2 ] || fail "--control-dir needs a value" "$PG_RESTORE_EXIT_USAGE"
+      control_dir=$2; shift 2 ;;
+    --control-witness)
+      [ "$#" -ge 2 ] || fail "--control-witness needs a value" "$PG_RESTORE_EXIT_USAGE"
+      control_witness=$2; shift 2 ;;
     --age-identity-file)
       [ "$#" -ge 2 ] || fail "--age-identity-file needs a value" "$PG_RESTORE_EXIT_USAGE"
       age_identity=$2; shift 2 ;;
@@ -87,6 +111,11 @@ done
 [ -n "$admin_url" ] || fail "no --admin-url (or MUSTER_RESTORE_ADMIN_URL) given" "$PG_RESTORE_EXIT_USAGE"
 [ -n "$new_db" ] || fail "no --new-db given" "$PG_RESTORE_EXIT_USAGE"
 [ -n "$new_repo_root" ] || fail "no --new-repo-root given" "$PG_RESTORE_EXIT_USAGE"
+[ -n "$control_dir" ] && [ -n "$control_witness" ] \
+  || fail "the deployment's lifecycle authority is required: --control-dir and --control-witness (or MUSTER_CONTROL_DIR/MUSTER_CONTROL_WITNESS)" "$PG_RESTORE_EXIT_USAGE"
+ops_bin=${MUSTER_CLOUD_OPS:-$(command -v muster-cloud-ops 2>/dev/null || true)}
+[ -n "$ops_bin" ] && [ -x "$ops_bin" ] \
+  || fail "muster-cloud-ops not found (PATH or MUSTER_CLOUD_OPS)" "$PG_RESTORE_EXIT_USAGE"
 [ -d "$backup_dir" ] || fail "backup dir does not exist: $backup_dir" "$PG_RESTORE_EXIT_BACKUP"
 
 # The database name becomes part of SQL literals and libpq arguments: accept
@@ -155,6 +184,21 @@ if [ -e "$new_repo_root" ] && [ -n "$(ls -A "$new_repo_root" 2>/dev/null)" ]; th
   fail "target repo root already exists and is not empty; refusing to overwrite: $new_repo_root" \
     "$PG_RESTORE_EXIT_EXISTS"
 fi
+
+# The authority must open cleanly before anything is created. `ops` exit
+# 65 is a refusal; 78 a configuration error (e.g. overlapping paths).
+authority_ops() {
+  MUSTER_CONTROL_DIR=$control_dir MUSTER_CONTROL_WITNESS=$control_witness \
+    MUSTER_REPO_ROOT=$new_repo_root "$ops_bin" "$@"
+}
+authority_out=$(authority_ops status 2>&1 >/dev/null)
+authority_rc=$?
+case $authority_rc in
+  0) ;;
+  65) fail "lifecycle authority refused: ${authority_out#muster-cloud-ops: }" "$PG_RESTORE_EXIT_AUTHORITY" ;;
+  78|64) fail "lifecycle authority configuration: ${authority_out#muster-cloud-ops: }" "$PG_RESTORE_EXIT_USAGE" ;;
+  *) fail "lifecycle authority check failed (rc=$authority_rc): ${authority_out#muster-cloud-ops: }" "$PG_RESTORE_EXIT_AUTHORITY" ;;
+esac
 
 # Targets this run owns; torn down if any step below fails.
 created_db=""
@@ -245,8 +289,24 @@ for repo in "$new_repo_root"/*.git; do
          fail "restored repo failed git fsck; targets torn down" "$PG_RESTORE_EXIT_FSCK"; }
 done
 
+# Restore gate: the restored binding must belong to this authority and not
+# be ahead of or diverge from its journal (read-only on the restored db).
+new_db_url=$(pg_conn_with_db "$admin_url" "$new_db")
+gate_err_file=$(mktemp "${TMPDIR:-/tmp}/muster-restore-gate.XXXXXX") \
+  || { teardown_fail; fail "mktemp failed" "$PG_RESTORE_EXIT_USAGE"; }
+gate_json=$(MUSTER_DATABASE_URL=$new_db_url authority_ops restore-check 2>"$gate_err_file")
+gate_rc=$?
+gate_err=$(cat "$gate_err_file" 2>/dev/null); rm -f -- "$gate_err_file"
+unset new_db_url
+if [ "$gate_rc" != 0 ]; then
+  teardown_fail
+  fail "lifecycle authority refused the restored database (targets torn down): ${gate_err#muster-cloud-ops: }" \
+    "$PG_RESTORE_EXIT_AUTHORITY"
+fi
+
 [ -z "$work" ] || rm -rf -- "$work"
 
+printf 'pg-restore.sh: authority verified: %s\n' "$gate_json"
 printf 'pg-restore.sh: restore complete (NEW resources only; cutover is manual)\n'
 printf 'pg-restore.sh: database=%s repo_root=%s heads_checked=%s repos_fscked=%s\n' \
   "$new_db" "$new_repo_root" "$heads_checked" "$repos_fscked"

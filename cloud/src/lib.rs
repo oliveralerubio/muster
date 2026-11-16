@@ -11,6 +11,7 @@ pub mod auth;
 pub mod billing;
 pub mod billing_reconcile;
 pub mod config;
+pub mod control;
 pub mod device_links;
 pub mod error;
 pub mod history;
@@ -160,6 +161,12 @@ async fn readyz(State(state): State<AppState>) -> Result<Json<HealthResponse>, A
         .map_err(|err| {
             tracing::warn!(error = %err, "readiness: database unreachable");
             AppError::not_ready("database unreachable")
+        })?;
+    control::check_for_service(&state.config.control, &state.db)
+        .await
+        .map_err(|err| {
+            tracing::warn!(error = %err, "readiness: lifecycle authority");
+            AppError::not_ready(err.to_string())
         })?;
     Ok(Json(HealthResponse {
         status: "ready".into(),

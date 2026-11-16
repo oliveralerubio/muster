@@ -20,6 +20,45 @@ use tokio::process::{Child, Command};
 pub struct Cloud {
     pub base: String,
     child: Child,
+    /// Synthetic authority created for a caller that brought none.
+    _control: Option<tempfile::TempDir>,
+}
+
+/// Explicit, synthetic lifecycle authority for a development service: a
+/// control directory and an independent witness in a private temporary
+/// directory (alive as long as the returned guard), initialised by the real
+/// `muster-cloud-ops init` on the (pristine) database and repository root
+/// in `env`. The service itself never creates an authority.
+pub async fn synthetic_authority(env: &mut Env) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("control tempdir");
+    let control = dir.path().join("control");
+    let witness_dir = dir.path().join("witness");
+    std::fs::create_dir_all(&witness_dir).unwrap();
+    env.retain(|(k, _)| *k != "MUSTER_CONTROL_DIR" && *k != "MUSTER_CONTROL_WITNESS");
+    env.push(("MUSTER_CONTROL_DIR", control.display().to_string()));
+    env.push((
+        "MUSTER_CONTROL_WITNESS",
+        witness_dir.join("witness.json").display().to_string(),
+    ));
+    let out = run_ops(env, &["init"]).await;
+    assert!(
+        out.status.success(),
+        "muster-cloud-ops init failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    dir
+}
+
+/// Runs `muster-cloud-ops` with exactly `env` (plus PATH).
+pub async fn run_ops(env: &[(&str, String)], args: &[&str]) -> std::process::Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_muster-cloud-ops"));
+    cmd.env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .args(args);
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    cmd.output().await.expect("run muster-cloud-ops")
 }
 
 /// Environment for a service process with the given base URL known up front.
@@ -52,6 +91,22 @@ pub async fn fresh_database() -> String {
 /// Starts the service binary with exactly `env` (plus `PATH`) and waits for
 /// its listening line.
 pub async fn spawn_cloud(env: &[(&str, String)]) -> Cloud {
+    let mut env: Env = env.iter().map(|(k, v)| (leak(k), v.clone())).collect();
+    let control = if env.iter().any(|(k, _)| *k == "MUSTER_CONTROL_DIR") {
+        None
+    } else {
+        Some(synthetic_authority(&mut env).await)
+    };
+    let mut cloud = spawn_with(&env).await;
+    cloud._control = control;
+    cloud
+}
+
+fn leak(s: &str) -> &'static str {
+    Box::leak(s.to_string().into_boxed_str())
+}
+
+async fn spawn_with(env: &[(&'static str, String)]) -> Cloud {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_muster-cloud"));
     cmd.env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
@@ -82,7 +137,11 @@ pub async fn spawn_cloud(env: &[(&str, String)]) -> Cloud {
     };
     // Keep draining stdout so the child never blocks on a full pipe.
     tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
-    Cloud { base, child }
+    Cloud {
+        base,
+        child,
+        _control: None,
+    }
 }
 
 /// Runs the service binary to completion with `env` and returns
@@ -113,6 +172,7 @@ pub struct Stack {
     /// database and Git storage (durability tests).
     pub env: Env,
     _repos: tempfile::TempDir,
+    _control: tempfile::TempDir,
 }
 
 impl Stack {
@@ -201,12 +261,14 @@ pub async fn stack_with_env(extra: &[(&'static str, String)]) -> Stack {
         ),
     ];
     env.extend(extra.iter().cloned());
+    let control = synthetic_authority(&mut env).await;
     let cloud = spawn_cloud(&env).await;
     Stack {
         cloud,
         idp,
         env,
         _repos: repos,
+        _control: control,
     }
 }
 
@@ -216,7 +278,7 @@ pub async fn stack_with_paddle(paddle: &paddle_fixture::PaddleFixture) -> Stack 
     let port = free_port();
     let public = format!("http://127.0.0.1:{port}");
     let repos = tempfile::tempdir().expect("repo root");
-    let env: Env = vec![
+    let mut env: Env = vec![
         ("MUSTER_ENV", "development".into()),
         ("MUSTER_REPO_ROOT", repos.path().display().to_string()),
         ("MUSTER_BIND", format!("127.0.0.1:{port}")),
@@ -244,12 +306,14 @@ pub async fn stack_with_paddle(paddle: &paddle_fixture::PaddleFixture) -> Stack 
         ("MUSTER_PADDLE_BASE_URL", paddle.base_url.clone()),
         ("MUSTER_PADDLE_ENVIRONMENT", "sandbox".into()),
     ];
+    let control = synthetic_authority(&mut env).await;
     let cloud = spawn_cloud(&env).await;
     Stack {
         cloud,
         idp,
         env,
         _repos: repos,
+        _control: control,
     }
 }
 

@@ -37,6 +37,10 @@ pub struct Config {
     /// plan's `max_storage_bytes`, in `GET /billing` and in the guard alike,
     /// so tests can reach the limit. Refused in production.
     pub dev_storage_limit: Option<u64>,
+    /// Lifecycle authority (`crate::control`): journal directory and its
+    /// independent witness file. Mandatory everywhere; never created by
+    /// the service.
+    pub control: crate::control::ControlPaths,
 }
 
 #[derive(Clone)]
@@ -224,6 +228,8 @@ impl Config {
             })?),
         };
 
+        let control = control_paths(&get, &repo_root)?;
+
         Ok(Self {
             env,
             bind,
@@ -235,6 +241,7 @@ impl Config {
             repo_root,
             paddle,
             dev_storage_limit,
+            control,
         })
     }
 
@@ -245,6 +252,94 @@ impl Config {
     pub fn oidc_client_secret(&self) -> &str {
         &self.oidc_client_secret
     }
+}
+
+/// `a` is `b` or lies inside it (component-wise; both already resolved).
+fn within(a: &std::path::Path, b: &std::path::Path) -> bool {
+    a.starts_with(b)
+}
+
+/// The real filesystem identity of an absolute path that may not exist yet
+/// (first init): `..` components are refused outright (ambiguous through
+/// symbolic links); the longest existing ancestor is canonicalised (every
+/// symbolic link resolved) and the missing leaves appended. A dangling
+/// symbolic link is refused: writing through it would land wherever it
+/// points.
+fn resolve_identity(path: &std::path::Path) -> Result<std::path::PathBuf, String> {
+    use std::path::Component;
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err("must not contain '..' components".into());
+    }
+    let mut existing = path.to_path_buf();
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::canonicalize(&existing) {
+            Ok(mut real) => {
+                real.extend(missing.iter().rev());
+                return Ok(real);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if std::fs::symlink_metadata(&existing).is_ok() {
+                    return Err(format!(
+                        "{} is a dangling symbolic link",
+                        existing.display()
+                    ));
+                }
+                let Some(name) = existing.file_name().map(|n| n.to_os_string()) else {
+                    return Err("has no existing ancestor".into());
+                };
+                missing.push(name);
+                existing.pop();
+            }
+            Err(e) => return Err(format!("cannot be resolved: {e}")),
+        }
+    }
+}
+
+/// Validates `MUSTER_CONTROL_DIR` / `MUSTER_CONTROL_WITNESS` (shared by the
+/// service and `muster-cloud-ops`).
+pub fn control_paths(
+    get: &impl Fn(&str) -> Option<String>,
+    repo_root: &std::path::Path,
+) -> Result<crate::control::ControlPaths, ConfigError> {
+    let dir = std::path::PathBuf::from(
+        get("MUSTER_CONTROL_DIR").ok_or(ConfigError::Missing("MUSTER_CONTROL_DIR"))?,
+    );
+    let witness = std::path::PathBuf::from(
+        get("MUSTER_CONTROL_WITNESS").ok_or(ConfigError::Missing("MUSTER_CONTROL_WITNESS"))?,
+    );
+    let invalid = |name: &'static str, reason: &str| ConfigError::Invalid {
+        name,
+        reason: reason.into(),
+    };
+    if !dir.is_absolute() {
+        return Err(invalid("MUSTER_CONTROL_DIR", "must be an absolute path"));
+    }
+    if !witness.is_absolute() {
+        return Err(invalid(
+            "MUSTER_CONTROL_WITNESS",
+            "must be an absolute path",
+        ));
+    }
+    // Separation is decided on real identities, never on spelling: an alias
+    // (`..`, symbolic link) must not put the authority into the Git store or
+    // its backups. The service and ops then use the resolved paths.
+    let dir = resolve_identity(&dir).map_err(|r| invalid("MUSTER_CONTROL_DIR", &r))?;
+    let witness = resolve_identity(&witness).map_err(|r| invalid("MUSTER_CONTROL_WITNESS", &r))?;
+    let repo_root = &resolve_identity(repo_root).map_err(|r| invalid("MUSTER_REPO_ROOT", &r))?;
+    if within(&dir, repo_root) || within(repo_root, &dir) {
+        return Err(invalid(
+            "MUSTER_CONTROL_DIR",
+            "must be disjoint from MUSTER_REPO_ROOT (neither inside the other)",
+        ));
+    }
+    if within(&witness, &dir) || within(&witness, repo_root) {
+        return Err(invalid(
+            "MUSTER_CONTROL_WITNESS",
+            "must be outside MUSTER_CONTROL_DIR and MUSTER_REPO_ROOT",
+        ));
+    }
+    Ok(crate::control::ControlPaths { dir, witness })
 }
 
 /// True for `localhost`, `*.localhost`, 127.0.0.0/8 and `[::1]`.
@@ -286,6 +381,7 @@ impl fmt::Debug for Config {
             .field("oidc_client_secret", &"[REDACTED]")
             .field("repo_root", &self.repo_root)
             .field("paddle", &self.paddle)
+            .field("control", &self.control)
             .finish()
     }
 }

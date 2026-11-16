@@ -1,6 +1,6 @@
 mod support;
 
-use support::run_cloud_expecting_exit;
+use support::{run_cloud_expecting_exit, run_ops};
 
 #[tokio::test]
 async fn production_refuses_plain_http_public_url() {
@@ -80,6 +80,11 @@ async fn startup_output_never_contains_database_password_or_client_secret() {
         (
             "MUSTER_OIDC_CLIENT_SECRET",
             "synthetic-oidc-secret-9c2e".into(),
+        ),
+        ("MUSTER_CONTROL_DIR", "/nonexistent/muster-control".into()),
+        (
+            "MUSTER_CONTROL_WITNESS",
+            "/nonexistent/muster-witness/w.json".into(),
         ),
     ])
     .await;
@@ -274,6 +279,11 @@ async fn startup_log_redacts_paddle_credentials() {
             "MUSTER_PADDLE_PRICE_TEAM_SEAT",
             "pri_01synthetic00000000000teamseat".into(),
         ),
+        ("MUSTER_CONTROL_DIR", "/nonexistent/muster-control".into()),
+        (
+            "MUSTER_CONTROL_WITNESS",
+            "/nonexistent/muster-witness/w.json".into(),
+        ),
     ])
     .await;
     assert_eq!(code, Some(78), "{output}");
@@ -309,4 +319,174 @@ async fn production_refuses_the_development_storage_limit() {
         output.contains("MUSTER_DEV_STORAGE_LIMIT_BYTES is invalid"),
         "output: {output}"
     );
+}
+
+/// Lifecycle authority is mandatory in every environment (the service never
+/// creates it): an absolute control directory and an independent witness
+/// file, disjoint from each other and from the Git storage root.
+#[tokio::test]
+async fn control_authority_paths_are_required_absolute_and_disjoint() {
+    let base = |control: Option<(&str, &str)>| {
+        let mut env = vec![
+            ("MUSTER_ENV", "development".to_string()),
+            ("MUSTER_BIND", "127.0.0.1:0".to_string()),
+            ("MUSTER_PUBLIC_URL", "http://127.0.0.1:1".to_string()),
+            ("MUSTER_DATABASE_URL", "postgres://localhost/db".to_string()),
+            ("MUSTER_OIDC_ISSUER", "http://127.0.0.1:2".to_string()),
+            ("MUSTER_OIDC_CLIENT_ID", "client".to_string()),
+            ("MUSTER_OIDC_CLIENT_SECRET", "synthetic".to_string()),
+            ("MUSTER_REPO_ROOT", "/srv/muster/repos".to_string()),
+        ];
+        if let Some((dir, witness)) = control {
+            env.push(("MUSTER_CONTROL_DIR", dir.to_string()));
+            env.push(("MUSTER_CONTROL_WITNESS", witness.to_string()));
+        }
+        env
+    };
+    /// (case, control dir + witness, expected refusal)
+    type Case<'a> = (&'a str, Option<(&'a str, &'a str)>, &'a str);
+    let cases: [Case; 5] = [
+        ("missing", None, "MUSTER_CONTROL_DIR is required"),
+        (
+            "relative",
+            Some(("control", "/srv/witness/w.json")),
+            "MUSTER_CONTROL_DIR is invalid",
+        ),
+        (
+            "witness inside control",
+            Some(("/srv/control", "/srv/control/w.json")),
+            "MUSTER_CONTROL_WITNESS is invalid",
+        ),
+        (
+            "control inside repo root",
+            Some(("/srv/muster/repos/control", "/srv/witness/w.json")),
+            "MUSTER_CONTROL_DIR is invalid",
+        ),
+        (
+            "repo root inside control",
+            Some(("/srv/muster", "/srv/witness/w.json")),
+            "MUSTER_CONTROL_DIR is invalid",
+        ),
+    ];
+    for (name, control, expected) in cases {
+        let (code, output) = run_cloud_expecting_exit(&base(control)).await;
+        assert_eq!(code, Some(78), "{name}: {output}");
+        assert!(output.contains(expected), "{name}: {output}");
+    }
+}
+
+/// Separation is decided on the real filesystem identity of the paths, not
+/// their spelling: parent traversal is refused outright, and symbolic links
+/// (in either direction, or hiding the witness) are resolved before
+/// comparing. Both the service and the ops tool refuse with 78.
+#[tokio::test]
+async fn control_paths_are_compared_by_real_identity_not_spelling() {
+    use std::os::unix::fs::symlink;
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().canonicalize().unwrap();
+    let repos = p.join("repos");
+    let ctl = p.join("ctl");
+    std::fs::create_dir_all(&repos).unwrap();
+    std::fs::create_dir_all(&ctl).unwrap();
+    std::fs::create_dir_all(p.join("alias")).unwrap();
+    std::fs::create_dir_all(p.join("wit")).unwrap();
+    std::fs::create_dir_all(p.join("dangling")).unwrap();
+    symlink(&repos, p.join("to-repos")).unwrap();
+    symlink(&ctl, p.join("to-ctl")).unwrap();
+    symlink(repos.join("w.json"), p.join("dangling/w.json")).unwrap();
+    let s = |x: std::path::PathBuf| x.display().to_string();
+    let good_witness = s(p.join("wit/w.json"));
+    // (case, repo root, control dir, witness, variable refused)
+    let cases = [
+        (
+            "control via ..",
+            s(repos.clone()),
+            s(p.join("alias/../repos/control")),
+            good_witness.clone(),
+            "MUSTER_CONTROL_DIR",
+        ),
+        (
+            "control via symlink into repo",
+            s(repos.clone()),
+            s(p.join("to-repos/control")),
+            good_witness.clone(),
+            "MUSTER_CONTROL_DIR",
+        ),
+        (
+            "repo via symlink into control",
+            s(p.join("to-ctl/repos")),
+            s(ctl.clone()),
+            good_witness.clone(),
+            "MUSTER_CONTROL_DIR",
+        ),
+        (
+            "control is a symlink to repo",
+            s(repos.clone()),
+            s(p.join("to-repos")),
+            good_witness.clone(),
+            "MUSTER_CONTROL_DIR",
+        ),
+        (
+            "repo via ..",
+            s(p.join("ctl/x/../repos")),
+            s(ctl.clone()),
+            good_witness.clone(),
+            "MUSTER_REPO_ROOT",
+        ),
+        (
+            "witness via symlink into control",
+            s(repos.clone()),
+            s(ctl.clone()),
+            s(p.join("to-ctl/w.json")),
+            "MUSTER_CONTROL_WITNESS",
+        ),
+        (
+            "witness via symlink into repo",
+            s(repos.clone()),
+            s(ctl.clone()),
+            s(p.join("to-repos/w.json")),
+            "MUSTER_CONTROL_WITNESS",
+        ),
+        (
+            "witness via ..",
+            s(repos.clone()),
+            s(ctl.clone()),
+            s(p.join("wit/../ctl/w.json")),
+            "MUSTER_CONTROL_WITNESS",
+        ),
+        (
+            "witness is a dangling symlink into repo",
+            s(repos.clone()),
+            s(ctl.clone()),
+            s(p.join("dangling/w.json")),
+            "MUSTER_CONTROL_WITNESS",
+        ),
+    ];
+    for (name, repo, control, witness, refused) in cases {
+        let env: Vec<(&'static str, String)> = vec![
+            ("MUSTER_ENV", "development".into()),
+            ("MUSTER_BIND", "127.0.0.1:0".into()),
+            ("MUSTER_PUBLIC_URL", "http://127.0.0.1:1".into()),
+            ("MUSTER_DATABASE_URL", "postgres://localhost/db".into()),
+            ("MUSTER_OIDC_ISSUER", "http://127.0.0.1:2".into()),
+            ("MUSTER_OIDC_CLIENT_ID", "client".into()),
+            ("MUSTER_OIDC_CLIENT_SECRET", "synthetic".into()),
+            ("MUSTER_REPO_ROOT", repo),
+            ("MUSTER_CONTROL_DIR", control),
+            ("MUSTER_CONTROL_WITNESS", witness),
+        ];
+        let (code, output) = run_cloud_expecting_exit(&env).await;
+        assert_eq!(code, Some(78), "service, {name}: {output}");
+        assert!(
+            output.contains(&format!("{refused} is invalid")),
+            "service, {name}: {output}"
+        );
+        let out = run_ops(&env, &["status"]).await;
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(78), "ops, {name}: {err}");
+        assert!(
+            err.contains(&format!("{refused} is invalid")),
+            "ops, {name}: {err}"
+        );
+    }
 }
