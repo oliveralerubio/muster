@@ -2211,6 +2211,640 @@ async function journey23WorkspaceAsyncIsolationMembersHistoryProposalsInvites(br
   await context.close();
 }
 
+async function journey24SessionAccountOwnershipAndReset(browser) {
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  const page = await context.newPage();
+  const pageErrors = [];
+  page.on('pageerror', (err) => pageErrors.push(err.message));
+
+  const alice = { subject: 'alice-sess-1', email: 'alice-sess@example.com' };
+  const bob = { subject: 'bob-sess-1', email: 'bob-sess@example.com' };
+
+  // Setup: sign in as Alice, create one base workspace, toggle dark theme
+  await page.goto(`${baseUrl}/`, { waitUntil: 'networkidle' });
+  await signInViaIdp(page, alice);
+  await page.getByLabel(/Workspace name/i).fill('Alice Base Fleet');
+  await page.getByRole('button', { name: /Create workspace/i }).click();
+  await page.waitForURL(/\/workspaces\/([0-9a-f-]{36})$/, { timeout: 5000 });
+  await page.getByRole('button', { name: /Switch to dark mode/i }).click();
+  assert.equal(await page.evaluate(() => document.documentElement.getAttribute('data-theme')), 'dark');
+  await page.getByRole('link', { name: /All workspaces/i }).click();
+  await page.getByRole('link', { name: /Alice Base Fleet/i }).waitFor({ timeout: 5000 });
+
+  // 1a. Stale GET /v1/workspaces (real 200 fetched before logout, fulfilled after logout)
+  let releaseList200 = null;
+  let resolveList200Fetched = null;
+  const list200Fetched = new Promise((r) => {
+    resolveList200Fetched = r;
+  });
+  let holdNextList = true;
+  await page.route('**/v1/workspaces', async (route) => {
+    if (route.request().method() !== 'GET' || !holdNextList) {
+      await route.continue();
+      return;
+    }
+    holdNextList = false;
+    const response = await route.fetch();
+    await new Promise((resolve) => {
+      releaseList200 = async () => {
+        await route.fulfill({ response });
+        resolve();
+      };
+      resolveList200Fetched();
+    });
+  });
+
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await page.getByText(/Loading workspaces/i).waitFor({ timeout: 5000 });
+  await list200Fetched;
+  assert.ok(releaseList200, 'expected GET /v1/workspaces 200 to be held');
+
+  await page.getByRole('button', { name: /Sign out/i }).click();
+  await page.getByRole('link', { name: /Sign in/i }).waitFor({ timeout: 5000 });
+
+  await releaseList200();
+  await page.waitForTimeout(100);
+  await page.getByRole('link', { name: /Sign in/i }).waitFor({ timeout: 3000 });
+  assert.equal(await page.getByRole('link', { name: /Alice Base Fleet/i }).count(), 0);
+  assert.equal(await page.locator('[role="alert"]').count(), 0);
+  await page.unroute('**/v1/workspaces');
+
+  // 1b. Real stale 401 on GET /v1/workspaces (held before route.continue, released after logout)
+  await signInViaIdp(page, alice);
+  assert.equal(await page.evaluate(() => document.documentElement.getAttribute('data-theme')), 'dark');
+  let releaseList401 = null;
+  let resolveList401Held = null;
+  const list401Held = new Promise((r) => {
+    resolveList401Held = r;
+  });
+  let holdList401 = true;
+  await page.route('**/v1/workspaces', async (route) => {
+    if (route.request().method() !== 'GET' || !holdList401) {
+      await route.continue();
+      return;
+    }
+    holdList401 = false;
+    await new Promise((resolve) => {
+      releaseList401 = async () => {
+        await route.continue();
+        resolve();
+      };
+      resolveList401Held();
+    });
+  });
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await page.getByText(/Loading workspaces/i).waitFor({ timeout: 5000 });
+  await list401Held;
+  assert.ok(releaseList401, 'expected GET /v1/workspaces to be held before 401');
+  await page.getByRole('button', { name: /Sign out/i }).click();
+  await page.getByRole('link', { name: /Sign in/i }).waitFor({ timeout: 5000 });
+
+  const respList401 = page.waitForResponse(
+    (r) => new URL(r.url()).pathname === '/v1/workspaces' && r.request().method() === 'GET' && r.status() === 401
+  );
+  await releaseList401();
+  await respList401;
+  await page.waitForTimeout(100);
+  await page.getByRole('link', { name: /Sign in/i }).waitFor({ timeout: 3000 });
+  assert.equal(await page.locator('[role="alert"]').count(), 0);
+  await page.unroute('**/v1/workspaces');
+
+  // 2a. Stale POST /v1/workspaces (real 201 after logout) + form/idempotency reset + same-account reauth
+  await signInViaIdp(page, alice);
+  const seenKeysSession1 = [];
+  let abortCreateOnce = true;
+  let releaseCreate201 = null;
+  let resolveCreate201Fetched = null;
+  const create201Fetched = new Promise((r) => {
+    resolveCreate201Fetched = r;
+  });
+  await page.route('**/v1/workspaces', async (route) => {
+    if (route.request().method() !== 'POST') {
+      await route.continue();
+      return;
+    }
+    const key = route.request().headers()['idempotency-key'];
+    if (key) seenKeysSession1.push(key);
+    if (abortCreateOnce) {
+      abortCreateOnce = false;
+      await route.abort('failed');
+      return;
+    }
+    const response = await route.fetch();
+    await new Promise((resolve) => {
+      releaseCreate201 = async () => {
+        await route.fulfill({ response });
+        resolve();
+      };
+      resolveCreate201Fetched();
+    });
+  });
+
+  await page.getByLabel(/Workspace name/i).fill('Dirty Retry Name');
+  await page.getByRole('button', { name: /Create workspace/i }).click();
+  await page.locator('[role="alert"]').waitFor({ timeout: 5000 });
+  assert.equal(seenKeysSession1.length, 1);
+
+  await page.getByLabel(/Workspace name/i).fill('Delayed Created Fleet');
+  await page.getByRole('button', { name: /Create workspace/i }).click();
+  await page.getByRole('button', { name: /Creating/i }).waitFor({ timeout: 3000 });
+  await create201Fetched;
+  assert.ok(releaseCreate201, 'expected POST /v1/workspaces 201 to be held');
+
+  await page.getByRole('button', { name: /Sign out/i }).click();
+  await page.getByRole('link', { name: /Sign in/i }).waitFor({ timeout: 5000 });
+
+  await releaseCreate201();
+  await page.waitForTimeout(100);
+  assert.equal(new URL(page.url()).pathname, '/', 'stale 201 create must not navigate after logout');
+  await page.getByRole('link', { name: /Sign in/i }).waitFor({ timeout: 3000 });
+  assert.equal(await page.getByRole('heading', { name: 'Delayed Created Fleet' }).count(), 0);
+  assert.equal(await page.locator('[role="alert"]').count(), 0);
+  await page.unroute('**/v1/workspaces');
+
+  // Same-account reauthentication: completed mutation observed, theme preserved, old form/idempotency cleared, fresh retry works
+  await signInViaIdp(page, alice);
+  assert.equal(await page.evaluate(() => document.documentElement.getAttribute('data-theme')), 'dark');
+  await page.getByRole('link', { name: /Delayed Created Fleet/i }).waitFor({ timeout: 5000 });
+  assert.equal(await page.getByLabel(/Workspace name/i).inputValue(), '');
+  assert.equal(await page.locator('[role="alert"]').count(), 0);
+
+  const seenKeysSession2 = [];
+  let dropSession2Once = true;
+  await page.route('**/v1/workspaces', async (route) => {
+    if (route.request().method() !== 'POST') {
+      await route.continue();
+      return;
+    }
+    const key = route.request().headers()['idempotency-key'];
+    if (key) seenKeysSession2.push(key);
+    if (dropSession2Once) {
+      dropSession2Once = false;
+      await route.abort('failed');
+      return;
+    }
+    await route.continue();
+  });
+
+  await page.getByLabel(/Workspace name/i).fill('Fresh Retry Fleet');
+  await page.getByRole('button', { name: /Create workspace/i }).click();
+  await page.locator('[role="alert"]').waitFor({ timeout: 5000 });
+  await page.getByRole('button', { name: /Create workspace/i }).click();
+  await page.getByRole('heading', { name: 'Fresh Retry Fleet' }).waitFor({ timeout: 5000 });
+  assert.equal(seenKeysSession2.length, 2);
+  assert.equal(seenKeysSession2[0], seenKeysSession2[1], 'retry in new session must reuse new key');
+  assert.notEqual(seenKeysSession2[0], seenKeysSession1[0], 'new session must not reuse previous session idempotency key');
+  await page.unroute('**/v1/workspaces');
+
+  // 2b. Real stale 401 on POST /v1/workspaces (held before route.continue, released after logout)
+  await page.getByRole('link', { name: /All workspaces/i }).click();
+  let releaseCreate401 = null;
+  let resolveCreate401Held = null;
+  const create401Held = new Promise((r) => {
+    resolveCreate401Held = r;
+  });
+  await page.route('**/v1/workspaces', async (route) => {
+    if (route.request().method() !== 'POST') {
+      await route.continue();
+      return;
+    }
+    await new Promise((resolve) => {
+      releaseCreate401 = async () => {
+        await route.continue();
+        resolve();
+      };
+      resolveCreate401Held();
+    });
+  });
+  await page.getByLabel(/Workspace name/i).fill('Held 401 Fleet');
+  await page.getByRole('button', { name: /Create workspace/i }).click();
+  await page.getByRole('button', { name: /Creating/i }).waitFor({ timeout: 3000 });
+  await create401Held;
+  assert.ok(releaseCreate401, 'expected POST /v1/workspaces to be held before 401');
+  await page.getByRole('button', { name: /Sign out/i }).click();
+  await page.getByRole('link', { name: /Sign in/i }).waitFor({ timeout: 5000 });
+
+  const respCreate401 = page.waitForResponse(
+    (r) => new URL(r.url()).pathname === '/v1/workspaces' && r.request().method() === 'POST' && r.status() === 401
+  );
+  await releaseCreate401();
+  await respCreate401;
+  await page.waitForTimeout(100);
+  await page.getByRole('link', { name: /Sign in/i }).waitFor({ timeout: 3000 });
+  assert.equal(await page.locator('[role="alert"]').count(), 0);
+  await page.unroute('**/v1/workspaces');
+
+  // 3. Stale device decision (real 200, real 400 error, real 401) + reset + route re-derivation
+  const auth1 = await startDeviceAuthorization('stale-device-cli');
+  const auth2 = await startDeviceAuthorization('fresh-device-cli');
+
+  await page.goto(auth1.verification_uri_complete, { waitUntil: 'networkidle' });
+  await signInViaIdp(page, alice);
+  await page.waitForURL((u) => new URL(u).pathname === '/device', { timeout: 5000 });
+
+  let releaseDevice200 = null;
+  let resolveDevice200Fetched = null;
+  const device200Fetched = new Promise((r) => {
+    resolveDevice200Fetched = r;
+  });
+  await page.route('**/v1/device/approve', async (route) => {
+    const response = await route.fetch();
+    await new Promise((resolve) => {
+      releaseDevice200 = async () => {
+        await route.fulfill({ response });
+        resolve();
+      };
+      resolveDevice200Fetched();
+    });
+  });
+  await page.getByRole('button', { name: /Approve/i }).click();
+  await page.getByRole('button', { name: /Submitting/i }).waitFor({ timeout: 3000 });
+  await device200Fetched;
+  assert.ok(releaseDevice200, 'expected POST /v1/device/approve 200 to be held');
+
+  await page.getByRole('button', { name: /Sign out/i }).click();
+  await page.getByRole('link', { name: /Sign in/i }).waitFor({ timeout: 5000 });
+
+  await releaseDevice200();
+  await page.waitForTimeout(100);
+  assert.equal(await page.getByRole('heading', { name: /CLI login approved/i }).count(), 0);
+  assert.equal((await page.locator('main').innerText()).includes('stale-device-cli'), false);
+  assert.equal(await page.locator('[role="alert"]').count(), 0);
+  await page.unroute('**/v1/device/approve');
+
+  // Observe completed server mutation via real device token poll
+  const devToken1 = await pollDeviceToken(auth1.device_code);
+  assert.equal(devToken1.status, 200);
+  assert.ok(devToken1.body.access_token.startsWith('mca_'));
+
+  // Stale 400 device error across logout
+  await page.goto(`${baseUrl}/device`, { waitUntil: 'networkidle' });
+  await signInViaIdp(page, alice);
+  let releaseDevice400 = null;
+  let resolveDevice400Fetched = null;
+  const device400Fetched = new Promise((r) => {
+    resolveDevice400Fetched = r;
+  });
+  await page.route('**/v1/device/approve', async (route) => {
+    const response = await route.fetch();
+    await new Promise((resolve) => {
+      releaseDevice400 = async () => {
+        await route.fulfill({ response });
+        resolve();
+      };
+      resolveDevice400Fetched();
+    });
+  });
+  await page.getByLabel(/Verification code/i).fill('ZZZZ-9999');
+  await page.getByRole('button', { name: /Approve/i }).click();
+  await page.getByRole('button', { name: /Submitting/i }).waitFor({ timeout: 3000 });
+  await device400Fetched;
+  await page.getByRole('button', { name: /Sign out/i }).click();
+  await page.getByRole('link', { name: /Sign in/i }).waitFor({ timeout: 5000 });
+  await releaseDevice400();
+  await page.waitForTimeout(100);
+  assert.equal(await page.locator('[role="alert"]').count(), 0);
+  await page.unroute('**/v1/device/approve');
+
+  // Stale 401 on device decision + fresh usable device approval on reauth
+  await page.goto(auth2.verification_uri_complete, { waitUntil: 'networkidle' });
+  await signInViaIdp(page, alice);
+  assert.equal((await page.getByLabel(/Verification code/i).inputValue()).toUpperCase(), auth2.user_code);
+  let releaseDevice401 = null;
+  let resolveDevice401Held = null;
+  const device401Held = new Promise((r) => {
+    resolveDevice401Held = r;
+  });
+  await page.route('**/v1/device/approve', async (route) => {
+    await new Promise((resolve) => {
+      releaseDevice401 = async () => {
+        await route.continue();
+        resolve();
+      };
+      resolveDevice401Held();
+    });
+  });
+  await page.getByRole('button', { name: /Approve/i }).click();
+  await page.getByRole('button', { name: /Submitting/i }).waitFor({ timeout: 3000 });
+  await device401Held;
+  await page.getByRole('button', { name: /Sign out/i }).click();
+  await page.getByRole('link', { name: /Sign in/i }).waitFor({ timeout: 5000 });
+  const respDev401 = page.waitForResponse((r) => r.url().includes('/v1/device/approve') && r.status() === 401);
+  await releaseDevice401();
+  await respDev401;
+  await page.waitForTimeout(100);
+  assert.equal(await page.locator('[role="alert"]').count(), 0);
+  await page.unroute('**/v1/device/approve');
+
+  await page.goto(auth2.verification_uri_complete, { waitUntil: 'networkidle' });
+  await signInViaIdp(page, alice);
+  await page.getByRole('button', { name: /Approve/i }).click();
+  await page.getByRole('heading', { name: /CLI login approved/i }).waitFor({ timeout: 5000 });
+  await page.getByText('fresh-device-cli').waitFor({ timeout: 5000 });
+  await page.getByRole('button', { name: /Sign out/i }).click();
+  await page.getByRole('link', { name: /Sign in/i }).waitFor({ timeout: 5000 });
+
+  // 4. Stale explicit invitation acceptance (403 mismatch, 200 accept, 401)
+  const bobCtx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  const bobPage = await bobCtx.newPage();
+  await bobPage.goto(`${baseUrl}/`, { waitUntil: 'networkidle' });
+  await signInViaIdp(bobPage, bob);
+  await bobPage.getByLabel(/Workspace name/i).fill('Invite Session Fleet');
+  await bobPage.getByRole('button', { name: /Create workspace/i }).click();
+  await bobPage.waitForURL(/\/workspaces\/([0-9a-f-]{36})$/, { timeout: 5000 });
+  const bobMembers = bobPage.getByRole('region', { name: /^Members$/i });
+  await bobMembers.getByLabel(/Invite email/i).fill('carol-sess@example.com');
+  await bobMembers.getByRole('button', { name: /Send invite/i }).click();
+  const mismatchInviteUrl = await bobMembers.getByLabel(/Shareable invite link/i).inputValue();
+  await bobMembers.getByRole('button', { name: /Dismiss/i }).click();
+
+  await bobMembers.getByLabel(/Invite email/i).fill(alice.email);
+  await bobMembers.getByRole('button', { name: /Send invite/i }).click();
+  const aliceInviteUrl = await bobMembers.getByLabel(/Shareable invite link/i).inputValue();
+
+  // Create second workspace for 401 invite test
+  await bobPage.getByRole('link', { name: /All workspaces/i }).click();
+  await bobPage.getByLabel(/Workspace name/i).fill('Invite 401 Fleet');
+  await bobPage.getByRole('button', { name: /Create workspace/i }).click();
+  await bobPage.waitForURL(/\/workspaces\/([0-9a-f-]{36})$/, { timeout: 5000 });
+  const bobMembers2 = bobPage.getByRole('region', { name: /^Members$/i });
+  await bobMembers2.getByLabel(/Invite email/i).fill(alice.email);
+  await bobMembers2.getByRole('button', { name: /Send invite/i }).click();
+  const aliceInvite401Url = await bobMembers2.getByLabel(/Shareable invite link/i).inputValue();
+  await bobCtx.close();
+
+  // 4a. Stale 403 invitation_mismatch held across Sign out
+  await page.goto(mismatchInviteUrl, { waitUntil: 'networkidle' });
+  await signInViaIdp(page, alice);
+  let releaseInvite403 = null;
+  let resolveInvite403Fetched = null;
+  const invite403Fetched = new Promise((r) => {
+    resolveInvite403Fetched = r;
+  });
+  await page.route('**/v1/invitations/*/accept', async (route) => {
+    const response = await route.fetch();
+    await new Promise((resolve) => {
+      releaseInvite403 = async () => {
+        await route.fulfill({ response });
+        resolve();
+      };
+      resolveInvite403Fetched();
+    });
+  });
+  await page.getByRole('button', { name: /Accept invitation/i }).click();
+  await page.getByRole('button', { name: /Accepting/i }).waitFor({ timeout: 3000 });
+  await invite403Fetched;
+  await page.getByRole('button', { name: /Sign out/i }).click();
+  await page.getByRole('link', { name: /Sign in/i }).waitFor({ timeout: 5000 });
+  await releaseInvite403();
+  await page.waitForTimeout(100);
+  assert.equal(await page.locator('[role="alert"]').count(), 0);
+  await page.unroute('**/v1/invitations/*/accept');
+
+  // 4b. Stale 200 invitation accept held across Sign out, then observed on reauth
+  await page.goto(aliceInviteUrl, { waitUntil: 'networkidle' });
+  await signInViaIdp(page, alice);
+  let releaseInvite200 = null;
+  let resolveInvite200Fetched = null;
+  const invite200Fetched = new Promise((r) => {
+    resolveInvite200Fetched = r;
+  });
+  await page.route('**/v1/invitations/*/accept', async (route) => {
+    const response = await route.fetch();
+    await new Promise((resolve) => {
+      releaseInvite200 = async () => {
+        await route.fulfill({ response });
+        resolve();
+      };
+      resolveInvite200Fetched();
+    });
+  });
+  await page.getByRole('button', { name: /Accept invitation/i }).click();
+  await page.getByRole('button', { name: /Accepting/i }).waitFor({ timeout: 3000 });
+  await invite200Fetched;
+  await page.getByRole('button', { name: /Sign out/i }).click();
+  await page.getByRole('link', { name: /Sign in/i }).waitFor({ timeout: 5000 });
+  await releaseInvite200();
+  await page.waitForTimeout(100);
+  assert.equal(await page.getByRole('heading', { name: /Invitation accepted/i }).count(), 0);
+  assert.equal(await page.getByRole('link', { name: /Open workspace/i }).count(), 0);
+  await page.unroute('**/v1/invitations/*/accept');
+
+  await signInViaIdp(page, alice);
+  await page.getByRole('link', { name: /Invite Session Fleet/i }).waitFor({ timeout: 5000 });
+  await page.getByRole('button', { name: /Sign out/i }).click();
+  await page.getByRole('link', { name: /Sign in/i }).waitFor({ timeout: 5000 });
+
+  // 4c. Real stale 401 on invitation accept
+  await page.goto(aliceInvite401Url, { waitUntil: 'networkidle' });
+  await signInViaIdp(page, alice);
+  let releaseInvite401 = null;
+  let resolveInvite401Held = null;
+  const invite401Held = new Promise((r) => {
+    resolveInvite401Held = r;
+  });
+  await page.route('**/v1/invitations/*/accept', async (route) => {
+    await new Promise((resolve) => {
+      releaseInvite401 = async () => {
+        await route.continue();
+        resolve();
+      };
+      resolveInvite401Held();
+    });
+  });
+  await page.getByRole('button', { name: /Accept invitation/i }).click();
+  await page.getByRole('button', { name: /Accepting/i }).waitFor({ timeout: 3000 });
+  await invite401Held;
+  await page.getByRole('button', { name: /Sign out/i }).click();
+  await page.getByRole('link', { name: /Sign in/i }).waitFor({ timeout: 5000 });
+  const respInv401 = page.waitForResponse((r) => r.url().includes('/accept') && r.status() === 401);
+  await releaseInvite401();
+  await respInv401;
+  await page.waitForTimeout(100);
+  assert.equal(await page.locator('[role="alert"]').count(), 0);
+  await page.unroute('**/v1/invitations/*/accept');
+
+  // 5a. Obsolete bootstrap (init): held 401 Retry #1 must not wipe out signed-in Retry #2
+  let mePhase = 'abort_initial';
+  let releaseBootstrap401 = null;
+  let resolveBootstrap401Fetched = null;
+  const bootstrap401Fetched = new Promise((r) => {
+    resolveBootstrap401Fetched = r;
+  });
+  await page.route('**/v1/me', async (route) => {
+    if (mePhase === 'abort_initial') {
+      mePhase = 'hold_retry_401';
+      await route.abort('failed');
+      return;
+    }
+    if (mePhase === 'hold_retry_401') {
+      mePhase = 'passthrough';
+      const response = await route.fetch();
+      assert.equal(response.status(), 401);
+      await new Promise((resolve) => {
+        releaseBootstrap401 = async () => {
+          await route.fulfill({ response });
+          resolve();
+        };
+        resolveBootstrap401Fetched();
+      });
+      return;
+    }
+    await route.continue();
+  });
+
+  await page.goto(`${baseUrl}/`, { waitUntil: 'domcontentloaded' });
+  await page.getByText(/Could not reach Muster Cloud/i).waitFor({ timeout: 5000 });
+  const retryBtn = page.getByRole('button', { name: /Retry/i });
+  await retryBtn.click();
+  await bootstrap401Fetched;
+  assert.ok(releaseBootstrap401, 'expected first Retry /v1/me 401 to be held');
+
+  // Sign in via second tab sharing the browser context cookies
+  const tab2 = await context.newPage();
+  await tab2.goto(`${baseUrl}/`, { waitUntil: 'networkidle' });
+  await signInViaIdp(tab2, alice);
+  await tab2.getByText(alice.email, { exact: true }).waitFor({ timeout: 5000 });
+
+  // Second Retry on original page establishes current session in-document
+  await retryBtn.click();
+  await page.getByText(alice.email, { exact: true }).waitFor({ timeout: 5000 });
+  await page.getByRole('link', { name: /Alice Base Fleet/i }).waitFor({ timeout: 5000 });
+
+  // Release obsolete 401 from Retry #1 -> must NOT clear state.me or render Sign in
+  await releaseBootstrap401();
+  await page.waitForTimeout(100);
+  await page.getByText(alice.email, { exact: true }).waitFor({ timeout: 3000 });
+  assert.equal(await page.getByRole('link', { name: /Sign in/i }).count(), 0);
+  assert.equal(await page.locator('[role="alert"]').count(), 0);
+  await page.unroute('**/v1/me');
+
+  // 5a-2. Obsolete bootstrap 200 (Alice) must not overwrite newer session (Bob) in same document
+  const page3 = await context.newPage();
+  let p3MePhase = 'abort_initial';
+  let releaseBootstrapAlice200 = null;
+  let resolveBootstrapAliceFetched = null;
+  const bootstrapAliceFetched = new Promise((r) => {
+    resolveBootstrapAliceFetched = r;
+  });
+  await page3.route('**/v1/me', async (route) => {
+    if (p3MePhase === 'abort_initial') {
+      p3MePhase = 'hold_retry_200';
+      await route.abort('failed');
+      return;
+    }
+    if (p3MePhase === 'hold_retry_200') {
+      p3MePhase = 'passthrough';
+      const response = await route.fetch();
+      assert.equal(response.status(), 200);
+      await new Promise((resolve) => {
+        releaseBootstrapAlice200 = async () => {
+          await route.fulfill({ response });
+          resolve();
+        };
+        resolveBootstrapAliceFetched();
+      });
+      return;
+    }
+    await route.continue();
+  });
+  await page3.goto(`${baseUrl}/`, { waitUntil: 'domcontentloaded' });
+  await page3.getByText(/Could not reach Muster Cloud/i).waitFor({ timeout: 5000 });
+  const p3RetryBtn = page3.getByRole('button', { name: /Retry/i });
+  await p3RetryBtn.click();
+  await bootstrapAliceFetched;
+  assert.ok(releaseBootstrapAlice200, 'expected stale 200 /v1/me to be held');
+
+  // Switch tab2 from Alice to Bob
+  await tab2.getByRole('button', { name: /Sign out/i }).click();
+  await tab2.getByRole('link', { name: /Sign in/i }).waitFor({ timeout: 5000 });
+  await signInViaIdp(tab2, bob);
+  await tab2.getByText(bob.email, { exact: true }).waitFor({ timeout: 5000 });
+
+  // Retry #2 on page3 signs in as Bob
+  await p3RetryBtn.click();
+  await page3.getByText(bob.email, { exact: true }).waitFor({ timeout: 5000 });
+  await page3.getByRole('link', { name: /Invite Session Fleet/i }).waitFor({ timeout: 5000 });
+
+  // Release stale 200 Alice -> Bob UI must remain intact
+  await releaseBootstrapAlice200();
+  await page3.waitForTimeout(100);
+  await page3.getByText(bob.email, { exact: true }).waitFor({ timeout: 3000 });
+  assert.equal(await page3.getByText(alice.email, { exact: true }).count(), 0);
+  assert.equal(await page3.getByRole('link', { name: /Alice Base Fleet/i }).count(), 0);
+  await page3.unroute('**/v1/me');
+  await page3.close();
+
+  // Sign back in as Alice on tab2 for logout tests
+  await tab2.getByRole('button', { name: /Sign out/i }).click();
+  await tab2.getByRole('link', { name: /Sign in/i }).waitFor({ timeout: 5000 });
+  await signInViaIdp(tab2, alice);
+  await page.reload({ waitUntil: 'networkidle' });
+  await page.getByText(alice.email, { exact: true }).waitFor({ timeout: 5000 });
+
+  // 5b. Failed logout -> Retry sign out works; obsolete logout failure does not overwrite expired state
+  let abortLogoutOnce = true;
+  await page.route('**/v1/auth/logout', async (route) => {
+    if (abortLogoutOnce) {
+      abortLogoutOnce = false;
+      await route.abort('failed');
+      return;
+    }
+    await route.continue();
+  });
+  await page.getByRole('button', { name: /Sign out/i }).click();
+  await page.getByText(/Could not sign out/i).waitFor({ timeout: 5000 });
+  await page.getByText(alice.email, { exact: true }).waitFor({ timeout: 3000 });
+  await page.getByRole('button', { name: /Retry sign out/i }).click();
+  await page.getByRole('link', { name: /Sign in/i }).waitFor({ timeout: 5000 });
+  await page.unroute('**/v1/auth/logout');
+
+  // Obsolete logout failure after session already expired via real 401
+  await page.goto(`${baseUrl}/`, { waitUntil: 'networkidle' });
+  await signInViaIdp(page, alice);
+  await page.getByRole('link', { name: /Alice Base Fleet/i }).waitFor({ timeout: 5000 });
+
+  let releaseObsoleteLogout = null;
+  let resolveObsoleteLogoutHeld = null;
+  const obsoleteLogoutHeld = new Promise((r) => {
+    resolveObsoleteLogoutHeld = r;
+  });
+  await page.route('**/v1/auth/logout', async (route) => {
+    await new Promise((resolve) => {
+      releaseObsoleteLogout = async () => {
+        await route.abort('failed');
+        resolve();
+      };
+      resolveObsoleteLogoutHeld();
+    });
+  });
+  await page.getByRole('button', { name: /Sign out/i }).click();
+  await page.getByRole('button', { name: /Signing out/i }).waitFor({ timeout: 3000 });
+  await obsoleteLogoutHeld;
+  assert.ok(releaseObsoleteLogout, 'expected POST /v1/auth/logout to be held');
+
+  // Sign out on tab2 so server session is truly invalidated
+  await tab2.reload({ waitUntil: 'networkidle' });
+  await tab2.getByRole('button', { name: /Sign out/i }).click();
+  await tab2.getByRole('link', { name: /Sign in/i }).waitFor({ timeout: 5000 });
+  await tab2.close();
+
+  // Trigger real 401 on page while old logout is in flight -> page resets to signed out
+  await page.getByRole('link', { name: /Alice Base Fleet/i }).click();
+  await page.getByRole('link', { name: /Sign in/i }).waitFor({ timeout: 5000 });
+
+  // Release held logout failure -> obsolete logout must NOT publish signOutError
+  await releaseObsoleteLogout();
+  await page.waitForTimeout(100);
+  await page.getByRole('link', { name: /Sign in/i }).waitFor({ timeout: 3000 });
+  assert.equal(await page.locator('[role="alert"]').count(), 0);
+  await page.unroute('**/v1/auth/logout');
+
+  await saveScreenshot(page, '36-session-account-ownership');
+  assert.deepEqual(pageErrors, [], `unexpected page errors: ${pageErrors.join('; ')}`);
+  await context.close();
+}
+
 const journeys = [
   ['journey_1_signin_and_account', journey1SignInAndAccount],
   ['journey_2_empty_workspaces', journey2EmptyWorkspaces],
@@ -2235,6 +2869,7 @@ const journeys = [
   ['journey_21_billing_navigation_isolation_and_stale_response_guard', journey21BillingNavigationIsolationAndStaleResponseGuard],
   ['journey_22_billing_machines_limit_excludes_revoked_devices', journey22BillingMachinesLimitExcludesRevokedDevices],
   ['journey_23_workspace_async_isolation_members_history_proposals_invites', journey23WorkspaceAsyncIsolationMembersHistoryProposalsInvites],
+  ['journey_24_session_account_ownership_and_reset', journey24SessionAccountOwnershipAndReset],
 ];
 
 async function main() {

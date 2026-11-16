@@ -3,6 +3,8 @@
 
   const THEME_STORAGE_KEY = 'mc_theme';
   const state = {
+    sessionGeneration: 0,
+    bootstrapSeq: 0,
     me: null,
     workspaces: null,
     loadingWorkspaces: false,
@@ -148,15 +150,57 @@
     state.cancelInFlight = false;
   }
 
-  function expireSession() {
+  function resetSessionState({ render = true } = {}) {
+    state.sessionGeneration += 1;
     state.me = null;
     state.workspaces = null;
+    state.loadingWorkspaces = false;
+    state.loadError = null;
+    state.formName = '';
+    state.formError = null;
+    state.submitError = null;
+    state.createInFlight = false;
+    state.createIdempotencyKey = null;
+    state.createIntentBody = null;
+    state.deviceUserCode = '';
+    state.deviceFieldError = null;
+    state.deviceSubmitError = null;
+    state.deviceInFlight = false;
+    state.deviceResult = null;
+    state.acceptInFlight = false;
+    state.acceptError = null;
+    state.acceptResult = null;
+    state.signOutInFlight = false;
+    state.signOutError = null;
     resetWorkspaceState();
-    renderShell();
+    syncDeviceCodeFromUrl();
+    if (render) {
+      renderShell();
+    }
+  }
+
+  function expireSession() {
+    resetSessionState();
+  }
+
+  function captureSessionContext() {
+    return {
+      generation: state.sessionGeneration,
+      accountId: state.me ? state.me.id : null,
+    };
+  }
+
+  function isCurrentSessionContext(ctx) {
+    return (
+      Boolean(ctx && ctx.accountId) &&
+      state.sessionGeneration === ctx.generation &&
+      Boolean(state.me && state.me.id === ctx.accountId)
+    );
   }
 
   function captureWorkspaceContext(wsId) {
     return {
+      sessionGeneration: state.sessionGeneration,
       epoch: state.workspaceEpoch,
       wsId,
       accountId: state.me ? state.me.id : null,
@@ -166,6 +210,7 @@
   function isCurrentWorkspaceContext(ctx, requireActive = true) {
     return (
       Boolean(ctx && ctx.accountId) &&
+      state.sessionGeneration === ctx.sessionGeneration &&
       state.workspaceEpoch === ctx.epoch &&
       Boolean(state.me && state.me.id === ctx.accountId) &&
       (!requireActive || Boolean(state.activeWorkspace && state.activeWorkspace.id === ctx.wsId)) &&
@@ -276,6 +321,7 @@
   }
 
   function syncDeviceCodeFromUrl() {
+    if (!isDeviceRoute()) return;
     const params = new URLSearchParams(window.location.search);
     const code = params.get('user_code');
     if (code) {
@@ -324,6 +370,8 @@
 
   async function handleSignOut() {
     if (state.signOutInFlight || !state.me) return;
+    const sessionCtx = captureSessionContext();
+    if (!isCurrentSessionContext(sessionCtx)) return;
     state.signOutInFlight = true;
     state.signOutError = null;
     renderShell();
@@ -335,19 +383,14 @@
         },
         credentials: 'same-origin',
       });
+      if (!isCurrentSessionContext(sessionCtx)) return;
       if (!resp.ok && resp.status !== 401) {
         throw new Error(`HTTP ${resp.status}`);
       }
-      state.signOutInFlight = false;
-      state.me = null;
-      state.workspaces = null;
-      state.acceptInFlight = false;
-      state.acceptError = null;
-      state.acceptResult = null;
-      resetWorkspaceState();
       window.history.pushState({}, '', '/');
-      renderShell();
+      resetSessionState();
     } catch (_err) {
+      if (!isCurrentSessionContext(sessionCtx)) return;
       state.signOutInFlight = false;
       state.signOutError = 'Could not sign out. Please try again.';
       renderShell();
@@ -355,6 +398,7 @@
   }
 
   function navigateToList() {
+    state.signOutError = null;
     state.acceptInFlight = false;
     state.acceptError = null;
     state.acceptResult = null;
@@ -371,6 +415,7 @@
   }
 
   function navigateToWorkspace(id) {
+    state.signOutError = null;
     state.acceptInFlight = false;
     state.acceptError = null;
     state.acceptResult = null;
@@ -450,6 +495,8 @@
 
   async function handleDeviceDecision(decision) {
     if (state.deviceInFlight || !state.me) return;
+    const sessionCtx = captureSessionContext();
+    if (!isCurrentSessionContext(sessionCtx)) return;
     const code = state.deviceUserCode.trim();
     if (!code) {
       state.deviceFieldError = 'Enter the verification code shown by your CLI.';
@@ -476,13 +523,13 @@
         credentials: 'same-origin',
         body: JSON.stringify({ user_code: code, decision }),
       });
+      if (!isCurrentSessionContext(sessionCtx)) return;
       if (resp.status === 401) {
-        state.me = null;
-        state.deviceInFlight = false;
-        renderShell();
+        expireSession();
         return;
       }
       const data = await resp.json().catch(() => null);
+      if (!isCurrentSessionContext(sessionCtx)) return;
       if (!resp.ok) {
         state.deviceSubmitError =
           (data && data.error && data.error.message) ||
@@ -495,6 +542,7 @@
       state.deviceResult = data;
       renderShell();
     } catch (_err) {
+      if (!isCurrentSessionContext(sessionCtx)) return;
       state.deviceInFlight = false;
       state.deviceSubmitError = 'Connection failed while sending your decision. Please try again.';
       renderShell();
@@ -2802,7 +2850,9 @@
 
   async function handleCreateWorkspace(e) {
     e.preventDefault();
-    if (state.createInFlight) return;
+    if (state.createInFlight || !state.me) return;
+    const sessionCtx = captureSessionContext();
+    if (!isCurrentSessionContext(sessionCtx)) return;
 
     const check = validateWorkspaceName(state.formName);
     if (!check.ok) {
@@ -2825,6 +2875,7 @@
     state.createInFlight = true;
     renderShell();
 
+    let created = false;
     try {
       const resp = await fetch('/v1/workspaces', {
         method: 'POST',
@@ -2837,13 +2888,13 @@
         credentials: 'same-origin',
         body: state.createIntentBody,
       });
+      if (!isCurrentSessionContext(sessionCtx)) return;
       if (resp.status === 401) {
-        state.me = null;
-        state.createInFlight = false;
-        renderShell();
+        expireSession();
         return;
       }
       const data = await resp.json().catch(() => null);
+      if (!isCurrentSessionContext(sessionCtx)) return;
       if (!resp.ok) {
         const msg =
           (data && data.error && data.error.message) ||
@@ -2854,6 +2905,7 @@
         return;
       }
 
+      created = true;
       state.createInFlight = false;
       state.formName = '';
       state.createIdempotencyKey = null;
@@ -2878,6 +2930,8 @@
       }
       await Promise.all(createLoaders);
     } catch (_err) {
+      if (!isCurrentSessionContext(sessionCtx)) return;
+      if (created) return;
       state.createInFlight = false;
       state.submitError = 'Connection failed while creating the workspace. Click Create workspace to retry safely.';
       renderShell();
@@ -2933,6 +2987,8 @@
 
   async function handleAcceptInvitation(token) {
     if (state.acceptInFlight || !state.me) return;
+    const sessionCtx = captureSessionContext();
+    if (!isCurrentSessionContext(sessionCtx)) return;
     state.acceptInFlight = true;
     state.acceptError = null;
     renderShell();
@@ -2945,13 +3001,13 @@
         },
         credentials: 'same-origin',
       });
+      if (!isCurrentSessionContext(sessionCtx)) return;
       if (resp.status === 401) {
-        state.me = null;
-        state.acceptInFlight = false;
-        renderShell();
+        expireSession();
         return;
       }
       const data = await resp.json().catch(() => null);
+      if (!isCurrentSessionContext(sessionCtx)) return;
       if (!resp.ok) {
         state.acceptInFlight = false;
         if (resp.status === 404) {
@@ -2972,6 +3028,7 @@
       state.workspaces = null;
       renderShell();
     } catch (_err) {
+      if (!isCurrentSessionContext(sessionCtx)) return;
       state.acceptInFlight = false;
       state.acceptError = 'Connection failed while accepting the invitation. Please try again.';
       renderShell();
@@ -3053,14 +3110,6 @@
   }
 
   function renderSignedIn() {
-    if (isDeviceRoute()) {
-      return renderDeviceAuth();
-    }
-    const inviteToken = parseInvitationTokenFromPath();
-    if (inviteToken) {
-      return renderInvitationAccept(inviteToken);
-    }
-
     if (state.signOutError) {
       return el('section', { className: 'stack-md' }, [
         el('div', { className: 'alert', role: 'alert' }, [
@@ -3073,6 +3122,13 @@
           }),
         ]),
       ]);
+    }
+    if (isDeviceRoute()) {
+      return renderDeviceAuth();
+    }
+    const inviteToken = parseInvitationTokenFromPath();
+    if (inviteToken) {
+      return renderInvitationAccept(inviteToken);
     }
 
     if (state.loadingDetail) {
@@ -3388,6 +3444,8 @@
   }
 
   async function loadWorkspaces() {
+    const sessionCtx = captureSessionContext();
+    if (!isCurrentSessionContext(sessionCtx)) return;
     state.loadingWorkspaces = true;
     state.loadError = null;
     renderShell();
@@ -3396,20 +3454,21 @@
         headers: { Accept: 'application/json' },
         credentials: 'same-origin',
       });
+      if (!isCurrentSessionContext(sessionCtx)) return;
       if (resp.status === 401) {
-        state.me = null;
-        state.workspaces = null;
-        state.loadingWorkspaces = false;
-        renderShell();
+        expireSession();
         return;
       }
       if (!resp.ok) {
         throw new Error(`HTTP ${resp.status}`);
       }
-      state.workspaces = await resp.json();
+      const workspaces = await resp.json();
+      if (!isCurrentSessionContext(sessionCtx)) return;
+      state.workspaces = workspaces;
       state.loadingWorkspaces = false;
       renderShell();
     } catch (_err) {
+      if (!isCurrentSessionContext(sessionCtx)) return;
       state.loadingWorkspaces = false;
       state.loadError = 'Could not load your workspaces. Please try again.';
       renderShell();
@@ -3429,20 +3488,28 @@
   async function init() {
     applyTheme(localStorage.getItem(THEME_STORAGE_KEY));
     syncDeviceCodeFromUrl();
+    state.bootstrapSeq += 1;
+    const seq = state.bootstrapSeq;
+    const gen = state.sessionGeneration;
+    const isCurrentBootstrap = () =>
+      state.bootstrapSeq === seq && state.sessionGeneration === gen;
     try {
       const resp = await fetch('/v1/me', {
         headers: { Accept: 'application/json' },
         credentials: 'same-origin',
       });
+      if (!isCurrentBootstrap()) return;
       if (resp.status === 401) {
-        state.me = null;
-        renderShell();
+        resetSessionState();
         return;
       }
       if (!resp.ok) {
         throw new Error(`Unexpected status ${resp.status}`);
       }
-      state.me = await resp.json();
+      const me = await resp.json();
+      if (!isCurrentBootstrap()) return;
+      resetSessionState({ render: false });
+      state.me = me;
       const wsId = parseWorkspaceIdFromPath(window.location.pathname);
       if (isDeviceRoute() || parseInvitationTokenFromPath()) {
         renderShell();
@@ -3452,6 +3519,7 @@
         await loadWorkspaces();
       }
     } catch (_err) {
+      if (!isCurrentBootstrap()) return;
       renderShell(
         el('div', { className: 'alert', role: 'alert' }, [
           el('span', { textContent: 'Could not reach Muster Cloud. Please try again.' }),
@@ -3470,6 +3538,7 @@
     syncDeviceCodeFromUrl();
     if (!state.me) return;
     const wsId = parseWorkspaceIdFromPath(window.location.pathname);
+    state.signOutError = null;
     state.acceptInFlight = false;
     state.acceptError = null;
     state.acceptResult = null;
