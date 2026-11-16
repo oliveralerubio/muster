@@ -103,6 +103,7 @@ pg_test_diagnostics() {
       sub(/^[^]]*\] /, "", severity); sub(/:.*/, "", severity)
       sub(/^[^]]*\] (LOG|ERROR|FATAL|PANIC):  /, "")
       label = ""
+      is_cause = 0
       role = $0; sub(/ \(PID .*/, "", role)
       if (role ~ /^(server process|client backend|background writer|checkpointer|WAL writer|walwriter|startup process|archiver process|autovacuum launcher|autovacuum worker|logical replication launcher|logical replication worker|background worker "(logical replication launcher|parallel worker)")$/ &&
           $0 ~ / \(PID [0-9]+\) (was terminated by signal [0-9]+(: [A-Za-z ]+)?|exited with exit code [0-9]+)$/) {
@@ -114,6 +115,7 @@ pg_test_diagnostics() {
           number = $0; sub(/^.*exit code /, "", number)
           label = role " exited with code " number " (PID " pid ")"
         }
+        is_cause = 1
       }
       else if ($0 == "terminating any other active server processes") label = "terminating active server processes"
       else if ($0 == "all server processes terminated; reinitializing") label = "reinitializing"
@@ -133,10 +135,14 @@ pg_test_diagnostics() {
       else if ($0 ~ /: Too many open files in system$/) label = "system file limit reached"
       else if ($0 ~ /: Permission denied$/) label = "permission denied"
       else if (severity == "FATAL" || severity == "PANIC") label = severity " (unclassified)"
-      if (label != "") records[++count % 20] = label
+      if (label == "out of memory" || label == "no space left on device" || label == "disk quota exceeded" || label == "process file limit reached" || label == "system file limit reached" || label == "permission denied") is_cause = 1
+      if (is_cause && first_cause == "") first_cause = label
+      else if (label != "") records[++count % 20] = label
     }
     END {
-      start = count > 20 ? count - 19 : 1
+      limit = first_cause == "" ? 20 : 19
+      if (first_cause != "") print "pg-test.sh: PostgreSQL: " first_cause > "/dev/stderr"
+      start = count > limit ? count - limit + 1 : 1
       for (i = start; i <= count; i++) print "pg-test.sh: PostgreSQL: " records[i % 20] > "/dev/stderr"
     }
   ' || true
