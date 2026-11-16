@@ -97,7 +97,15 @@ pub fn pull(ctx: &mut Context, link: &CloudLink) -> Result<PullOutcome, MusterEr
     let dir = ctx.state_dir.join("cloud");
     let bundle = dir.join("pull.bundle");
     let previous = crate::git::head_commit_opt(&ctx.config_dir);
-    let query = previous.as_deref().map(|rev| format!("since={rev}"));
+    let since = load_accepted_for_link(link, &dir).filter(|rev| {
+        is_canonical_object_id(rev)
+            && previous.is_some()
+            && git_bool(
+                &ctx.config_dir,
+                &["merge-base", "--is-ancestor", rev, "HEAD"],
+            )
+    });
+    let query = since.as_deref().map(|rev| format!("since={rev}"));
     let path = format!("/v1/workspaces/{}/sync", link.workspace);
     let path_and_query = protocol::canonical_path_and_query(&path, query.as_deref());
     let hash = protocol::body_sha256_hex(b"");
@@ -144,10 +152,38 @@ pub fn pull(ctx: &mut Context, link: &CloudLink) -> Result<PullOutcome, MusterEr
         .headers()
         .get(protocol::HEADER_REVISION)
         .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
         .map(str::to_owned);
     if response.status().as_u16() == 204 {
-        if let Some(revision) = tip {
-            record_accepted(link, &dir, &revision)?;
+        match (tip.as_deref(), since.as_deref()) {
+            (Some(revision), Some(sent))
+                if is_canonical_object_id(revision) && revision == sent =>
+            {
+                record_accepted(link, &dir, revision)?;
+            }
+            (Some(revision), _) => {
+                clear_accepted_if_same_link(link, &dir);
+                ctx.diag(crate::output::Diagnostic::new(
+                    crate::output::Severity::Warning,
+                    "cloud_revision_mismatch",
+                    format!(
+                        "Cloud reported revision `{revision}` on an up-to-date response \
+                         that does not match the requested revision; accepted provenance \
+                         was cleared"
+                    ),
+                ));
+            }
+            (None, _) => {
+                clear_accepted_if_same_link(link, &dir);
+                ctx.diag(crate::output::Diagnostic::new(
+                    crate::output::Severity::Warning,
+                    "cloud_revision_missing",
+                    "Cloud up-to-date response omitted the x-muster-revision header; \
+                     accepted provenance was cleared"
+                        .to_string(),
+                ));
+            }
         }
         return Ok(PullOutcome::UpToDate);
     }
@@ -178,14 +214,68 @@ pub fn pull(ctx: &mut Context, link: &CloudLink) -> Result<PullOutcome, MusterEr
         .args(["update-ref", "-d", PULL_REF])
         .output();
     match outcome {
-        Ok(outcome) => {
+        Ok((outcome, fetched_tip)) => {
             let _ = std::fs::remove_file(&bundle);
-            if let Some(revision) = tip {
-                record_accepted(link, &dir, &revision)?;
+            match tip {
+                Some(revision) if is_canonical_object_id(&revision) && revision == fetched_tip => {
+                    record_accepted(link, &dir, &revision)?;
+                }
+                Some(revision) => {
+                    clear_accepted_if_same_link(link, &dir);
+                    ctx.diag(crate::output::Diagnostic::new(
+                        crate::output::Severity::Warning,
+                        "cloud_revision_mismatch",
+                        format!(
+                            "Cloud revision header `{revision}` does not match the verified \
+                             fetched commit {fetched_tip}; accepted provenance was not recorded"
+                        ),
+                    ));
+                }
+                None => {
+                    clear_accepted_if_same_link(link, &dir);
+                    ctx.diag(crate::output::Diagnostic::new(
+                        crate::output::Severity::Warning,
+                        "cloud_revision_missing",
+                        "Cloud response omitted the x-muster-revision header; accepted \
+                         provenance was not recorded"
+                            .to_string(),
+                    ));
+                }
             }
             Ok(outcome)
         }
         Err(message) => Err(failure(&message)),
+    }
+}
+
+/// Whether `revision` is a canonical lowercase 40- or 64-hex Git object ID.
+pub(crate) fn is_canonical_object_id(revision: &str) -> bool {
+    matches!(revision.len(), 40 | 64)
+        && revision
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn load_accepted_for_link(link: &CloudLink, dir: &Path) -> Option<String> {
+    let bytes = std::fs::read(dir.join("accepted.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    if value["workspace"] != link.workspace || value["device"] != link.device {
+        return None;
+    }
+    value["revision"].as_str().map(str::to_owned)
+}
+
+fn clear_accepted_if_same_link(link: &CloudLink, dir: &Path) {
+    let path = dir.join("accepted.json");
+    let Ok(bytes) = std::fs::read(&path) else {
+        return;
+    };
+    let should_remove = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(value) => value["workspace"] == link.workspace && value["device"] == link.device,
+        Err(_) => true,
+    };
+    if should_remove {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -202,15 +292,16 @@ fn record_accepted(link: &CloudLink, dir: &Path, revision: &str) -> Result<(), M
         .map_err(|_| failure("cannot save accepted Cloud revision"))
 }
 
-/// Staging verification and the checkout it guards. The error is a plain
-/// message so the downloaded bundle and staging directory can be cleaned up
-/// before the caller turns it into a `MusterError`.
+/// Staging verification and the checkout it guards. Returns the pull outcome
+/// together with the exact commit hash fetched into `PULL_REF`. The error is a
+/// plain message so the downloaded bundle and staging directory can be cleaned
+/// up before the caller turns it into a `MusterError`.
 fn verify_and_checkout(
     ctx: &mut Context,
     bundle: &str,
     staging: &str,
     previous: Option<&str>,
-) -> Result<PullOutcome, String> {
+) -> Result<(PullOutcome, String), String> {
     // Fetch the incoming tip without touching the working tree, then decide
     // whether it continues this machine's history or is another fleet.
     if !git_bool(
@@ -223,6 +314,20 @@ fn verify_and_checkout(
         ],
     ) {
         return Err("cannot read the Cloud bundle".into());
+    }
+    let fetched_out = std::process::Command::new("git")
+        .current_dir(&ctx.config_dir)
+        .args(["rev-parse", "--verify", &format!("{PULL_REF}^{{commit}}")])
+        .output()
+        .map_err(|e| format!("cannot resolve fetched Cloud commit: {e}"))?;
+    if !fetched_out.status.success() {
+        return Err("cannot resolve fetched Cloud commit".into());
+    }
+    let fetched_tip = String::from_utf8_lossy(&fetched_out.stdout)
+        .trim()
+        .to_ascii_lowercase();
+    if !is_canonical_object_id(&fetched_tip) {
+        return Err("fetched Cloud ref did not resolve to a canonical commit id".into());
     }
     // Whether the served tip shares history with this machine's HEAD decides
     // between a plain update and a confirmed join. `git merge-base A B`
@@ -342,11 +447,12 @@ fn verify_and_checkout(
     // failure here restores the previous HEAD (nothing was applied yet).
     crate::trust::verify_pulled(ctx, previous, !related, true, own_scaffold_pin)
         .map_err(|e| e.to_string())?;
-    Ok(if related {
+    let outcome = if related {
         PullOutcome::Updated
     } else {
         PullOutcome::Joined
-    })
+    };
+    Ok((outcome, fetched_tip))
 }
 
 /// Publish a persistent exact bundle; a retry uses the same key and bytes.

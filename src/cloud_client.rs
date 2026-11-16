@@ -251,12 +251,46 @@ pub fn clear_link_intent(state_dir: &Path) -> Result<(), MusterError> {
     }
 }
 
+/// The newest receipt sequence the service holds for `device` (`0` when it
+/// has none), read with the account session from the workspace's device
+/// listing. Any failure is an error: the caller must not guess a sequence.
+pub fn device_last_receipt_sequence(
+    account: &CloudAccount,
+    workspace: &str,
+    device: &str,
+) -> Result<u64, MusterError> {
+    let unavailable =
+        || MusterError::Operational("cannot read the device's receipt history from Cloud".into());
+    let agent: ureq::Agent = ureq::config::Config::builder()
+        .max_redirects(0)
+        .http_status_as_error(false)
+        .timeout_global(Some(std::time::Duration::from_secs(30)))
+        .build()
+        .into();
+    let path = crate::cloud_protocol::routes::WORKSPACE_DEVICES.replace("{ws}", workspace);
+    let mut response = agent
+        .get(format!("{}{path}", account.endpoint))
+        .header("Authorization", format!("Bearer {}", account.token()))
+        .call()
+        .map_err(|_| unavailable())?;
+    if !response.status().is_success() {
+        return Err(unavailable());
+    }
+    let devices: Vec<crate::cloud_protocol::Device> =
+        response.body_mut().read_json().map_err(|_| unavailable())?;
+    let found = devices
+        .iter()
+        .find(|d| d.id == device)
+        .ok_or_else(unavailable)?;
+    Ok(found.last_receipt.as_ref().map_or(0, |r| r.sequence))
+}
+
 /// Sends one device-signed request over the transport and returns
 /// `(status, body bytes)` — the caller inspects both. The signature binds
 /// method, canonical path, workspace, device, body hash, base revision,
 /// idempotency key, timestamp and nonce: the same request scheme the sync
 /// transport uses.
-fn device_request(
+pub(crate) fn device_request(
     link: &CloudLink,
     signer: &crate::signing::Signer,
     method: &str,

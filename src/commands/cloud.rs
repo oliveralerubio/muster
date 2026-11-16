@@ -275,6 +275,11 @@ fn link(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     };
     if let Some(existing) = crate::cloud_client::CloudLink::load(&ctx.state_dir)? {
         if existing.endpoint == account.endpoint && existing.workspace == workspace.id {
+            if !ctx.dry_run {
+                // Re-running `link` on an established link reconciles the
+                // receipt sequence (e.g. after the local receipt state was lost).
+                establish_receipt_sequence(ctx, &account, &existing, false)?;
+            }
             return Ok(
                 json!({"status":"linked", "workspace": existing.workspace, "device": existing.device}),
             );
@@ -345,15 +350,49 @@ fn link(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
             "Cloud returned a different workspace".into(),
         ));
     }
-    crate::cloud_client::CloudLink::new(
-        account.endpoint,
+    let link = crate::cloud_client::CloudLink::new(
+        account.endpoint.clone(),
         linked.workspace_id,
         linked.device_id.clone(),
         linked.device_token,
-    )?
-    .save(&ctx.state_dir)?;
+    )?;
+    // The service re-links the same signing key to the SAME device, so the
+    // receipt counter is reconciled, never reset, under the sync lock.
+    establish_receipt_sequence(ctx, &account, &link, true)?;
     crate::cloud_client::clear_link_intent(&ctx.state_dir)?;
     Ok(
         json!({"status": linked.status, "bootstrap": linked.bootstrap, "workspace":workspace.id, "device":linked.device_id}),
     )
+}
+
+/// Persists the link (when `save`) and establishes its durable receipt
+/// counter in ONE critical section under `sync.lock`: the queue is shared
+/// with a running `muster sync`, which holds the same lock.
+fn establish_receipt_sequence(
+    ctx: &mut Context,
+    account: &crate::cloud_client::CloudAccount,
+    link: &crate::cloud_client::CloudLink,
+    save: bool,
+) -> Result<(), MusterError> {
+    let remote =
+        crate::cloud_client::device_last_receipt_sequence(account, &link.workspace, &link.device)
+            .ok();
+    let state_dir = ctx.state_dir.clone();
+    let sequence = crate::receipts::with_sync_lock(&state_dir, || {
+        if save {
+            link.save(&state_dir)?;
+        }
+        crate::receipts::init_for_link(&state_dir, link, remote)
+    })?;
+    if sequence == crate::receipts::LinkSequence::Deferred {
+        ctx.diag(crate::output::Diagnostic::new(
+            crate::output::Severity::Warning,
+            "receipt_sequence_deferred",
+            "this machine has no receipt history for the device and the service's receipt \
+             history could not be read; apply receipts are deferred until `muster cloud link` \
+             succeeds again"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }

@@ -24,6 +24,7 @@ pub mod manifest;
 pub mod mcp;
 pub mod output;
 pub mod providers;
+pub mod receipts;
 pub mod registry;
 pub mod revocation_tx;
 pub mod secret_leases;

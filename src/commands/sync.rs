@@ -191,6 +191,19 @@ fn sync(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         }));
     }
     let global = target == engine::Target::Global;
+    // Apply-receipt provenance is established BEFORE the plan, from the
+    // exact accepted revision's verified signed fleet state (read from that
+    // commit and covered by the pin): a receipt attests the applied accepted
+    // revision with clean configuration — never the worktree's latest state
+    // or a later HEAD.
+    let receipt_provenance = if global
+        && !ctx.dry_run
+        && crate::cloud_client::CloudLink::load(&ctx.state_dir)?.is_some()
+    {
+        crate::receipts::accepted_provenance(ctx)?
+    } else {
+        None
+    };
     let plan = engine::plan(
         ctx,
         &Options {
@@ -200,6 +213,12 @@ fn sync(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     )?;
     let mut result = engine::apply(ctx, plan)?;
     if global {
+        // Freeze the signed receipt BEFORE `team::record_applied` commits
+        // bookkeeping: the receipt attests the applied accepted revision,
+        // never the bookkeeping commit.
+        if let Some(provenance) = &receipt_provenance {
+            crate::receipts::freeze_applied_receipt(ctx, provenance, &result)?;
+        }
         let recorded = crate::team::record_applied(ctx, &result)?;
         if recorded && transport["pushed"] == true {
             if let Some(link) = crate::cloud_client::CloudLink::load(&ctx.state_dir)? {
@@ -319,6 +338,11 @@ fn transport(
                 "Cloud sync needs an explicit --pull (download) or --push (publish)".into(),
             ));
         }
+        // Drain queued apply receipts FIRST, while nothing has failed: their
+        // delivery must not depend on pull/push steps that can fail later.
+        // Receipts that cannot be delivered stay queued and visible without
+        // failing this sync.
+        crate::receipts::drain(ctx, &link);
         let committed = git::commit_if_configured(&ctx.config_dir, "chore(muster): sync")?;
         if only_push {
             crate::sync_transport::push(ctx, &link)?;
