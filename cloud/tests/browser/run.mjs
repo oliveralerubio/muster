@@ -4173,6 +4173,161 @@ async function journey29BillingSeatLimitsAndWorkspacePlanStatus(browser) {
   await context.close();
 }
 
+async function journey31BillingCheckoutAlreadyPaidPollsUntilSubscriptionAppears(browser) {
+  assert.ok(billingUrl, 'MUSTER_BILLING_CLOUD_URL is required');
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  await context.clock.install();
+  const page = await context.newPage();
+  const pageErrors = [];
+  page.on('pageerror', (err) => pageErrors.push(err.message));
+
+  await page.goto(`${billingUrl}/`, { waitUntil: 'networkidle' });
+  await signInViaIdp(page, { subject: 'quinn-paid-checkout-1', email: 'quinn@example.com' });
+
+  let billingPath = '';
+  let billingGets = 0;
+  page.on('request', (req) => {
+    if (req.method() === 'GET' && new URL(req.url()).pathname === billingPath) billingGets += 1;
+  });
+  const billingSection = page.getByRole('region', { name: /^Billing$/i });
+  const statusWith = (re) => billingSection.locator('[role="status"]', { hasText: re });
+  // Answers the console's GET /billing with the trial state while `remaining()` > 0.
+  const trialRoute = (trial, remaining) => async (route) => {
+    const req = route.request();
+    if (req.method() === 'GET' && new URL(req.url()).pathname === billingPath && remaining()) {
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(trial) });
+      return;
+    }
+    await route.continue();
+  };
+  // Lets fake time pass in rounds (each fires at most one poll, whose
+  // request then completes in real time) until `locator` shows.
+  const advanceUntil = async (locator, rounds, what) => {
+    for (let i = 0; i < rounds; i += 1) {
+      await page.clock.runFor(30_000);
+      try {
+        await locator.waitFor({ timeout: 1500 });
+        return;
+      } catch (_err) {
+        // not yet: next round
+      }
+    }
+    assert.fail(`${what} did not show after ${rounds} rounds of 30 s`);
+  };
+  // A workspace whose open checkout the customer pays at Paddle while this
+  // console still offers it. Returns the billing the console last saw (trial).
+  const paidCheckoutWorkspace = async (name, n) => {
+    await page.getByLabel(/Workspace name/i).fill(name);
+    await page.getByRole('button', { name: /Create workspace/i }).click();
+    await page.waitForURL(/\/workspaces\/([0-9a-f-]{36})$/, { timeout: 5000 });
+    const wsId = page.url().match(/\/workspaces\/([0-9a-f-]{36})$/)[1];
+    billingPath = `/v1/workspaces/${wsId}/billing`;
+    await billingSection.waitFor({ timeout: 5000 });
+    await billingSection.getByRole('button', { name: /Continue to checkout/i }).click();
+    const paddleLink = billingSection.getByRole('link', { name: /Open Paddle checkout/i });
+    await paddleLink.waitFor({ timeout: 5000 });
+    const txnId = (await paddleLink.getAttribute('href')).split('/').pop();
+    const trial = await page.evaluate(async (path) => {
+      const r = await fetch(path, { credentials: 'same-origin' });
+      return r.json();
+    }, billingPath);
+    assert.equal(trial.plan, 'trial');
+    await paddleControl('POST', '/complete-checkout', {
+      transaction_id: txnId,
+      subscription_id: `sub_01browserpaid${n}000000000`,
+      customer_id: `ctm_01browserpaid${n}000000000`,
+    });
+    return trial;
+  };
+  // "Continue to checkout" answered 409 subscription_exists, as the server
+  // does for a checkout that was paid meanwhile.
+  const continueToCheckout409 = async () => {
+    const route409 = async (route) => {
+      if (route.request().method() !== 'POST') {
+        await route.continue();
+        return;
+      }
+      await route.fulfill({
+        status: 409,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          error: {
+            code: 'subscription_exists',
+            message: 'a checkout of this workspace was paid; its subscription is being set up',
+          },
+        }),
+      });
+    };
+    await page.route(`**${billingPath}/checkout`, route409);
+    await Promise.all([
+      page.waitForResponse(
+        (r) =>
+          r.request().method() === 'POST' &&
+          new URL(r.url()).pathname === `${billingPath}/checkout` &&
+          r.status() === 409
+      ),
+      billingSection.getByRole('button', { name: /Continue to checkout/i }).click(),
+    ]);
+    await page.unroute(`**${billingPath}/checkout`, route409);
+  };
+
+  // 1. 409 subscription_exists: the console reloads billing on its own, keeps
+  //    polling while the subscription is not there yet, shows it once it
+  //    appears and then stops, with no manual Refresh.
+  const trial = await paidCheckoutWorkspace('Paid Checkout Poll Fleet', 1);
+  let trialLeft = 3;
+  const routeTrial = trialRoute(trial, () => (trialLeft > 0 ? trialLeft-- : 0));
+  await page.route(`**${billingPath}`, routeTrial);
+  const getsBefore = billingGets;
+  await continueToCheckout409();
+  await billingSection.locator('[role="alert"]', { hasText: /subscription is being set up/i }).waitFor({
+    timeout: 5000,
+  });
+  // The reload is immediate: no clock time has passed.
+  const reloaded = Date.now();
+  while (billingGets === getsBefore) {
+    assert.ok(Date.now() - reloaded < 5000, 'billing was not reloaded right after the 409');
+    await page.waitForTimeout(50);
+  }
+  await statusWith(/waiting for the subscription to be set up/i).waitFor({ timeout: 5000 });
+  await advanceUntil(billingSection.locator('dd', { hasText: /^Personal$/i }), 8, 'the subscription');
+  await billingSection.locator('dd', { hasText: /^Active$/i }).waitFor({ timeout: 3000 });
+  assert.ok(billingGets - getsBefore >= 3, `billing was not polled: ${billingGets - getsBefore} reads`);
+  assert.equal(
+    await billingSection.locator('[role="alert"]', { hasText: /subscription is being set up/i }).count(),
+    0,
+    'the stale 409 error must go once the subscription shows'
+  );
+  await page.unroute(`**${billingPath}`, routeTrial);
+  const getsAfterFound = billingGets;
+  for (let i = 0; i < 6; i += 1) {
+    await page.clock.runFor(60_000);
+    await page.waitForTimeout(200);
+  }
+  assert.equal(billingGets, getsAfterFound, 'billing was still polled after the subscription showed');
+
+  // 2. Leaving the workspace while the subscription is still missing stops it.
+  await page.getByRole('link', { name: /All workspaces/i }).click();
+  await page.getByLabel(/Workspace name/i).waitFor({ timeout: 5000 });
+  const trial2 = await paidCheckoutWorkspace('Paid Checkout Leave Fleet', 2);
+  const routeAlwaysTrial = trialRoute(trial2, () => true);
+  await page.route(`**${billingPath}`, routeAlwaysTrial);
+  await continueToCheckout409();
+  await statusWith(/waiting for the subscription to be set up/i).waitFor({ timeout: 5000 });
+  await page.getByRole('link', { name: /All workspaces/i }).click();
+  await page.getByLabel(/Workspace name/i).waitFor({ timeout: 5000 });
+  const getsAfterLeaving = billingGets;
+  for (let i = 0; i < 6; i += 1) {
+    await page.clock.runFor(30_000);
+    await page.waitForTimeout(200);
+  }
+  assert.equal(billingGets, getsAfterLeaving, 'billing was polled after leaving the workspace');
+  await page.unroute(`**${billingPath}`, routeAlwaysTrial);
+
+  assert.deepEqual(pageErrors, [], `unexpected page errors: ${pageErrors.join('; ')}`);
+  await context.close();
+}
+
 const journeys = [
   ['journey_1_signin_and_account', journey1SignInAndAccount],
   ['journey_2_empty_workspaces', journey2EmptyWorkspaces],
@@ -4206,6 +4361,10 @@ const journeys = [
   [
     'journey_30_billing_confirmation_polls_until_confirmed_or_honestly_gives_up',
     journey30BillingConfirmationPollsUntilConfirmedOrHonestlyGivesUp,
+  ],
+  [
+    'journey_31_billing_checkout_already_paid_polls_until_subscription_appears',
+    journey31BillingCheckoutAlreadyPaidPollsUntilSubscriptionAppears,
   ],
 ];
 

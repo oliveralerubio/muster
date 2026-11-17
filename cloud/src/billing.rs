@@ -517,7 +517,7 @@ pub(crate) async fn record_paid_checkout(
                               THEN 'completed' ELSE 'paid' END,
                 subscription_id = COALESCE($2, subscription_id),
                 updated_at = now()
-          WHERE transaction_id = $1 AND status <> 'completed'",
+          WHERE transaction_id = $1 AND status IN ('open', 'paid')",
     )
     .bind(txn_id)
     .bind(subscription_id)
@@ -1262,14 +1262,29 @@ pub async fn handle_webhook(
     if let Some((sub, ws)) = &sub_to_reconcile {
         crate::billing_reconcile::enqueue(&mut tx, sub, *ws).await?;
     }
-    // Paddle paid this checkout (it names it as the origin of a subscription):
-    // never offer its payment link again, and no other checkout until that
-    // subscription is reconciled here.
-    if let Some(txn) = data
-        .and_then(|d| d.get("transaction_id"))
-        .and_then(|v| v.as_str())
-    {
-        let sub = sub_to_reconcile.as_ref().map(|(sub, _)| sub.as_str());
+    // Paddle paid this checkout: a subscription event names it as the origin
+    // of the subscription (`transaction_id`), a completed transaction is that
+    // transaction itself. Never offer its payment link again, and no other
+    // checkout until that subscription is reconciled here. Any other event
+    // that merely names a transaction (an adjustment or refund, say) says
+    // nothing about its checkout being paid.
+    let paid_txn = match data {
+        Some(d) if event_type.starts_with("subscription.") => d
+            .get("transaction_id")
+            .and_then(|v| v.as_str())
+            .map(|txn| (txn, sub_to_reconcile.as_ref().map(|(sub, _)| sub.as_str()))),
+        Some(d) if event_type == "transaction.completed" => {
+            d.get("id").and_then(|v| v.as_str()).map(|txn| {
+                let sub = d
+                    .get("subscription_id")
+                    .and_then(|v| v.as_str())
+                    .filter(|id| id.starts_with("sub_"));
+                (txn, sub)
+            })
+        }
+        _ => None,
+    };
+    if let Some((txn, sub)) = paid_txn {
         record_paid_checkout(&mut tx, txn, sub).await?;
     }
     tx.commit().await?;

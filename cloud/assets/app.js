@@ -2282,6 +2282,9 @@
     if (pending.kind === 'cancel') {
       return Boolean(billing.cancel_at_period_end) || billing.plan_status === 'canceled';
     }
+    if (pending.kind === 'subscription') {
+      return billing.plan !== 'trial' && billing.plan_status !== 'canceled';
+    }
     return false;
   }
 
@@ -2297,6 +2300,11 @@
   }
 
   function pendingBillingNotice(pending) {
+    if (pending.kind === 'subscription') {
+      return pending.unconfirmed
+        ? 'Paddle has not finished setting up the subscription yet. It will appear here once Paddle confirms it.'
+        : 'Payment received, waiting for the subscription to be set up.';
+    }
     if (pending.unconfirmed) {
       return pending.kind === 'cancel'
         ? 'Paddle has not confirmed the cancellation yet. It will appear here once Paddle confirms it.'
@@ -2394,10 +2402,13 @@
         if (doesBillingReflectPendingAction(billing, state.pendingBillingAction)) {
           const kind = state.pendingBillingAction.kind;
           state.pendingBillingAction = null;
+          if (kind === 'subscription') state.billingActionError = null;
           state.billingNotice =
             kind === 'cancel'
               ? 'Subscription cancellation scheduled for the end of the current billing period.'
-              : 'Subscription updated cleanly with Paddle.';
+              : kind === 'subscription'
+                ? 'Your subscription is now active.'
+                : 'Subscription updated cleanly with Paddle.';
         } else if (
           state.pendingBillingAction.kind === 'plan' &&
           (billing.plan === 'trial' || billing.plan_status === 'canceled')
@@ -2493,6 +2504,20 @@
         }
         state.billingActionError = msg;
         handleDeletionScheduledConflict(wsId, data);
+        if (resp.status === 409 && data && data.error && data.error.code === 'subscription_exists') {
+          // A checkout of this workspace was paid: its subscription is being
+          // set up. Look for it now and keep looking, boundedly, so it shows
+          // without a manual Refresh.
+          const pending = { kind: 'subscription' };
+          state.pendingBillingAction = pending;
+          state.billingNotice = pendingBillingNotice(pending);
+          renderShell();
+          await loadWorkspaceBilling(wsId);
+          if (state.pendingBillingAction === pending && isCurrentWorkspaceContext(ctx)) {
+            startBillingConfirmationPoll(wsId, pending);
+          }
+          return;
+        }
         renderShell();
         return;
       }

@@ -1023,6 +1023,37 @@ async fn a_checkout_paid_before_its_webhook_blocks_a_second_checkout() {
     assert_eq!(billing.plan_status, PlanStatus::Active);
 }
 
+/// A webhook that merely names a transaction (a refund adjustment for an old,
+/// replaced checkout, or for the open one) does not mean its checkout was
+/// paid: it never blocks the next checkout.
+#[tokio::test]
+async fn an_adjustment_for_an_unpaid_checkout_does_not_block_a_new_checkout() {
+    let paddle = start_paddle().await;
+    let s = stack_with_paddle(&paddle).await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let ws = create_workspace(&s, &alice, "Adjustment WS").await;
+
+    let personal = checkout(&s, &alice, &ws.id, "personal", 1).await;
+    let team = checkout(&s, &alice, &ws.id, "team", 3).await;
+    assert_ne!(personal, team);
+
+    assert_eq!(
+        post_webhook(&s, &paddle, &paddle.adjustment_event(&personal)).await,
+        200
+    );
+    assert_eq!(
+        post_webhook(&s, &paddle, &paddle.adjustment_event(&team)).await,
+        200
+    );
+
+    // Neither checkout became `paid`: the open one is still offered and a
+    // switch is still possible, with no 409 subscription_exists.
+    assert_eq!(checkout(&s, &alice, &ws.id, "team", 3).await, team);
+    let again = checkout(&s, &alice, &ws.id, "personal", 1).await;
+    assert_ne!(again, personal);
+    assert_eq!(paddle.payable_transactions(), vec![again]);
+}
+
 /// Concurrent requests for different plans on one workspace: every request
 /// gets an answer, and at the end exactly one transaction is still payable
 /// at Paddle, the one the server offers now.

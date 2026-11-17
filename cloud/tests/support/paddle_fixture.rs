@@ -205,6 +205,20 @@ impl PaddleFixture {
         event("subscription.created", data)
     }
 
+    /// An `adjustment.created` (refund) webhook for transaction `txn_id`. It
+    /// names the transaction but says nothing about its checkout being paid.
+    pub fn adjustment_event(&self, txn_id: &str) -> serde_json::Value {
+        event(
+            "adjustment.created",
+            serde_json::json!({
+                "id": new_id("adj"),
+                "action": "refund",
+                "status": "pending_approval",
+                "transaction_id": txn_id
+            }),
+        )
+    }
+
     /// Changes the canonical subscription (as a customer action or Paddle's
     /// own lifecycle would) and returns the `event_type` webhook for it.
     pub fn update_subscription(
