@@ -33,6 +33,12 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # No debug info in CI builds. The self-hosted runners share one disk;
+  # debug info dominates the size of the ~25 linked test binaries, and a
+  # full disk made `ld` die with SIGBUS (signal 7) mid-link. Panic messages
+  # still report file:line; only backtraces lose source locations.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
   cloud:
