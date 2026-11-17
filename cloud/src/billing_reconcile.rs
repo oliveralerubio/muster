@@ -172,11 +172,11 @@ async fn process(state: &AppState, sub_id: &str, ws: Uuid, generation: i64, atte
         Err(f) => Err(f),
     };
     let result = match outcome {
-        Ok(()) => finish(state, sub_id, generation).await,
+        Ok(()) => finish(state, sub_id, ws, generation).await,
         Err(Failure::Refused(why)) => {
             tracing::warn!(subscription = sub_id, workspace = %ws, reason = %why,
                 "billing reconcile: subscription refused, no entitlement change");
-            finish(state, sub_id, generation).await
+            finish(state, sub_id, ws, generation).await
         }
         Err(Failure::Transient(why)) => {
             let backoff = 2i64
@@ -207,7 +207,23 @@ async fn process(state: &AppState, sub_id: &str, ws: Uuid, generation: i64, atte
 }
 
 /// Done with the state seen at `generation`; a newer enqueue keeps the job due.
-async fn finish(state: &AppState, sub_id: &str, generation: i64) -> Result<(), sqlx::Error> {
+/// The paid checkouts of `ws` that created `sub_id` are settled: their
+/// subscription is reconciled (granted or refused), so they no longer hold
+/// back another checkout.
+async fn finish(
+    state: &AppState,
+    sub_id: &str,
+    ws: Uuid,
+    generation: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE billing_checkouts SET status = 'completed', updated_at = now()
+          WHERE subscription_id = $1 AND workspace_id = $2 AND status = 'paid'",
+    )
+    .bind(sub_id)
+    .bind(ws)
+    .execute(&state.db)
+    .await?;
     let deleted = sqlx::query(
         "DELETE FROM billing_reconcile_jobs WHERE paddle_subscription_id = $1 AND generation = $2",
     )

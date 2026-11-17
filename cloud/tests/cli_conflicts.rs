@@ -11,14 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-async fn stack() -> support::Stack {
-    static START_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-    let _guard = START_LOCK
-        .get_or_init(|| tokio::sync::Mutex::new(()))
-        .lock()
-        .await;
-    support::stack().await
-}
+use support::stack;
 
 fn cli_command(home: &Path) -> tokio::process::Command {
     let mut command = tokio::process::Command::new(

@@ -73,6 +73,7 @@
     billingActionError: null,
     billingNotice: null,
     pendingBillingAction: null,
+    billingPollTimer: null,
     checkoutPlan: 'personal',
     checkoutSeats: '2',
     checkoutFieldError: null,
@@ -102,6 +103,7 @@
   };
 
   function resetWorkspaceState() {
+    stopBillingConfirmationPoll();
     state.workspaceEpoch += 1;
     state.activeWorkspace = null;
     state.loadingDetail = false;
@@ -2283,6 +2285,55 @@
     return false;
   }
 
+  // Delays between the reads that look for a submitted plan change or
+  // cancellation once Paddle confirms it (about a minute in all).
+  const BILLING_CONFIRMATION_DELAYS_MS = [2000, 3000, 5000, 10000, 15000, 25000];
+
+  function stopBillingConfirmationPoll() {
+    if (state.billingPollTimer !== null) {
+      clearTimeout(state.billingPollTimer);
+      state.billingPollTimer = null;
+    }
+  }
+
+  function pendingBillingNotice(pending) {
+    if (pending.unconfirmed) {
+      return pending.kind === 'cancel'
+        ? 'Paddle has not confirmed the cancellation yet. It will appear here once Paddle confirms it.'
+        : 'Paddle has not confirmed the plan change yet. It will appear here once Paddle confirms it.';
+    }
+    return pending.kind === 'cancel'
+      ? 'Cancellation submitted, waiting for Paddle confirmation.'
+      : 'Plan change submitted, waiting for Paddle confirmation.';
+  }
+
+  // Reads billing again with backoff while `pending` is still the action
+  // waiting for confirmation in this workspace view. Stops when the change
+  // shows, when the view changes, or after the last delay, which marks the
+  // action unconfirmed (an honest notice; a later read still resolves it).
+  function startBillingConfirmationPoll(wsId, pending) {
+    stopBillingConfirmationPoll();
+    const ctx = captureWorkspaceContext(wsId);
+    const step = (attempt) => {
+      if (attempt >= BILLING_CONFIRMATION_DELAYS_MS.length) {
+        if (state.pendingBillingAction === pending && isCurrentWorkspaceContext(ctx)) {
+          pending.unconfirmed = true;
+          state.billingNotice = pendingBillingNotice(pending);
+          renderShell();
+        }
+        return;
+      }
+      state.billingPollTimer = setTimeout(async () => {
+        state.billingPollTimer = null;
+        if (state.pendingBillingAction !== pending || !isCurrentWorkspaceContext(ctx)) return;
+        await loadWorkspaceBilling(wsId);
+        if (state.pendingBillingAction !== pending || !isCurrentWorkspaceContext(ctx)) return;
+        step(attempt + 1);
+      }, BILLING_CONFIRMATION_DELAYS_MS[attempt]);
+    };
+    step(0);
+  }
+
   async function loadWorkspaceBilling(id) {
     const ctx = captureWorkspaceContext(id);
     if (!isCurrentWorkspaceContext(ctx)) return;
@@ -2354,10 +2405,7 @@
           state.pendingBillingAction = null;
           state.billingNotice = null;
         } else {
-          state.billingNotice =
-            state.pendingBillingAction.kind === 'cancel'
-              ? 'Cancellation submitted, waiting for Paddle confirmation.'
-              : 'Plan change submitted, waiting for Paddle confirmation.';
+          state.billingNotice = pendingBillingNotice(state.pendingBillingAction);
         }
       } else {
         state.billingNotice = null;
@@ -2607,9 +2655,13 @@
       }
       state.updatePlanInFlight = false;
       state.confirmingPlanChange = null;
-      state.pendingBillingAction = { kind: 'plan', plan, seats };
-      state.billingNotice = 'Plan change submitted, waiting for Paddle confirmation.';
+      const pending = { kind: 'plan', plan, seats };
+      state.pendingBillingAction = pending;
+      state.billingNotice = pendingBillingNotice(pending);
       await loadWorkspaceBilling(wsId);
+      if (state.pendingBillingAction === pending && isCurrentWorkspaceContext(ctx)) {
+        startBillingConfirmationPoll(wsId, pending);
+      }
     } catch (_err) {
       if (!isCurrentWorkspaceContext(ctx)) return;
       state.updatePlanInFlight = false;
@@ -2664,9 +2716,13 @@
       }
       state.cancelInFlight = false;
       state.confirmingCancel = false;
-      state.pendingBillingAction = { kind: 'cancel' };
-      state.billingNotice = 'Cancellation submitted, waiting for Paddle confirmation.';
+      const pending = { kind: 'cancel' };
+      state.pendingBillingAction = pending;
+      state.billingNotice = pendingBillingNotice(pending);
       await loadWorkspaceBilling(wsId);
+      if (state.pendingBillingAction === pending && isCurrentWorkspaceContext(ctx)) {
+        startBillingConfirmationPoll(wsId, pending);
+      }
     } catch (_err) {
       if (!isCurrentWorkspaceContext(ctx)) return;
       state.cancelInFlight = false;

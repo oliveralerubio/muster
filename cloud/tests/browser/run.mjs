@@ -3757,6 +3757,174 @@ async function journey28BillingConfirmationWaitsForRefreshedState(browser) {
   await context.close();
 }
 
+// After a plan change or cancellation the console keeps asking the server
+// (bounded backoff) until the change shows, with no manual Refresh; if it
+// never shows it says so honestly and stops asking, and leaving the
+// workspace stops it too. Time is driven by Playwright's clock.
+async function journey30BillingConfirmationPollsUntilConfirmedOrHonestlyGivesUp(browser) {
+  assert.ok(billingUrl, 'MUSTER_BILLING_CLOUD_URL is required');
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  await context.clock.install();
+  const page = await context.newPage();
+  const pageErrors = [];
+  page.on('pageerror', (err) => pageErrors.push(err.message));
+
+  await page.goto(`${billingUrl}/`, { waitUntil: 'networkidle' });
+  await signInViaIdp(page, { subject: 'pia-poll-confirm-1', email: 'pia@example.com' });
+
+  await page.getByLabel(/Workspace name/i).fill('Poll Confirm Billing Fleet');
+  await page.getByRole('button', { name: /Create workspace/i }).click();
+  await page.waitForURL(/\/workspaces\/([0-9a-f-]{36})$/, { timeout: 5000 });
+  const wsId = page.url().match(/\/workspaces\/([0-9a-f-]{36})$/)[1];
+  const billingPath = `/v1/workspaces/${wsId}/billing`;
+
+  const billingSection = page.getByRole('region', { name: /^Billing$/i });
+  await billingSection.waitFor({ timeout: 5000 });
+  await billingSection.getByLabel(/^Plan$/i).selectOption('team');
+  await billingSection.getByLabel(/Seats/i).fill('2');
+  await billingSection.getByRole('button', { name: /Continue to checkout/i }).click();
+  const paddleLink = billingSection.getByRole('link', { name: /Open Paddle checkout/i });
+  await paddleLink.waitFor({ timeout: 5000 });
+  const txnId = (await paddleLink.getAttribute('href')).split('/').pop();
+  await paddleControl('POST', '/complete-checkout', {
+    transaction_id: txnId,
+    subscription_id: 'sub_01browserpoll0000000001',
+    customer_id: 'ctm_01browserpoll0000000001',
+  });
+  await billingSection.getByRole('button', { name: /Refresh billing status/i }).click();
+  await billingSection.locator('dd', { hasText: /^Team \(2 seats\)$/i }).waitFor({ timeout: 5000 });
+
+  let billingGets = 0;
+  page.on('request', (req) => {
+    if (req.method() === 'GET' && new URL(req.url()).pathname === billingPath) billingGets += 1;
+  });
+  const currentBilling = () =>
+    page.evaluate(async (path) => {
+      const r = await fetch(path, { credentials: 'same-origin' });
+      return r.json();
+    }, billingPath);
+  // Answers the console's GET /billing with `stale` while `remaining()` > 0.
+  const staleRoute = (stale, remaining) => async (route) => {
+    const req = route.request();
+    if (req.method() === 'GET' && new URL(req.url()).pathname === billingPath && remaining()) {
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(stale) });
+      return;
+    }
+    await route.continue();
+  };
+  // Lets fake time pass in rounds (each fires at most one poll, whose
+  // request then completes in real time) until `locator` shows.
+  const advanceUntil = async (locator, rounds, what) => {
+    for (let i = 0; i < rounds; i += 1) {
+      await page.clock.runFor(30_000);
+      try {
+        await locator.waitFor({ timeout: 1500 });
+        return;
+      } catch (_err) {
+        // not yet: next round
+      }
+    }
+    assert.fail(`${what} did not show after ${rounds} rounds of 30 s`);
+  };
+  const statusWith = (re) => billingSection.locator('[role="status"]', { hasText: re });
+  const confirmPlanChange = async (seats) => {
+    await billingSection.getByLabel(/Update seats/i).fill(String(seats));
+    await billingSection.getByRole('button', { name: /Review plan change/i }).click();
+    await Promise.all([
+      page.waitForResponse(
+        (r) =>
+          r.request().method() === 'POST' &&
+          new URL(r.url()).pathname === `${billingPath}/plan` &&
+          r.status() === 200
+      ),
+      billingSection.getByRole('button', { name: /Confirm plan change/i }).click(),
+    ]);
+    await statusWith(/Plan change submitted, waiting for Paddle confirmation/i).waitFor({
+      timeout: 5000,
+    });
+  };
+
+  // 1. The server's re-read lands after two stale reads: the console finds
+  //    it on its own, without a manual Refresh.
+  const twoSeats = await currentBilling();
+  let staleLeft = 2;
+  const routeTwoStale = staleRoute(twoSeats, () => (staleLeft > 0 ? staleLeft-- : 0));
+  await page.route(`**${billingPath}`, routeTwoStale);
+  await confirmPlanChange(4);
+  await advanceUntil(
+    statusWith(/Subscription updated cleanly with Paddle/i),
+    8,
+    'plan change confirmation'
+  );
+  await billingSection.locator('dd', { hasText: /^Team \(4 seats\)$/i }).waitFor({ timeout: 5000 });
+  await page.unroute(`**${billingPath}`, routeTwoStale);
+
+  // 2. Leaving the workspace while still unconfirmed stops the polling.
+  const fourSeats = await currentBilling();
+  const routeAlwaysStalePlan = staleRoute(fourSeats, () => true);
+  await page.route(`**${billingPath}`, routeAlwaysStalePlan);
+  await confirmPlanChange(5);
+  await page.getByRole('link', { name: /All workspaces/i }).click();
+  await page.getByRole('link', { name: /Poll Confirm Billing Fleet/i }).waitFor({ timeout: 5000 });
+  const getsAfterLeaving = billingGets;
+  for (let i = 0; i < 6; i += 1) {
+    await page.clock.runFor(30_000);
+    await page.waitForTimeout(200);
+  }
+  assert.equal(billingGets, getsAfterLeaving, 'billing was polled after leaving the workspace');
+  await page.unroute(`**${billingPath}`, routeAlwaysStalePlan);
+  await page.getByRole('link', { name: /Poll Confirm Billing Fleet/i }).click();
+  await billingSection.locator('dd', { hasText: /^Team \(5 seats\)$/i }).waitFor({ timeout: 5000 });
+
+  // 3. Paddle never confirms the cancellation while the console waits: an
+  //    honest notice replaces the waiting one and the polling stops.
+  const notCanceled = await currentBilling();
+  assert.equal(notCanceled.cancel_at_period_end, false);
+  const routeAlwaysStaleCancel = staleRoute(notCanceled, () => true);
+  await page.route(`**${billingPath}`, routeAlwaysStaleCancel);
+  await billingSection.getByRole('button', { name: /Cancel subscription/i }).click();
+  const getsBeforeCancel = billingGets;
+  await Promise.all([
+    page.waitForResponse(
+      (r) =>
+        r.request().method() === 'POST' &&
+        new URL(r.url()).pathname === `${billingPath}/cancel` &&
+        r.status() === 200
+    ),
+    billingSection.getByRole('button', { name: /Confirm cancellation/i }).click(),
+  ]);
+  await statusWith(/Cancellation submitted, waiting for Paddle confirmation/i).waitFor({
+    timeout: 5000,
+  });
+  const honest = statusWith(/Paddle has not confirmed the cancellation yet/i);
+  await advanceUntil(honest, 10, 'honest unconfirmed notice');
+  assert.match(await honest.innerText(), /will appear here once Paddle confirms/i);
+  assert.equal(
+    await statusWith(/waiting for Paddle confirmation/i).count(),
+    0,
+    'the waiting notice must be replaced'
+  );
+  const pollsForCancel = billingGets - getsBeforeCancel;
+  assert.ok(pollsForCancel <= 8, `polling was not bounded: ${pollsForCancel} reads`);
+  const getsAfterGivingUp = billingGets;
+  for (let i = 0; i < 6; i += 1) {
+    await page.clock.runFor(60_000);
+    await page.waitForTimeout(200);
+  }
+  assert.equal(billingGets, getsAfterGivingUp, 'billing was still polled after giving up');
+  await page.unroute(`**${billingPath}`, routeAlwaysStaleCancel);
+
+  // A later manual refresh still resolves it once Paddle's state shows.
+  await billingSection.getByRole('button', { name: /Refresh billing status/i }).click();
+  await billingSection.getByText(/Cancels at period end/i).waitFor({ timeout: 5000 });
+  await statusWith(
+    /Subscription cancellation scheduled for the end of the current billing period/i
+  ).waitFor({ timeout: 5000 });
+
+  assert.deepEqual(pageErrors, [], `unexpected page errors: ${pageErrors.join('; ')}`);
+  await context.close();
+}
+
 async function journey29BillingSeatLimitsAndWorkspacePlanStatus(browser) {
   assert.ok(billingUrl, 'MUSTER_BILLING_CLOUD_URL is required');
   const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
@@ -4035,6 +4203,10 @@ const journeys = [
   ['journey_27_workspace_deletion_stale_response_and_isolation', journey27WorkspaceDeletionStaleResponseAndIsolation],
   ['journey_28_billing_confirmation_waits_for_refreshed_state', journey28BillingConfirmationWaitsForRefreshedState],
   ['journey_29_billing_seat_limits_and_workspace_plan_status', journey29BillingSeatLimitsAndWorkspacePlanStatus],
+  [
+    'journey_30_billing_confirmation_polls_until_confirmed_or_honestly_gives_up',
+    journey30BillingConfirmationPollsUntilConfirmedOrHonestlyGivesUp,
+  ],
 ];
 
 async function main() {

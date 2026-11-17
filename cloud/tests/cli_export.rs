@@ -15,17 +15,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-/// [`support::stack`] with the `free_port()` -> `spawn_cloud()` window
-/// serialized across concurrent tests in this binary so two stacks starting
-/// at the same time cannot pick the same loopback port.
-async fn stack() -> support::Stack {
-    static START_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-    let _guard = START_LOCK
-        .get_or_init(|| tokio::sync::Mutex::new(()))
-        .lock()
-        .await;
-    support::stack().await
-}
+use support::stack;
 
 /// A fresh home directory for one machine.
 fn new_home() -> std::path::PathBuf {

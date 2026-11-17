@@ -73,14 +73,6 @@ struct SignedDevice<'a> {
     key: &'a MachineKey,
 }
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 async fn login_user(base: &str, subject: &str, email: &str) -> Session {
     let client = support::http();
     let login_resp = client
@@ -707,7 +699,7 @@ async fn browser_journeys() {
     let idp = support::oidc_fixture::start().await;
     let database_url = support::fresh_database().await;
     let repo_root = tempfile::tempdir().expect("repo root");
-    let port = free_port();
+    let port = support::free_port();
     let public_url = format!("http://localhost:{port}");
 
     let cloud = support::spawn_cloud(&[
@@ -728,6 +720,8 @@ async fn browser_journeys() {
     ])
     .await;
 
+    // The start moves to another port if this one was taken meanwhile.
+    let public_url = cloud.public_url();
     let fixtures = seed_browser_fixtures(&public_url).await;
     let fixtures_json = serde_json::to_string(&fixtures).unwrap();
 
@@ -758,7 +752,7 @@ async fn browser_journeys() {
 
     let billing_database_url = support::fresh_database().await;
     let billing_repo_root = tempfile::tempdir().expect("billing repo root");
-    let billing_port = free_port();
+    let billing_port = support::free_port();
     let billing_public_url = format!("http://localhost:{billing_port}");
     let billing_cloud = support::spawn_cloud(&[
         ("MUSTER_ENV", "development".into()),
@@ -798,6 +792,7 @@ async fn browser_journeys() {
         ("MUSTER_PADDLE_ENVIRONMENT", "sandbox".into()),
     ])
     .await;
+    let billing_public_url = billing_cloud.public_url();
 
     let control_state = PaddleControlState {
         paddle: paddle.clone(),

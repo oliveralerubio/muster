@@ -308,21 +308,47 @@ pub async fn get_billing(
     Ok(Json(billing))
 }
 
-/// Serialises the billing actions of workspace `ws` (checkout, plan change,
-/// cancellation) with each other for the rest of `tx`: one decision, and one
-/// Paddle call, at a time per workspace. It is not the workspace row lock,
-/// so holding it across a Paddle call (up to its 15 s timeout) never holds
-/// up a push, a link or a deletion request. The caller takes no row lock on
-/// the workspace before its Paddle calls and only a short one after them.
-async fn lock_billing_actions(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+/// How long a billing action waits for the one already running on the same
+/// workspace before answering `503 not_ready` (retry later).
+const BILLING_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Begins the transaction of a billing action of workspace `ws` (checkout,
+/// plan change, cancellation), holding the workspace's billing lock until it
+/// ends: one decision, and one Paddle call, at a time per workspace, across
+/// processes. It is not the workspace row lock, so holding it across a
+/// Paddle call (up to its 15 s timeout) never holds up a push, a link or a
+/// deletion request.
+///
+/// Only the action holding the lock holds a database connection. Another
+/// one waits without a connection (each try is a short transaction that
+/// ends at once when the lock is taken) for at most [`BILLING_LOCK_WAIT`],
+/// so actions piling up behind a slow Paddle never exhaust the pool.
+async fn begin_billing_action(
+    state: &AppState,
     ws: Uuid,
-) -> Result<(), AppError> {
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('muster.billing'), hashtext($1::text))")
+) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, AppError> {
+    let deadline = tokio::time::Instant::now() + BILLING_LOCK_WAIT;
+    let mut pause = std::time::Duration::from_millis(20);
+    loop {
+        let mut tx = state.db.begin().await?;
+        let locked: bool = sqlx::query_scalar(
+            "SELECT pg_try_advisory_xact_lock(hashtext('muster.billing'), hashtext($1::text))",
+        )
         .bind(ws.to_string())
-        .execute(&mut **tx)
+        .fetch_one(&mut *tx)
         .await?;
-    Ok(())
+        if locked {
+            return Ok(tx);
+        }
+        tx.rollback().await?;
+        if tokio::time::Instant::now() + pause > deadline {
+            return Err(AppError::not_ready(
+                "another billing action for this workspace is in progress; retry shortly",
+            ));
+        }
+        tokio::time::sleep(pause).await;
+        pause = (pause * 2).min(std::time::Duration::from_millis(250));
+    }
 }
 
 /// `404` for a missing workspace and `409 workspace_deletion_scheduled`
@@ -358,6 +384,11 @@ fn requested_seats(is_team: bool, seats: u32) -> Result<i32, AppError> {
 
 /// `POST /v1/workspaces/{ws}/billing/checkout`: creates a Paddle checkout
 /// transaction associated with this workspace.
+///
+/// The decision runs to completion even when the client gives up (a closed
+/// connection drops this handler), so a Paddle transaction it creates is
+/// always recorded; it is bounded by [`CHECKOUT_DEADLINE`] and holds one
+/// database connection, only while it holds the workspace's billing lock.
 pub async fn create_checkout(
     State(state): State<AppState>,
     account: Account,
@@ -368,14 +399,189 @@ pub async fn create_checkout(
     let ws = parse_uuid(&ws_str)?;
     require_admin_or_owner(&state, ws, account.user_id).await?;
 
-    let Some(paddle) = &state.config.paddle else {
+    if state.config.paddle.is_none() {
         return Err(AppError::billing_unconfigured());
-    };
+    }
 
     let req: CreateCheckout = parse_json(&body)?;
     let is_team = req.plan == "team";
-    let plan = if is_team { "team" } else { "personal" };
     let seats = requested_seats(is_team, req.seats)?;
+    let user_id = account.user_id;
+    tokio::spawn(async move {
+        let decision = checkout_decision(&state, ws, user_id, is_team, seats);
+        tokio::time::timeout(CHECKOUT_DEADLINE, decision)
+            .await
+            .unwrap_or_else(|_| {
+                Err(AppError::not_ready(
+                    "the billing provider did not answer in time; retry shortly",
+                ))
+            })
+    })
+    .await
+    .map_err(AppError::internal)?
+    .map(Json)
+}
+
+/// The longest a checkout decision may take: its lock wait plus the Paddle
+/// calls it can make (each with a 15 s timeout). When it is reached the
+/// decision is abandoned and its transaction rolled back; what Paddle did
+/// meanwhile is read back from Paddle by the next request.
+const CHECKOUT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How many times in a row the stored link of an open checkout is offered
+/// while Paddle cannot tell its status (each time logged). After that the
+/// checkout answers `503 not_ready` until Paddle answers again, which also
+/// starts the count over: a link Paddle may have canceled is never handed
+/// out indefinitely.
+const MAX_UNVERIFIED_OFFERS: i32 = 3;
+
+/// What Paddle reports about a checkout this server offered.
+enum CheckoutAtPaddle {
+    /// Still payable.
+    Payable,
+    /// Canceled: never to be offered again.
+    Canceled,
+    /// Paid (captured, then completed or billed): its subscription is on
+    /// the way, settled as the deletion's checkout cancellation reads it.
+    Paid,
+}
+
+fn checkout_at_paddle(status: &str) -> CheckoutAtPaddle {
+    match status {
+        "canceled" => CheckoutAtPaddle::Canceled,
+        "paid" | "completed" | "billed" => CheckoutAtPaddle::Paid,
+        _ => CheckoutAtPaddle::Payable,
+    }
+}
+
+/// A transaction as Paddle holds it (`GET /transactions/{id}`).
+struct PaddleTransaction {
+    status: String,
+    /// The subscription Paddle created from it, once it has.
+    subscription_id: Option<String>,
+}
+
+/// Reads transaction `txn_id` from Paddle; the error says why it could not
+/// (never the request URL or the key).
+async fn read_transaction(
+    paddle: &crate::config::PaddleConfig,
+    txn_id: &str,
+) -> Result<PaddleTransaction, String> {
+    let resp = crate::billing_reconcile::paddle_http()
+        .get(format!("{}/transactions/{txn_id}", paddle.base_url))
+        .bearer_auth(&paddle.api_key)
+        .send()
+        .await
+        .map_err(|e| format!("paddle unreachable: {}", e.without_url()))?;
+    if !resp.status().is_success() {
+        return Err(format!("paddle answered {}", resp.status()));
+    }
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("invalid paddle json: {}", e.without_url()))?;
+    let data = &body["data"];
+    if data["id"].as_str() != Some(txn_id) {
+        return Err("paddle returned a different transaction".into());
+    }
+    let status = data["status"]
+        .as_str()
+        .ok_or("paddle transaction without status")?
+        .to_string();
+    let subscription_id = data["subscription_id"]
+        .as_str()
+        .filter(|id| id.starts_with("sub_"))
+        .map(str::to_string);
+    Ok(PaddleTransaction {
+        status,
+        subscription_id,
+    })
+}
+
+/// Records that Paddle reports checkout `txn_id` paid, with the subscription
+/// it created from it when Paddle names it. The checkout becomes `paid`,
+/// which refuses every other checkout of its workspace, until that
+/// subscription is reconciled here (`completed`); it is `completed` at once
+/// when the subscription is already registered for the workspace.
+pub(crate) async fn record_paid_checkout(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    txn_id: &str,
+    subscription_id: Option<&str>,
+) -> Result<(), AppError> {
+    sqlx::query(
+        "UPDATE billing_checkouts
+            SET status = CASE WHEN EXISTS (
+                                 SELECT 1 FROM subscriptions s
+                                  WHERE s.paddle_subscription_id = $2
+                                    AND s.workspace_id = billing_checkouts.workspace_id)
+                              THEN 'completed' ELSE 'paid' END,
+                subscription_id = COALESCE($2, subscription_id),
+                updated_at = now()
+          WHERE transaction_id = $1 AND status <> 'completed'",
+    )
+    .bind(txn_id)
+    .bind(subscription_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+fn paid_checkout_conflict() -> AppError {
+    AppError::new(
+        StatusCode::CONFLICT,
+        error_codes::SUBSCRIPTION_EXISTS,
+        "a checkout of this workspace was paid; its subscription is being set up",
+    )
+}
+
+/// The open checkout `txn_id` turned out paid: recorded (blocking other
+/// checkouts), its subscription queued and reconciled now when Paddle names
+/// it, and the request refused.
+async fn refuse_as_paid(
+    state: &AppState,
+    mut tx: sqlx::Transaction<'static, sqlx::Postgres>,
+    ws: Uuid,
+    txn_id: &str,
+    subscription_id: Option<String>,
+) -> Result<CheckoutSession, AppError> {
+    record_paid_checkout(&mut tx, txn_id, subscription_id.as_deref()).await?;
+    if let Some(sub) = &subscription_id {
+        crate::billing_reconcile::enqueue(&mut tx, sub, ws).await?;
+    }
+    tx.commit().await?;
+    if let Some(sub) = &subscription_id {
+        crate::billing_reconcile::run_now(state, sub).await;
+    }
+    Err(paid_checkout_conflict())
+}
+
+async fn mark_checkout(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    txn_id: &str,
+    status: &str,
+) -> Result<(), AppError> {
+    sqlx::query(
+        "UPDATE billing_checkouts SET status = $2, updated_at = now()
+          WHERE transaction_id = $1 AND status = 'open'",
+    )
+    .bind(txn_id)
+    .bind(status)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn checkout_decision(
+    state: &AppState,
+    ws: Uuid,
+    user_id: Uuid,
+    is_team: bool,
+    seats: i32,
+) -> Result<CheckoutSession, AppError> {
+    let Some(paddle) = &state.config.paddle else {
+        return Err(AppError::billing_unconfigured());
+    };
+    let plan = if is_team { "team" } else { "personal" };
     let price_id = if is_team {
         &paddle.price_team_seat
     } else {
@@ -385,8 +591,7 @@ pub async fn create_checkout(
     // One checkout decision at a time per workspace: concurrent requests
     // and retries see the same open checkout instead of each creating a
     // payable Paddle transaction.
-    let mut tx = state.db.begin().await?;
-    lock_billing_actions(&mut tx, ws).await?;
+    let mut tx = begin_billing_action(state, ws).await?;
     ensure_writable_unlocked(&mut tx, ws).await?;
     if current_subscription(&mut *tx, ws)
         .await?
@@ -399,74 +604,158 @@ pub async fn create_checkout(
         ));
     }
 
-    type OpenCheckout = (String, String, i32, Option<String>);
+    // A paid checkout whose subscription is not registered yet (its webhook
+    // late or lost): no second checkout, whatever the plan. Its
+    // subscription is reconciled from Paddle now instead of waiting.
+    let paid: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT transaction_id, subscription_id FROM billing_checkouts
+          WHERE workspace_id = $1 AND status = 'paid'",
+    )
+    .bind(ws)
+    .fetch_all(&mut *tx)
+    .await?;
+    if !paid.is_empty() {
+        let mut reconcile = Vec::new();
+        for (txn_id, known) in paid {
+            let sub = match known {
+                Some(sub) => Some(sub),
+                None => match read_transaction(paddle, &txn_id).await {
+                    Ok(t) => t.subscription_id,
+                    Err(why) => {
+                        tracing::warn!(workspace = %ws, transaction = %txn_id, reason = %why,
+                            "billing checkout: could not read a paid checkout's subscription");
+                        None
+                    }
+                },
+            };
+            if let Some(sub) = sub {
+                record_paid_checkout(&mut tx, &txn_id, Some(&sub)).await?;
+                crate::billing_reconcile::enqueue(&mut tx, &sub, ws).await?;
+                reconcile.push(sub);
+            }
+        }
+        tx.commit().await?;
+        for sub in reconcile {
+            crate::billing_reconcile::run_now(state, &sub).await;
+        }
+        return Err(paid_checkout_conflict());
+    }
+
+    type OpenCheckout = (String, String, i32, Option<String>, i32);
     let open: Option<OpenCheckout> = sqlx::query_as(
-        "SELECT transaction_id, plan, seats, checkout_url FROM billing_checkouts
+        "SELECT transaction_id, plan, seats, checkout_url, unverified_offers
+           FROM billing_checkouts
           WHERE workspace_id = $1 AND status = 'open'",
     )
     .bind(ws)
     .fetch_optional(&mut *tx)
     .await?;
-    if let Some((txn_id, open_plan, open_seats, Some(url))) = &open {
-        if open_plan == plan && *open_seats == seats {
-            tx.commit().await?;
-            return Ok(Json(CheckoutSession {
-                checkout_url: url.clone(),
-                transaction_id: txn_id.clone(),
-            }));
-        }
-    }
-    if let Some((txn_id, ..)) = &open {
-        // A different plan: the old payment link must stop being payable
-        // before a new one exists (Paddle: PATCH status=canceled, alone).
-        let resp = crate::billing_reconcile::paddle_http()
-            .patch(format!("{}/transactions/{txn_id}", paddle.base_url))
-            .bearer_auth(&paddle.api_key)
-            .json(&serde_json::json!({ "status": "canceled" }))
-            .send()
-            .await
-            .map_err(|e| {
-                AppError::internal(format!(
-                    "paddle transaction cancel error: {}",
-                    e.without_url()
-                ))
-            })?;
-        if !resp.status().is_success() {
-            // Paddle does not name the refusal; read the transaction instead.
-            // Paid (captured, then completed or billed) is settled exactly as
-            // the deletion's checkout cancellation reads it.
-            let paid = transaction_status(paddle, txn_id)
-                .await
-                .is_some_and(|st| matches!(st.as_str(), "paid" | "completed" | "billed"));
-            if paid {
-                // Paid: its subscription is on the way and the association
-                // stays; never offer this link again nor a second checkout.
-                sqlx::query(
-                    "UPDATE billing_checkouts SET status = 'completed', updated_at = now()
-                      WHERE transaction_id = $1",
-                )
-                .bind(txn_id)
-                .execute(&mut *tx)
-                .await?;
-                tx.commit().await?;
-                return Err(AppError::new(
-                    StatusCode::CONFLICT,
-                    error_codes::SUBSCRIPTION_EXISTS,
-                    "the open checkout was already paid; its subscription is being set up",
-                ));
+    if let Some((txn_id, open_plan, open_seats, url, unverified)) = open {
+        let reusable = url.filter(|_| open_plan == plan && open_seats == seats);
+        if let Some(url) = reusable {
+            // Offered again only while Paddle still reports it payable: a
+            // cancel whose answer was lost, or one made at Paddle, is caught
+            // here instead of handing out a dead link.
+            match read_transaction(paddle, &txn_id).await {
+                Ok(t) => match checkout_at_paddle(&t.status) {
+                    CheckoutAtPaddle::Payable => {
+                        if unverified > 0 {
+                            sqlx::query(
+                                "UPDATE billing_checkouts SET unverified_offers = 0
+                                  WHERE transaction_id = $1",
+                            )
+                            .bind(&txn_id)
+                            .execute(&mut *tx)
+                            .await?;
+                        }
+                        tx.commit().await?;
+                        return Ok(CheckoutSession {
+                            checkout_url: url,
+                            transaction_id: txn_id,
+                        });
+                    }
+                    CheckoutAtPaddle::Canceled => {
+                        mark_checkout(&mut tx, &txn_id, "canceled").await?
+                    }
+                    CheckoutAtPaddle::Paid => {
+                        return refuse_as_paid(state, tx, ws, &txn_id, t.subscription_id).await
+                    }
+                },
+                Err(why) if unverified >= MAX_UNVERIFIED_OFFERS => {
+                    tracing::warn!(workspace = %ws, transaction = %txn_id, reason = %why,
+                        offers = unverified,
+                        "billing checkout: Paddle still cannot confirm the open checkout; not offering it");
+                    return Err(AppError::not_ready(
+                        "Paddle cannot confirm the open checkout right now; retry later",
+                    ));
+                }
+                Err(why) => {
+                    // Unreadable now (Paddle down, or a key without permission
+                    // to read transactions): the stored link is all there is,
+                    // offered a bounded number of times.
+                    tracing::warn!(workspace = %ws, transaction = %txn_id, reason = %why,
+                        offer = unverified + 1, max_offers = MAX_UNVERIFIED_OFFERS,
+                        "billing checkout: Paddle could not confirm the open checkout; offering its stored link");
+                    sqlx::query(
+                        "UPDATE billing_checkouts SET unverified_offers = unverified_offers + 1
+                          WHERE transaction_id = $1",
+                    )
+                    .bind(&txn_id)
+                    .execute(&mut *tx)
+                    .await?;
+                    tx.commit().await?;
+                    return Ok(CheckoutSession {
+                        checkout_url: url,
+                        transaction_id: txn_id,
+                    });
+                }
             }
-            return Err(AppError::internal(format!(
-                "paddle refused to cancel the open checkout with {}",
-                resp.status()
-            )));
+        } else {
+            // A different plan: the old payment link must stop being payable
+            // before a new one exists (Paddle: PATCH status=canceled, alone).
+            let cancel = crate::billing_reconcile::paddle_http()
+                .patch(format!("{}/transactions/{txn_id}", paddle.base_url))
+                .bearer_auth(&paddle.api_key)
+                .json(&serde_json::json!({ "status": "canceled" }))
+                .send()
+                .await;
+            let at_paddle = match &cancel {
+                Ok(resp) if resp.status().is_success() => Ok(PaddleTransaction {
+                    status: "canceled".into(),
+                    subscription_id: None,
+                }),
+                // Refused (Paddle does not name why: already canceled, or
+                // paid) or unanswered: the transaction says what happened.
+                _ => read_transaction(paddle, &txn_id).await,
+            };
+            match at_paddle {
+                Ok(t) => match checkout_at_paddle(&t.status) {
+                    // Settled in this transaction: if it is rolled back (the
+                    // new checkout fails), the next request reads Paddle's
+                    // canceled status again before offering anything.
+                    CheckoutAtPaddle::Canceled => {
+                        mark_checkout(&mut tx, &txn_id, "canceled").await?
+                    }
+                    CheckoutAtPaddle::Paid => {
+                        return refuse_as_paid(state, tx, ws, &txn_id, t.subscription_id).await
+                    }
+                    CheckoutAtPaddle::Payable => {
+                        return Err(AppError::internal(
+                            "paddle did not cancel the open checkout; it is still payable",
+                        ))
+                    }
+                },
+                Err(why) => {
+                    let cancel = match cancel {
+                        Ok(resp) => format!("refused with {}", resp.status()),
+                        Err(e) => format!("error: {}", e.without_url()),
+                    };
+                    return Err(AppError::internal(format!(
+                        "paddle transaction cancel {cancel}; status unreadable: {why}"
+                    )));
+                }
+            }
         }
-        sqlx::query(
-            "UPDATE billing_checkouts SET status = 'canceled', updated_at = now()
-              WHERE transaction_id = $1",
-        )
-        .bind(txn_id)
-        .execute(&mut *tx)
-        .await?;
     }
 
     let customer_row: Option<(String,)> =
@@ -484,7 +773,7 @@ pub async fn create_checkout(
         ],
         "custom_data": {
             "workspace_id": ws.to_string(),
-            "user_id": account.user_id.to_string(),
+            "user_id": user_id.to_string(),
             "plan": plan
         }
     });
@@ -537,7 +826,7 @@ pub async fn create_checkout(
     if let Err(denied) = crate::lifecycle::lock_writable(&mut tx, ws, true).await {
         drop(tx);
         if denied.code == error_codes::WORKSPACE_DELETION_SCHEDULED {
-            crate::lifecycle_provider::cancel_late_checkout(&state, ws, &txn_id).await;
+            crate::lifecycle_provider::cancel_late_checkout(state, ws, &txn_id).await;
         }
         return Err(denied);
     }
@@ -549,7 +838,7 @@ pub async fn create_checkout(
     )
     .bind(&txn_id)
     .bind(ws)
-    .bind(account.user_id)
+    .bind(user_id)
     .bind(plan)
     .bind(seats)
     .bind(price_id)
@@ -558,26 +847,10 @@ pub async fn create_checkout(
     .await?;
     tx.commit().await?;
 
-    Ok(Json(CheckoutSession {
+    Ok(CheckoutSession {
         checkout_url,
         transaction_id: txn_id,
-    }))
-}
-
-/// Paddle's current status of transaction `txn_id` (`GET /transactions/{id}`),
-/// `None` when it cannot be read.
-async fn transaction_status(paddle: &crate::config::PaddleConfig, txn_id: &str) -> Option<String> {
-    let resp = crate::billing_reconcile::paddle_http()
-        .get(format!("{}/transactions/{txn_id}", paddle.base_url))
-        .bearer_auth(&paddle.api_key)
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let body: serde_json::Value = resp.json().await.ok()?;
-    body["data"]["status"].as_str().map(str::to_string)
+    })
 }
 
 /// `POST /v1/workspaces/{ws}/billing/portal`: customer portal session.
@@ -665,8 +938,7 @@ pub async fn cancel_subscription(
     // Billing actions of the workspace are serialised (concurrent cancels
     // ask Paddle once) without holding the workspace row during the call.
     // After a deletion request the provider work cancels immediately.
-    let mut tx = state.db.begin().await?;
-    lock_billing_actions(&mut tx, ws).await?;
+    let mut tx = begin_billing_action(&state, ws).await?;
     ensure_writable_unlocked(&mut tx, ws).await?;
     let sub_row: Option<(String, String, bool)> = sqlx::query_as(&format!(
         "SELECT paddle_subscription_id, status, cancel_at_period_end FROM subscriptions
@@ -739,8 +1011,7 @@ pub async fn update_plan(
     // Serialised with the other billing actions of the workspace, without
     // holding the workspace row during the Paddle call; refused after a
     // deletion request.
-    let mut tx = state.db.begin().await?;
-    lock_billing_actions(&mut tx, ws).await?;
+    let mut tx = begin_billing_action(&state, ws).await?;
     ensure_writable_unlocked(&mut tx, ws).await?;
     let sub_row: Option<(String,)> = sqlx::query_as(
         "SELECT paddle_subscription_id FROM subscriptions
@@ -992,18 +1263,14 @@ pub async fn handle_webhook(
         crate::billing_reconcile::enqueue(&mut tx, sub, *ws).await?;
     }
     // Paddle paid this checkout (it names it as the origin of a subscription):
-    // never offer its payment link again.
+    // never offer its payment link again, and no other checkout until that
+    // subscription is reconciled here.
     if let Some(txn) = data
         .and_then(|d| d.get("transaction_id"))
         .and_then(|v| v.as_str())
     {
-        sqlx::query(
-            "UPDATE billing_checkouts SET status = 'completed', updated_at = now()
-              WHERE transaction_id = $1 AND status <> 'completed'",
-        )
-        .bind(txn)
-        .execute(&mut *tx)
-        .await?;
+        let sub = sub_to_reconcile.as_ref().map(|(sub, _)| sub.as_str());
+        record_paid_checkout(&mut tx, txn, sub).await?;
     }
     tx.commit().await?;
 

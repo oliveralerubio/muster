@@ -149,7 +149,7 @@ async fn staging_left_by_a_killed_process_is_reclaimed_on_restart() {
         "precondition: staging left by the kill"
     );
 
-    s.cloud = spawn_cloud(&s.env).await;
+    s.start().await;
     assert_eq!(
         staging_dirs(&tmp),
         Vec::<PathBuf>::new(),
@@ -219,11 +219,7 @@ async fn a_second_instance_never_reclaims_a_live_instances_staging() {
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
 
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let port = support::free_port();
     let mut env = s.env.clone();
     env.retain(|(k, _)| *k != "MUSTER_BIND");
     env.push(("MUSTER_BIND", format!("127.0.0.1:{port}")));
@@ -278,7 +274,7 @@ async fn reclaim_finishes_interrupted_cleanups_and_only_touches_its_own_area() {
     let legacy = root.join("tmp/.tmpLegacy/stage.git");
     std::fs::create_dir_all(&legacy).unwrap();
 
-    s.cloud = spawn_cloud(&s.env).await;
+    s.start().await;
     for gone in [
         area.join(format!("{lease_only}.lease")),
         area.join(area_only.to_string()),
@@ -376,7 +372,7 @@ async fn accepted_and_retained_uploads_survive_a_kill_right_after() {
         .to_string();
     s.cloud.kill().await;
 
-    s.cloud = spawn_cloud(&s.env).await;
+    s.start().await;
     let resp = dev.send(&s, &dev.get(&dev.sync_path())).await;
     assert_eq!(resp.status(), 200);
     assert_eq!(

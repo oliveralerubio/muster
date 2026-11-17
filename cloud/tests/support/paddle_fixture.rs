@@ -43,6 +43,22 @@ struct Inner {
     calls: HashMap<&'static str, usize>,
     /// Upcoming `GET /subscriptions/{id}` calls that answer 503.
     failing_gets: usize,
+    /// How the upcoming `POST /transactions` calls fail, in order.
+    create_failures: std::collections::VecDeque<CreateFailure>,
+}
+
+/// A way `POST /transactions` can fail, injected with
+/// [`PaddleFixture::fail_next_create`].
+#[derive(Clone, Copy, Debug)]
+pub enum CreateFailure {
+    /// `503` and nothing created.
+    Unavailable,
+    /// `201` with a transaction but no `checkout.url` (Paddle omits it when
+    /// no default payment link is set).
+    WithoutCheckoutUrl,
+    /// The transaction is created but the answer comes only after `delay`
+    /// (longer than the service's client timeout): the answer is lost.
+    Hang(std::time::Duration),
 }
 
 /// Fields of a synthetic `subscription.*` webhook event.
@@ -238,6 +254,23 @@ impl PaddleFixture {
     pub fn fail_next_gets(&self, n: usize) {
         self.inner.lock().unwrap().failing_gets = n;
     }
+
+    /// The next `POST /transactions` call fails as `failure`.
+    pub fn fail_next_create(&self, failure: CreateFailure) {
+        self.inner
+            .lock()
+            .unwrap()
+            .create_failures
+            .push_back(failure);
+    }
+
+    /// Paddle cancels transaction `txn_id` on its own side (a dashboard
+    /// action, or a cancel whose answer the service never got).
+    pub fn cancel_at_paddle(&self, txn_id: &str) {
+        let mut g = self.inner.lock().unwrap();
+        let txn = g.transactions.get_mut(txn_id).expect("known transaction");
+        txn["status"] = "canceled".into();
+    }
 }
 
 fn touch(sub: &mut serde_json::Value) {
@@ -340,9 +373,13 @@ async fn create_transaction(
     if !authorized(&headers) {
         return unauthorized();
     }
+    let failure = inner.lock().unwrap().create_failures.pop_front();
+    if let Some(CreateFailure::Unavailable) = failure {
+        return (StatusCode::SERVICE_UNAVAILABLE, "temporarily unavailable").into_response();
+    }
     let txn_id = new_id("txn");
     let checkout_url = format!("https://sandbox-checkout.paddle.com/checkout/{txn_id}");
-    let data = serde_json::json!({
+    let mut data = serde_json::json!({
         "id": txn_id,
         "status": "draft",
         "customer_id": body.get("customer_id"),
@@ -352,11 +389,17 @@ async fn create_transaction(
             "url": checkout_url
         }
     });
+    if let Some(CreateFailure::WithoutCheckoutUrl) = failure {
+        data["checkout"] = serde_json::Value::Null;
+    }
     inner
         .lock()
         .unwrap()
         .transactions
         .insert(txn_id, data.clone());
+    if let Some(CreateFailure::Hang(delay)) = failure {
+        tokio::time::sleep(delay).await;
+    }
     (
         StatusCode::CREATED,
         Json(serde_json::json!({ "data": data })),
@@ -484,7 +527,9 @@ async fn update_subscription(
 /// `PATCH /transactions/{id}`: only cancellation is modelled. Paddle:
 /// "You can cancel transactions that are draft, ready, billed, or past_due";
 /// "billed and completed transactions ... can't be changed";
-/// "When canceling, only include status in your request."
+/// "When canceling, only include status in your request." A transaction
+/// that is already canceled is not in the cancelable list either, so a
+/// second cancel is refused like any other immutable transaction.
 async fn update_transaction(
     State(inner): State<Shared>,
     Path(txn_id): Path<String>,
@@ -509,7 +554,6 @@ async fn update_transaction(
             txn["status"] = "canceled".into();
             Json(serde_json::json!({ "data": txn.clone() })).into_response()
         }
-        "canceled" => Json(serde_json::json!({ "data": txn.clone() })).into_response(),
         _ => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({

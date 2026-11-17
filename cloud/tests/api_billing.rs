@@ -6,7 +6,7 @@ use muster_cloud::protocol::{
 };
 use support::fleet::{account_token, create_workspace, link, FleetRepo, MachineKey};
 use support::paddle_fixture::{
-    start as start_paddle, PaddleFixture, SubscriptionEvent, PRICE_PERSONAL,
+    start as start_paddle, CreateFailure, PaddleFixture, SubscriptionEvent, PRICE_PERSONAL,
 };
 use support::{http, stack_with_paddle, Stack, UserSession};
 
@@ -855,6 +855,131 @@ async fn changing_plan_before_paying_cancels_the_previous_transaction_at_paddle(
     assert_eq!(checkout(&s, &alice, &ws.id, "team", 3).await, team);
 }
 
+/// Switching plan cancels the open checkout at Paddle; when creating the new
+/// one then fails, that cancellation is still recorded, so asking for the
+/// original plan again gets a new, payable checkout, never the dead link.
+async fn a_failed_switch_never_leaves_the_canceled_link_offered(failure: CreateFailure) {
+    let paddle = start_paddle().await;
+    let s = stack_with_paddle(&paddle).await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let ws = create_workspace(&s, &alice, "Failed switch WS").await;
+
+    let personal = checkout(&s, &alice, &ws.id, "personal", 1).await;
+    paddle.fail_next_create(failure);
+    let (status, _) = session_post(
+        &s,
+        &alice,
+        &format!("/v1/workspaces/{}/billing/checkout", ws.id),
+        &CreateCheckout {
+            plan: "team".into(),
+            seats: 3,
+        },
+    )
+    .await;
+    assert_eq!(status, 500, "{failure:?}");
+    assert_eq!(paddle.transaction(&personal).unwrap()["status"], "canceled");
+
+    let again = checkout(&s, &alice, &ws.id, "personal", 1).await;
+    assert_ne!(
+        again, personal,
+        "{failure:?}: the canceled link was offered again"
+    );
+    assert_eq!(paddle.transaction(&again).unwrap()["status"], "draft");
+    // And the next switch still works.
+    let team = checkout(&s, &alice, &ws.id, "team", 3).await;
+    assert_eq!(paddle.transaction(&again).unwrap()["status"], "canceled");
+    assert_eq!(paddle.transaction(&team).unwrap()["status"], "draft");
+}
+
+#[tokio::test]
+async fn a_switch_whose_new_checkout_times_out_offers_a_new_checkout_next() {
+    a_failed_switch_never_leaves_the_canceled_link_offered(CreateFailure::Hang(
+        std::time::Duration::from_secs(20),
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn a_switch_whose_new_checkout_paddle_rejects_offers_a_new_checkout_next() {
+    a_failed_switch_never_leaves_the_canceled_link_offered(CreateFailure::Unavailable).await;
+}
+
+#[tokio::test]
+async fn a_switch_whose_new_checkout_has_no_url_offers_a_new_checkout_next() {
+    a_failed_switch_never_leaves_the_canceled_link_offered(CreateFailure::WithoutCheckoutUrl).await;
+}
+
+/// The client gives up while a plan switch waits on Paddle: the switch still
+/// finishes on the server, and the original plan asked again gets a new,
+/// payable checkout. Only that one is payable at Paddle in the end.
+#[tokio::test]
+async fn a_switch_dropped_by_the_client_still_leaves_one_working_checkout() {
+    let paddle = start_paddle().await;
+    let path = PaddlePath::start(&paddle).await;
+    let s = stack_with_paddle(&path.configured(&paddle)).await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let ws = create_workspace(&s, &alice, "Dropped switch WS").await;
+
+    let personal = checkout(&s, &alice, &ws.id, "personal", 1).await;
+    path.slow("POST", "/transactions", std::time::Duration::from_secs(2));
+    let dropped = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(500))
+        .build()
+        .unwrap()
+        .post(s.url(&format!("/v1/workspaces/{}/billing/checkout", ws.id)))
+        .header("Cookie", format!("__Host-mc_session={}", alice.cookie))
+        .header("Origin", s.origin())
+        .header("X-CSRF-Token", &alice.csrf_token)
+        .json(&CreateCheckout {
+            plan: "team".into(),
+            seats: 3,
+        })
+        .send()
+        .await;
+    assert!(dropped.is_err(), "the client should have given up");
+    *path.slow.lock().unwrap() = None;
+
+    let again = checkout(&s, &alice, &ws.id, "personal", 1).await;
+    assert_ne!(again, personal, "the canceled link was offered again");
+    assert_eq!(paddle.transaction(&personal).unwrap()["status"], "canceled");
+    assert_eq!(paddle.payable_transactions(), vec![again]);
+}
+
+/// A checkout Paddle reports canceled (on its own side, or by a cancel whose
+/// answer was lost) is never offered: the same plan gets a new checkout, and
+/// a switch does not fail because Paddle refuses to cancel it a second time.
+#[tokio::test]
+async fn a_checkout_paddle_reports_canceled_is_replaced_not_offered() {
+    let paddle = start_paddle().await;
+    let s = stack_with_paddle(&paddle).await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let ws = create_workspace(&s, &alice, "Canceled at Paddle WS").await;
+
+    let personal = checkout(&s, &alice, &ws.id, "personal", 1).await;
+    paddle.cancel_at_paddle(&personal);
+    let again = checkout(&s, &alice, &ws.id, "personal", 1).await;
+    assert_ne!(again, personal);
+    assert_eq!(paddle.payable_transactions(), vec![again.clone()]);
+    // A working checkout is still reused as before.
+    assert_eq!(checkout(&s, &alice, &ws.id, "personal", 1).await, again);
+}
+
+#[tokio::test]
+async fn a_switch_is_not_broken_by_paddle_refusing_a_second_cancel() {
+    let paddle = start_paddle().await;
+    let s = stack_with_paddle(&paddle).await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let ws = create_workspace(&s, &alice, "Recancel WS").await;
+
+    let personal = checkout(&s, &alice, &ws.id, "personal", 1).await;
+    paddle.cancel_at_paddle(&personal);
+    // Paddle now refuses `PATCH status=canceled` on it: already canceled.
+    let team = checkout(&s, &alice, &ws.id, "team", 3).await;
+    assert_ne!(team, personal);
+    assert_eq!(paddle.payable_transactions(), vec![team.clone()]);
+    assert_eq!(checkout(&s, &alice, &ws.id, "team", 3).await, team);
+}
+
 /// The open checkout was already paid but Paddle's webhook has not arrived:
 /// Paddle refuses to cancel it, so no second transaction is created, and the
 /// late webhook still grants the plan through the kept association.
@@ -1082,6 +1207,8 @@ struct PaddlePath {
     redirect_portal: std::sync::Arc<std::sync::atomic::AtomicBool>,
     redirect_hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// `GET /transactions/{id}` answers 403 (a key without that permission).
+    unreadable_transactions: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl PaddlePath {
@@ -1114,6 +1241,16 @@ impl PaddlePath {
 
     fn mark_paid(&self, txn: &str) {
         self.paid.lock().unwrap().insert(txn.into());
+    }
+
+    /// Paddle's own answers for `txn` again (it went on to complete).
+    fn unmark_paid(&self, txn: &str) {
+        self.paid.lock().unwrap().remove(txn);
+    }
+
+    fn transactions_unreadable(&self, unreadable: bool) {
+        self.unreadable_transactions
+            .store(unreadable, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Waits until a slow call is being held.
@@ -1151,6 +1288,15 @@ async fn paddle_path_forward(
             .into_response();
     }
     if let Some(txn) = route.strip_prefix("/transactions/") {
+        if method == axum::http::Method::GET && p.unreadable_transactions.load(Ordering::SeqCst) {
+            return (
+                axum::http::StatusCode::FORBIDDEN,
+                axum::Json(serde_json::json!({
+                    "error": { "type": "request_error", "code": "forbidden" }
+                })),
+            )
+                .into_response();
+        }
         if p.paid.lock().unwrap().contains(txn) {
             if method == axum::http::Method::PATCH {
                 return (
@@ -1448,4 +1594,194 @@ async fn a_deletion_during_a_slow_checkout_is_not_held_and_leaves_no_payable_lin
         );
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
+}
+
+/// A checkout request answered `409 subscription_exists`, as every request
+/// must be while a paid checkout's subscription is not registered here.
+async fn checkout_refused_as_paid(s: &Stack, u: &UserSession, ws_id: &str, plan: &str, seats: u32) {
+    let (status, resp) = session_post(
+        s,
+        u,
+        &format!("/v1/workspaces/{ws_id}/billing/checkout"),
+        &CreateCheckout {
+            plan: plan.into(),
+            seats,
+        },
+    )
+    .await;
+    assert_eq!(status, 409, "{plan} x{seats}");
+    assert_eq!(
+        resp.json::<ApiError>().await.unwrap().error.code,
+        error_codes::SUBSCRIPTION_EXISTS
+    );
+}
+
+/// The customer paid but Paddle's `subscription.created` never arrives:
+/// every later checkout (same plan or another) is refused, never a second
+/// payable transaction, and the subscription is registered from Paddle's
+/// transaction without waiting for the webhook.
+#[tokio::test]
+async fn a_paid_checkout_whose_webhook_is_lost_blocks_checkouts_and_reconciles_itself() {
+    let paddle = start_paddle().await;
+    let s = stack_with_paddle(&paddle).await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let ws = create_workspace(&s, &alice, "Lost webhook WS").await;
+
+    let txn = checkout(&s, &alice, &ws.id, "personal", 1).await;
+    let _never_delivered = paddle.complete_checkout(
+        &txn,
+        "sub_01h8vzp8f4kek3yd4g1lostwh1",
+        "ctm_01h8vzp8f4kek3yd4g1lostwh1",
+    );
+    for (plan, seats) in [("personal", 1), ("team", 3), ("personal", 1), ("team", 2)] {
+        checkout_refused_as_paid(&s, &alice, &ws.id, plan, seats).await;
+    }
+    assert_eq!(paddle.calls("create_transaction"), 1);
+    assert!(paddle.payable_transactions().is_empty());
+    billing_when(&s, &alice, &ws.id, "personal plan active", |b| {
+        b.plan == "personal" && b.plan_status == PlanStatus::Active
+    })
+    .await;
+}
+
+/// Paddle reports the checkout paid before it has created its subscription
+/// (no `subscription_id` yet) and no webhook arrives: checkouts stay refused,
+/// and once Paddle has the subscription the next request registers it.
+#[tokio::test]
+async fn a_checkout_paid_before_its_subscription_exists_keeps_blocking_until_registered() {
+    let paddle = start_paddle().await;
+    let path = PaddlePath::start(&paddle).await;
+    let s = stack_with_paddle(&path.configured(&paddle)).await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let ws = create_workspace(&s, &alice, "Paid early WS").await;
+
+    let txn = checkout(&s, &alice, &ws.id, "team", 2).await;
+    path.mark_paid(&txn);
+    for (plan, seats) in [("personal", 1), ("team", 2), ("team", 5)] {
+        checkout_refused_as_paid(&s, &alice, &ws.id, plan, seats).await;
+    }
+    assert_eq!(paddle.calls("create_transaction"), 1);
+
+    let _never_delivered = paddle.complete_checkout(
+        &txn,
+        "sub_01h8vzp8f4kek3yd4g1paidea1",
+        "ctm_01h8vzp8f4kek3yd4g1paidea1",
+    );
+    path.unmark_paid(&txn);
+    checkout_refused_as_paid(&s, &alice, &ws.id, "personal", 1).await;
+    billing_when(&s, &alice, &ws.id, "team plan active", |b| {
+        b.plan == "team" && b.plan_status == PlanStatus::Active
+    })
+    .await;
+    assert_eq!(paddle.calls("create_transaction"), 1);
+}
+
+/// Clients that give up while Paddle is slow leave their checkouts running
+/// on the server; however many there are, they never take the database
+/// connections other requests need, and in the end one checkout is payable.
+#[tokio::test]
+async fn abandoned_checkouts_against_a_slow_paddle_never_exhaust_the_database_pool() {
+    let paddle = start_paddle().await;
+    let path = PaddlePath::start(&paddle).await;
+    let s = stack_with_paddle(&path.configured(&paddle)).await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let busy = create_workspace(&s, &alice, "Storm WS").await;
+    let calm = create_workspace(&s, &alice, "Calm WS").await;
+    path.slow("POST", "/transactions", std::time::Duration::from_secs(1));
+
+    let impatient = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(300))
+        .build()
+        .unwrap();
+    let started = std::time::Instant::now();
+    let storm = (0..24).map(|i| {
+        let (plan, seats) = if i % 2 == 0 {
+            ("personal", 1)
+        } else {
+            ("team", 2)
+        };
+        impatient
+            .post(s.url(&format!("/v1/workspaces/{}/billing/checkout", busy.id)))
+            .header("Cookie", format!("__Host-mc_session={}", alice.cookie))
+            .header("Origin", s.origin())
+            .header("X-CSRF-Token", &alice.csrf_token)
+            .json(&CreateCheckout {
+                plan: plan.into(),
+                seats,
+            })
+            .send()
+    });
+    let answered = futures::future::join_all(storm).await;
+    assert!(answered.iter().all(|r| r.is_err()), "every client gave up");
+
+    // The abandoned checkouts are still running; other requests are not
+    // held up by them.
+    for _ in 0..3 {
+        let t = std::time::Instant::now();
+        let (status, _) = session_get::<WorkspaceBilling>(
+            &s,
+            &alice,
+            &format!("/v1/workspaces/{}/billing", calm.id),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let resp = http().get(s.url("/readyz")).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(2),
+            "requests waited {:?} behind abandoned checkouts",
+            t.elapsed()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    // Each abandoned checkout waits a bounded time for its turn and then
+    // gives up; afterwards exactly one checkout is payable.
+    tokio::time::sleep(std::time::Duration::from_secs(14).saturating_sub(started.elapsed())).await;
+    *path.slow.lock().unwrap() = None;
+    let offered = checkout(&s, &alice, &busy.id, "team", 2).await;
+    assert_eq!(checkout(&s, &alice, &busy.id, "team", 2).await, offered);
+    assert_eq!(paddle.payable_transactions(), vec![offered]);
+}
+
+/// Paddle cannot tell the status of the open checkout (a key without
+/// permission to read transactions): its stored link is offered a bounded
+/// number of times in a row, then refused until Paddle answers again.
+#[tokio::test]
+async fn an_unverifiable_checkout_link_is_not_offered_indefinitely() {
+    let paddle = start_paddle().await;
+    let path = PaddlePath::start(&paddle).await;
+    let s = stack_with_paddle(&path.configured(&paddle)).await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let ws = create_workspace(&s, &alice, "Unverified WS").await;
+
+    let txn = checkout(&s, &alice, &ws.id, "personal", 1).await;
+    path.transactions_unreadable(true);
+    for _ in 0..3 {
+        assert_eq!(checkout(&s, &alice, &ws.id, "personal", 1).await, txn);
+    }
+    let (status, resp) = session_post(
+        &s,
+        &alice,
+        &format!("/v1/workspaces/{}/billing/checkout", ws.id),
+        &CreateCheckout {
+            plan: "personal".into(),
+            seats: 1,
+        },
+    )
+    .await;
+    assert_eq!(status, 503);
+    assert_eq!(
+        resp.json::<ApiError>().await.unwrap().error.code,
+        error_codes::NOT_READY
+    );
+
+    // Readable again: the link is offered, and the count starts over.
+    path.transactions_unreadable(false);
+    assert_eq!(checkout(&s, &alice, &ws.id, "personal", 1).await, txn);
+    path.transactions_unreadable(true);
+    for _ in 0..3 {
+        assert_eq!(checkout(&s, &alice, &ws.id, "personal", 1).await, txn);
+    }
+    assert_eq!(paddle.calls("create_transaction"), 1);
 }

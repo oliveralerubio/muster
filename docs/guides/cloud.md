@@ -79,6 +79,22 @@ change a plan, and confirm cancellation. A checkout return URL never activates
 a subscription: only the server's verified provider state does. Pull and export
 remain available when payment blocks publication.
 
+After a plan change or cancellation, the console checks the billing state again
+for about a minute and shows the change once Paddle confirms it. If Paddle has
+not confirmed it by then, the console says so and stops checking; the change
+appears on the next refresh after Paddle confirms it. Choosing another plan
+before paying cancels the earlier checkout link, and a checkout link that Paddle
+reports canceled is never offered again: asking for that plan creates a new one.
+
+Once Paddle reports a checkout paid, no other checkout is offered for that
+workspace, on any plan, until its subscription is registered. The server
+registers it from Paddle itself, without waiting for Paddle's notification.
+When Paddle cannot report the status of an open checkout, its link is offered
+at most three times in a row; after that, checkout answers "not ready" until
+Paddle answers again. Billing actions on one workspace run one at a time; one
+that waits more than 10 seconds for its turn answers "not ready", so retry it
+shortly.
+
 The workspace list shows the same plan status as the billing page. Limits
 follow the subscription's status: when a subscription is canceled or paused, the
 workspace returns to the base limits. Existing machines and stored data stay in

@@ -19,6 +19,10 @@ use tokio::process::{Child, Command};
 
 pub struct Cloud {
     pub base: String,
+    /// The environment the process runs with: the one asked for, with
+    /// `MUSTER_BIND` and `MUSTER_PUBLIC_URL` moved to a new port when the
+    /// chosen one was taken before the service could bind it.
+    pub env: Env,
     child: Child,
     /// Synthetic authority created for a caller that brought none.
     _control: Option<tempfile::TempDir>,
@@ -106,18 +110,82 @@ fn leak(s: &str) -> &'static str {
     Box::leak(s.to_string().into_boxed_str())
 }
 
+/// How many ports a start tries before giving up. Each retry follows a
+/// port taken between choosing it and the service binding it, which is
+/// already rare; ten in a row does not happen.
+const BIND_ATTEMPTS: usize = 10;
+
+/// The service must know its public URL (OIDC redirect URI, origin checks)
+/// before it starts, so its port is chosen before it binds and another
+/// process can take it in between. That start fails with `cannot bind ...
+/// Address already in use`; it is then retried on a new port, with
+/// `MUSTER_BIND` and `MUSTER_PUBLIC_URL` moved together.
 async fn spawn_with(env: &[(&'static str, String)]) -> Cloud {
+    let mut env: Env = env.to_vec();
+    let mut attempt = 1;
+    loop {
+        match start_once(&env).await {
+            Start::Up { base, child } => {
+                return Cloud {
+                    base,
+                    env,
+                    child: *child,
+                    _control: None,
+                }
+            }
+            Start::PortTaken(port) if attempt < BIND_ATTEMPTS && move_to_new_port(&mut env) => {
+                eprintln!("support: port {port} was taken before muster-cloud bound it; retrying");
+                attempt += 1;
+            }
+            Start::PortTaken(port) => {
+                panic!("muster-cloud could not bind a port after {attempt} attempts (last {port})")
+            }
+            Start::Failed(status) => {
+                panic!("muster-cloud did not report a listening address (exit: {status:?})")
+            }
+        }
+    }
+}
+
+enum Start {
+    Up {
+        base: String,
+        child: Box<Child>,
+    },
+    /// The process exited because its configured port was in use.
+    PortTaken(u16),
+    Failed(Option<std::process::ExitStatus>),
+}
+
+async fn start_once(env: &[(&'static str, String)]) -> Start {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_muster-cloud"));
     cmd.env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("MUSTER_LOG", "warn")
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
     for (key, value) in env {
         cmd.env(key, value);
     }
     let mut child = cmd.spawn().expect("spawn muster-cloud");
+    // Stderr is forwarded as it was inherited before, and watched for the
+    // bind refusal.
+    let port_taken = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut errors = BufReader::new(child.stderr.take().expect("stderr")).lines();
+    let stderr = tokio::spawn({
+        let port_taken = port_taken.clone();
+        async move {
+            while let Ok(Some(line)) = errors.next_line().await {
+                if line.starts_with("muster-cloud: cannot bind ")
+                    && line.contains("Address already in use")
+                {
+                    port_taken.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                eprintln!("{line}");
+            }
+        }
+    });
     let mut lines = BufReader::new(child.stdout.take().expect("stdout")).lines();
     let wait = async {
         while let Ok(Some(line)) = lines.next_line().await {
@@ -127,21 +195,73 @@ async fn spawn_with(env: &[(&'static str, String)]) -> Cloud {
         }
         None
     };
-    let base = match tokio::time::timeout(Duration::from_secs(60), wait).await {
-        Ok(Some(base)) => base,
+    match tokio::time::timeout(Duration::from_secs(60), wait).await {
+        Ok(Some(base)) => {
+            // Keep draining stdout so the child never blocks on a full pipe.
+            tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
+            Start::Up {
+                base,
+                child: Box::new(child),
+            }
+        }
         _ => {
             let _ = child.start_kill();
             let status = child.wait().await.ok();
-            panic!("muster-cloud did not report a listening address (exit: {status:?})");
+            let _ = stderr.await;
+            match bind_port(env) {
+                Some(port) if port_taken.load(std::sync::atomic::Ordering::SeqCst) => {
+                    Start::PortTaken(port)
+                }
+                _ => Start::Failed(status),
+            }
         }
-    };
-    // Keep draining stdout so the child never blocks on a full pipe.
-    tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
-    Cloud {
-        base,
-        child,
-        _control: None,
     }
+}
+
+/// The last value of `name` in `env` (the one the process sees).
+fn env_value<'a>(env: &'a [(&'static str, String)], name: &str) -> Option<&'a str> {
+    env.iter()
+        .rev()
+        .find(|(k, _)| *k == name)
+        .map(|(_, v)| v.as_str())
+}
+
+/// The explicit (non-zero) port of `MUSTER_BIND`.
+fn bind_port(env: &[(&'static str, String)]) -> Option<u16> {
+    let bind: std::net::SocketAddr = env_value(env, "MUSTER_BIND")?.parse().ok()?;
+    Some(bind.port()).filter(|p| *p != 0)
+}
+
+/// Moves `MUSTER_BIND` to a new free port, and `MUSTER_PUBLIC_URL` with it
+/// when it named the same port (a second process sharing another's public
+/// URL keeps it). `false` when there is no explicit port to move.
+fn move_to_new_port(env: &mut Env) -> bool {
+    let Some(old) = bind_port(env) else {
+        return false;
+    };
+    let mut new = free_port();
+    while new == old {
+        new = free_port();
+    }
+    let mut bind: std::net::SocketAddr = env_value(env, "MUSTER_BIND").unwrap().parse().unwrap();
+    bind.set_port(new);
+    let public = env_value(env, "MUSTER_PUBLIC_URL").map(|public| {
+        let same_port = url::Url::parse(public)
+            .ok()
+            .and_then(|u| u.port_or_known_default())
+            == Some(old);
+        if same_port {
+            public.replacen(&format!(":{old}"), &format!(":{new}"), 1)
+        } else {
+            public.to_string()
+        }
+    });
+    env.retain(|(k, _)| *k != "MUSTER_BIND" && *k != "MUSTER_PUBLIC_URL");
+    env.push(("MUSTER_BIND", bind.to_string()));
+    if let Some(public) = public {
+        env.push(("MUSTER_PUBLIC_URL", public));
+    }
+    true
 }
 
 /// Runs the service binary to completion with `env` and returns
@@ -227,8 +347,9 @@ pub struct UserSession {
 
 /// Picks a free loopback port for the service. The service must know its
 /// public URL (OIDC redirect URI) before it starts, so the port is chosen
-/// here; the tiny race with other processes is acceptable in tests.
-fn free_port() -> u16 {
+/// here and released before the service binds it; [`spawn_cloud`] moves to
+/// a new port when another process took it in between.
+pub fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -264,9 +385,9 @@ pub async fn stack_with_env(extra: &[(&'static str, String)]) -> Stack {
     let control = synthetic_authority(&mut env).await;
     let cloud = spawn_cloud(&env).await;
     Stack {
+        env: cloud.env.clone(),
         cloud,
         idp,
-        env,
         _repos: repos,
         _control: control,
     }
@@ -309,9 +430,9 @@ pub async fn stack_with_paddle(paddle: &paddle_fixture::PaddleFixture) -> Stack 
     let control = synthetic_authority(&mut env).await;
     let cloud = spawn_cloud(&env).await;
     Stack {
+        env: cloud.env.clone(),
         cloud,
         idp,
-        env,
         _repos: repos,
         _control: control,
     }
@@ -322,7 +443,14 @@ impl Stack {
     /// environment (database, Git storage, port).
     pub async fn restart(&mut self) {
         self.cloud.kill().await;
+        self.start().await;
+    }
+
+    /// Starts the service again with [`Stack::env`] after it was stopped or
+    /// died, keeping `env` in step with the port it ends up on.
+    pub async fn start(&mut self) {
         self.cloud = spawn_cloud(&self.env).await;
+        self.env = self.cloud.env.clone();
     }
 
     /// [`Stack::restart`] with `extra` settings added or replaced: an
@@ -336,6 +464,13 @@ impl Stack {
 }
 
 impl Cloud {
+    /// The `MUSTER_PUBLIC_URL` the process runs with.
+    pub fn public_url(&self) -> String {
+        env_value(&self.env, "MUSTER_PUBLIC_URL")
+            .expect("MUSTER_PUBLIC_URL")
+            .to_string()
+    }
+
     pub async fn kill(&mut self) {
         let _ = self.child.start_kill();
         let _ = self.child.wait().await;

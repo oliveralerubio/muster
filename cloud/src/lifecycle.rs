@@ -363,7 +363,7 @@ pub async fn request_deletion(
             .await?;
             let checkouts: Vec<String> = sqlx::query_scalar(
                 "SELECT transaction_id FROM billing_checkouts
-                  WHERE workspace_id = $1 AND status = 'open' ORDER BY transaction_id",
+                  WHERE workspace_id = $1 AND status IN ('open', 'paid') ORDER BY transaction_id",
             )
             .bind(id)
             .fetch_all(&mut *tx)

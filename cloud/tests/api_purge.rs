@@ -455,11 +455,7 @@ async fn concurrent_readers_and_pushes_are_drained_safely_across_two_processes()
     let a = tenant(&s, &alice, &token, "Busy", &ka).await;
     let b = tenant(&s, &alice, &token, "Calm", &kb).await;
     // A second service process on the same database, root and authority.
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let port = support::free_port();
     let mut env2 = s.env.clone();
     env2.retain(|(k, _)| *k != "MUSTER_BIND" && *k != "MUSTER_PUBLIC_URL");
     env2.push(("MUSTER_BIND", format!("127.0.0.1:{port}")));
