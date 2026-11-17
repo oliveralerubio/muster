@@ -295,3 +295,52 @@ async fn accepting_an_invitation_never_demotes_the_last_owner() {
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].role, Role::Owner, "the only owner was demoted");
 }
+
+/// Accepting an invitation changes a membership: a CLI account token, which
+/// only reads workspaces and links machines, cannot do it; the invitee's
+/// browser session still can, so the refusal consumes nothing.
+#[tokio::test]
+async fn a_cli_account_token_cannot_accept_an_invitation() {
+    let s = stack().await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let bob = s.login_user("bob", "bob@example.com").await;
+    let ws = create_workspace(&s, &alice, "Scoped accept").await;
+    let (status, resp) = session_post(
+        &s,
+        &alice,
+        &format!("/v1/workspaces/{}/invitations", ws.id),
+        &CreateInvitation {
+            email: bob.email.clone(),
+            role: Role::Member,
+        },
+    )
+    .await;
+    assert_eq!(status, 201);
+    let created: CreatedInvitation = resp.json().await.unwrap();
+
+    let bob_cli = support::fleet::account_token(&s, &bob).await;
+    let resp = http()
+        .post(s.url(&created.accept_path))
+        .header("Authorization", format!("Bearer {}", bob_cli.access_token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    let err: ApiError = resp.json().await.unwrap();
+    assert_eq!(err.error.code, error_codes::INSUFFICIENT_SCOPE);
+    assert_eq!(
+        err.error.details["required_scope"],
+        muster_cloud::protocol::scopes::WORKSPACES_WRITE
+    );
+    let (status, members) = session_get::<Vec<WorkspaceMember>>(
+        &s,
+        &alice,
+        &format!("/v1/workspaces/{}/members", ws.id),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(members.unwrap().len(), 1, "the token joined bob");
+
+    let (status, _) = session_post(&s, &bob, &created.accept_path, &serde_json::json!({})).await;
+    assert_eq!(status, 200);
+}

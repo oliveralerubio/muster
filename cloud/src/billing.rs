@@ -19,7 +19,7 @@ use crate::auth::account::Account;
 use crate::error::AppError;
 use crate::protocol::{
     error_codes, scopes, CheckoutSession, CreateCheckout, CustomerPortalSession, PlanStatus,
-    UpdatePlan, WorkspaceBilling,
+    UpdatePlan, WorkspaceBilling, MAX_TEAM_SEATS,
 };
 use crate::state::AppState;
 use crate::tenancy::parse_json;
@@ -60,22 +60,44 @@ async fn require_admin_or_owner(state: &AppState, ws: Uuid, user: Uuid) -> Resul
 /// `(plan, status, seats, current_period_end, cancel_at_period_end)`.
 pub(crate) type SubRow = (String, String, i32, OffsetDateTime, bool);
 
-/// The subscription that decides a workspace's entitlements: a workspace can
-/// accumulate several (canceled, then subscribed again); a live one wins over
-/// a canceled one, then the most recently updated by Paddle.
+/// Which of a workspace's subscriptions decides its entitlements: a
+/// workspace can accumulate several (canceled, then subscribed again); a
+/// live one wins over a canceled one, then the most recently updated by
+/// Paddle. The `ORDER BY` of every query that picks it.
+pub(crate) const CURRENT_SUBSCRIPTION_ORDER: &str =
+    "(status <> 'canceled') DESC, provider_updated_at DESC NULLS LAST, updated_at DESC";
+
+/// The subscription that decides a workspace's entitlements (see
+/// [`CURRENT_SUBSCRIPTION_ORDER`]).
 pub(crate) async fn current_subscription<'e>(
     db: impl sqlx::PgExecutor<'e>,
     ws: Uuid,
 ) -> Result<Option<SubRow>, AppError> {
-    Ok(sqlx::query_as(
+    Ok(sqlx::query_as(&format!(
         "SELECT plan, status, seats, current_period_end, cancel_at_period_end
            FROM subscriptions WHERE workspace_id = $1
-          ORDER BY (status <> 'canceled') DESC, provider_updated_at DESC NULLS LAST, updated_at DESC
-          LIMIT 1",
-    )
+          ORDER BY {CURRENT_SUBSCRIPTION_ORDER}
+          LIMIT 1"
+    ))
     .bind(ws)
     .fetch_optional(db)
     .await?)
+}
+
+/// A workspace's plan status and whether it may push: from the status of its
+/// current subscription when it has one ([`subscription_entitlement`]),
+/// from the trial otherwise. The one rule behind `GET /billing` and the
+/// workspace list and detail (the push gate applies the same rule).
+pub(crate) fn plan_status(
+    subscription_status: Option<&str>,
+    trial_ends_at: OffsetDateTime,
+    now: OffsetDateTime,
+) -> (PlanStatus, bool) {
+    match subscription_status {
+        Some(status) => subscription_entitlement(status),
+        None if now < trial_ends_at => (PlanStatus::Trialing, true),
+        None => (PlanStatus::TrialExpired, false),
+    }
 }
 
 /// What a Paddle subscription status allows, with no locally invented
@@ -105,23 +127,30 @@ const GIB: u64 = 1024 * MIB;
 pub(crate) const MAX_PLAN_BUNDLE_BYTES: usize = (25 * MIB) as usize;
 
 /// Limits for the subscription that decides entitlements (see
-/// [`current_subscription`]); no subscription means the trial.
+/// [`current_subscription`]). They follow entitlement, not the plan name: a
+/// subscription that no longer entitles (canceled, paused) gets the same
+/// base limits as no subscription. Only new links and pushes are measured
+/// against them; nothing already stored is removed or hidden.
 fn plan_limits(sub: Option<&SubRow>) -> PlanLimits {
     match sub {
-        Some((plan, _, seats, _, _)) if plan == "team" => {
-            let seats = *seats as u32;
-            PlanLimits {
-                max_devices: seats * 50,
-                max_bundle_bytes: MAX_PLAN_BUNDLE_BYTES,
-                max_storage_bytes: seats as u64 * 100 * GIB,
+        Some((plan, status, seats, _, _)) if subscription_entitlement(status).1 => {
+            if plan == "team" {
+                // Seats come from Paddle's quantity: never trust them to fit.
+                let seats = u32::try_from(*seats).unwrap_or(0).max(1);
+                PlanLimits {
+                    max_devices: seats.saturating_mul(50),
+                    max_bundle_bytes: MAX_PLAN_BUNDLE_BYTES,
+                    max_storage_bytes: u64::from(seats).saturating_mul(100 * GIB),
+                }
+            } else {
+                PlanLimits {
+                    max_devices: 10,
+                    max_bundle_bytes: MAX_PLAN_BUNDLE_BYTES,
+                    max_storage_bytes: 10 * GIB,
+                }
             }
         }
-        Some(_) => PlanLimits {
-            max_devices: 10,
-            max_bundle_bytes: MAX_PLAN_BUNDLE_BYTES,
-            max_storage_bytes: 10 * GIB,
-        },
-        None => PlanLimits {
+        _ => PlanLimits {
             max_devices: 3,
             max_bundle_bytes: (10 * MIB) as usize,
             max_storage_bytes: GIB,
@@ -235,13 +264,13 @@ pub async fn get_billing(
 
     let billing = match sub {
         Some((plan, status_str, seats, period_end, cancel_at_end)) => {
-            let (plan_status, can_push) = subscription_entitlement(&status_str);
+            let (plan_status, can_push) = plan_status(Some(&status_str), trial_ends_at, now);
             WorkspaceBilling {
                 workspace_id: ws.to_string(),
                 billing_configured,
                 plan,
                 plan_status,
-                seats: seats as u32,
+                seats: u32::try_from(seats).unwrap_or(0),
                 trial_ends_at: None,
                 current_period_end: Some(rfc3339(period_end)?),
                 cancel_at_period_end: cancel_at_end,
@@ -255,12 +284,7 @@ pub async fn get_billing(
             }
         }
         None => {
-            let is_trialing = now < trial_ends_at;
-            let plan_status = if is_trialing {
-                PlanStatus::Trialing
-            } else {
-                PlanStatus::TrialExpired
-            };
+            let (plan_status, can_push) = plan_status(None, trial_ends_at, now);
             WorkspaceBilling {
                 workspace_id: ws.to_string(),
                 billing_configured,
@@ -270,7 +294,7 @@ pub async fn get_billing(
                 trial_ends_at: Some(rfc3339(trial_ends_at)?),
                 current_period_end: None,
                 cancel_at_period_end: false,
-                can_push: is_trialing,
+                can_push,
                 can_pull: true,
                 can_export: true,
                 max_devices: limits.max_devices,
@@ -282,6 +306,54 @@ pub async fn get_billing(
     };
 
     Ok(Json(billing))
+}
+
+/// Serialises the billing actions of workspace `ws` (checkout, plan change,
+/// cancellation) with each other for the rest of `tx`: one decision, and one
+/// Paddle call, at a time per workspace. It is not the workspace row lock,
+/// so holding it across a Paddle call (up to its 15 s timeout) never holds
+/// up a push, a link or a deletion request. The caller takes no row lock on
+/// the workspace before its Paddle calls and only a short one after them.
+async fn lock_billing_actions(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ws: Uuid,
+) -> Result<(), AppError> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('muster.billing'), hashtext($1::text))")
+        .bind(ws.to_string())
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// `404` for a missing workspace and `409 workspace_deletion_scheduled`
+/// after a deletion request, read without locking the workspace row. A
+/// deletion that lands later is caught by the short re-check after the
+/// Paddle call.
+async fn ensure_writable_unlocked(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ws: Uuid,
+) -> Result<(), AppError> {
+    sqlx::query("SELECT id FROM workspaces WHERE id = $1")
+        .bind(ws)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or_else(AppError::not_found)?;
+    crate::lifecycle::deny_if_scheduled(tx, ws).await
+}
+
+/// The seat count a checkout or plan change asks Paddle for: one for a
+/// personal plan, at least one for a team, and never above
+/// [`MAX_TEAM_SEATS`] (`400`, `details.field = "seats"`), so it always fits
+/// the stored `INT` and the limit arithmetic.
+fn requested_seats(is_team: bool, seats: u32) -> Result<i32, AppError> {
+    if seats > MAX_TEAM_SEATS {
+        return Err(
+            AppError::bad_request(format!("seats must be at most {MAX_TEAM_SEATS}"))
+                .with_details(serde_json::json!({ "field": "seats" })),
+        );
+    }
+    let seats = if is_team { seats.max(1) } else { 1 };
+    i32::try_from(seats).map_err(AppError::internal)
 }
 
 /// `POST /v1/workspaces/{ws}/billing/checkout`: creates a Paddle checkout
@@ -303,7 +375,7 @@ pub async fn create_checkout(
     let req: CreateCheckout = parse_json(&body)?;
     let is_team = req.plan == "team";
     let plan = if is_team { "team" } else { "personal" };
-    let seats = if is_team { req.seats.max(1) } else { 1 };
+    let seats = requested_seats(is_team, req.seats)?;
     let price_id = if is_team {
         &paddle.price_team_seat
     } else {
@@ -314,8 +386,8 @@ pub async fn create_checkout(
     // and retries see the same open checkout instead of each creating a
     // payable Paddle transaction.
     let mut tx = state.db.begin().await?;
-    // Also serialises with a deletion request: none after it.
-    crate::lifecycle::lock_writable(&mut tx, ws, true).await?;
+    lock_billing_actions(&mut tx, ws).await?;
+    ensure_writable_unlocked(&mut tx, ws).await?;
     if current_subscription(&mut *tx, ws)
         .await?
         .is_some_and(|(_, status, ..)| status != "canceled")
@@ -336,7 +408,7 @@ pub async fn create_checkout(
     .fetch_optional(&mut *tx)
     .await?;
     if let Some((txn_id, open_plan, open_seats, Some(url))) = &open {
-        if open_plan == plan && *open_seats == seats as i32 {
+        if open_plan == plan && *open_seats == seats {
             tx.commit().await?;
             return Ok(Json(CheckoutSession {
                 checkout_url: url.clone(),
@@ -361,9 +433,11 @@ pub async fn create_checkout(
             })?;
         if !resp.status().is_success() {
             // Paddle does not name the refusal; read the transaction instead.
+            // Paid (captured, then completed or billed) is settled exactly as
+            // the deletion's checkout cancellation reads it.
             let paid = transaction_status(paddle, txn_id)
                 .await
-                .is_some_and(|st| st == "completed" || st == "billed");
+                .is_some_and(|st| matches!(st.as_str(), "paid" | "completed" | "billed"));
             if paid {
                 // Paid: its subscription is on the way and the association
                 // stays; never offer this link again nor a second checkout.
@@ -456,6 +530,17 @@ pub async fn create_checkout(
         .ok_or_else(|| AppError::internal("no checkout url in paddle resp"))?
         .to_string();
 
+    // Short re-check under the workspace row lock, serialised with a
+    // deletion request: either the request comes after this commit and
+    // journals this checkout to cancel it, or it came during the Paddle call
+    // and the new transaction is handed to its provider cancellation now.
+    if let Err(denied) = crate::lifecycle::lock_writable(&mut tx, ws, true).await {
+        drop(tx);
+        if denied.code == error_codes::WORKSPACE_DELETION_SCHEDULED {
+            crate::lifecycle_provider::cancel_late_checkout(&state, ws, &txn_id).await;
+        }
+        return Err(denied);
+    }
     // The association that lets `subscription.created` grant rights.
     sqlx::query(
         "INSERT INTO billing_checkouts
@@ -466,7 +551,7 @@ pub async fn create_checkout(
     .bind(ws)
     .bind(account.user_id)
     .bind(plan)
-    .bind(seats as i32)
+    .bind(seats)
     .bind(price_id)
     .bind(&checkout_url)
     .execute(&mut *tx)
@@ -509,37 +594,47 @@ pub async fn customer_portal(
         return Err(AppError::billing_unconfigured());
     };
 
-    let cust_row: Option<(String,)> =
-        sqlx::query_as("SELECT customer_id FROM billing_customers WHERE workspace_id = $1")
-            .bind(ws)
-            .fetch_optional(&state.db)
-            .await?;
+    // Refused after a deletion request like every other billing action: the
+    // provider objects are being canceled and nothing is left to manage.
+    let cust_row: Option<(String,)> = {
+        let mut tx = state.db.begin().await?;
+        ensure_writable_unlocked(&mut tx, ws).await?;
+        let row =
+            sqlx::query_as("SELECT customer_id FROM billing_customers WHERE workspace_id = $1")
+                .bind(ws)
+                .fetch_optional(&mut *tx)
+                .await?;
+        tx.commit().await?;
+        row
+    };
 
     let (cust_id,) = cust_row
         .ok_or_else(|| AppError::bad_request("workspace has no billing customer associated yet"))?;
 
-    let client = reqwest::Client::new();
-    let url = format!("{}/customers/{cust_id}/portal-sessions", paddle.base_url);
-
-    let resp = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", paddle.api_key))
+    // The shared provider client: timeouts, and no redirects (the API key
+    // must never follow one).
+    let resp = crate::billing_reconcile::paddle_http()
+        .post(format!(
+            "{}/customers/{cust_id}/portal-sessions",
+            paddle.base_url
+        ))
+        .bearer_auth(&paddle.api_key)
         .json(&serde_json::json!({}))
         .send()
         .await
-        .map_err(|e| AppError::internal(format!("paddle portal error: {e}")))?;
+        .map_err(|e| AppError::internal(format!("paddle portal error: {}", e.without_url())))?;
 
     if !resp.status().is_success() {
-        let err_text = resp.text().await.unwrap_or_default();
         return Err(AppError::internal(format!(
-            "paddle portal rejected: {err_text}"
+            "paddle portal rejected with {}",
+            resp.status()
         )));
     }
 
     let resp_json: serde_json::Value = resp
         .json()
         .await
-        .map_err(|e| AppError::internal(format!("invalid paddle json: {e}")))?;
+        .map_err(|e| AppError::internal(format!("invalid paddle json: {}", e.without_url())))?;
 
     let portal_url = resp_json
         .get("data")
@@ -567,17 +662,18 @@ pub async fn cancel_subscription(
         return Err(AppError::billing_unconfigured());
     };
 
-    // The row lock serialises concurrent cancels of the same subscription.
+    // Billing actions of the workspace are serialised (concurrent cancels
+    // ask Paddle once) without holding the workspace row during the call.
     // After a deletion request the provider work cancels immediately.
     let mut tx = state.db.begin().await?;
-    crate::lifecycle::lock_writable(&mut tx, ws, true).await?;
-    let sub_row: Option<(String, String, bool)> = sqlx::query_as(
+    lock_billing_actions(&mut tx, ws).await?;
+    ensure_writable_unlocked(&mut tx, ws).await?;
+    let sub_row: Option<(String, String, bool)> = sqlx::query_as(&format!(
         "SELECT paddle_subscription_id, status, cancel_at_period_end FROM subscriptions
           WHERE workspace_id = $1
-          ORDER BY (status <> 'canceled') DESC, provider_updated_at DESC NULLS LAST, updated_at DESC
-          LIMIT 1
-          FOR UPDATE",
-    )
+          ORDER BY {CURRENT_SUBSCRIPTION_ORDER}
+          LIMIT 1"
+    ))
     .bind(ws)
     .fetch_optional(&mut *tx)
     .await?;
@@ -606,6 +702,9 @@ pub async fn cancel_subscription(
     }
 
     // Local state comes from Paddle's canonical subscription, not from here.
+    // Paddle has made the change, so it is re-read even if a deletion
+    // request landed during the call (the reconciliation then hands a live
+    // subscription to its immediate cancellation).
     crate::billing_reconcile::enqueue(&mut tx, &sub_id, ws).await?;
     tx.commit().await?;
     crate::billing_reconcile::run_now(&state, &sub_id).await;
@@ -630,17 +729,19 @@ pub async fn update_plan(
 
     let req: UpdatePlan = parse_json(&body)?;
     let is_team = req.plan == "team";
-    let seats = if is_team { req.seats.max(1) } else { 1 };
+    let seats = requested_seats(is_team, req.seats)?;
     let price_id = if is_team {
         &paddle.price_team_seat
     } else {
         &paddle.price_personal
     };
 
-    // Under the workspace row lock: serialised with checkouts and with a
-    // deletion request (no plan change after it).
+    // Serialised with the other billing actions of the workspace, without
+    // holding the workspace row during the Paddle call; refused after a
+    // deletion request.
     let mut tx = state.db.begin().await?;
-    crate::lifecycle::lock_writable(&mut tx, ws, true).await?;
+    lock_billing_actions(&mut tx, ws).await?;
+    ensure_writable_unlocked(&mut tx, ws).await?;
     let sub_row: Option<(String,)> = sqlx::query_as(
         "SELECT paddle_subscription_id FROM subscriptions
           WHERE workspace_id = $1 AND status <> 'canceled'
@@ -677,7 +778,8 @@ pub async fn update_plan(
         )));
     }
 
-    // Entitlements follow Paddle's canonical subscription.
+    // Entitlements follow Paddle's canonical subscription, re-read even if a
+    // deletion request landed during the call (as for a cancellation).
     crate::billing_reconcile::enqueue(&mut tx, &sub_id, ws).await?;
     tx.commit().await?;
     crate::billing_reconcile::run_now(&state, &sub_id).await;

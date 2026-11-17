@@ -347,6 +347,32 @@ async fn register(
     Ok(())
 }
 
+/// A checkout transaction Paddle created for `ws` while its deletion was
+/// being requested (the checkout makes its Paddle call without holding the
+/// workspace row, so the request could not journal it): registered as an
+/// item of that request and canceled now, so no payable link is left. A
+/// failure here leaves a link nobody was given (the checkout was refused);
+/// it is logged.
+pub async fn cancel_late_checkout(state: &AppState, ws: Uuid, txn_id: &str) {
+    let request: Result<Option<(Uuid,)>, sqlx::Error> =
+        sqlx::query_as("SELECT request_id FROM workspace_lifecycle WHERE workspace_id = $1")
+            .bind(ws)
+            .fetch_optional(&state.db)
+            .await;
+    let registered = match request {
+        Ok(Some((request_id,))) => register(state, ws, request_id, ProviderItem::Checkout, txn_id)
+            .await
+            .map_err(|e| e.message),
+        Ok(None) => Err("no deletion request found".to_string()),
+        Err(e) => Err(e.to_string()),
+    };
+    match registered {
+        Ok(()) => attempt_workspace(state, ws).await,
+        Err(why) => tracing::error!(workspace = %ws, transaction = %txn_id, reason = %why,
+            "lifecycle provider: could not register a checkout created during the deletion request"),
+    }
+}
+
 /// Called by the canonical subscription reconciliation once Paddle shows
 /// `sub_id` live (not canceled) for `ws`: when `ws` has a deletion request,
 /// the subscription is registered and canceled immediately.

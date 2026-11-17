@@ -1122,6 +1122,11 @@ fn default_one() -> u32 {
     1
 }
 
+/// Most seats a checkout or plan change may ask for. Above it the request
+/// is `400 bad_request` with `details.field = "seats"`, before Paddle is
+/// called. Larger teams are arranged with support.
+pub const MAX_TEAM_SEATS: u32 = 1000;
+
 /// `POST /v1/workspaces/{ws}/billing/checkout` body.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CreateCheckout {

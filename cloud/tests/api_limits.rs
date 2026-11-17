@@ -678,6 +678,20 @@ async fn subscribe(
     plan: &str,
     seats: u32,
 ) -> WorkspaceBilling {
+    let sub = format!("sub_{}", uuid::Uuid::new_v4().simple());
+    subscribe_as(s, paddle, u, ws, plan, seats, &sub).await
+}
+
+/// [`subscribe`] with the Paddle subscription id chosen by the caller.
+async fn subscribe_as(
+    s: &Stack,
+    paddle: &PaddleFixture,
+    u: &UserSession,
+    ws: &str,
+    plan: &str,
+    seats: u32,
+    sub: &str,
+) -> WorkspaceBilling {
     let resp = session_send(
         s,
         u,
@@ -692,9 +706,8 @@ async fn subscribe(
     .await;
     assert_eq!(resp.status(), 200);
     let txn = resp.json::<CheckoutSession>().await.unwrap().transaction_id;
-    let sub = format!("sub_{}", uuid::Uuid::new_v4().simple());
     let customer = format!("ctm_{}", uuid::Uuid::new_v4().simple());
-    let event = paddle.complete_checkout(&txn, &sub, &customer);
+    let event = paddle.complete_checkout(&txn, sub, &customer);
     let bytes = serde_json::to_vec(&event).unwrap();
     let sig = paddle.sign_webhook(&bytes, time::OffsetDateTime::now_utc().unix_timestamp());
     let resp = http()
@@ -974,4 +987,95 @@ async fn closed_proposals_release_their_storage() {
         )
         .await;
     assert_eq!(resp.status(), 404);
+}
+
+/// Limits follow entitlement, not the plan name: once Paddle ends the paid
+/// subscription the workspace is back to the base limits for anything new
+/// (one more machine is refused), while everything already stored stays.
+#[tokio::test]
+async fn an_ended_subscription_falls_back_to_the_base_limits_without_losing_data() {
+    let paddle = support::paddle_fixture::start().await;
+    let s = stack_with_paddle(&paddle).await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let token = account_token(&s, &alice).await;
+    let ws = create_workspace(&s, &alice, "Lapsed").await;
+    let base = billing_of(&s, &alice, &ws.id).await;
+    let sub = format!("sub_{}", uuid::Uuid::new_v4().simple());
+    let paid = subscribe_as(&s, &paddle, &alice, &ws.id, "personal", 1, &sub).await;
+    let kept = base.max_devices as usize + 1;
+    assert!(paid.max_devices as usize >= kept);
+    for i in 0..kept {
+        let key = MachineKey::new(&format!("node-{i}"));
+        assert_eq!(try_link(&s, &token, &ws.id, &key).await.status(), 201);
+    }
+
+    let event = paddle.update_subscription(&sub, "subscription.canceled", |sub| {
+        sub["status"] = "canceled".into();
+        sub["canceled_at"] = support::paddle_fixture::now_rfc3339().into();
+        sub["scheduled_change"] = serde_json::Value::Null;
+    });
+    let bytes = serde_json::to_vec(&event).unwrap();
+    let sig = paddle.sign_webhook(&bytes, time::OffsetDateTime::now_utc().unix_timestamp());
+    let resp = http()
+        .post(s.url("/v1/billing/webhook"))
+        .header("Paddle-Signature", sig)
+        .body(bytes)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let ended = billing_of(&s, &alice, &ws.id).await;
+    assert_eq!(ended.plan_status, PlanStatus::Canceled);
+    assert_eq!(
+        (
+            ended.max_devices,
+            ended.max_bundle_bytes,
+            ended.max_storage_bytes
+        ),
+        (
+            base.max_devices,
+            base.max_bundle_bytes,
+            base.max_storage_bytes
+        )
+    );
+    let resp = try_link(&s, &token, &ws.id, &MachineKey::new("after-cancel")).await;
+    assert_eq!(resp.status(), 507);
+    assert_eq!(
+        resp.json::<ApiError>().await.unwrap().error.code,
+        error_codes::QUOTA_EXCEEDED
+    );
+    assert_eq!(devices_of(&s, &token, &ws.id).await.len(), kept);
+}
+
+/// Seats come from Paddle's canonical quantity, which this service does not
+/// bound: an enormous team still gets an answer, with limits that saturate
+/// instead of overflowing.
+#[tokio::test]
+async fn an_enormous_canonical_seat_count_saturates_the_team_limits() {
+    let paddle = support::paddle_fixture::start().await;
+    let s = stack_with_paddle(&paddle).await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let ws = create_workspace(&s, &alice, "Huge team").await;
+    let sub = format!("sub_{}", uuid::Uuid::new_v4().simple());
+    subscribe_as(&s, &paddle, &alice, &ws.id, "team", 1, &sub).await;
+
+    let event = paddle.update_subscription(&sub, "subscription.updated", |sub| {
+        sub["items"][0]["quantity"] = 2_000_000_000u32.into();
+    });
+    let bytes = serde_json::to_vec(&event).unwrap();
+    let sig = paddle.sign_webhook(&bytes, time::OffsetDateTime::now_utc().unix_timestamp());
+    let resp = http()
+        .post(s.url("/v1/billing/webhook"))
+        .header("Paddle-Signature", sig)
+        .body(bytes)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let billing = billing_of(&s, &alice, &ws.id).await;
+    assert_eq!(billing.seats, 2_000_000_000);
+    assert_eq!(billing.max_devices, u32::MAX);
+    assert_eq!(billing.max_storage_bytes, u64::MAX);
 }

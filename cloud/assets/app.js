@@ -2,6 +2,7 @@
   'use strict';
 
   const THEME_STORAGE_KEY = 'mc_theme';
+  const MAX_TEAM_SEATS = 1000;
   const state = {
     sessionGeneration: 0,
     bootstrapSeq: 0,
@@ -47,6 +48,7 @@
     revisions: null,
     loadingRevisions: false,
     revisionsError: null,
+    revisionsMoreError: null,
     loadingMoreRevisions: false,
     hasMoreRevisions: false,
     selectedDiffRev: null,
@@ -65,10 +67,12 @@
     restoreInFlight: false,
     restoreCreatedMessage: null,
     billing: null,
+    billingSeq: 0,
     loadingBilling: false,
     billingError: null,
     billingActionError: null,
     billingNotice: null,
+    pendingBillingAction: null,
     checkoutPlan: 'personal',
     checkoutSeats: '2',
     checkoutFieldError: null,
@@ -122,6 +126,7 @@
     state.revisions = null;
     state.loadingRevisions = false;
     state.revisionsError = null;
+    state.revisionsMoreError = null;
     state.loadingMoreRevisions = false;
     state.hasMoreRevisions = false;
     state.selectedDiffRev = null;
@@ -140,10 +145,12 @@
     state.restoreInFlight = false;
     state.restoreCreatedMessage = null;
     state.billing = null;
+    state.billingSeq += 1;
     state.loadingBilling = false;
     state.billingError = null;
     state.billingActionError = null;
     state.billingNotice = null;
+    state.pendingBillingAction = null;
     state.checkoutPlan = 'personal';
     state.checkoutSeats = '2';
     state.checkoutFieldError = null;
@@ -773,7 +780,7 @@
         el('p', {
           className: 'muted',
           textContent:
-            'Scheduling deletion immediately refuses all workspace writes, member changes, proposals, and billing mutations. Pull and Git bundle export remain available through a 30-day export window (with a 35-day backup policy cap). Once the primary purge tombstone is recorded after the window closes, deletion is irreversible and data can no longer be recovered.',
+            'Scheduling deletion immediately refuses all workspace writes, member invitations, proposals, and billing mutations. Member removals and departures remain allowed during the 30-day export window so machine access can still be revoked. Pull and Git bundle export remain available through the 30-day export window (with a 35-day backup policy cap). Once the primary purge tombstone is recorded after the window closes, deletion is irreversible and data can no longer be recovered.',
         }),
         el('p', { className: 'muted' }, [
           'Before deleting, you can back up your accepted history in ',
@@ -841,6 +848,10 @@
     );
   }
 
+  function isTrialPlanStatus(status) {
+    return status === 'trialing' || status === 'trial_expired';
+  }
+
   function formatPlanStatus(status) {
     switch (status) {
       case 'trialing':
@@ -852,7 +863,7 @@
       case 'past_due':
         return { label: 'Past due', badgeClass: 'badge badge-warn' };
       case 'restricted':
-        return { label: 'Restricted', badgeClass: 'badge badge-warn' };
+        return { label: 'Restricted', badgeClass: 'badge badge-danger' };
       case 'canceled':
         return { label: 'Canceled', badgeClass: 'badge badge-neutral' };
       default:
@@ -1428,7 +1439,7 @@
   }
 
   async function handleRemoveMember(ws, m) {
-    if (state.removingMemberId || !state.me || isDeletionScheduled(ws)) return;
+    if (state.removingMemberId || !state.me) return;
     const ctx = captureWorkspaceContext(ws.id);
     if (!isCurrentWorkspaceContext(ctx)) return;
     state.removingMemberId = m.user_id;
@@ -1513,7 +1524,6 @@
       ]);
     }
 
-    const locked = isDeletionScheduled(ws);
     const members = state.members || [];
     return el('section', { className: 'card stack-md', 'aria-labelledby': 'members-heading' }, [
       heading,
@@ -1552,7 +1562,7 @@
                 ? el('button', {
                     type: 'button',
                     className: 'btn btn-danger btn-sm',
-                    disabled: locked || Boolean(state.removingMemberId),
+                    disabled: Boolean(state.removingMemberId),
                     'aria-label': isSelf ? 'Leave workspace' : `Remove ${m.email}`,
                     onClick: () => handleRemoveMember(ws, m),
                     textContent: busy
@@ -2040,7 +2050,7 @@
           }
 
           const actions = [];
-          if (p.revision && isExportAllowed(ws)) {
+          if (p.status === 'open' && p.revision && isExportAllowed(ws)) {
             actions.push(
               el('a', {
                 href: `/v1/workspaces/${encodeURIComponent(ws.id)}/proposals/${encodeURIComponent(p.id)}/bundle`,
@@ -2087,6 +2097,8 @@
     if (!isCurrentWorkspaceContext(ctx)) return;
     state.loadingRevisions = true;
     state.revisionsError = null;
+    state.revisionsMoreError = null;
+    state.loadingMoreRevisions = false;
     state.revisions = null;
     state.hasMoreRevisions = false;
     renderShell();
@@ -2121,6 +2133,7 @@
     if (!isCurrentWorkspaceContext(ctx)) return;
     const oldest = state.revisions[state.revisions.length - 1];
     state.loadingMoreRevisions = true;
+    state.revisionsMoreError = null;
     renderShell();
     try {
       const resp = await fetch(
@@ -2142,7 +2155,7 @@
     } catch (_err) {
       if (!isCurrentWorkspaceContext(ctx)) return;
       state.loadingMoreRevisions = false;
-      state.revisionsError = 'Could not load older revisions. Please try again.';
+      state.revisionsMoreError = 'Could not load older revisions. Please try again.';
       renderShell();
     }
   }
@@ -2255,9 +2268,25 @@
     return params.has('checkout') || params.has('_ptxn') || params.has('ptxn');
   }
 
+  function doesBillingReflectPendingAction(billing, pending) {
+    if (!billing || !pending) return false;
+    if (pending.kind === 'plan') {
+      if (billing.plan === 'trial' || billing.plan_status === 'canceled') {
+        return false;
+      }
+      const expectedSeats = pending.plan === 'team' ? Number(pending.seats || 1) : 1;
+      return billing.plan === pending.plan && Number(billing.seats || 1) === expectedSeats;
+    }
+    if (pending.kind === 'cancel') {
+      return Boolean(billing.cancel_at_period_end) || billing.plan_status === 'canceled';
+    }
+    return false;
+  }
+
   async function loadWorkspaceBilling(id) {
     const ctx = captureWorkspaceContext(id);
     if (!isCurrentWorkspaceContext(ctx)) return;
+    const seq = ++state.billingSeq;
     state.loadingBilling = true;
     state.billingError = null;
     if (!state.billing || state.billing.workspace_id !== id) {
@@ -2269,16 +2298,27 @@
         `/v1/workspaces/${encodeURIComponent(id)}/billing`,
         { headers: { Accept: 'application/json' }, credentials: 'same-origin' }
       );
-      if (!isCurrentWorkspaceContext(ctx)) return;
+      if (!isCurrentWorkspaceContext(ctx) || seq !== state.billingSeq) return;
       if (resp.status === 401) {
         expireSession();
         return;
       }
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const billing = await resp.json();
-      if (!isCurrentWorkspaceContext(ctx)) return;
+      if (!isCurrentWorkspaceContext(ctx) || seq !== state.billingSeq) return;
       state.billing = billing;
       state.loadingBilling = false;
+      if (state.activeWorkspace && state.activeWorkspace.id === id) {
+        state.activeWorkspace = {
+          ...state.activeWorkspace,
+          plan_status: billing.plan_status,
+        };
+      }
+      if (Array.isArray(state.workspaces)) {
+        state.workspaces = state.workspaces.map((item) =>
+          item.id === id ? { ...item, plan_status: billing.plan_status } : item
+        );
+      }
       if (billing.plan !== 'trial' && billing.plan_status !== 'canceled') {
         state.checkoutSession = null;
         if (!state.confirmingPlanChange && !state.updatePlanInFlight) {
@@ -2299,6 +2339,29 @@
           state.confirmingCancel = false;
         }
       }
+      if (state.pendingBillingAction) {
+        if (doesBillingReflectPendingAction(billing, state.pendingBillingAction)) {
+          const kind = state.pendingBillingAction.kind;
+          state.pendingBillingAction = null;
+          state.billingNotice =
+            kind === 'cancel'
+              ? 'Subscription cancellation scheduled for the end of the current billing period.'
+              : 'Subscription updated cleanly with Paddle.';
+        } else if (
+          state.pendingBillingAction.kind === 'plan' &&
+          (billing.plan === 'trial' || billing.plan_status === 'canceled')
+        ) {
+          state.pendingBillingAction = null;
+          state.billingNotice = null;
+        } else {
+          state.billingNotice =
+            state.pendingBillingAction.kind === 'cancel'
+              ? 'Cancellation submitted, waiting for Paddle confirmation.'
+              : 'Plan change submitted, waiting for Paddle confirmation.';
+        }
+      } else {
+        state.billingNotice = null;
+      }
       if (
         billing.billing_configured &&
         hasCheckoutReturnQuery() &&
@@ -2309,7 +2372,7 @@
       }
       renderShell();
     } catch (_err) {
-      if (!isCurrentWorkspaceContext(ctx)) return;
+      if (!isCurrentWorkspaceContext(ctx) || seq !== state.billingSeq) return;
       state.loadingBilling = false;
       state.billingError = 'Could not load workspace billing details. Please try again.';
       renderShell();
@@ -2327,8 +2390,13 @@
     if (plan === 'team') {
       const rawSeats = String(state.checkoutSeats || '').trim();
       const parsed = Number.parseInt(rawSeats, 10);
-      if (!/^\d+$/.test(rawSeats) || Number.isNaN(parsed) || parsed < 1) {
-        state.checkoutFieldError = 'Enter a whole number of seats (1 or more).';
+      if (
+        !/^\d+$/.test(rawSeats) ||
+        Number.isNaN(parsed) ||
+        parsed < 1 ||
+        parsed > MAX_TEAM_SEATS
+      ) {
+        state.checkoutFieldError = `Enter a whole number of seats between 1 and ${MAX_TEAM_SEATS}.`;
         renderShell();
         const input = document.getElementById('billing-checkout-seats');
         if (input) input.focus();
@@ -2361,12 +2429,21 @@
       const data = await resp.json().catch(() => null);
       if (!isCurrentWorkspaceContext(ctx)) return;
       if (!resp.ok) {
-        state.billingActionError = formatServerError(
+        const msg = formatServerError(
           data,
           resp.status,
           'Could not create a checkout session. Please try again.'
         );
         state.checkoutInFlight = false;
+        if (data && data.error && data.error.details && data.error.details.field === 'seats') {
+          state.checkoutFieldError = msg;
+          state.billingActionError = null;
+          renderShell();
+          const input = document.getElementById('billing-checkout-seats');
+          if (input) input.focus();
+          return;
+        }
+        state.billingActionError = msg;
         handleDeletionScheduledConflict(wsId, data);
         renderShell();
         return;
@@ -2377,6 +2454,7 @@
         plan,
         seats,
       };
+      state.pendingBillingAction = null;
       state.billingNotice = null;
       state.checkoutInFlight = false;
       renderShell();
@@ -2390,7 +2468,7 @@
   }
 
   async function handleOpenPortal(wsId) {
-    if (state.portalInFlight || !state.me) return;
+    if (state.portalInFlight || !state.me || isDeletionScheduled(state.activeWorkspace)) return;
     const ctx = captureWorkspaceContext(wsId);
     if (!isCurrentWorkspaceContext(ctx)) return;
     state.portalInFlight = true;
@@ -2421,6 +2499,7 @@
           'Could not open the billing portal. Please try again.'
         );
         state.portalInFlight = false;
+        handleDeletionScheduledConflict(wsId, data);
         renderShell();
         return;
       }
@@ -2444,8 +2523,13 @@
     if (plan === 'team') {
       const rawSeats = String(state.updateSeats || '').trim();
       const parsed = Number.parseInt(rawSeats, 10);
-      if (!/^\d+$/.test(rawSeats) || Number.isNaN(parsed) || parsed < 1) {
-        state.updatePlanFieldError = 'Enter a whole number of seats (1 or more).';
+      if (
+        !/^\d+$/.test(rawSeats) ||
+        Number.isNaN(parsed) ||
+        parsed < 1 ||
+        parsed > MAX_TEAM_SEATS
+      ) {
+        state.updatePlanFieldError = `Enter a whole number of seats between 1 and ${MAX_TEAM_SEATS}.`;
         state.confirmingPlanChange = null;
         renderShell();
         const input = document.getElementById('billing-update-seats');
@@ -2480,6 +2564,7 @@
     const { plan, seats } = state.confirmingPlanChange;
     state.updatePlanInFlight = true;
     state.billingActionError = null;
+    state.updatePlanFieldError = null;
     renderShell();
     try {
       const resp = await fetch(`/v1/workspaces/${encodeURIComponent(wsId)}/billing/plan`, {
@@ -2500,19 +2585,30 @@
       if (!resp.ok) {
         const data = await resp.json().catch(() => null);
         if (!isCurrentWorkspaceContext(ctx)) return;
-        state.billingActionError = formatServerError(
+        const msg = formatServerError(
           data,
           resp.status,
           'Could not update the subscription plan. Please try again.'
         );
         state.updatePlanInFlight = false;
+        if (data && data.error && data.error.details && data.error.details.field === 'seats') {
+          state.updatePlanFieldError = msg;
+          state.billingActionError = null;
+          state.confirmingPlanChange = null;
+          renderShell();
+          const input = document.getElementById('billing-update-seats');
+          if (input) input.focus();
+          return;
+        }
+        state.billingActionError = msg;
         handleDeletionScheduledConflict(wsId, data);
         renderShell();
         return;
       }
       state.updatePlanInFlight = false;
       state.confirmingPlanChange = null;
-      state.billingNotice = 'Subscription updated cleanly with Paddle.';
+      state.pendingBillingAction = { kind: 'plan', plan, seats };
+      state.billingNotice = 'Plan change submitted, waiting for Paddle confirmation.';
       await loadWorkspaceBilling(wsId);
     } catch (_err) {
       if (!isCurrentWorkspaceContext(ctx)) return;
@@ -2568,8 +2664,8 @@
       }
       state.cancelInFlight = false;
       state.confirmingCancel = false;
-      state.billingNotice =
-        'Subscription cancellation scheduled for the end of the current billing period.';
+      state.pendingBillingAction = { kind: 'cancel' };
+      state.billingNotice = 'Cancellation submitted, waiting for Paddle confirmation.';
       await loadWorkspaceBilling(wsId);
     } catch (_err) {
       if (!isCurrentWorkspaceContext(ctx)) return;
@@ -2770,6 +2866,7 @@
               className: 'input',
               type: 'number',
               min: '1',
+              max: String(MAX_TEAM_SEATS),
               step: '1',
               value: state.checkoutSeats,
               disabled: locked || state.checkoutInFlight,
@@ -2879,6 +2976,7 @@
               className: 'input',
               type: 'number',
               min: '1',
+              max: String(MAX_TEAM_SEATS),
               step: '1',
               value: state.updateSeats,
               disabled: locked || state.updatePlanInFlight,
@@ -2899,7 +2997,7 @@
           el('button', {
             type: 'button',
             className: 'btn btn-secondary',
-            disabled: state.portalInFlight,
+            disabled: locked || state.portalInFlight,
             onClick: () => handleOpenPortal(ws.id),
             textContent: state.portalInFlight ? 'Opening billing portal…' : 'Open billing portal',
           }),
@@ -3293,7 +3391,19 @@
           ]);
         })
       ),
-      state.hasMoreRevisions
+      state.revisionsMoreError
+        ? el('div', { className: 'alert', role: 'alert' }, [
+            el('span', { textContent: state.revisionsMoreError }),
+            el('button', {
+              type: 'button',
+              className: 'btn btn-secondary btn-sm',
+              disabled: state.loadingMoreRevisions,
+              onClick: () => loadMoreRevisions(ws.id),
+              textContent: 'Retry',
+            }),
+          ])
+        : null,
+      state.hasMoreRevisions && !state.revisionsMoreError
         ? el('div', {}, [
             el('button', {
               type: 'button',
@@ -3796,10 +3906,12 @@
               el('dt', { textContent: 'Plan status' }),
               el('dd', { textContent: plan.label }),
             ]),
-            el('div', { className: 'meta-item' }, [
-              el('dt', { textContent: 'Trial ends' }),
-              el('dd', { textContent: formatDate(ws.trial_ends_at) }),
-            ]),
+            isTrialPlanStatus(ws.plan_status)
+              ? el('div', { className: 'meta-item' }, [
+                  el('dt', { textContent: 'Trial ends' }),
+                  el('dd', { textContent: formatDate(ws.trial_ends_at) }),
+                ])
+              : null,
             el('div', { className: 'meta-item' }, [
               el('dt', { textContent: 'Created' }),
               el('dd', { textContent: formatDate(ws.created_at) }),
@@ -3889,7 +4001,11 @@
                 ]),
                 el('div', { className: 'row-between muted' }, [
                   el('span', { textContent: `Role: ${w.role}` }),
-                  el('span', { textContent: `Trial ends ${formatDate(w.trial_ends_at)}` }),
+                  el('span', {
+                    textContent: isTrialPlanStatus(w.plan_status)
+                      ? `Trial ends ${formatDate(w.trial_ends_at)}`
+                      : `Created ${formatDate(w.created_at)}`,
+                  }),
                 ]),
               ]
             );

@@ -936,12 +936,22 @@ async function journey14ProposalsAndConflictsVisible(browser) {
   // Owner rejects the conflict proposal via real API
   await conflictCard.getByRole("button", { name: /Reject proposal/i }).click();
   await conflictCard.getByText(/^Rejected$/i).waitFor({ timeout: 5000 });
+  assert.equal(
+    await conflictCard.getByRole("link", { name: /Download proposal bundle/i }).count(),
+    0,
+    "closed proposal must not show Download proposal bundle"
+  );
   await page.reload({ waitUntil: "networkidle" });
   const conflictReloaded = page
     .getByRole("region", { name: /^Proposals$/i })
     .locator("article", { hasText: fixtures.conflictRevision.slice(0, 8) });
   await conflictReloaded.getByText(/^Rejected$/i).waitFor({ timeout: 5000 });
   assert.equal(await conflictReloaded.getByRole("button", { name: /Reject proposal/i }).count(), 0);
+  assert.equal(
+    await conflictReloaded.getByRole("link", { name: /Download proposal bundle/i }).count(),
+    0,
+    "closed proposal after reload must not show Download proposal bundle"
+  );
 
   await saveScreenshot(page, "25-proposals-and-conflicts");
 
@@ -1403,6 +1413,7 @@ async function journey19BillingTeamPortalPlanChangeAndExplicitCancel(browser) {
   await billingSection.getByRole('button', { name: /Review plan change/i }).click();
   await billingSection.getByRole('button', { name: /Confirm plan change/i }).click();
   await billingSection.locator('dd', { hasText: /^Team \(4 seats\)$/i }).waitFor({ timeout: 5000 });
+  await billingSection.locator('[role="status"]', { hasText: /Subscription updated cleanly with Paddle/i }).waitFor({ timeout: 3000 });
   await billingSection.locator('.meta-item', { hasText: /^Machines limit/i }).getByText(/^0 \/ 200$/).waitFor({ timeout: 3000 });
   await billingSection.locator('.meta-item', { hasText: /^Storage used/i }).getByText(/^0 B of 400 GiB$/).waitFor({ timeout: 3000 });
   assert.equal((await paddleControl('GET', '/calls/update')).count, updateBefore + 1);
@@ -1436,6 +1447,11 @@ async function journey19BillingTeamPortalPlanChangeAndExplicitCancel(browser) {
   await billingSection.getByRole('button', { name: /Cancel subscription/i }).click();
   await billingSection.getByRole('button', { name: /Confirm cancellation/i }).click();
   await billingSection.getByText(/Cancels at period end/i).waitFor({ timeout: 5000 });
+  await billingSection
+    .locator('[role="status"]', {
+      hasText: /Subscription cancellation scheduled for the end of the current billing period/i,
+    })
+    .waitFor({ timeout: 3000 });
   await billingSection.locator('.meta-item', { hasText: /^Access ends/i }).waitFor({ timeout: 3000 });
   await billingSection.locator('.meta-item', { hasText: /^Push/i }).getByText(/^Allowed$/i).waitFor({ timeout: 3000 });
   assert.equal(await billingSection.getByRole('button', { name: /^Cancel subscription$/i }).count(), 0);
@@ -3042,6 +3058,76 @@ async function journey25HistoryPaginationAndIsolation(browser) {
     assert.equal(await destHistory.locator('[role="alert"]').count(), 0);
     assert.equal(await page.locator('[role="alert"]').count(), 0);
 
+    // Revisit pagination workspace and test failed "Load older revisions" keeps loaded rows & export intact and retries from same cursor
+    await page.unroute(revisionsRoutePattern, routeHandler);
+    await page.getByRole('link', { name: /All workspaces/i }).click();
+    await page.getByRole('link', { name: new RegExp(fixtures.paginationWorkspaceName, 'i') }).click();
+    await page.waitForURL(new RegExp(`/workspaces/${fixtures.paginationWorkspaceId}$`), { timeout: 5000 });
+
+    await historySection.getByText(expectedFirst20[0].message, { exact: true }).waitFor({ timeout: 5000 });
+    await loadOlderBtn.waitFor({ timeout: 5000 });
+    const exportSection = page.getByRole('region', { name: /Export & offline recovery/i });
+    await exportSection.getByRole('link', { name: /Download Git bundle/i }).waitFor({ timeout: 5000 });
+
+    const seenSecondPageBeforeCursors = [];
+    let failNextSecondPage = true;
+    const cursorRouteHandler = async (route) => {
+      const req = route.request();
+      const url = new URL(req.url());
+      if (
+        req.method() === 'GET' &&
+        url.pathname === `/v1/workspaces/${fixtures.paginationWorkspaceId}/revisions` &&
+        url.searchParams.has('before')
+      ) {
+        seenSecondPageBeforeCursors.push(url.searchParams.get('before'));
+        if (failNextSecondPage) {
+          failNextSecondPage = false;
+          await route.fulfill({
+            status: 503,
+            contentType: 'application/json',
+            body: JSON.stringify({ error: { code: 'unavailable', message: 'temporary db outage' } }),
+          });
+          return;
+        }
+      }
+      await route.continue();
+    };
+    await page.route(revisionsRoutePattern, cursorRouteHandler);
+
+    await loadOlderBtn.click();
+    const inlineAlert = historySection.locator('[role="alert"]');
+    await inlineAlert.waitFor({ timeout: 5000 });
+    const retryMoreBtn = inlineAlert.getByRole('button', { name: /^Retry$/i });
+    await retryMoreBtn.waitFor({ timeout: 3000 });
+
+    // Loaded revisions and export section must remain visible while inline error is shown
+    assert.deepEqual(
+      await extractHistoryRows(historySection),
+      expectedFirst20,
+      'loaded revisions must remain visible after Load older revisions fails'
+    );
+    assert.equal(
+      await exportSection.getByRole('link', { name: /Download Git bundle/i }).count(),
+      1,
+      'export download link must remain visible when only Load older revisions fails'
+    );
+
+    // Retry must resume from the exact same cursor (not reload from scratch)
+    await retryMoreBtn.click();
+    await historySection.getByText('genesis', { exact: true }).waitFor({ timeout: 5000 });
+    assert.equal(await inlineAlert.count(), 0, 'inline error must clear after successful retry');
+    assert.deepEqual(
+      await extractHistoryRows(historySection),
+      expectedAll22,
+      'retrying Load older revisions must append remaining revisions in exact order'
+    );
+    assert.deepEqual(
+      seenSecondPageBeforeCursors,
+      [fixtures.paginationRevisions[19].revision, fixtures.paginationRevisions[19].revision],
+      'retry must resume from the same before cursor'
+    );
+    await page.unroute(revisionsRoutePattern, cursorRouteHandler);
+
     await saveScreenshot(page, '37-history-pagination-isolation');
     assert.deepEqual(pageErrors, [], `unexpected page errors: ${pageErrors.join('; ')}`);
   } finally {
@@ -3109,6 +3195,9 @@ async function journey26WorkspaceDeletionLifecycleRolesAndIdempotency(browser) {
   // 2. Owner sees Delete workspace section with explanation & link to Export section
   const deleteSection = page.getByRole('region', { name: /^Delete workspace$/i });
   await deleteSection.waitFor({ timeout: 5000 });
+  const deleteText = await deleteSection.innerText();
+  assert.doesNotMatch(deleteText, /member changes/i, 'deletion text must not say member changes are refused');
+  assert.match(deleteText, /member invitations/i, 'deletion text must state member invitations are refused');
   await deleteSection.getByText(/30-day/i).waitFor({ timeout: 3000 });
   await deleteSection.getByText(/export/i).first().waitFor({ timeout: 3000 });
   await deleteSection.getByText(/irreversible/i).waitFor({ timeout: 3000 });
@@ -3175,7 +3264,7 @@ async function journey26WorkspaceDeletionLifecycleRolesAndIdempotency(browser) {
     confirm_workspace_name: wsName,
   });
 
-  // 5. After 202: scheduled status with dates, write controls disabled, export & diff still work
+  // 5. After 202: scheduled status with dates, invitations & writes disabled, member removals/departures stay enabled, export & diff still work
   for (const label of ['Requested', 'Export until', 'Primary purge due', 'Backup policy cap']) {
     const item = statusRegion.locator('.meta-item', { hasText: new RegExp(`^${label}`, 'i') });
     await item.waitFor({ timeout: 3000 });
@@ -3187,11 +3276,11 @@ async function journey26WorkspaceDeletionLifecycleRolesAndIdempotency(browser) {
   await statusRegion.locator('.meta-item', { hasText: /^Export(?! until)/i }).getByText(/^Available$/i).waitFor({ timeout: 3000 });
   assert.equal(await page.getByRole('button', { name: /^Delete workspace$/i }).count(), 0);
 
-  // Disabled write controls
+  // Invitations are disabled, while member removal & leaving remain enabled during deletion_scheduled
   assert.equal(await membersSection.getByLabel(/Invite email/i).isDisabled(), true);
   assert.equal(await membersSection.getByRole('button', { name: /Send invite/i }).isDisabled(), true);
-  assert.equal(await membersSection.getByRole('button', { name: /Remove peter@example\.com/i }).isDisabled(), true);
-  assert.equal(await membersSection.getByRole('button', { name: /Leave workspace/i }).isDisabled(), true);
+  assert.equal(await membersSection.getByRole('button', { name: /Remove peter@example\.com/i }).isDisabled(), false);
+  assert.equal(await membersSection.getByRole('button', { name: /Leave workspace/i }).isDisabled(), false);
 
   const proposalsSection = page.getByRole('region', { name: /^Proposals$/i });
   assert.equal(await proposalsSection.getByRole('button', { name: /Create restore proposal/i }).isDisabled(), true);
@@ -3215,21 +3304,23 @@ async function journey26WorkspaceDeletionLifecycleRolesAndIdempotency(browser) {
   await historySection.getByRole('button', { name: /View diff/i }).first().click();
   await historySection.getByText('settings.toml', { exact: true }).waitFor({ timeout: 5000 });
 
-  // 6. Status survives reload for owner, admin, and member; admin/member see no delete button and can still export
+  // 6. Status survives reload for owner, admin, and member; admin/member see no delete button and can still export & leave/remove
   await page.reload({ waitUntil: 'networkidle' });
   await page.getByRole('region', { name: /Workspace deletion/i }).getByText(/^Scheduled$/i).waitFor({ timeout: 5000 });
   assert.equal(await page.getByRole('button', { name: /^Delete workspace$/i }).count(), 0);
   assert.equal(await membersSection.getByRole('button', { name: /Send invite/i }).isDisabled(), true);
+  assert.equal(await membersSection.getByRole('button', { name: /Remove peter@example\.com/i }).isDisabled(), false);
 
   await adminPage.reload({ waitUntil: 'networkidle' });
   await adminPage.getByRole('region', { name: /Workspace deletion/i }).getByText(/^Scheduled$/i).waitFor({ timeout: 5000 });
   assert.equal(await adminPage.getByRole('button', { name: /delete workspace/i }).count(), 0);
   assert.equal(await adminPage.getByRole('region', { name: /^Members$/i }).getByRole('button', { name: /Send invite/i }).isDisabled(), true);
+  assert.equal(await adminPage.getByRole('region', { name: /^Members$/i }).getByRole('button', { name: /Leave workspace/i }).isDisabled(), false);
 
   await memberPage.reload({ waitUntil: 'networkidle' });
   await memberPage.getByRole('region', { name: /Workspace deletion/i }).getByText(/^Scheduled$/i).waitFor({ timeout: 5000 });
   assert.equal(await memberPage.getByRole('button', { name: /delete workspace/i }).count(), 0);
-  assert.equal(await memberPage.getByRole('region', { name: /^Members$/i }).getByRole('button', { name: /Leave workspace/i }).isDisabled(), true);
+  assert.equal(await memberPage.getByRole('region', { name: /^Members$/i }).getByRole('button', { name: /Leave workspace/i }).isDisabled(), false);
   const [memberDownload] = await Promise.all([
     memberPage.waitForEvent('download'),
     memberPage.locator('#export-section').getByRole('link', { name: /Download Git bundle/i }).click(),
@@ -3238,7 +3329,18 @@ async function journey26WorkspaceDeletionLifecycleRolesAndIdempotency(browser) {
   assert.ok(memberBundleHead.startsWith('# v2 git bundle'));
   await saveScreenshot(page, '38-workspace-deletion-scheduled');
 
-  // 7. Billing write controls disabled & real 409 workspace_deletion_scheduled shown verbatim-ish in stale tab
+  // Admin can leave and Owner can remove a member during deletion_scheduled
+  await adminPage.getByRole('region', { name: /^Members$/i }).getByRole('button', { name: /Leave workspace/i }).click();
+  await adminPage.waitForURL(`${baseUrl}/`, { timeout: 5000 });
+  assert.equal(await adminPage.getByRole('link', { name: new RegExp(wsName, 'i') }).count(), 0);
+
+  await page.reload({ waitUntil: 'networkidle' });
+  const ownerMemberList = membersSection.locator('.member-list').first();
+  await membersSection.getByRole('button', { name: /Remove peter@example\.com/i }).click();
+  await ownerMemberList.getByText('peter@example.com', { exact: true }).waitFor({ state: 'detached', timeout: 5000 });
+  assert.equal(await membersSection.locator('[role="alert"]').count(), 0);
+
+  // 7. Billing write controls (including billing portal) disabled & real 409 workspace_deletion_scheduled shown in stale tab
   if (billingUrl) {
     const bCtx1 = await browser.newContext({ viewport: { width: 1280, height: 800 } });
     const bPage1 = await bCtx1.newPage();
@@ -3268,6 +3370,47 @@ async function journey26WorkspaceDeletionLifecycleRolesAndIdempotency(browser) {
     await b2Billing.getByRole('button', { name: /Continue to checkout/i }).click();
     await b2Billing.locator('[role="alert"]').getByText(/scheduled for deletion/i).waitFor({ timeout: 5000 });
     await bPage2.getByRole('region', { name: /Workspace deletion/i }).getByText(/^Scheduled$/i).waitFor({ timeout: 5000 });
+
+    // Subscribed workspace: Open billing portal disabled on deletion_scheduled & stale tab gets real 409
+    await bPage1.getByRole('link', { name: /All workspaces/i }).click();
+    await bPage1.getByLabel(/Workspace name/i).fill('Billing Portal Deletion Fleet');
+    await bPage1.getByRole('button', { name: /Create workspace/i }).click();
+    await bPage1.waitForURL(/\/workspaces\/([0-9a-f-]{36})$/, { timeout: 5000 });
+    const bPortalWsUrl = bPage1.url();
+    const b1PortalBilling = bPage1.getByRole('region', { name: /^Billing$/i });
+    await b1PortalBilling.getByLabel(/^Plan$/i).selectOption('personal');
+    await b1PortalBilling.getByRole('button', { name: /Continue to checkout/i }).click();
+    const pLink = b1PortalBilling.getByRole('link', { name: /Open Paddle checkout/i });
+    await pLink.waitFor({ timeout: 5000 });
+    const pTxnId = (await pLink.getAttribute('href')).split('/').pop();
+    await paddleControl('POST', '/complete-checkout', {
+      transaction_id: pTxnId,
+      subscription_id: 'sub_01browserportaldel000001',
+      customer_id: 'ctm_01browserportaldel000001',
+    });
+    await b1PortalBilling.getByRole('button', { name: /Refresh billing status/i }).click();
+    await b1PortalBilling.locator('dd', { hasText: /^Active$/i }).waitFor({ timeout: 5000 });
+
+    const bPortalStale = await bCtx1.newPage();
+    bPortalStale.on('pageerror', (err) => bErrors.push(err.message));
+    await bPortalStale.goto(bPortalWsUrl, { waitUntil: 'networkidle' });
+    const bStaleBilling = bPortalStale.getByRole('region', { name: /^Billing$/i });
+    await bStaleBilling.getByRole('button', { name: /Open billing portal/i }).waitFor({ timeout: 5000 });
+    assert.equal(await bStaleBilling.getByRole('button', { name: /Open billing portal/i }).isDisabled(), false);
+
+    const b1PortalDel = bPage1.getByRole('region', { name: /^Delete workspace$/i });
+    await b1PortalDel.getByLabel(/workspace name/i).fill('Billing Portal Deletion Fleet');
+    await b1PortalDel.getByRole('button', { name: /^Delete workspace$/i }).click();
+    await bPage1.getByRole('region', { name: /Workspace deletion/i }).getByText(/^Scheduled$/i).waitFor({ timeout: 5000 });
+    assert.equal(await b1PortalBilling.getByRole('button', { name: /Open billing portal/i }).isDisabled(), true);
+    assert.equal(await b1PortalBilling.getByRole('button', { name: /Review plan change/i }).isDisabled(), true);
+    assert.equal(await b1PortalBilling.getByRole('button', { name: /Cancel subscription/i }).isDisabled(), true);
+
+    await bStaleBilling.getByRole('button', { name: /Open billing portal/i }).click();
+    await bStaleBilling.locator('[role="alert"]').getByText(/scheduled for deletion/i).waitFor({ timeout: 5000 });
+    await bPortalStale.getByRole('region', { name: /Workspace deletion/i }).getByText(/^Scheduled$/i).waitFor({ timeout: 5000 });
+    assert.equal(await bStaleBilling.getByRole('button', { name: /Open billing portal/i }).isDisabled(), true);
+
     assert.deepEqual(bErrors, [], `unexpected billing deletion page errors: ${bErrors.join('; ')}`);
     await bCtx1.close();
   }
@@ -3443,6 +3586,425 @@ async function journey27WorkspaceDeletionStaleResponseAndIsolation(browser) {
   await context.close();
 }
 
+async function journey28BillingConfirmationWaitsForRefreshedState(browser) {
+  assert.ok(billingUrl, 'MUSTER_BILLING_CLOUD_URL is required');
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  const page = await context.newPage();
+  const pageErrors = [];
+  page.on('pageerror', (err) => pageErrors.push(err.message));
+
+  await page.goto(`${billingUrl}/`, { waitUntil: 'networkidle' });
+  await signInViaIdp(page, { subject: 'olivia-pending-confirm-1', email: 'olivia@example.com' });
+
+  await page.getByLabel(/Workspace name/i).fill('Pending Confirm Billing Fleet');
+  await page.getByRole('button', { name: /Create workspace/i }).click();
+  await page.waitForURL(/\/workspaces\/([0-9a-f-]{36})$/, { timeout: 5000 });
+  const wsId = page.url().match(/\/workspaces\/([0-9a-f-]{36})$/)[1];
+
+  const billingSection = page.getByRole('region', { name: /^Billing$/i });
+  await billingSection.waitFor({ timeout: 5000 });
+  await billingSection.getByLabel(/^Plan$/i).selectOption('team');
+  await billingSection.getByLabel(/Seats/i).fill('2');
+  await billingSection.getByRole('button', { name: /Continue to checkout/i }).click();
+
+  const paddleLink = billingSection.getByRole('link', { name: /Open Paddle checkout/i });
+  await paddleLink.waitFor({ timeout: 5000 });
+  const txnId = (await paddleLink.getAttribute('href')).split('/').pop();
+
+  await paddleControl('POST', '/complete-checkout', {
+    transaction_id: txnId,
+    subscription_id: 'sub_01browserpending00000001',
+    customer_id: 'ctm_01browserpending00000001',
+  });
+  await billingSection.getByRole('button', { name: /Refresh billing status/i }).click();
+  await billingSection.locator('dd', { hasText: /^Team \(2 seats\)$/i }).waitFor({ timeout: 5000 });
+
+  // 1. Plan change where refreshed GET /billing initially returns stale Team (2 seats)
+  const prePlanBilling = await page.evaluate(async (id) => {
+    const r = await fetch(`/v1/workspaces/${id}/billing`, { credentials: 'same-origin' });
+    return r.json();
+  }, wsId);
+  assert.equal(prePlanBilling.plan, 'team');
+  assert.equal(prePlanBilling.seats, 2);
+
+  let returnStalePlanGet = true;
+  const billingGetRoute = `**/v1/workspaces/${wsId}/billing`;
+  const stalePlanHandler = async (route) => {
+    const req = route.request();
+    const url = new URL(req.url());
+    if (
+      returnStalePlanGet &&
+      req.method() === 'GET' &&
+      url.pathname === `/v1/workspaces/${wsId}/billing`
+    ) {
+      returnStalePlanGet = false;
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify(prePlanBilling),
+      });
+      return;
+    }
+    await route.continue();
+  };
+  await page.route(billingGetRoute, stalePlanHandler);
+
+  await billingSection.getByLabel(/Update seats/i).fill('4');
+  await billingSection.getByRole('button', { name: /Review plan change/i }).click();
+  await Promise.all([
+    page.waitForResponse(
+      (r) =>
+        r.request().method() === 'POST' &&
+        new URL(r.url()).pathname === `/v1/workspaces/${wsId}/billing/plan` &&
+        r.status() === 200
+    ),
+    page.waitForResponse(
+      (r) =>
+        r.request().method() === 'GET' &&
+        new URL(r.url()).pathname === `/v1/workspaces/${wsId}/billing` &&
+        r.status() === 200
+    ),
+    billingSection.getByRole('button', { name: /Confirm plan change/i }).click(),
+  ]);
+
+  const statusBox = billingSection.locator('[role="status"]').first();
+  await billingSection
+    .locator('[role="status"]', { hasText: /Plan change submitted, waiting for Paddle confirmation/i })
+    .waitFor({ timeout: 5000 });
+  const pendingPlanText = await statusBox.innerText();
+  assert.match(pendingPlanText, /submitted, waiting for Paddle confirmation/i);
+  assert.equal(
+    /Subscription updated cleanly/i.test(pendingPlanText),
+    false,
+    'must not show plan success banner while refreshed state still shows 2 seats'
+  );
+  await page.unroute(billingGetRoute, stalePlanHandler);
+
+  // Next refresh returns real Team (4 seats) -> resolves to success banner
+  await billingSection.getByRole('button', { name: /Refresh billing status/i }).click();
+  await billingSection.locator('dd', { hasText: /^Team \(4 seats\)$/i }).waitFor({ timeout: 5000 });
+  await billingSection
+    .locator('[role="status"]', { hasText: /Subscription updated cleanly with Paddle/i })
+    .waitFor({ timeout: 5000 });
+
+  // 2. Cancel where refreshed GET /billing initially returns stale cancel_at_period_end=false
+  const preCancelBilling = await page.evaluate(async (id) => {
+    const r = await fetch(`/v1/workspaces/${id}/billing`, { credentials: 'same-origin' });
+    return r.json();
+  }, wsId);
+  assert.equal(preCancelBilling.cancel_at_period_end, false);
+
+  let returnStaleCancelGet = true;
+  const staleCancelHandler = async (route) => {
+    const req = route.request();
+    const url = new URL(req.url());
+    if (
+      returnStaleCancelGet &&
+      req.method() === 'GET' &&
+      url.pathname === `/v1/workspaces/${wsId}/billing`
+    ) {
+      returnStaleCancelGet = false;
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify(preCancelBilling),
+      });
+      return;
+    }
+    await route.continue();
+  };
+  await page.route(billingGetRoute, staleCancelHandler);
+
+  await billingSection.getByRole('button', { name: /Cancel subscription/i }).click();
+  await Promise.all([
+    page.waitForResponse(
+      (r) =>
+        r.request().method() === 'POST' &&
+        new URL(r.url()).pathname === `/v1/workspaces/${wsId}/billing/cancel` &&
+        r.status() === 200
+    ),
+    page.waitForResponse(
+      (r) =>
+        r.request().method() === 'GET' &&
+        new URL(r.url()).pathname === `/v1/workspaces/${wsId}/billing` &&
+        r.status() === 200
+    ),
+    billingSection.getByRole('button', { name: /Confirm cancellation/i }).click(),
+  ]);
+
+  await billingSection
+    .locator('[role="status"]', { hasText: /Cancellation submitted, waiting for Paddle confirmation/i })
+    .waitFor({ timeout: 5000 });
+  const pendingCancelText = await statusBox.innerText();
+  assert.match(pendingCancelText, /submitted, waiting for Paddle confirmation/i);
+  assert.equal(
+    /Subscription cancellation scheduled/i.test(pendingCancelText),
+    false,
+    'must not show cancellation success banner while refreshed state has cancel_at_period_end=false'
+  );
+  await page.unroute(billingGetRoute, staleCancelHandler);
+
+  // Next refresh returns real cancel_at_period_end=true -> resolves to cancellation success banner
+  await billingSection.getByRole('button', { name: /Refresh billing status/i }).click();
+  await billingSection.getByText(/Cancels at period end/i).waitFor({ timeout: 5000 });
+  await billingSection
+    .locator('[role="status"]', {
+      hasText: /Subscription cancellation scheduled for the end of the current billing period/i,
+    })
+    .waitFor({ timeout: 5000 });
+
+  assert.deepEqual(pageErrors, [], `unexpected page errors: ${pageErrors.join('; ')}`);
+  await context.close();
+}
+
+async function journey29BillingSeatLimitsAndWorkspacePlanStatus(browser) {
+  assert.ok(billingUrl, 'MUSTER_BILLING_CLOUD_URL is required');
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  const page = await context.newPage();
+  const pageErrors = [];
+  page.on('pageerror', (err) => pageErrors.push(err.message));
+
+  const wsName = 'Seat and Status Fleet';
+  await page.goto(`${billingUrl}/`, { waitUntil: 'networkidle' });
+  await signInViaIdp(page, { subject: 'olivia-seats-status-1', email: 'olivia@example.com' });
+
+  await page.getByLabel(/Workspace name/i).fill(wsName);
+  await page.getByRole('button', { name: /Create workspace/i }).click();
+  await page.waitForURL(/\/workspaces\/([0-9a-f-]{36})$/, { timeout: 5000 });
+  const wsId = page.url().match(/\/workspaces\/([0-9a-f-]{36})$/)[1];
+
+  // 1. Trialing workspace: detail header & list card both show Trialing and Trial ends
+  const headerCard = page.locator('main section.card').first();
+  await headerCard.locator('.meta-item', { hasText: /^Plan status/i }).getByText(/Trialing/i).waitFor({ timeout: 5000 });
+  await headerCard.locator('.meta-item', { hasText: /^Trial ends/i }).waitFor({ timeout: 3000 });
+
+  await page.getByRole('link', { name: /All workspaces/i }).click();
+  const listCard = page.locator('.workspace-card', { hasText: wsName });
+  await listCard.getByText(/Trialing/i).waitFor({ timeout: 5000 });
+  await listCard.getByText(/Trial ends/i).waitFor({ timeout: 3000 });
+
+  await listCard.click();
+  await page.waitForURL(new RegExp(`/workspaces/${wsId}$`), { timeout: 5000 });
+
+  // 2. Checkout seats input enforces 1..1000 client-side and surfaces server details.field="seats"
+  const billingSection = page.getByRole('region', { name: /^Billing$/i });
+  await billingSection.waitFor({ timeout: 5000 });
+  await billingSection.getByLabel(/^Plan$/i).selectOption('team');
+
+  const checkoutSeatsInput = billingSection.locator('#billing-checkout-seats');
+  assert.equal(await checkoutSeatsInput.getAttribute('min'), '1');
+  assert.equal(await checkoutSeatsInput.getAttribute('max'), '1000');
+
+  const checkoutCallsBefore = (await paddleControl('GET', '/calls/create_transaction')).count;
+  await checkoutSeatsInput.fill('1001');
+  await billingSection.getByRole('button', { name: /Continue to checkout/i }).click();
+  await billingSection.locator('#billing-checkout-seats-err').waitFor({ timeout: 3000 });
+  assert.equal(await checkoutSeatsInput.getAttribute('aria-invalid'), 'true');
+  assert.equal((await paddleControl('GET', '/calls/create_transaction')).count, checkoutCallsBefore);
+
+  // Bypass client check via outbound body rewrite to verify real server 400 details.field="seats" handling
+  const checkoutRoute = `**/v1/workspaces/${wsId}/billing/checkout`;
+  let rewriteCheckoutSeats = true;
+  const checkoutRewriteHandler = async (route) => {
+    const req = route.request();
+    if (rewriteCheckoutSeats && req.method() === 'POST') {
+      rewriteCheckoutSeats = false;
+      const body = req.postDataJSON();
+      await route.continue({ postData: JSON.stringify({ ...body, seats: 1001 }) });
+      return;
+    }
+    await route.continue();
+  };
+  await page.route(checkoutRoute, checkoutRewriteHandler);
+  await checkoutSeatsInput.fill('2');
+  await Promise.all([
+    page.waitForResponse(
+      (r) =>
+        r.request().method() === 'POST' &&
+        new URL(r.url()).pathname === `/v1/workspaces/${wsId}/billing/checkout` &&
+        r.status() === 400
+    ),
+    billingSection.getByRole('button', { name: /Continue to checkout/i }).click(),
+  ]);
+  await page.unroute(checkoutRoute, checkoutRewriteHandler);
+  const checkoutServerErr = billingSection.locator('#billing-checkout-seats-err');
+  await checkoutServerErr.waitFor({ timeout: 3000 });
+  assert.match(await checkoutServerErr.innerText(), /1000/);
+  assert.equal(await checkoutSeatsInput.getAttribute('aria-invalid'), 'true');
+  assert.equal((await paddleControl('GET', '/calls/create_transaction')).count, checkoutCallsBefore);
+
+  // Boundary 1000 seats succeeds cleanly
+  await checkoutSeatsInput.fill('1000');
+  await billingSection.getByRole('button', { name: /Continue to checkout/i }).click();
+  const paddleLink = billingSection.getByRole('link', { name: /Open Paddle checkout/i });
+  await paddleLink.waitFor({ timeout: 5000 });
+  await billingSection.getByText(/Team \(1000 seats\)/i).waitFor({ timeout: 3000 });
+  const txnId = (await paddleLink.getAttribute('href')).split('/').pop();
+  const subId = 'sub_01browsermaxseats0000001';
+  await paddleControl('POST', '/complete-checkout', {
+    transaction_id: txnId,
+    subscription_id: subId,
+    customer_id: 'ctm_01browsermaxseats0000001',
+  });
+
+  await billingSection.getByRole('button', { name: /Refresh billing status/i }).click();
+  await billingSection.locator('dd', { hasText: /^Team \(1000 seats\)$/i }).waitFor({ timeout: 5000 });
+
+  // 3. Active workspace detail header & list card show Active and NEVER show "Trial ends"
+  await headerCard.locator('.meta-item', { hasText: /^Plan status/i }).getByText(/^Active$/i).waitFor({ timeout: 5000 });
+  assert.equal(await headerCard.getByText(/Trial ends/i).count(), 0, 'Active detail header must not show Trial ends');
+
+  await page.reload({ waitUntil: 'networkidle' });
+  await headerCard.locator('.meta-item', { hasText: /^Plan status/i }).getByText(/^Active$/i).waitFor({ timeout: 5000 });
+  assert.equal(await headerCard.getByText(/Trial ends/i).count(), 0);
+
+  await page.getByRole('link', { name: /All workspaces/i }).click();
+  await listCard.getByText(/^Active$/i).waitFor({ timeout: 5000 });
+  assert.equal(await listCard.getByText(/Trial ends/i).count(), 0, 'Active list card must not show Trial ends');
+  await listCard.click();
+  await page.waitForURL(new RegExp(`/workspaces/${wsId}$`), { timeout: 5000 });
+
+  // 4. Update-plan seats input enforces 1..1000 client-side and surfaces server details.field="seats"
+  const updateBefore = (await paddleControl('GET', '/calls/update')).count;
+  const updateSeatsInput = billingSection.locator('#billing-update-seats');
+  await updateSeatsInput.waitFor({ timeout: 5000 });
+  assert.equal(await updateSeatsInput.getAttribute('min'), '1');
+  assert.equal(await updateSeatsInput.getAttribute('max'), '1000');
+
+  await updateSeatsInput.fill('1001');
+  await billingSection.getByRole('button', { name: /Review plan change/i }).click();
+  await billingSection.locator('#billing-update-seats-err').waitFor({ timeout: 3000 });
+  assert.equal(await updateSeatsInput.getAttribute('aria-invalid'), 'true');
+  assert.equal(await billingSection.getByRole('button', { name: /Confirm plan change/i }).count(), 0);
+  assert.equal((await paddleControl('GET', '/calls/update')).count, updateBefore);
+
+  // Bypass client check on confirm to verify real server 400 details.field="seats" on /billing/plan
+  const planRoute = `**/v1/workspaces/${wsId}/billing/plan`;
+  let rewritePlanSeats = true;
+  const planRewriteHandler = async (route) => {
+    const req = route.request();
+    if (rewritePlanSeats && req.method() === 'POST') {
+      rewritePlanSeats = false;
+      const body = req.postDataJSON();
+      await route.continue({ postData: JSON.stringify({ ...body, seats: 1001 }) });
+      return;
+    }
+    await route.continue();
+  };
+  await page.route(planRoute, planRewriteHandler);
+  await updateSeatsInput.fill('2');
+  await billingSection.getByRole('button', { name: /Review plan change/i }).click();
+  await Promise.all([
+    page.waitForResponse(
+      (r) =>
+        r.request().method() === 'POST' &&
+        new URL(r.url()).pathname === `/v1/workspaces/${wsId}/billing/plan` &&
+        r.status() === 400
+    ),
+    billingSection.getByRole('button', { name: /Confirm plan change/i }).click(),
+  ]);
+  await page.unroute(planRoute, planRewriteHandler);
+  const updateServerErr = billingSection.locator('#billing-update-seats-err');
+  await updateServerErr.waitFor({ timeout: 3000 });
+  assert.match(await updateServerErr.innerText(), /1000/);
+  assert.equal(await updateSeatsInput.getAttribute('aria-invalid'), 'true');
+  assert.equal((await paddleControl('GET', '/calls/update')).count, updateBefore);
+
+  // Valid update to 3 seats succeeds cleanly
+  await updateSeatsInput.fill('3');
+  await billingSection.getByRole('button', { name: /Review plan change/i }).click();
+  await billingSection.getByRole('button', { name: /Confirm plan change/i }).click();
+  await billingSection.locator('dd', { hasText: /^Team \(3 seats\)$/i }).waitFor({ timeout: 5000 });
+
+  // 5. Real subscription statuses (past_due, paused->restricted, canceled) render in both detail header and list without Trial ends
+  const transitions = [
+    { event_type: 'subscription.past_due', status: 'past_due', label: /^Past due$/i },
+    { event_type: 'subscription.paused', status: 'paused', label: /^Restricted$/i },
+    { event_type: 'subscription.canceled', status: 'canceled', label: /^Canceled$/i },
+  ];
+  for (const t of transitions) {
+    await paddleControl('POST', '/update-subscription', {
+      subscription_id: subId,
+      event_type: t.event_type,
+      status: t.status,
+      ...(t.status === 'canceled' ? { cancel_at_period_end: false } : {}),
+    });
+    await page.reload({ waitUntil: 'networkidle' });
+    await headerCard.locator('.meta-item', { hasText: /^Plan status/i }).getByText(t.label).waitFor({ timeout: 5000 });
+    await headerCard.locator('.badge-row').getByText(t.label).waitFor({ timeout: 3000 });
+    assert.equal(await headerCard.getByText(/Trial ends/i).count(), 0, `${t.status} detail header must not show Trial ends`);
+
+    await page.getByRole('link', { name: /All workspaces/i }).click();
+    await listCard.getByText(t.label).waitFor({ timeout: 5000 });
+    assert.equal(await listCard.getByText(/Trial ends/i).count(), 0, `${t.status} list card must not show Trial ends`);
+
+    await listCard.click();
+    await page.waitForURL(new RegExp(`/workspaces/${wsId}$`), { timeout: 5000 });
+  }
+
+  // 6. trial_expired displays Trial expired and DOES show Trial ends in both list and detail header
+  const wsListRoute = '**/v1/workspaces';
+  const wsDetailRoute = `**/v1/workspaces/${wsId}`;
+  const wsBillingRoute = `**/v1/workspaces/${wsId}/billing`;
+  await page.route(wsListRoute, async (route) => {
+    if (route.request().method() !== 'GET') {
+      await route.continue();
+      return;
+    }
+    const resp = await route.fetch();
+    const list = await resp.json();
+    await route.fulfill({
+      response: resp,
+      body: JSON.stringify(list.map((w) => (w.id === wsId ? { ...w, plan_status: 'trial_expired' } : w))),
+    });
+  });
+  await page.route(wsDetailRoute, async (route) => {
+    if (route.request().method() !== 'GET') {
+      await route.continue();
+      return;
+    }
+    const resp = await route.fetch();
+    const ws = await resp.json();
+    await route.fulfill({
+      response: resp,
+      body: JSON.stringify({ ...ws, plan_status: 'trial_expired' }),
+    });
+  });
+  await page.route(wsBillingRoute, async (route) => {
+    if (route.request().method() !== 'GET') {
+      await route.continue();
+      return;
+    }
+    const resp = await route.fetch();
+    const b = await resp.json();
+    await route.fulfill({
+      response: resp,
+      body: JSON.stringify({
+        ...b,
+        plan: 'trial',
+        plan_status: 'trial_expired',
+        trial_ends_at: '2026-01-01T00:00:00Z',
+        current_period_end: null,
+        can_push: false,
+      }),
+    });
+  });
+
+  await page.goto(`${billingUrl}/`, { waitUntil: 'networkidle' });
+  await listCard.getByText(/^Trial expired$/i).waitFor({ timeout: 5000 });
+  await listCard.getByText(/Trial ends/i).waitFor({ timeout: 3000 });
+  await listCard.click();
+  await page.waitForURL(new RegExp(`/workspaces/${wsId}$`), { timeout: 5000 });
+  await headerCard.locator('.meta-item', { hasText: /^Plan status/i }).getByText(/^Trial expired$/i).waitFor({ timeout: 5000 });
+  await headerCard.locator('.meta-item', { hasText: /^Trial ends/i }).waitFor({ timeout: 3000 });
+  await page.unroute(wsListRoute);
+  await page.unroute(wsDetailRoute);
+  await page.unroute(wsBillingRoute);
+
+  assert.deepEqual(pageErrors, [], `unexpected page errors: ${pageErrors.join('; ')}`);
+  await context.close();
+}
+
 const journeys = [
   ['journey_1_signin_and_account', journey1SignInAndAccount],
   ['journey_2_empty_workspaces', journey2EmptyWorkspaces],
@@ -3471,6 +4033,8 @@ const journeys = [
   ['journey_25_history_pagination_and_isolation', journey25HistoryPaginationAndIsolation],
   ['journey_26_workspace_deletion_lifecycle_roles_and_idempotency', journey26WorkspaceDeletionLifecycleRolesAndIdempotency],
   ['journey_27_workspace_deletion_stale_response_and_isolation', journey27WorkspaceDeletionStaleResponseAndIsolation],
+  ['journey_28_billing_confirmation_waits_for_refreshed_state', journey28BillingConfirmationWaitsForRefreshedState],
+  ['journey_29_billing_seat_limits_and_workspace_plan_status', journey29BillingSeatLimitsAndWorkspacePlanStatus],
 ];
 
 async function main() {

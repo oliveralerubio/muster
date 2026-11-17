@@ -233,6 +233,9 @@ pub async fn accept_invitation(
     account: Account,
     Path(token): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    // Joining changes a membership: like every member mutation it needs
+    // `workspaces:write` (browser sessions only, never a CLI token).
+    account.require_scope(scopes::WORKSPACES_WRITE)?;
     let token_hash = sha256(token.as_bytes());
 
     let user_row: Option<(String,)> = sqlx::query_as("SELECT email FROM users WHERE id = $1")

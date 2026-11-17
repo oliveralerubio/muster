@@ -79,6 +79,17 @@ change a plan, and confirm cancellation. A checkout return URL never activates
 a subscription: only the server's verified provider state does. Pull and export
 remain available when payment blocks publication.
 
+The workspace list shows the same plan status as the billing page. Limits
+follow the subscription's status: when a subscription is canceled or paused, the
+workspace returns to the base limits. Existing machines and stored data stay in
+place. New machines and pushes are measured against the base limits. A team
+plan accepts at most 1000 seats per checkout or plan change; larger requests are
+refused before anything is charged. Once a workspace deletion is requested,
+checkout, plan changes, cancellation and the customer portal are refused.
+
+Accepting an invitation requires the browser console. A CLI login can read
+workspaces and link machines, but it cannot join a workspace.
+
 ## Inspect or remove local access
 
 ```sh

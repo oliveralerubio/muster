@@ -12,7 +12,7 @@ use time::OffsetDateTime;
 
 use crate::auth::session::Session;
 use crate::error::AppError;
-use crate::protocol::{CreateWorkspace, PlanStatus, Role, Workspace, WORKSPACE_NAME_MAX_CHARS};
+use crate::protocol::{CreateWorkspace, Role, Workspace, WORKSPACE_NAME_MAX_CHARS};
 use crate::state::AppState;
 
 /// Length of the free trial granted at workspace creation (no card).
@@ -26,27 +26,35 @@ type WorkspaceRow = (
     OffsetDateTime,
     OffsetDateTime,
     bool,
+    Option<String>,
 );
 
-const SELECT_FOR_MEMBER: &str = "SELECT w.id, w.name, m.role, w.created_at, w.trial_ends_at, now(),
-            EXISTS (SELECT 1 FROM workspace_lifecycle l WHERE l.workspace_id = w.id)
-     FROM workspaces w JOIN memberships m ON m.workspace_id = w.id AND m.user_id = $1";
+/// The caller's workspaces with the status of each one's current
+/// subscription (the same pick as [`crate::billing::current_subscription`]),
+/// in a single query.
+fn select_for_member() -> String {
+    format!(
+        "SELECT w.id, w.name, m.role, w.created_at, w.trial_ends_at, now(),
+                EXISTS (SELECT 1 FROM workspace_lifecycle l WHERE l.workspace_id = w.id),
+                (SELECT s.status FROM subscriptions s WHERE s.workspace_id = w.id
+                  ORDER BY {} LIMIT 1)
+           FROM workspaces w JOIN memberships m ON m.workspace_id = w.id AND m.user_id = $1",
+        crate::billing::CURRENT_SUBSCRIPTION_ORDER
+    )
+}
 
 fn rfc3339(t: OffsetDateTime) -> Result<String, AppError> {
     t.format(&Rfc3339).map_err(AppError::internal)
 }
 
 fn to_dto(
-    (id, name, role, created_at, trial_ends_at, now, deletion_requested): WorkspaceRow,
+    (id, name, role, created_at, trial_ends_at, now, deletion_requested, subscription_status): WorkspaceRow,
 ) -> Result<Workspace, AppError> {
     let role =
         Role::parse(&role).ok_or_else(|| AppError::internal(format!("unknown role {role:?}")))?;
-    // Paid plans arrive with billing (tramo 4); until then only the trial exists.
-    let plan_status = if now < trial_ends_at {
-        PlanStatus::Trialing
-    } else {
-        PlanStatus::TrialExpired
-    };
+    // The same rule as `GET /billing` for this workspace.
+    let (plan_status, _) =
+        crate::billing::plan_status(subscription_status.as_deref(), trial_ends_at, now);
     Ok(Workspace {
         id: id.to_string(),
         name,
@@ -151,7 +159,7 @@ pub async fn create(
         .bind(session.user_id)
         .execute(&mut *tx)
         .await?;
-    let row: WorkspaceRow = sqlx::query_as(&format!("{SELECT_FOR_MEMBER} WHERE w.id = $2"))
+    let row: WorkspaceRow = sqlx::query_as(&format!("{} WHERE w.id = $2", select_for_member()))
         .bind(session.user_id)
         .bind(id)
         .fetch_one(&mut *tx)
@@ -178,11 +186,13 @@ pub async fn list(
     account: crate::auth::account::Account,
 ) -> Result<Json<Vec<Workspace>>, AppError> {
     account.require_scope(crate::protocol::scopes::WORKSPACES_READ)?;
-    let rows: Vec<WorkspaceRow> =
-        sqlx::query_as(&format!("{SELECT_FOR_MEMBER} ORDER BY w.created_at, w.id"))
-            .bind(account.user_id)
-            .fetch_all(&state.db)
-            .await?;
+    let rows: Vec<WorkspaceRow> = sqlx::query_as(&format!(
+        "{} ORDER BY w.created_at, w.id",
+        select_for_member()
+    ))
+    .bind(account.user_id)
+    .fetch_all(&state.db)
+    .await?;
     rows.into_iter()
         .map(to_dto)
         .collect::<Result<_, _>>()
@@ -197,11 +207,12 @@ pub async fn membership(
     raw_id: &str,
 ) -> Result<Workspace, AppError> {
     let id = uuid::Uuid::parse_str(raw_id).map_err(|_| AppError::not_found())?;
-    let row: Option<WorkspaceRow> = sqlx::query_as(&format!("{SELECT_FOR_MEMBER} WHERE w.id = $2"))
-        .bind(session.user_id)
-        .bind(id)
-        .fetch_optional(&state.db)
-        .await?;
+    let row: Option<WorkspaceRow> =
+        sqlx::query_as(&format!("{} WHERE w.id = $2", select_for_member()))
+            .bind(session.user_id)
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await?;
     to_dto(row.ok_or_else(AppError::not_found)?)
 }
 
@@ -213,10 +224,11 @@ pub async fn detail(
 ) -> Result<Json<Workspace>, AppError> {
     account.require_scope(crate::protocol::scopes::WORKSPACES_READ)?;
     let id = uuid::Uuid::parse_str(&ws).map_err(|_| AppError::not_found())?;
-    let row: Option<WorkspaceRow> = sqlx::query_as(&format!("{SELECT_FOR_MEMBER} WHERE w.id = $2"))
-        .bind(account.user_id)
-        .bind(id)
-        .fetch_optional(&state.db)
-        .await?;
+    let row: Option<WorkspaceRow> =
+        sqlx::query_as(&format!("{} WHERE w.id = $2", select_for_member()))
+            .bind(account.user_id)
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await?;
     to_dto(row.ok_or_else(AppError::not_found)?).map(Json)
 }

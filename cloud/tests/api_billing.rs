@@ -958,3 +958,494 @@ async fn concurrent_duplicate_deliveries_are_all_acknowledged() {
         );
     }
 }
+
+/// A seat count above the documented maximum is refused before Paddle is
+/// asked for anything, for a checkout and for a plan change alike.
+#[tokio::test]
+async fn seats_above_the_documented_maximum_are_refused() {
+    let paddle = start_paddle().await;
+    let s = stack_with_paddle(&paddle).await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let ws = create_workspace(&s, &alice, "Seats WS").await;
+    let billing_path = format!("/v1/workspaces/{}/billing", ws.id);
+
+    for seats in [muster_cloud::protocol::MAX_TEAM_SEATS + 1, u32::MAX] {
+        let (status, resp) = session_post(
+            &s,
+            &alice,
+            &format!("{billing_path}/checkout"),
+            &CreateCheckout {
+                plan: "team".into(),
+                seats,
+            },
+        )
+        .await;
+        assert_eq!(status, 400, "checkout with {seats} seats");
+        let err = resp.json::<ApiError>().await.unwrap().error;
+        assert_eq!(err.code, error_codes::BAD_REQUEST);
+        assert_eq!(err.details["field"], "seats");
+
+        let (status, resp) = session_post(
+            &s,
+            &alice,
+            &format!("{billing_path}/plan"),
+            &UpdatePlan {
+                plan: "team".into(),
+                seats,
+            },
+        )
+        .await;
+        assert_eq!(status, 400, "plan change to {seats} seats");
+        let err = resp.json::<ApiError>().await.unwrap().error;
+        assert_eq!(err.details["field"], "seats");
+    }
+    assert_eq!(paddle.calls("create_transaction"), 0);
+    assert_eq!(paddle.calls("update"), 0);
+
+    // The maximum itself is a valid team.
+    checkout(
+        &s,
+        &alice,
+        &ws.id,
+        "team",
+        muster_cloud::protocol::MAX_TEAM_SEATS,
+    )
+    .await;
+}
+
+/// The workspace list and detail report the same plan status as the billing
+/// view of that workspace, through a subscription's whole life.
+#[tokio::test]
+async fn workspace_plan_status_agrees_with_billing() {
+    let paddle = start_paddle().await;
+    let s = stack_with_paddle(&paddle).await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let ws = create_workspace(&s, &alice, "Agree WS").await;
+    let other = create_workspace(&s, &alice, "Trial WS").await;
+
+    async fn listed(s: &Stack, u: &UserSession, ws: &str) -> (PlanStatus, PlanStatus) {
+        let (status, list) =
+            session_get::<Vec<muster_cloud::protocol::Workspace>>(s, u, "/v1/workspaces").await;
+        assert_eq!(status, 200);
+        let in_list = list.unwrap().into_iter().find(|w| w.id == ws).unwrap();
+        let (status, detail) =
+            session_get::<muster_cloud::protocol::Workspace>(s, u, &format!("/v1/workspaces/{ws}"))
+                .await;
+        assert_eq!(status, 200);
+        (in_list.plan_status, detail.unwrap().plan_status)
+    }
+
+    let sub_id = "sub_01h8vzp8f4kek3yd4g1agree01";
+    active_subscription(&s, &paddle, &alice, &ws.id, sub_id).await;
+    let billing = billing_of(&s, &alice, &ws.id).await;
+    assert_eq!(billing.plan_status, PlanStatus::Active);
+    assert_eq!(
+        listed(&s, &alice, &ws.id).await,
+        (PlanStatus::Active, PlanStatus::Active)
+    );
+    assert_eq!(
+        listed(&s, &alice, &other.id).await,
+        (PlanStatus::Trialing, PlanStatus::Trialing)
+    );
+
+    let canceled = paddle.update_subscription(sub_id, "subscription.canceled", |sub| {
+        sub["status"] = "canceled".into();
+        sub["scheduled_change"] = serde_json::Value::Null;
+    });
+    assert_eq!(post_webhook(&s, &paddle, &canceled).await, 200);
+    let billing = billing_when(&s, &alice, &ws.id, "canceled", |b| {
+        b.plan_status == PlanStatus::Canceled
+    })
+    .await;
+    assert_eq!(
+        listed(&s, &alice, &ws.id).await,
+        (billing.plan_status, billing.plan_status)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Paddle over a controllable network path
+// ---------------------------------------------------------------------------
+
+/// Paddle as the service reaches it over the network: every call is
+/// forwarded to the external fixture over real HTTP, and the path can be
+/// slow for chosen calls, report chosen transactions as `paid` (captured,
+/// not yet completed: Paddle refuses to cancel them), or answer the portal
+/// with a redirect.
+#[derive(Clone, Default)]
+struct PaddlePath {
+    base_url: String,
+    target: String,
+    /// `(method, path prefix, delay)` of the calls that are slow.
+    slow: std::sync::Arc<std::sync::Mutex<Option<(String, String, std::time::Duration)>>>,
+    paid: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    redirect_portal: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    redirect_hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    in_flight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl PaddlePath {
+    async fn start(paddle: &PaddleFixture) -> PaddlePath {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let path = PaddlePath {
+            base_url: format!("http://{}", listener.local_addr().unwrap()),
+            target: paddle.base_url.clone(),
+            ..PaddlePath::default()
+        };
+        let app = axum::Router::new()
+            .fallback(paddle_path_forward)
+            .with_state(path.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        path
+    }
+
+    /// The fixture as the service is configured with it: through this path.
+    fn configured(&self, paddle: &PaddleFixture) -> PaddleFixture {
+        let mut via = paddle.clone();
+        via.base_url = self.base_url.clone();
+        via
+    }
+
+    fn slow(&self, method: &str, prefix: &str, delay: std::time::Duration) {
+        *self.slow.lock().unwrap() = Some((method.into(), prefix.into(), delay));
+    }
+
+    fn mark_paid(&self, txn: &str) {
+        self.paid.lock().unwrap().insert(txn.into());
+    }
+
+    /// Waits until a slow call is being held.
+    async fn held(&self) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while self.in_flight.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(std::time::Instant::now() < deadline, "no slow call arrived");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+}
+
+async fn paddle_path_forward(
+    axum::extract::State(p): axum::extract::State<PaddlePath>,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    use std::sync::atomic::Ordering;
+    let route = uri.path().to_string();
+    if route == "/redirected" {
+        p.redirect_hits.fetch_add(1, Ordering::SeqCst);
+        return axum::Json(serde_json::json!({
+            "data": { "urls": { "general": { "overview": "https://elsewhere.example/" } } }
+        }))
+        .into_response();
+    }
+    if route.ends_with("/portal-sessions") && p.redirect_portal.load(Ordering::SeqCst) {
+        return (
+            axum::http::StatusCode::TEMPORARY_REDIRECT,
+            [(axum::http::header::LOCATION, "/redirected")],
+        )
+            .into_response();
+    }
+    if let Some(txn) = route.strip_prefix("/transactions/") {
+        if p.paid.lock().unwrap().contains(txn) {
+            if method == axum::http::Method::PATCH {
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    axum::Json(serde_json::json!({
+                        "error": { "type": "request_error", "code": "transaction_immutable" }
+                    })),
+                )
+                    .into_response();
+            }
+            return axum::Json(serde_json::json!({ "data": { "id": txn, "status": "paid" } }))
+                .into_response();
+        }
+    }
+    let delay = p
+        .slow
+        .lock()
+        .unwrap()
+        .as_ref()
+        .filter(|(m, prefix, _)| *m == method.as_str() && route.starts_with(prefix.as_str()))
+        .map(|(_, _, d)| *d);
+    if let Some(delay) = delay {
+        p.in_flight.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(delay).await;
+    }
+    let mut req = http()
+        .request(
+            reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap(),
+            format!(
+                "{}{}",
+                p.target,
+                uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/")
+            ),
+        )
+        .body(body.to_vec());
+    for name in [
+        axum::http::header::AUTHORIZATION,
+        axum::http::header::CONTENT_TYPE,
+    ] {
+        if let Some(v) = headers.get(&name) {
+            req = req.header(name.as_str(), v.to_str().unwrap());
+        }
+    }
+    let resp = req.send().await.unwrap();
+    let status = axum::http::StatusCode::from_u16(resp.status().as_u16()).unwrap();
+    let bytes = resp.bytes().await.unwrap();
+    if delay.is_some() {
+        p.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+    (
+        status,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        bytes,
+    )
+        .into_response()
+}
+
+/// Paddle can report a checkout as `paid` (captured, not yet completed) and
+/// refuse to cancel it: like `completed`, that is a subscription on its
+/// way, so another checkout is `409 subscription_exists`, never an error.
+#[tokio::test]
+async fn a_checkout_paddle_reports_paid_blocks_a_second_checkout() {
+    let paddle = start_paddle().await;
+    let path = PaddlePath::start(&paddle).await;
+    let s = stack_with_paddle(&path.configured(&paddle)).await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let ws = create_workspace(&s, &alice, "Paid txn WS").await;
+
+    let paid = checkout(&s, &alice, &ws.id, "personal", 1).await;
+    path.mark_paid(&paid);
+    let (status, resp) = session_post(
+        &s,
+        &alice,
+        &format!("/v1/workspaces/{}/billing/checkout", ws.id),
+        &CreateCheckout {
+            plan: "team".into(),
+            seats: 3,
+        },
+    )
+    .await;
+    assert_eq!(status, 409);
+    assert_eq!(
+        resp.json::<ApiError>().await.unwrap().error.code,
+        error_codes::SUBSCRIPTION_EXISTS
+    );
+    assert_eq!(paddle.calls("create_transaction"), 1);
+}
+
+/// The customer portal call is made like every other Paddle call: a
+/// redirect from the provider is never followed (the API key would travel
+/// with it), and the session is refused once deletion is requested, like
+/// every other billing action.
+#[tokio::test]
+async fn the_portal_follows_no_redirect_and_is_refused_once_deletion_is_requested() {
+    let paddle = start_paddle().await;
+    let path = PaddlePath::start(&paddle).await;
+    let s = stack_with_paddle(&path.configured(&paddle)).await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let ws = create_workspace(&s, &alice, "Portal WS").await;
+    active_subscription(
+        &s,
+        &paddle,
+        &alice,
+        &ws.id,
+        "sub_01h8vzp8f4kek3yd4g1portal1",
+    )
+    .await;
+    let portal_path = format!("/v1/workspaces/{}/billing/portal", ws.id);
+
+    path.redirect_portal
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (status, _) = session_post(&s, &alice, &portal_path, &serde_json::json!({})).await;
+    assert!(status.is_server_error(), "{status}");
+    assert_eq!(
+        path.redirect_hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the service followed Paddle's redirect"
+    );
+    path.redirect_portal
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let (status, _) = session_post(&s, &alice, &portal_path, &serde_json::json!({})).await;
+    assert_eq!(status, 200);
+
+    let resp = http()
+        .delete(s.url(&format!("/v1/workspaces/{}", ws.id)))
+        .header("Cookie", format!("__Host-mc_session={}", alice.cookie))
+        .header("Origin", s.origin())
+        .header("X-CSRF-Token", &alice.csrf_token)
+        .header("Idempotency-Key", uuid::Uuid::new_v4().to_string())
+        .json(&serde_json::json!({
+            "confirm_workspace_id": ws.id,
+            "confirm_workspace_name": "Portal WS",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 202);
+    let sessions = paddle.calls("portal_session");
+    let (status, resp) = session_post(&s, &alice, &portal_path, &serde_json::json!({})).await;
+    assert_eq!(status, 409);
+    assert_eq!(
+        resp.json::<ApiError>().await.unwrap().error.code,
+        error_codes::WORKSPACE_DELETION_SCHEDULED
+    );
+    assert_eq!(paddle.calls("portal_session"), sessions);
+}
+
+/// While a billing action waits on a slow Paddle (up to its 15 s timeout),
+/// the workspace keeps syncing: a push during a checkout, a plan change and
+/// a cancellation is answered at once, not after Paddle.
+#[tokio::test]
+async fn a_slow_paddle_call_never_holds_up_a_push() {
+    let paddle = start_paddle().await;
+    let path = PaddlePath::start(&paddle).await;
+    let s = stack_with_paddle(&path.configured(&paddle)).await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let token = account_token(&s, &alice).await;
+    let ws = create_workspace(&s, &alice, "Slow WS").await;
+    let key = MachineKey::new("node-a");
+    let dev = link(&s, &token, &ws.id, &key).await;
+    let repo = FleetRepo::genesis(&key);
+    assert_eq!(
+        dev.send(&s, &dev.push(repo.bundle(None), None))
+            .await
+            .status(),
+        200
+    );
+
+    let delay = std::time::Duration::from_secs(3);
+    let push_while_held = |file: &'static str| {
+        let (path, repo, dev, s) = (&path, &repo, &dev, &s);
+        async move {
+            path.held().await;
+            let base = repo.head();
+            repo.touch(file, file);
+            let started = std::time::Instant::now();
+            let status = dev
+                .send(s, &dev.push(repo.bundle(Some(&base)), Some(&base)))
+                .await
+                .status();
+            (status, started.elapsed())
+        }
+    };
+    let billing_path = format!("/v1/workspaces/{}/billing", ws.id);
+
+    path.slow("POST", "/transactions", delay);
+    let (txn, (status, took)) = tokio::join!(
+        checkout(&s, &alice, &ws.id, "team", 3),
+        push_while_held("during-checkout.txt"),
+    );
+    assert_eq!(status, 200);
+    assert!(took < delay / 2, "push waited {took:?} for the checkout");
+
+    let sub_id = "sub_01h8vzp8f4kek3yd4g1slow001";
+    let created = paddle.complete_checkout(&txn, sub_id, "ctm_01h8vzp8f4kek3yd4g1slow001");
+    assert_eq!(post_webhook(&s, &paddle, &created).await, 200);
+    billing_when(&s, &alice, &ws.id, "team active", |b| {
+        b.plan == "team" && b.plan_status == PlanStatus::Active
+    })
+    .await;
+
+    path.slow("PATCH", "/subscriptions/", delay);
+    let (plan_path, plan) = (
+        format!("{billing_path}/plan"),
+        UpdatePlan {
+            plan: "team".into(),
+            seats: 4,
+        },
+    );
+    let ((status_plan, _), (status, took)) = tokio::join!(
+        session_post(&s, &alice, &plan_path, &plan),
+        push_while_held("during-plan.txt"),
+    );
+    assert_eq!(status_plan, 200);
+    assert_eq!(status, 200);
+    assert!(took < delay / 2, "push waited {took:?} for the plan change");
+
+    path.slow("POST", "/subscriptions/", delay);
+    let (cancel_path, empty) = (format!("{billing_path}/cancel"), serde_json::json!({}));
+    let ((status_cancel, _), (status, took)) = tokio::join!(
+        session_post(&s, &alice, &cancel_path, &empty),
+        push_while_held("during-cancel.txt"),
+    );
+    assert_eq!(status_cancel, 200);
+    assert_eq!(status, 200);
+    assert!(
+        took < delay / 2,
+        "push waited {took:?} for the cancellation"
+    );
+    billing_when(&s, &alice, &ws.id, "cancel scheduled, 4 seats", |b| {
+        b.cancel_at_period_end && b.seats == 4
+    })
+    .await;
+}
+
+/// A deletion requested while a checkout waits on a slow Paddle is answered
+/// at once; the checkout is then refused, and the transaction Paddle created
+/// meanwhile is canceled with the rest, so no payable link is left.
+#[tokio::test]
+async fn a_deletion_during_a_slow_checkout_is_not_held_and_leaves_no_payable_link() {
+    let paddle = start_paddle().await;
+    let path = PaddlePath::start(&paddle).await;
+    let s = stack_with_paddle(&path.configured(&paddle)).await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let ws = create_workspace(&s, &alice, "Slow delete WS").await;
+    let delay = std::time::Duration::from_secs(3);
+    path.slow("POST", "/transactions", delay);
+
+    let (checkout_path, personal) = (
+        format!("/v1/workspaces/{}/billing/checkout", ws.id),
+        CreateCheckout {
+            plan: "personal".into(),
+            seats: 1,
+        },
+    );
+    let (co, (del_status, took)) =
+        tokio::join!(session_post(&s, &alice, &checkout_path, &personal), async {
+            path.held().await;
+            let started = std::time::Instant::now();
+            let status = http()
+                .delete(s.url(&format!("/v1/workspaces/{}", ws.id)))
+                .header("Cookie", format!("__Host-mc_session={}", alice.cookie))
+                .header("Origin", s.origin())
+                .header("X-CSRF-Token", &alice.csrf_token)
+                .header("Idempotency-Key", uuid::Uuid::new_v4().to_string())
+                .json(&serde_json::json!({
+                    "confirm_workspace_id": ws.id,
+                    "confirm_workspace_name": "Slow delete WS",
+                }))
+                .send()
+                .await
+                .unwrap()
+                .status();
+            (status, started.elapsed())
+        },);
+    assert_eq!(del_status, 202);
+    assert!(
+        took < delay / 2,
+        "deletion waited {took:?} for the checkout"
+    );
+    let (co_status, co_resp) = co;
+    assert_eq!(co_status, 409);
+    assert_eq!(
+        co_resp.json::<ApiError>().await.unwrap().error.code,
+        error_codes::WORKSPACE_DELETION_SCHEDULED
+    );
+    assert_eq!(paddle.calls("create_transaction"), 1);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !paddle.payable_transactions().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "payable after deletion: {:?}",
+            paddle.payable_transactions()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
