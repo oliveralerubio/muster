@@ -1,5 +1,6 @@
 //! Muster Cloud service: multi-tenant hosted transport for Muster fleets.
-#![forbid(unsafe_code)]
+// `deny`, not `forbid`: only `dev_crash` opts in, for one `kill(2)` call.
+#![deny(unsafe_code)]
 
 /// Wire protocol shared with the CLI. Compiled from the root crate's source
 /// file so both sides use the same definitions without the service having to
@@ -13,6 +14,7 @@ pub mod billing;
 pub mod billing_reconcile;
 pub mod config;
 pub mod control;
+pub mod dev_crash;
 pub mod device_links;
 pub mod error;
 pub mod history;

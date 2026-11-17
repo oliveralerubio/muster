@@ -52,6 +52,8 @@ tempfile = "3.10"
 # HTTP client for external provider calls (Paddle Billing).
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 hmac = "0.12"
+# SIGKILL for the development-only injected crashes (see dev_crash).
+libc = "0.2"
 
 [dev-dependencies]
 time = { version = "0.3", features = ["parsing"] }

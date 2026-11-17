@@ -338,8 +338,7 @@ impl CrashPoint {
 
 fn crash_if(at: Option<CrashPoint>, here: CrashPoint) {
     if at == Some(here) {
-        eprintln!("injected crash at {here:?}");
-        std::process::abort();
+        crate::dev_crash::die(format_args!("injected crash at {here:?}"));
     }
 }
 

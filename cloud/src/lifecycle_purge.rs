@@ -92,8 +92,7 @@ pub struct PurgeCtx {
 
 fn crash_if(ctx: &PurgeCtx, here: PurgeCrash) {
     if ctx.crash == Some(here) {
-        eprintln!("injected purge crash at {here:?}");
-        std::process::abort();
+        crate::dev_crash::die(format_args!("injected purge crash at {here:?}"));
     }
 }
 

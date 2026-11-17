@@ -866,8 +866,7 @@ fn git_entries(
 
 fn crash_if(s: &Settings, here: BackupCrash) {
     if s.crash == Some(here) {
-        eprintln!("injected backup crash at {here:?}");
-        std::process::abort();
+        crate::dev_crash::die(format_args!("injected backup crash at {here:?}"));
     }
 }
 
