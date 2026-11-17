@@ -515,3 +515,18 @@ p {
   white-space: pre-wrap;
   line-height: 1.4;
 }
+
+.badge-danger {
+  background: var(--danger-bg);
+  color: var(--danger);
+  border: 1px solid var(--danger-border);
+}
+
+.card-danger {
+  border-color: var(--danger-border);
+}
+
+.banner-warn {
+  border-color: var(--warn);
+  background: var(--surface-subtle);
+}

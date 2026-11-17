@@ -1172,9 +1172,10 @@ async function journey17BillingUnconfiguredHonestStateAndLimits(browser) {
   await billingSection.locator(".meta-item", { hasText: /^Pull/i }).getByText(/^Allowed$/i).waitFor({ timeout: 3000 });
   await billingSection.locator(".meta-item", { hasText: /^Export/i }).getByText(/^Available$/i).waitFor({ timeout: 3000 });
 
-  // Must NEVER render simulated payment controls or premature workspace delete UI
+  // Must NEVER render simulated payment controls; Delete workspace is owner-only
   assert.equal(await billingSection.getByRole("button", { name: /checkout|subscribe|portal|cancel subscription|update plan/i }).count(), 0);
-  assert.equal(await page.getByRole("button", { name: /delete workspace/i }).count(), 0);
+  await page.getByRole("region", { name: /^Delete workspace$/i }).waitFor({ timeout: 3000 });
+  assert.equal(await page.getByRole("button", { name: /^Delete workspace$/i }).count(), 1);
   await saveScreenshot(page, "29-billing-unconfigured");
 
   // 2. Populated workspace reflects non-zero storage_used_bytes from real Git/proposal data
@@ -1189,7 +1190,7 @@ async function journey17BillingUnconfiguredHonestStateAndLimits(browser) {
   const storageText = await storageDd.innerText();
   assert.equal(storageText.startsWith("0 B "), false, `expected non-zero storage usage, got: ${storageText}`);
 
-  // 3. Member role sees billing info read-only
+  // 3. Member role sees billing info read-only and never sees Delete workspace controls
   const memberCtx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
   const memberPage = await memberCtx.newPage();
   const memberErrors = [];
@@ -1203,6 +1204,8 @@ async function journey17BillingUnconfiguredHonestStateAndLimits(browser) {
   const memberBilling = memberPage.getByRole("region", { name: /^Billing$/i });
   await memberBilling.waitFor({ timeout: 5000 });
   await memberBilling.getByText(/of 1 GiB/i).waitFor({ timeout: 5000 });
+  assert.equal(await memberPage.getByRole("region", { name: /Delete workspace/i }).count(), 0);
+  assert.equal(await memberPage.getByRole("button", { name: /delete workspace/i }).count(), 0);
 
   assert.deepEqual(pageErrors, [], `unexpected page errors: ${pageErrors.join("; ")}`);
   assert.deepEqual(memberErrors, [], `unexpected member errors: ${memberErrors.join("; ")}`);
@@ -3051,6 +3054,395 @@ async function journey25HistoryPaginationAndIsolation(browser) {
   }
 }
 
+async function journey26WorkspaceDeletionLifecycleRolesAndIdempotency(browser) {
+  const fixtures = loadFixtures();
+  const wsId = fixtures.historyWorkspaceId;
+  const wsName = fixtures.historyWorkspaceName;
+
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 }, acceptDownloads: true });
+  const page = await context.newPage();
+  const pageErrors = [];
+  page.on('pageerror', (err) => pageErrors.push(err.message));
+
+  await page.goto(`${baseUrl}/`, { waitUntil: 'networkidle' });
+  await signInViaIdp(page, { subject: 'olivia-sub-1', email: 'olivia@example.com' });
+  await page.getByRole('link', { name: new RegExp(wsName, 'i') }).click();
+  await page.waitForURL(new RegExp(`/workspaces/${wsId}$`), { timeout: 5000 });
+
+  // Invite an admin so we verify owner vs admin vs member deletion UI rules
+  const membersSection = page.getByRole('region', { name: /^Members$/i });
+  await membersSection.waitFor({ timeout: 5000 });
+  await membersSection.getByLabel(/Invite email/i).fill('admin-del@example.com');
+  await membersSection.getByLabel(/Cloud role/i).selectOption('admin');
+  await membersSection.getByRole('button', { name: /Send invite/i }).click();
+  const adminInviteLink = membersSection.getByLabel(/Shareable invite link/i);
+  await adminInviteLink.waitFor({ timeout: 5000 });
+  const adminInviteUrl = await adminInviteLink.inputValue();
+
+  const adminCtx = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  const adminPage = await adminCtx.newPage();
+  const adminErrors = [];
+  adminPage.on('pageerror', (err) => adminErrors.push(err.message));
+  await adminPage.goto(adminInviteUrl, { waitUntil: 'networkidle' });
+  await signInViaIdp(adminPage, { subject: 'admin-del-1', email: 'admin-del@example.com' });
+  await adminPage.getByRole('button', { name: /Accept invitation/i }).click();
+  await adminPage.getByRole('link', { name: /Open workspace/i }).click();
+  await adminPage.waitForURL(new RegExp(`/workspaces/${wsId}$`), { timeout: 5000 });
+
+  const memberCtx = await browser.newContext({ viewport: { width: 1280, height: 800 }, acceptDownloads: true });
+  const memberPage = await memberCtx.newPage();
+  const memberErrors = [];
+  memberPage.on('pageerror', (err) => memberErrors.push(err.message));
+  await memberPage.goto(`${baseUrl}/`, { waitUntil: 'networkidle' });
+  await signInViaIdp(memberPage, { subject: 'peter-sub-1', email: 'peter@example.com' });
+  await memberPage.getByRole('link', { name: new RegExp(wsName, 'i') }).click();
+  await memberPage.waitForURL(new RegExp(`/workspaces/${wsId}$`), { timeout: 5000 });
+
+  // 1. Admin and Member see ZERO Delete workspace section/button/input
+  await adminPage.getByRole('region', { name: /^Members$/i }).waitFor({ timeout: 5000 });
+  await memberPage.getByRole('region', { name: /^Members$/i }).waitFor({ timeout: 5000 });
+  assert.equal(await adminPage.getByRole('region', { name: /Delete workspace/i }).count(), 0);
+  assert.equal(await adminPage.getByRole('button', { name: /delete workspace/i }).count(), 0);
+  assert.equal(await memberPage.getByRole('region', { name: /Delete workspace/i }).count(), 0);
+  assert.equal(await memberPage.getByRole('button', { name: /delete workspace/i }).count(), 0);
+
+  // 2. Owner sees Delete workspace section with explanation & link to Export section
+  const deleteSection = page.getByRole('region', { name: /^Delete workspace$/i });
+  await deleteSection.waitFor({ timeout: 5000 });
+  await deleteSection.getByText(/30-day/i).waitFor({ timeout: 3000 });
+  await deleteSection.getByText(/export/i).first().waitFor({ timeout: 3000 });
+  await deleteSection.getByText(/irreversible/i).waitFor({ timeout: 3000 });
+  const exportJumpLink = deleteSection.getByRole('link', { name: /export/i });
+  await exportJumpLink.waitFor({ timeout: 3000 });
+  assert.equal(await exportJumpLink.getAttribute('href'), '#export-section');
+  assert.ok((await page.locator('#export-section').count()) === 1);
+
+  // 3. Client-side validation refuses wrong names with ZERO network DELETE requests
+  const networkDeleteAttempts = [];
+  page.on('request', (req) => {
+    if (req.method() === 'DELETE' && new URL(req.url()).pathname === `/v1/workspaces/${wsId}`) {
+      networkDeleteAttempts.push(req);
+    }
+  });
+
+  const confirmInput = deleteSection.getByLabel(/workspace name/i);
+  const deleteBtn = deleteSection.getByRole('button', { name: /^Delete workspace$/i });
+  for (const wrong of ['', wsName.toLowerCase(), `${wsName} `]) {
+    await confirmInput.fill(wrong);
+    await deleteBtn.click();
+    await deleteSection.locator('[role="alert"]').waitFor({ timeout: 3000 });
+    assert.equal(await confirmInput.getAttribute('aria-invalid'), 'true');
+  }
+  assert.equal(networkDeleteAttempts.length, 0, 'wrong confirmation name must send zero DELETE requests');
+
+  // 4. Right name + network drop -> error shown, never claims success; retry double-click reuses one Idempotency-Key and sends one request
+  const seenDeletes = [];
+  let dropFirstDelete = true;
+  await page.route(`**/v1/workspaces/${wsId}`, async (route) => {
+    if (route.request().method() !== 'DELETE') {
+      await route.continue();
+      return;
+    }
+    const headers = route.request().headers();
+    seenDeletes.push({
+      key: headers['idempotency-key'],
+      body: route.request().postDataJSON(),
+    });
+    if (dropFirstDelete) {
+      dropFirstDelete = false;
+      await route.abort('failed');
+      return;
+    }
+    await route.continue();
+  });
+
+  await confirmInput.fill(wsName);
+  await deleteBtn.click();
+  await deleteSection.locator('[role="alert"]').waitFor({ timeout: 5000 });
+  assert.equal(await page.getByText(/Deletion scheduled/i).count(), 0, 'must never claim success on failed request');
+
+  await deleteBtn.dblclick();
+  const statusRegion = page.getByRole('region', { name: /Workspace deletion/i });
+  await statusRegion.waitFor({ timeout: 5000 });
+  await statusRegion.getByText(/^Scheduled$/i).waitFor({ timeout: 5000 });
+  await page.unroute(`**/v1/workspaces/${wsId}`);
+
+  assert.equal(seenDeletes.length, 2, `expected 2 DELETE attempts (1 aborted + 1 retry), got ${seenDeletes.length}`);
+  assert.equal(seenDeletes[0].key, seenDeletes[1].key, 'retry must reuse exact same Idempotency-Key');
+  assert.match(seenDeletes[0].key, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+  assert.deepEqual(seenDeletes[0].body, {
+    confirm_workspace_id: wsId,
+    confirm_workspace_name: wsName,
+  });
+
+  // 5. After 202: scheduled status with dates, write controls disabled, export & diff still work
+  for (const label of ['Requested', 'Export until', 'Primary purge due', 'Backup policy cap']) {
+    const item = statusRegion.locator('.meta-item', { hasText: new RegExp(`^${label}`, 'i') });
+    await item.waitFor({ timeout: 3000 });
+    const val = (await item.locator('dd').innerText()).trim();
+    assert.ok(val.length > 0, `expected non-empty ${label} timestamp`);
+  }
+  await statusRegion.locator('.meta-item', { hasText: /^Writes/i }).getByText(/^Refused$/i).waitFor({ timeout: 3000 });
+  await statusRegion.locator('.meta-item', { hasText: /^Pull/i }).getByText(/^Allowed$/i).waitFor({ timeout: 3000 });
+  await statusRegion.locator('.meta-item', { hasText: /^Export(?! until)/i }).getByText(/^Available$/i).waitFor({ timeout: 3000 });
+  assert.equal(await page.getByRole('button', { name: /^Delete workspace$/i }).count(), 0);
+
+  // Disabled write controls
+  assert.equal(await membersSection.getByLabel(/Invite email/i).isDisabled(), true);
+  assert.equal(await membersSection.getByRole('button', { name: /Send invite/i }).isDisabled(), true);
+  assert.equal(await membersSection.getByRole('button', { name: /Remove peter@example\.com/i }).isDisabled(), true);
+  assert.equal(await membersSection.getByRole('button', { name: /Leave workspace/i }).isDisabled(), true);
+
+  const proposalsSection = page.getByRole('region', { name: /^Proposals$/i });
+  assert.equal(await proposalsSection.getByRole('button', { name: /Create restore proposal/i }).isDisabled(), true);
+  assert.equal(await proposalsSection.getByLabel(/Paths to restore/i).isDisabled(), true);
+  const rejectBtns = proposalsSection.getByRole('button', { name: /Reject proposal/i });
+  assert.ok((await rejectBtns.count()) >= 1);
+  assert.equal(await rejectBtns.first().isDisabled(), true);
+
+  const historySection = page.getByRole('region', { name: /^History$/i });
+  assert.equal(await historySection.getByRole('button', { name: /Propose restore/i }).first().isDisabled(), true);
+
+  // Export & read diff still work after 202
+  const exportSection = page.locator('#export-section');
+  const [ownerDownload] = await Promise.all([
+    page.waitForEvent('download'),
+    exportSection.getByRole('link', { name: /Download Git bundle/i }).click(),
+  ]);
+  const ownerBundleHead = fs.readFileSync(await ownerDownload.path(), 'utf8').slice(0, 32);
+  assert.ok(ownerBundleHead.startsWith('# v2 git bundle'), `expected git bundle, got: ${ownerBundleHead}`);
+
+  await historySection.getByRole('button', { name: /View diff/i }).first().click();
+  await historySection.getByText('settings.toml', { exact: true }).waitFor({ timeout: 5000 });
+
+  // 6. Status survives reload for owner, admin, and member; admin/member see no delete button and can still export
+  await page.reload({ waitUntil: 'networkidle' });
+  await page.getByRole('region', { name: /Workspace deletion/i }).getByText(/^Scheduled$/i).waitFor({ timeout: 5000 });
+  assert.equal(await page.getByRole('button', { name: /^Delete workspace$/i }).count(), 0);
+  assert.equal(await membersSection.getByRole('button', { name: /Send invite/i }).isDisabled(), true);
+
+  await adminPage.reload({ waitUntil: 'networkidle' });
+  await adminPage.getByRole('region', { name: /Workspace deletion/i }).getByText(/^Scheduled$/i).waitFor({ timeout: 5000 });
+  assert.equal(await adminPage.getByRole('button', { name: /delete workspace/i }).count(), 0);
+  assert.equal(await adminPage.getByRole('region', { name: /^Members$/i }).getByRole('button', { name: /Send invite/i }).isDisabled(), true);
+
+  await memberPage.reload({ waitUntil: 'networkidle' });
+  await memberPage.getByRole('region', { name: /Workspace deletion/i }).getByText(/^Scheduled$/i).waitFor({ timeout: 5000 });
+  assert.equal(await memberPage.getByRole('button', { name: /delete workspace/i }).count(), 0);
+  assert.equal(await memberPage.getByRole('region', { name: /^Members$/i }).getByRole('button', { name: /Leave workspace/i }).isDisabled(), true);
+  const [memberDownload] = await Promise.all([
+    memberPage.waitForEvent('download'),
+    memberPage.locator('#export-section').getByRole('link', { name: /Download Git bundle/i }).click(),
+  ]);
+  const memberBundleHead = fs.readFileSync(await memberDownload.path(), 'utf8').slice(0, 32);
+  assert.ok(memberBundleHead.startsWith('# v2 git bundle'));
+  await saveScreenshot(page, '38-workspace-deletion-scheduled');
+
+  // 7. Billing write controls disabled & real 409 workspace_deletion_scheduled shown verbatim-ish in stale tab
+  if (billingUrl) {
+    const bCtx1 = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+    const bPage1 = await bCtx1.newPage();
+    const bPage2 = await bCtx1.newPage();
+    const bErrors = [];
+    bPage1.on('pageerror', (err) => bErrors.push(err.message));
+    bPage2.on('pageerror', (err) => bErrors.push(err.message));
+
+    await bPage1.goto(`${billingUrl}/`, { waitUntil: 'networkidle' });
+    await signInViaIdp(bPage1, { subject: 'olivia-del-bill-1', email: 'olivia@example.com' });
+    await bPage1.getByLabel(/Workspace name/i).fill('Billing Deletion Fleet');
+    await bPage1.getByRole('button', { name: /Create workspace/i }).click();
+    await bPage1.waitForURL(/\/workspaces\/([0-9a-f-]{36})$/, { timeout: 5000 });
+    const bWsUrl = bPage1.url();
+
+    await bPage2.goto(bWsUrl, { waitUntil: 'networkidle' });
+    const b2Billing = bPage2.getByRole('region', { name: /^Billing$/i });
+    await b2Billing.getByRole('button', { name: /Continue to checkout/i }).waitFor({ timeout: 5000 });
+
+    const b1Delete = bPage1.getByRole('region', { name: /^Delete workspace$/i });
+    await b1Delete.getByLabel(/workspace name/i).fill('Billing Deletion Fleet');
+    await b1Delete.getByRole('button', { name: /^Delete workspace$/i }).click();
+    await bPage1.getByRole('region', { name: /Workspace deletion/i }).getByText(/^Scheduled$/i).waitFor({ timeout: 5000 });
+    assert.equal(await bPage1.getByRole('region', { name: /^Billing$/i }).getByRole('button', { name: /Continue to checkout/i }).isDisabled(), true);
+
+    // Stale tab submits checkout -> real 409 workspace_deletion_scheduled from server
+    await b2Billing.getByRole('button', { name: /Continue to checkout/i }).click();
+    await b2Billing.locator('[role="alert"]').getByText(/scheduled for deletion/i).waitFor({ timeout: 5000 });
+    await bPage2.getByRole('region', { name: /Workspace deletion/i }).getByText(/^Scheduled$/i).waitFor({ timeout: 5000 });
+    assert.deepEqual(bErrors, [], `unexpected billing deletion page errors: ${bErrors.join('; ')}`);
+    await bCtx1.close();
+  }
+
+  assert.deepEqual(pageErrors, [], `unexpected page errors: ${pageErrors.join('; ')}`);
+  assert.deepEqual(adminErrors, [], `unexpected admin errors: ${adminErrors.join('; ')}`);
+  assert.deepEqual(memberErrors, [], `unexpected member errors: ${memberErrors.join('; ')}`);
+  await context.close();
+  await adminCtx.close();
+  await memberCtx.close();
+}
+
+async function journey27WorkspaceDeletionStaleResponseAndIsolation(browser) {
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  const page = await context.newPage();
+  const pageErrors = [];
+  page.on('pageerror', (err) => pageErrors.push(err.message));
+
+  await page.goto(`${baseUrl}/`, { waitUntil: 'networkidle' });
+  await signInViaIdp(page, { subject: 'olivia-del-iso-1', email: 'olivia@example.com' });
+
+  async function createWs(name) {
+    await page.getByLabel(/Workspace name/i).fill(name);
+    await page.getByRole('button', { name: /Create workspace/i }).click();
+    await page.waitForURL(/\/workspaces\/([0-9a-f-]{36})$/, { timeout: 5000 });
+    const id = page.url().match(/\/workspaces\/([0-9a-f-]{36})$/)[1];
+    await page.getByRole('link', { name: /All workspaces/i }).click();
+    await page.getByRole('link', { name: new RegExp(name, 'i') }).waitFor({ timeout: 5000 });
+    return id;
+  }
+
+  const wsAId = await createWs('Del Iso A');
+  const wsBId = await createWs('Del Iso B');
+  const wsCId = await createWs('Del Iso C');
+  const wsDId = await createWs('Del Iso D');
+
+  // 1. Stale DELETE 202 for wsA arriving after switching to wsB must NOT taint wsB
+  await page.getByRole('link', { name: /Del Iso A/i }).click();
+  await page.waitForURL(new RegExp(`/workspaces/${wsAId}$`), { timeout: 5000 });
+  let releaseDelA = null;
+  let resolveDelAHeld = null;
+  const delAHeld = new Promise((r) => {
+    resolveDelAHeld = r;
+  });
+  await page.route(`**/v1/workspaces/${wsAId}`, async (route) => {
+    if (route.request().method() !== 'DELETE') {
+      await route.continue();
+      return;
+    }
+    const response = await route.fetch();
+    assert.equal(response.status(), 202);
+    await new Promise((resolve) => {
+      releaseDelA = async () => {
+        await route.fulfill({ response });
+        resolve();
+      };
+      resolveDelAHeld();
+    });
+  });
+
+  const delSecA = page.getByRole('region', { name: /^Delete workspace$/i });
+  await delSecA.getByLabel(/workspace name/i).fill('Del Iso A');
+  await delSecA.getByRole('button', { name: /^Delete workspace$/i }).click();
+  await delSecA.getByRole('button', { name: /Scheduling deletion/i }).waitFor({ timeout: 3000 });
+  await delAHeld;
+  assert.ok(releaseDelA, 'expected DELETE wsA to be held');
+
+  await page.getByRole('link', { name: /All workspaces/i }).click();
+  await page.getByRole('link', { name: /Del Iso B/i }).click();
+  await page.waitForURL(new RegExp(`/workspaces/${wsBId}$`), { timeout: 5000 });
+
+  await releaseDelA();
+  await page.waitForTimeout(100);
+  await page.getByRole('region', { name: /^Delete workspace$/i }).waitFor({ timeout: 3000 });
+  assert.equal(await page.getByRole('region', { name: /Workspace deletion/i }).count(), 0);
+  assert.equal(await page.getByRole('region', { name: /^Members$/i }).getByRole('button', { name: /Send invite/i }).isDisabled(), false);
+  await page.unroute(`**/v1/workspaces/${wsAId}`);
+
+  // Confirm wsA actually transitioned on the server
+  await page.getByRole('link', { name: /All workspaces/i }).click();
+  await page.getByRole('link', { name: /Del Iso A/i }).click();
+  await page.waitForURL(new RegExp(`/workspaces/${wsAId}$`), { timeout: 5000 });
+  await page.getByRole('region', { name: /Workspace deletion/i }).getByText(/^Scheduled$/i).waitFor({ timeout: 5000 });
+
+  // 2. Stale GET /lifecycle for wsA arriving after switching to wsD must NOT overwrite wsD
+  let releaseLcA = null;
+  let resolveLcAHeld = null;
+  const lcAHeld = new Promise((r) => {
+    resolveLcAHeld = r;
+  });
+  await page.route(`**/v1/workspaces/${wsAId}/lifecycle`, async (route) => {
+    const response = await route.fetch();
+    await new Promise((resolve) => {
+      releaseLcA = async () => {
+        await route.fulfill({ response });
+        resolve();
+      };
+      resolveLcAHeld();
+    });
+  });
+
+  await page.getByRole('link', { name: /All workspaces/i }).click();
+  await page.getByRole('link', { name: /Del Iso A/i }).click();
+  await page.waitForURL(new RegExp(`/workspaces/${wsAId}$`), { timeout: 5000 });
+  await lcAHeld;
+  assert.ok(releaseLcA, 'expected GET /lifecycle wsA to be held');
+
+  await page.getByRole('link', { name: /All workspaces/i }).click();
+  await page.getByRole('link', { name: /Del Iso D/i }).click();
+  await page.waitForURL(new RegExp(`/workspaces/${wsDId}$`), { timeout: 5000 });
+
+  await releaseLcA();
+  await page.waitForTimeout(100);
+  assert.equal(await page.getByRole('region', { name: /Workspace deletion/i }).count(), 0);
+  assert.equal(await page.getByRole('region', { name: /^Members$/i }).getByRole('button', { name: /Send invite/i }).isDisabled(), false);
+  await page.unroute(`**/v1/workspaces/${wsAId}/lifecycle`);
+
+  // 3. Stale DELETE across Sign out must not leak alerts or state into signed-out or next session
+  await page.getByRole('link', { name: /All workspaces/i }).click();
+  await page.getByRole('link', { name: /Del Iso C/i }).click();
+  await page.waitForURL(new RegExp(`/workspaces/${wsCId}$`), { timeout: 5000 });
+
+  let releaseDelC = null;
+  let resolveDelCHeld = null;
+  const delCHeld = new Promise((r) => {
+    resolveDelCHeld = r;
+  });
+  await page.route(`**/v1/workspaces/${wsCId}`, async (route) => {
+    if (route.request().method() !== 'DELETE') {
+      await route.continue();
+      return;
+    }
+    const response = await route.fetch();
+    await new Promise((resolve) => {
+      releaseDelC = async () => {
+        await route.fulfill({ response });
+        resolve();
+      };
+      resolveDelCHeld();
+    });
+  });
+
+  const delSecC = page.getByRole('region', { name: /^Delete workspace$/i });
+  await delSecC.getByLabel(/workspace name/i).fill('Del Iso C');
+  await delSecC.getByRole('button', { name: /^Delete workspace$/i }).click();
+  await delSecC.getByRole('button', { name: /Scheduling deletion/i }).waitFor({ timeout: 3000 });
+  await delCHeld;
+
+  await page.getByRole('button', { name: /Sign out/i }).click();
+  await page.getByRole('link', { name: /Sign in/i }).waitFor({ timeout: 5000 });
+
+  await releaseDelC();
+  await page.waitForTimeout(100);
+  await page.getByRole('link', { name: /Sign in/i }).waitFor({ timeout: 3000 });
+  assert.equal(await page.locator('[role="alert"]').count(), 0);
+  assert.equal(await page.getByRole('region', { name: /Workspace deletion/i }).count(), 0);
+  await page.unroute(`**/v1/workspaces/${wsCId}`);
+
+  // Sign back in -> form state reset cleanly on active wsD, wsC shows server truth
+  await signInViaIdp(page, { subject: 'olivia-del-iso-1', email: 'olivia@example.com' });
+  await page.getByRole('link', { name: /Del Iso D/i }).click();
+  await page.waitForURL(new RegExp(`/workspaces/${wsDId}$`), { timeout: 5000 });
+  assert.equal(await page.getByRole('region', { name: /^Delete workspace$/i }).getByLabel(/workspace name/i).inputValue(), '');
+
+  // wsC's DELETE reached the server before sign-out, so it must show the scheduled deletion
+  await page.getByRole('link', { name: /All workspaces/i }).click();
+  await page.getByRole('link', { name: /Del Iso C/i }).click();
+  await page.waitForURL(new RegExp(`/workspaces/${wsCId}$`), { timeout: 5000 });
+  await page.getByRole('region', { name: /Workspace deletion/i }).getByText(/^Scheduled$/i).waitFor({ timeout: 5000 });
+
+  await saveScreenshot(page, '39-workspace-deletion-isolation');
+  assert.deepEqual(pageErrors, [], `unexpected page errors: ${pageErrors.join('; ')}`);
+  await context.close();
+}
+
 const journeys = [
   ['journey_1_signin_and_account', journey1SignInAndAccount],
   ['journey_2_empty_workspaces', journey2EmptyWorkspaces],
@@ -3077,6 +3469,8 @@ const journeys = [
   ['journey_23_workspace_async_isolation_members_history_proposals_invites', journey23WorkspaceAsyncIsolationMembersHistoryProposalsInvites],
   ['journey_24_session_account_ownership_and_reset', journey24SessionAccountOwnershipAndReset],
   ['journey_25_history_pagination_and_isolation', journey25HistoryPaginationAndIsolation],
+  ['journey_26_workspace_deletion_lifecycle_roles_and_idempotency', journey26WorkspaceDeletionLifecycleRolesAndIdempotency],
+  ['journey_27_workspace_deletion_stale_response_and_isolation', journey27WorkspaceDeletionStaleResponseAndIsolation],
 ];
 
 async function main() {

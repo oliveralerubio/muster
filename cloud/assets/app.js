@@ -83,6 +83,16 @@
     updatePlanInFlight: false,
     confirmingCancel: false,
     cancelInFlight: false,
+    lifecycle: null,
+    loadingLifecycle: false,
+    lifecycleError: null,
+    lifecycleOnlyView: false,
+    deleteConfirmName: '',
+    deleteFieldError: null,
+    deleteSubmitError: null,
+    deleteInFlight: false,
+    deleteIdempotencyKey: null,
+    deleteIntentBody: null,
     signOutInFlight: false,
     signOutError: null,
   };
@@ -148,6 +158,16 @@
     state.updatePlanInFlight = false;
     state.confirmingCancel = false;
     state.cancelInFlight = false;
+    state.lifecycle = null;
+    state.loadingLifecycle = false;
+    state.lifecycleError = null;
+    state.lifecycleOnlyView = false;
+    state.deleteConfirmName = '';
+    state.deleteFieldError = null;
+    state.deleteSubmitError = null;
+    state.deleteInFlight = false;
+    state.deleteIdempotencyKey = null;
+    state.deleteIntentBody = null;
   }
 
   function resetSessionState({ render = true } = {}) {
@@ -347,6 +367,478 @@
       month: 'short',
       day: 'numeric',
     });
+  }
+
+  function formatDateTime(iso) {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return iso;
+    return d.toLocaleString('en-US', {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit',
+      timeZoneName: 'short',
+    });
+  }
+
+  function formatServerError(data, status, fallback) {
+    if (data && data.error && data.error.message) {
+      return data.error.code
+        ? `${data.error.message} (${data.error.code})`
+        : data.error.message;
+    }
+    return status ? `${fallback} (HTTP ${status})` : fallback;
+  }
+
+  function isDeletionScheduled(ws) {
+    return Boolean(
+      (state.lifecycle && state.lifecycle.state === 'deletion_scheduled') ||
+      (ws && ws.lifecycle_state === 'deletion_scheduled')
+    );
+  }
+
+  function isExportAllowed(ws) {
+    if (state.lifecycle && state.lifecycle.state === 'deletion_scheduled' && state.lifecycle.deletion) {
+      return Boolean(state.lifecycle.deletion.export_allowed);
+    }
+    return Boolean(ws);
+  }
+
+  function formatPrimaryDeletionStatus(status) {
+    switch (status) {
+      case 'scheduled':
+        return {
+          label: 'Scheduled',
+          badgeClass: 'badge badge-warn',
+          summary:
+            'Workspace deletion is scheduled. Writes are refused; pull and Git bundle export remain available until the export window closes.',
+        };
+      case 'due':
+        return {
+          label: 'Due (not yet purged)',
+          badgeClass: 'badge badge-warn',
+          summary:
+            'The scheduled purge date has passed, but primary erasure has not happened yet. Pull and export remain available until the irreversible tombstone is recorded.',
+        };
+      case 'purge_committed':
+        return {
+          label: 'Tombstoned (irreversible)',
+          badgeClass: 'badge badge-danger',
+          summary:
+            'An irreversible tombstone has been recorded. Workspace access, pull, and export are permanently closed while primary erasure completes.',
+        };
+      case 'purged':
+        return {
+          label: 'Purged',
+          badgeClass: 'badge badge-danger',
+          summary:
+            'Primary workspace data erasure has been verified. Backups are governed by the policy cap shown below.',
+        };
+      default:
+        return {
+          label: status || 'Scheduled',
+          badgeClass: 'badge badge-warn',
+          summary: 'Workspace deletion is scheduled.',
+        };
+    }
+  }
+
+  function handleDeletionScheduledConflict(wsId, data) {
+    if (data && data.error && data.error.code === 'workspace_deletion_scheduled') {
+      if (state.activeWorkspace && state.activeWorkspace.id === wsId) {
+        state.activeWorkspace = {
+          ...state.activeWorkspace,
+          lifecycle_state: 'deletion_scheduled',
+        };
+      }
+      loadWorkspaceLifecycle(wsId);
+    }
+  }
+
+  async function loadWorkspaceLifecycle(id) {
+    const ctx = captureWorkspaceContext(id);
+    if (!isCurrentWorkspaceContext(ctx, false)) return;
+    state.loadingLifecycle = true;
+    state.lifecycleError = null;
+    renderShell();
+    try {
+      const resp = await fetch(`/v1/workspaces/${encodeURIComponent(id)}/lifecycle`, {
+        headers: { Accept: 'application/json' },
+        credentials: 'same-origin',
+      });
+      if (!isCurrentWorkspaceContext(ctx, false)) return;
+      if (resp.status === 401) {
+        expireSession();
+        return;
+      }
+      const data = await resp.json().catch(() => null);
+      if (!isCurrentWorkspaceContext(ctx, false)) return;
+      if (!resp.ok || !data) {
+        throw new Error(`HTTP ${resp.status}`);
+      }
+      state.lifecycle = data;
+      state.loadingLifecycle = false;
+      if (state.activeWorkspace && state.activeWorkspace.id === id) {
+        state.activeWorkspace = {
+          ...state.activeWorkspace,
+          lifecycle_state: data.state,
+        };
+      }
+      renderShell();
+    } catch (_err) {
+      if (!isCurrentWorkspaceContext(ctx, false)) return;
+      state.loadingLifecycle = false;
+      state.lifecycleError = 'Could not load workspace deletion status. Please try again.';
+      renderShell();
+    }
+  }
+
+  async function handleDeleteWorkspace(e, ws) {
+    e.preventDefault();
+    if (state.deleteInFlight || !state.me || isDeletionScheduled(ws)) return;
+    const ctx = captureWorkspaceContext(ws.id);
+    if (!isCurrentWorkspaceContext(ctx)) return;
+
+    if (state.deleteConfirmName !== ws.name) {
+      state.deleteFieldError = `Type "${ws.name}" exactly to confirm deletion.`;
+      state.deleteSubmitError = null;
+      renderShell();
+      const input = document.getElementById('delete-confirm-name');
+      if (input) input.focus();
+      return;
+    }
+
+    state.deleteFieldError = null;
+    state.deleteSubmitError = null;
+    const body = JSON.stringify({
+      confirm_workspace_id: ws.id,
+      confirm_workspace_name: ws.name,
+    });
+    if (!state.deleteIdempotencyKey || state.deleteIntentBody !== body) {
+      state.deleteIdempotencyKey = crypto.randomUUID();
+      state.deleteIntentBody = body;
+    }
+
+    state.deleteInFlight = true;
+    renderShell();
+
+    try {
+      const resp = await fetch(`/v1/workspaces/${encodeURIComponent(ws.id)}`, {
+        method: 'DELETE',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          'X-CSRF-Token': state.me.csrf_token,
+          'Idempotency-Key': state.deleteIdempotencyKey,
+        },
+        credentials: 'same-origin',
+        body: state.deleteIntentBody,
+      });
+      if (!isCurrentWorkspaceContext(ctx)) return;
+      if (resp.status === 401) {
+        expireSession();
+        return;
+      }
+      const data = await resp.json().catch(() => null);
+      if (!isCurrentWorkspaceContext(ctx)) return;
+      if (!resp.ok) {
+        state.deleteInFlight = false;
+        state.deleteSubmitError = formatServerError(
+          data,
+          resp.status,
+          'Could not schedule workspace deletion. Please try again.'
+        );
+        if (resp.status === 422) {
+          state.deleteIdempotencyKey = null;
+          state.deleteIntentBody = null;
+        }
+        handleDeletionScheduledConflict(ws.id, data);
+        renderShell();
+        return;
+      }
+
+      state.deleteInFlight = false;
+      state.deleteConfirmName = '';
+      state.deleteIdempotencyKey = null;
+      state.deleteIntentBody = null;
+      state.lifecycle = data;
+      state.lifecycleError = null;
+      if (state.activeWorkspace && state.activeWorkspace.id === ws.id) {
+        state.activeWorkspace = {
+          ...state.activeWorkspace,
+          lifecycle_state: data.state,
+        };
+      }
+      if (Array.isArray(state.workspaces)) {
+        state.workspaces = state.workspaces.map((item) =>
+          item.id === ws.id ? { ...item, lifecycle_state: data.state } : item
+        );
+      }
+      renderShell();
+    } catch (_err) {
+      if (!isCurrentWorkspaceContext(ctx)) return;
+      state.deleteInFlight = false;
+      state.deleteSubmitError =
+        'Connection failed while requesting workspace deletion. Retry safely to reuse the same confirmation attempt.';
+      renderShell();
+    }
+  }
+
+  function renderLifecycleStatusSection(lifecycle, ws) {
+    const heading = el('h2', {
+      id: 'workspace-deletion-heading',
+      textContent: 'Workspace deletion',
+    });
+    const targetId = (lifecycle && lifecycle.workspace_id) || (ws && ws.id);
+
+    if (state.loadingLifecycle && (!lifecycle || !lifecycle.deletion)) {
+      return el(
+        'section',
+        {
+          id: 'workspace-deletion-section',
+          className: 'card card-danger stack-sm',
+          'aria-labelledby': 'workspace-deletion-heading',
+          'aria-live': 'polite',
+        },
+        [heading, el('p', { className: 'muted', textContent: 'Loading deletion status\u2026' })]
+      );
+    }
+
+    if (!lifecycle || !lifecycle.deletion) {
+      return el(
+        'section',
+        {
+          id: 'workspace-deletion-section',
+          className: 'card card-danger stack-md',
+          'aria-labelledby': 'workspace-deletion-heading',
+        },
+        [
+          heading,
+          el('div', { className: 'alert', role: 'alert' }, [
+            el('span', {
+              textContent:
+                state.lifecycleError || 'Workspace deletion is scheduled, but status details could not be loaded.',
+            }),
+            targetId
+              ? el('button', {
+                  type: 'button',
+                  className: 'btn btn-secondary btn-sm',
+                  onClick: () => loadWorkspaceLifecycle(targetId),
+                  textContent: 'Retry',
+                })
+              : null,
+          ]),
+        ]
+      );
+    }
+
+    const del = lifecycle.deletion;
+    const primaryStatus = formatPrimaryDeletionStatus(del.primary && del.primary.status);
+    const metaItems = [
+      el('div', { className: 'meta-item' }, [
+        el('dt', { textContent: 'Requested' }),
+        el('dd', { textContent: formatDateTime(del.requested_at) }),
+      ]),
+      el('div', { className: 'meta-item' }, [
+        el('dt', { textContent: 'Export until' }),
+        el('dd', { textContent: formatDateTime(del.export_until) }),
+      ]),
+      el('div', { className: 'meta-item' }, [
+        el('dt', { textContent: 'Primary purge due' }),
+        el('dd', { textContent: formatDateTime(del.primary.purge_at) }),
+      ]),
+    ];
+
+    if (del.primary.purge_committed_at) {
+      metaItems.push(
+        el('div', { className: 'meta-item' }, [
+          el('dt', { textContent: 'Tombstoned' }),
+          el('dd', { textContent: formatDateTime(del.primary.purge_committed_at) }),
+        ])
+      );
+    }
+    if (del.primary.purged_at) {
+      metaItems.push(
+        el('div', { className: 'meta-item' }, [
+          el('dt', { textContent: 'Purged' }),
+          el('dd', { textContent: formatDateTime(del.primary.purged_at) }),
+        ])
+      );
+    }
+
+    metaItems.push(
+      el('div', { className: 'meta-item' }, [
+        el('dt', { textContent: 'Backup policy cap' }),
+        el('dd', { textContent: formatDateTime(del.backups.cap_at) }),
+      ]),
+      el('div', { className: 'meta-item' }, [
+        el('dt', { textContent: 'Writes' }),
+        el('dd', { textContent: del.writes_allowed ? 'Allowed' : 'Refused' }),
+      ]),
+      el('div', { className: 'meta-item' }, [
+        el('dt', { textContent: 'Pull' }),
+        el('dd', { textContent: del.pull_allowed ? 'Allowed' : 'Unavailable' }),
+      ]),
+      el('div', { className: 'meta-item' }, [
+        el('dt', { textContent: 'Export' }),
+        el('dd', { textContent: del.export_allowed ? 'Available' : 'Unavailable' }),
+      ]),
+      el('div', { className: 'meta-item' }, [
+        el('dt', { textContent: 'Provider cancellation' }),
+        el('dd', { textContent: del.provider ? del.provider.status : 'none' }),
+      ]),
+      el('div', { className: 'meta-item meta-item-wide' }, [
+        el('dt', { textContent: 'Deletion request ID' }),
+        el('dd', { className: 'mono', textContent: del.request_id }),
+      ])
+    );
+
+    const children = [
+      el('div', { className: 'row-between' }, [
+        heading,
+        el('div', { className: 'badge-row' }, [
+          el('span', { className: primaryStatus.badgeClass, textContent: primaryStatus.label }),
+        ]),
+      ]),
+      el('p', { className: 'muted', textContent: primaryStatus.summary }),
+      state.lifecycleError
+        ? el('div', { className: 'alert', role: 'alert' }, [
+            el('span', { textContent: state.lifecycleError }),
+          ])
+        : null,
+      el('dl', { className: 'meta-list' }, metaItems),
+    ];
+
+    if (del.primary.last_error) {
+      children.push(
+        el('div', { className: 'alert', role: 'alert' }, [
+          el('span', { textContent: `Purge status note: ${del.primary.last_error}` }),
+        ])
+      );
+    }
+
+    if (del.backups && del.backups.reason) {
+      children.push(
+        el('p', {
+          className: 'muted',
+          textContent: `Backup status (${del.backups.status}): ${del.backups.reason}.`,
+        })
+      );
+    }
+
+    if (del.export_allowed && ws) {
+      children.push(
+        el('div', { className: 'btn-row' }, [
+          el('a', {
+            href: '#export-section',
+            className: 'btn btn-secondary btn-sm',
+            textContent: 'Go to export & offline recovery',
+          }),
+        ])
+      );
+    }
+
+    return el(
+      'section',
+      {
+        id: 'workspace-deletion-section',
+        className: 'card card-danger stack-md',
+        'aria-labelledby': 'workspace-deletion-heading',
+      },
+      children
+    );
+  }
+
+  function renderDeleteWorkspaceSection(ws) {
+    if (!ws || ws.role !== 'owner' || isDeletionScheduled(ws)) {
+      return null;
+    }
+
+    const heading = el('h2', {
+      id: 'delete-workspace-heading',
+      textContent: 'Delete workspace',
+    });
+    const hasFieldError = Boolean(state.deleteFieldError);
+
+    return el(
+      'section',
+      {
+        id: 'delete-workspace-section',
+        className: 'card card-danger stack-md',
+        'aria-labelledby': 'delete-workspace-heading',
+      },
+      [
+        heading,
+        el('p', {
+          className: 'muted',
+          textContent:
+            'Scheduling deletion immediately refuses all workspace writes, member changes, proposals, and billing mutations. Pull and Git bundle export remain available through a 30-day export window (with a 35-day backup policy cap). Once the primary purge tombstone is recorded after the window closes, deletion is irreversible and data can no longer be recovered.',
+        }),
+        el('p', { className: 'muted' }, [
+          'Before deleting, you can back up your accepted history in ',
+          el('a', {
+            href: '#export-section',
+            textContent: 'Export & offline recovery',
+          }),
+          '.',
+        ]),
+        state.deleteSubmitError
+          ? el('div', { className: 'alert', role: 'alert' }, [
+              el('span', { textContent: state.deleteSubmitError }),
+            ])
+          : null,
+        el(
+          'form',
+          {
+            className: 'stack-md',
+            noValidate: true,
+            onSubmit: (e) => handleDeleteWorkspace(e, ws),
+          },
+          [
+            el('div', { className: 'field' }, [
+              el('label', {
+                for: 'delete-confirm-name',
+                textContent: `Type workspace name "${ws.name}" to confirm deletion`,
+              }),
+              el('input', {
+                id: 'delete-confirm-name',
+                name: 'confirm_workspace_name',
+                type: 'text',
+                className: 'input',
+                autocomplete: 'off',
+                placeholder: ws.name,
+                value: state.deleteConfirmName,
+                disabled: state.deleteInFlight,
+                'aria-invalid': hasFieldError ? 'true' : null,
+                'aria-describedby': hasFieldError ? 'delete-confirm-name-error' : null,
+                onInput: (e) => {
+                  state.deleteConfirmName = e.target.value;
+                  state.deleteFieldError = null;
+                  state.deleteSubmitError = null;
+                },
+              }),
+              hasFieldError
+                ? el('p', {
+                    id: 'delete-confirm-name-error',
+                    className: 'field-error',
+                    role: 'alert',
+                    textContent: state.deleteFieldError,
+                  })
+                : null,
+            ]),
+            el('div', { className: 'btn-row' }, [
+              el('button', {
+                type: 'submit',
+                className: 'btn btn-danger',
+                disabled: state.deleteInFlight,
+                textContent: state.deleteInFlight ? 'Scheduling deletion\u2026' : 'Delete workspace',
+              }),
+            ]),
+          ]
+        ),
+      ]
+    );
   }
 
   function formatPlanStatus(status) {
@@ -680,7 +1172,7 @@
 
   async function handleCreateInvitation(e, ws) {
     e.preventDefault();
-    if (state.inviteInFlight || !state.me) return;
+    if (state.inviteInFlight || !state.me || isDeletionScheduled(ws)) return;
     const ctx = captureWorkspaceContext(ws.id);
     if (!isCurrentWorkspaceContext(ctx)) return;
 
@@ -721,10 +1213,13 @@
       const data = await resp.json().catch(() => null);
       if (!isCurrentWorkspaceContext(ctx)) return;
       if (!resp.ok) {
-        state.inviteSubmitError =
-          (data && data.error && data.error.message) ||
-          'Could not create the invitation. Please try again.';
+        state.inviteSubmitError = formatServerError(
+          data,
+          resp.status,
+          'Could not create the invitation. Please try again.'
+        );
         state.inviteInFlight = false;
+        handleDeletionScheduledConflict(ws.id, data);
         renderShell();
         return;
       }
@@ -750,6 +1245,7 @@
   function renderInviteControls(ws) {
     if (!canManageInvites(ws)) return null;
 
+    const locked = isDeletionScheduled(ws);
     const hasFieldError = Boolean(state.inviteFieldError);
     const roleOptions = ws.role === 'owner' ? ['member', 'admin'] : ['member'];
     const selectedRole = roleOptions.includes(state.inviteRole) ? state.inviteRole : 'member';
@@ -777,6 +1273,7 @@
               autocomplete: 'off',
               placeholder: 'teammate@example.com',
               value: state.inviteEmail,
+              disabled: locked || state.inviteInFlight,
               'aria-invalid': hasFieldError ? 'true' : null,
               'aria-describedby': hasFieldError ? 'invite-email-error' : null,
               onInput: (e) => {
@@ -802,6 +1299,7 @@
                 id: 'invite-role',
                 name: 'role',
                 className: 'input',
+                disabled: locked || state.inviteInFlight,
                 onChange: (e) => {
                   state.inviteRole = e.target.value;
                 },
@@ -820,7 +1318,7 @@
           el('button', {
             type: 'submit',
             className: 'btn btn-primary btn-sm',
-            disabled: state.inviteInFlight,
+            disabled: locked || state.inviteInFlight,
             textContent: state.inviteInFlight ? 'Sending…' : 'Send invite',
           }),
         ]),
@@ -930,7 +1428,7 @@
   }
 
   async function handleRemoveMember(ws, m) {
-    if (state.removingMemberId || !state.me) return;
+    if (state.removingMemberId || !state.me || isDeletionScheduled(ws)) return;
     const ctx = captureWorkspaceContext(ws.id);
     if (!isCurrentWorkspaceContext(ctx)) return;
     state.removingMemberId = m.user_id;
@@ -957,9 +1455,12 @@
         const data = await resp.json().catch(() => null);
         if (!isCurrentWorkspaceContext(ctx)) return;
         state.removingMemberId = null;
-        state.memberActionError =
-          (data && data.error && data.error.message) ||
-          'Could not remove this member. Please try again.';
+        state.memberActionError = formatServerError(
+          data,
+          resp.status,
+          'Could not remove this member. Please try again.'
+        );
+        handleDeletionScheduledConflict(ws.id, data);
         renderShell();
         return;
       }
@@ -1012,6 +1513,7 @@
       ]);
     }
 
+    const locked = isDeletionScheduled(ws);
     const members = state.members || [];
     return el('section', { className: 'card stack-md', 'aria-labelledby': 'members-heading' }, [
       heading,
@@ -1050,7 +1552,7 @@
                 ? el('button', {
                     type: 'button',
                     className: 'btn btn-danger btn-sm',
-                    disabled: Boolean(state.removingMemberId),
+                    disabled: locked || Boolean(state.removingMemberId),
                     'aria-label': isSelf ? 'Leave workspace' : `Remove ${m.email}`,
                     onClick: () => handleRemoveMember(ws, m),
                     textContent: busy
@@ -1156,7 +1658,7 @@
   }
 
   async function handleRejectProposal(ws, proposal) {
-    if (state.rejectingProposalId || !state.me) return;
+    if (state.rejectingProposalId || !state.me || isDeletionScheduled(ws)) return;
     const ctx = captureWorkspaceContext(ws.id);
     if (!isCurrentWorkspaceContext(ctx)) return;
     state.rejectingProposalId = proposal.id;
@@ -1185,9 +1687,12 @@
       if (!isCurrentWorkspaceContext(ctx)) return;
       if (!resp.ok) {
         state.rejectingProposalId = null;
-        state.proposalActionError =
-          (data && data.error && data.error.message) ||
-          'Could not reject this proposal. Please try again.';
+        state.proposalActionError = formatServerError(
+          data,
+          resp.status,
+          'Could not reject this proposal. Please try again.'
+        );
+        handleDeletionScheduledConflict(ws.id, data);
         renderShell();
         return;
       }
@@ -1206,6 +1711,7 @@
   }
 
   function selectRestoreTarget(rev) {
+    if (isDeletionScheduled(state.activeWorkspace)) return;
     state.restoreTargetRev = rev;
     state.restoreFieldError = null;
     state.restoreSubmitError = null;
@@ -1219,7 +1725,7 @@
 
   async function handleCreateRestoreProposal(e, ws) {
     e.preventDefault();
-    if (state.restoreInFlight || !state.me) return;
+    if (state.restoreInFlight || !state.me || isDeletionScheduled(ws)) return;
     const ctx = captureWorkspaceContext(ws.id);
     if (!isCurrentWorkspaceContext(ctx)) return;
     const revisions = state.revisions || [];
@@ -1280,9 +1786,12 @@
       if (!isCurrentWorkspaceContext(ctx)) return;
       if (!resp.ok) {
         state.restoreInFlight = false;
-        state.restoreSubmitError =
-          (data && data.error && data.error.message) ||
-          'Could not create restore proposal. Please try again.';
+        state.restoreSubmitError = formatServerError(
+          data,
+          resp.status,
+          'Could not create restore proposal. Please try again.'
+        );
+        handleDeletionScheduledConflict(ws.id, data);
         renderShell();
         return;
       }
@@ -1305,6 +1814,7 @@
     const revisions = state.revisions || [];
     if (!canReviewProposals(ws) || revisions.length === 0) return null;
 
+    const locked = isDeletionScheduled(ws);
     const selectedRev =
       revisions.some((r) => r.revision === state.restoreTargetRev)
         ? state.restoreTargetRev
@@ -1344,6 +1854,7 @@
             {
               id: 'restore-target',
               className: 'input mono',
+              disabled: locked || state.restoreInFlight,
               onChange: (e) => {
                 state.restoreTargetRev = e.target.value;
               },
@@ -1366,6 +1877,7 @@
             autocomplete: 'off',
             placeholder: 'settings.toml, vault/default.age',
             value: state.restorePathsText,
+            disabled: locked || state.restoreInFlight,
             'aria-invalid': hasFieldError ? 'true' : null,
             'aria-describedby': hasFieldError ? 'restore-paths-error' : null,
             onInput: (e) => {
@@ -1387,7 +1899,7 @@
           el('button', {
             type: 'submit',
             className: 'btn btn-primary btn-sm',
-            disabled: state.restoreInFlight,
+            disabled: locked || state.restoreInFlight,
             textContent: state.restoreInFlight
               ? 'Creating proposal…'
               : 'Create restore proposal',
@@ -1441,6 +1953,7 @@
     }
 
     const reviewer = canReviewProposals(ws);
+    const locked = isDeletionScheduled(ws);
 
     return el('section', { className: 'card stack-md', 'aria-labelledby': 'proposals-heading' }, [
       heading,
@@ -1527,7 +2040,7 @@
           }
 
           const actions = [];
-          if (p.revision) {
+          if (p.revision && isExportAllowed(ws)) {
             actions.push(
               el('a', {
                 href: `/v1/workspaces/${encodeURIComponent(ws.id)}/proposals/${encodeURIComponent(p.id)}/bundle`,
@@ -1543,7 +2056,7 @@
               el('button', {
                 type: 'button',
                 className: 'btn btn-danger btn-sm',
-                disabled: Boolean(state.rejectingProposalId),
+                disabled: locked || Boolean(state.rejectingProposalId),
                 onClick: () => handleRejectProposal(ws, p),
                 textContent: busy ? 'Rejecting…' : 'Reject proposal',
               })
@@ -1805,7 +2318,7 @@
 
   async function handleStartCheckout(e, wsId) {
     e.preventDefault();
-    if (state.checkoutInFlight || !state.me) return;
+    if (state.checkoutInFlight || !state.me || isDeletionScheduled(state.activeWorkspace)) return;
     const ctx = captureWorkspaceContext(wsId);
     if (!isCurrentWorkspaceContext(ctx)) return;
 
@@ -1848,10 +2361,13 @@
       const data = await resp.json().catch(() => null);
       if (!isCurrentWorkspaceContext(ctx)) return;
       if (!resp.ok) {
-        state.billingActionError =
-          (data && data.error && data.error.message) ||
-          'Could not create a checkout session. Please try again.';
+        state.billingActionError = formatServerError(
+          data,
+          resp.status,
+          'Could not create a checkout session. Please try again.'
+        );
         state.checkoutInFlight = false;
+        handleDeletionScheduledConflict(wsId, data);
         renderShell();
         return;
       }
@@ -1899,9 +2415,11 @@
       const data = await resp.json().catch(() => null);
       if (!isCurrentWorkspaceContext(ctx)) return;
       if (!resp.ok) {
-        state.billingActionError =
-          (data && data.error && data.error.message) ||
-          'Could not open the billing portal. Please try again.';
+        state.billingActionError = formatServerError(
+          data,
+          resp.status,
+          'Could not open the billing portal. Please try again.'
+        );
         state.portalInFlight = false;
         renderShell();
         return;
@@ -1920,7 +2438,7 @@
 
   function handleReviewPlanChange(e, b) {
     e.preventDefault();
-    if (state.updatePlanInFlight) return;
+    if (state.updatePlanInFlight || isDeletionScheduled(state.activeWorkspace)) return;
     const plan = state.updatePlanChoice === 'team' ? 'team' : 'personal';
     let seats = 1;
     if (plan === 'team') {
@@ -1949,7 +2467,14 @@
   }
 
   async function handleConfirmPlanChange(wsId) {
-    if (!state.confirmingPlanChange || state.updatePlanInFlight || !state.me) return;
+    if (
+      !state.confirmingPlanChange ||
+      state.updatePlanInFlight ||
+      !state.me ||
+      isDeletionScheduled(state.activeWorkspace)
+    ) {
+      return;
+    }
     const ctx = captureWorkspaceContext(wsId);
     if (!isCurrentWorkspaceContext(ctx)) return;
     const { plan, seats } = state.confirmingPlanChange;
@@ -1975,10 +2500,13 @@
       if (!resp.ok) {
         const data = await resp.json().catch(() => null);
         if (!isCurrentWorkspaceContext(ctx)) return;
-        state.billingActionError =
-          (data && data.error && data.error.message) ||
-          'Could not update the subscription plan. Please try again.';
+        state.billingActionError = formatServerError(
+          data,
+          resp.status,
+          'Could not update the subscription plan. Please try again.'
+        );
         state.updatePlanInFlight = false;
+        handleDeletionScheduledConflict(wsId, data);
         renderShell();
         return;
       }
@@ -1996,7 +2524,14 @@
   }
 
   async function handleConfirmCancel(wsId) {
-    if (!state.confirmingCancel || state.cancelInFlight || !state.me) return;
+    if (
+      !state.confirmingCancel ||
+      state.cancelInFlight ||
+      !state.me ||
+      isDeletionScheduled(state.activeWorkspace)
+    ) {
+      return;
+    }
     const ctx = captureWorkspaceContext(wsId);
     if (!isCurrentWorkspaceContext(ctx)) return;
     state.cancelInFlight = true;
@@ -2021,10 +2556,13 @@
       if (!resp.ok) {
         const data = await resp.json().catch(() => null);
         if (!isCurrentWorkspaceContext(ctx)) return;
-        state.billingActionError =
-          (data && data.error && data.error.message) ||
-          'Could not cancel the subscription. Please try again.';
+        state.billingActionError = formatServerError(
+          data,
+          resp.status,
+          'Could not cancel the subscription. Please try again.'
+        );
         state.cancelInFlight = false;
+        handleDeletionScheduledConflict(wsId, data);
         renderShell();
         return;
       }
@@ -2180,6 +2718,8 @@
       );
     }
 
+    const locked = isDeletionScheduled(ws);
+
     if (!b.billing_configured) {
       children.push(
         el('p', {
@@ -2198,6 +2738,7 @@
               id: 'billing-checkout-plan',
               className: 'input',
               value: state.checkoutPlan,
+              disabled: locked || state.checkoutInFlight,
               onChange: (ev) => {
                 state.checkoutPlan = ev.target.value;
                 state.checkoutFieldError = null;
@@ -2231,6 +2772,7 @@
               min: '1',
               step: '1',
               value: state.checkoutSeats,
+              disabled: locked || state.checkoutInFlight,
               'aria-invalid': state.checkoutFieldError ? 'true' : null,
               'aria-describedby': state.checkoutFieldError ? 'billing-checkout-seats-err' : null,
               onInput: (ev) => {
@@ -2266,7 +2808,7 @@
             el('button', {
               type: 'submit',
               className: 'btn btn-primary',
-              disabled: state.checkoutInFlight,
+              disabled: locked || state.checkoutInFlight,
               textContent: state.checkoutInFlight ? 'Starting checkout…' : 'Continue to checkout',
             }),
           ]),
@@ -2304,6 +2846,7 @@
               id: 'billing-update-plan',
               className: 'input',
               value: state.updatePlanChoice,
+              disabled: locked || state.updatePlanInFlight,
               onChange: (ev) => {
                 state.updatePlanChoice = ev.target.value;
                 state.updatePlanFieldError = null;
@@ -2338,6 +2881,7 @@
               min: '1',
               step: '1',
               value: state.updateSeats,
+              disabled: locked || state.updatePlanInFlight,
               'aria-invalid': state.updatePlanFieldError ? 'true' : null,
               'aria-describedby': state.updatePlanFieldError ? 'billing-update-seats-err' : null,
               onInput: (ev) => {
@@ -2393,7 +2937,7 @@
           el('button', {
             type: 'submit',
             className: 'btn btn-secondary',
-            disabled: state.updatePlanInFlight,
+            disabled: locked || state.updatePlanInFlight,
             textContent: 'Review plan change',
           }),
         ])
@@ -2421,7 +2965,7 @@
                 el('button', {
                   type: 'button',
                   className: 'btn btn-primary',
-                  disabled: state.updatePlanInFlight,
+                  disabled: locked || state.updatePlanInFlight,
                   onClick: () => handleConfirmPlanChange(ws.id),
                   textContent: state.updatePlanInFlight ? 'Updating plan…' : 'Confirm plan change',
                 }),
@@ -2467,7 +3011,7 @@
                 el('button', {
                   type: 'button',
                   className: 'btn btn-danger',
-                  disabled: state.cancelInFlight,
+                  disabled: locked || state.cancelInFlight,
                   onClick: () => handleConfirmCancel(ws.id),
                   textContent: state.cancelInFlight ? 'Canceling…' : 'Confirm cancellation',
                 }),
@@ -2491,6 +3035,7 @@
             el('button', {
               type: 'button',
               className: 'btn btn-danger',
+              disabled: locked,
               onClick: () => {
                 state.confirmingCancel = true;
                 state.billingActionError = null;
@@ -2529,10 +3074,27 @@
         'Download the full accepted Git history as a portable bundle. Available to any workspace member with no Cloud subscription required.',
     });
 
+    if (!isExportAllowed(ws)) {
+      return el(
+        'section',
+        { id: 'export-section', className: 'card stack-sm', 'aria-labelledby': 'export-heading' },
+        [
+          heading,
+          note,
+          el('p', {
+            className: 'muted',
+            textContent:
+              'Export is no longer available because this workspace has reached the irreversible purge stage.',
+          }),
+        ]
+      );
+    }
+
     if (state.loadingRevisions) {
       return el(
         'section',
         {
+          id: 'export-section',
           className: 'card stack-sm',
           'aria-labelledby': 'export-heading',
           'aria-live': 'polite',
@@ -2548,7 +3110,7 @@
     if (state.revisionsError) {
       return el(
         'section',
-        { className: 'card stack-md', 'aria-labelledby': 'export-heading' },
+        { id: 'export-section', className: 'card stack-md', 'aria-labelledby': 'export-heading' },
         [
           heading,
           note,
@@ -2564,7 +3126,7 @@
     if (revisions.length === 0) {
       return el(
         'section',
-        { className: 'card stack-sm', 'aria-labelledby': 'export-heading' },
+        { id: 'export-section', className: 'card stack-sm', 'aria-labelledby': 'export-heading' },
         [
           heading,
           note,
@@ -2584,7 +3146,7 @@
 
     return el(
       'section',
-      { className: 'card stack-md', 'aria-labelledby': 'export-heading' },
+      { id: 'export-section', className: 'card stack-md', 'aria-labelledby': 'export-heading' },
       [
         heading,
         note,
@@ -2708,6 +3270,7 @@
                   ? el('button', {
                       type: 'button',
                       className: 'btn btn-secondary btn-sm',
+                      disabled: isDeletionScheduled(ws),
                       onClick: () => selectRestoreTarget(rev.revision),
                       textContent: 'Propose restore',
                     })
@@ -2913,6 +3476,11 @@
       state.workspaces = [...(state.workspaces || []).filter((w) => w.id !== data.id), data];
       resetWorkspaceState();
       state.activeWorkspace = data;
+      state.lifecycle = {
+        workspace_id: data.id,
+        state: data.lifecycle_state || 'active',
+        deletion: null,
+      };
       state.devices = [];
       state.invitations = [];
       state.revisions = [];
@@ -3166,9 +3734,42 @@
       ]);
     }
 
+    if (state.lifecycleOnlyView && state.lifecycle) {
+      return el('div', { className: 'stack-lg' }, [
+        el('div', {}, [
+          el('a', {
+            href: '/',
+            className: 'btn btn-secondary btn-sm',
+            onClick: (e) => {
+              e.preventDefault();
+              navigateToList();
+            },
+            textContent: 'All workspaces',
+          }),
+        ]),
+        el('section', { className: 'card stack-md' }, [
+          el('h1', { textContent: 'Workspace deletion status' }),
+          el('dl', { className: 'meta-list' }, [
+            el('div', { className: 'meta-item meta-item-wide' }, [
+              el('dt', { textContent: 'Workspace ID' }),
+              el('dd', { className: 'mono', textContent: state.lifecycle.workspace_id }),
+            ]),
+          ]),
+        ]),
+        renderLifecycleStatusSection(state.lifecycle, null),
+      ]);
+    }
+
     if (state.activeWorkspace) {
       const ws = state.activeWorkspace;
       const plan = formatPlanStatus(ws.plan_status);
+      const deletionScheduled = isDeletionScheduled(ws);
+      const headerBadges = [el('span', { className: plan.badgeClass, textContent: plan.label })];
+      if (deletionScheduled) {
+        headerBadges.push(
+          el('span', { className: 'badge badge-danger', textContent: 'Deletion scheduled' })
+        );
+      }
       return el('div', { className: 'stack-lg' }, [
         el('div', {}, [
           el('a', {
@@ -3184,7 +3785,7 @@
         el('section', { className: 'card stack-md' }, [
           el('div', { className: 'row-between' }, [
             el('h1', { textContent: ws.name }),
-            el('span', { className: plan.badgeClass, textContent: plan.label }),
+            el('div', { className: 'badge-row' }, headerBadges),
           ]),
           el('dl', { className: 'meta-list' }, [
             el('div', { className: 'meta-item' }, [
@@ -3209,12 +3810,14 @@
             ]),
           ]),
         ]),
+        deletionScheduled ? renderLifecycleStatusSection(state.lifecycle, ws) : null,
         renderMachinesSection(ws),
         renderHistorySection(ws),
         renderProposalsSection(ws),
         renderExportSection(ws),
         renderMembersSection(ws),
         renderBillingSection(ws),
+        !deletionScheduled ? renderDeleteWorkspaceSection(ws) : null,
       ]);
     }
 
@@ -3263,6 +3866,12 @@
           { className: 'workspace-grid' },
           list.map((w) => {
             const plan = formatPlanStatus(w.plan_status);
+            const badges = [el('span', { className: plan.badgeClass, textContent: plan.label })];
+            if (w.lifecycle_state === 'deletion_scheduled') {
+              badges.push(
+                el('span', { className: 'badge badge-danger', textContent: 'Deletion scheduled' })
+              );
+            }
             return el(
               'a',
               {
@@ -3276,7 +3885,7 @@
               [
                 el('div', { className: 'row-between' }, [
                   el('h2', { textContent: w.name }),
-                  el('span', { className: plan.badgeClass, textContent: plan.label }),
+                  el('div', { className: 'badge-row' }, badges),
                 ]),
                 el('div', { className: 'row-between muted' }, [
                   el('span', { textContent: `Role: ${w.role}` }),
@@ -3409,6 +4018,26 @@
         return;
       }
       if (resp.status === 404) {
+        const lcResp = await fetch(`/v1/workspaces/${encodeURIComponent(id)}/lifecycle`, {
+          headers: { Accept: 'application/json' },
+          credentials: 'same-origin',
+        });
+        if (!isCurrentWorkspaceContext(ctx, false)) return;
+        if (lcResp.status === 401) {
+          expireSession();
+          return;
+        }
+        if (lcResp.ok) {
+          const lc = await lcResp.json().catch(() => null);
+          if (!isCurrentWorkspaceContext(ctx, false)) return;
+          if (lc && lc.state === 'deletion_scheduled') {
+            state.lifecycle = lc;
+            state.lifecycleOnlyView = true;
+            state.loadingDetail = false;
+            renderShell();
+            return;
+          }
+        }
         state.loadingDetail = false;
         state.detailError = {
           title: 'Workspace not found',
@@ -3426,7 +4055,14 @@
       state.activeWorkspace = ws;
       state.loadingDetail = false;
       renderShell();
-      const loaders = [loadWorkspaceDevices(id), loadWorkspaceMembers(id), loadWorkspaceRevisions(id), loadWorkspaceProposals(id), loadWorkspaceBilling(id)];
+      const loaders = [
+        loadWorkspaceLifecycle(id),
+        loadWorkspaceDevices(id),
+        loadWorkspaceMembers(id),
+        loadWorkspaceRevisions(id),
+        loadWorkspaceProposals(id),
+        loadWorkspaceBilling(id),
+      ];
       if (canManageInvites(state.activeWorkspace)) {
         loaders.push(loadWorkspaceInvitations(id));
       }
