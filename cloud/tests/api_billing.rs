@@ -6,7 +6,7 @@ use muster_cloud::protocol::{
 };
 use support::fleet::{account_token, create_workspace, link, FleetRepo, MachineKey};
 use support::paddle_fixture::{
-    start as start_paddle, CreateFailure, PaddleFixture, SubscriptionEvent, PRICE_PERSONAL,
+    start as start_paddle, CreateFailure, PaddleFixture, SubscriptionEvent, API_KEY, PRICE_PERSONAL,
 };
 use support::{http, stack_with_paddle, Stack, UserSession};
 
@@ -1815,4 +1815,621 @@ async fn an_unverifiable_checkout_link_is_not_offered_indefinitely() {
         assert_eq!(checkout(&s, &alice, &ws.id, "personal", 1).await, txn);
     }
     assert_eq!(paddle.calls("create_transaction"), 1);
+}
+
+/// Prices the operator rotates to after the workspace's checkout was paid.
+fn rotated_prices() -> [(&'static str, String); 2] {
+    [
+        (
+            "MUSTER_PADDLE_PRICE_PERSONAL",
+            "pri_01h8vzp8f4kek3yd4g1rotatp".into(),
+        ),
+        (
+            "MUSTER_PADDLE_PRICE_TEAM_SEAT",
+            "pri_01h8vzp8f4kek3yd4g1rotatt".into(),
+        ),
+    ]
+}
+
+/// The customer pays a `plan` checkout of `ws_id` (subscription `sub_id`,
+/// customer `customer`) while Paddle cannot be read, so the payment is only
+/// queued. Returns the checkout's transaction. The caller rotates the prices
+/// and then lets Paddle answer again (`fail_next_gets(0)`).
+#[allow(clippy::too_many_arguments)]
+async fn pay_while_paddle_unreadable(
+    s: &Stack,
+    paddle: &PaddleFixture,
+    u: &UserSession,
+    ws_id: &str,
+    plan: &str,
+    seats: u32,
+    sub_id: &str,
+    customer: &str,
+) -> String {
+    let txn = checkout(s, u, ws_id, plan, seats).await;
+    let created = paddle.complete_checkout(&txn, sub_id, customer);
+    paddle.fail_next_gets(usize::MAX);
+    assert_eq!(post_webhook(s, paddle, &created).await, 200);
+    assert_ne!(
+        billing_of(s, u, ws_id).await.plan_status,
+        PlanStatus::Active
+    );
+    txn
+}
+
+/// The paid checkout of `ws_id` was settled without granting anything: a
+/// new checkout is offered again and the workspace is still on its trial.
+async fn refused_and_offered_again(s: &Stack, u: &UserSession, ws_id: &str, case: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let (status, _) = session_post(
+            s,
+            u,
+            &format!("/v1/workspaces/{ws_id}/billing/checkout"),
+            &CreateCheckout {
+                plan: "personal".into(),
+                seats: 1,
+            },
+        )
+        .await;
+        if status == 200 {
+            break;
+        }
+        assert_eq!(status, 409, "{case}");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{case}: the paid checkout was never settled"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    let billing = billing_of(s, u, ws_id).await;
+    assert_eq!(billing.plan, "trial", "{case}");
+    assert_eq!(billing.plan_status, PlanStatus::Trialing, "{case}");
+}
+
+/// The operator rotates the configured prices between the customer's
+/// payment and its reconciliation. The subscription Paddle created from this
+/// workspace's own checkout is still granted (plan from that checkout, seats
+/// from Paddle), so no second checkout is offered and nobody pays twice.
+#[tokio::test]
+async fn a_subscription_from_the_workspace_checkout_is_granted_after_a_price_rotation() {
+    let paddle = start_paddle().await;
+    let mut s = stack_with_paddle(&paddle).await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let ws = create_workspace(&s, &alice, "Rotated WS").await;
+
+    let sub_id = "sub_01h8vzp8f4kek3yd4g1rotate1";
+    let customer = "ctm_01h8vzp8f4kek3yd4g1rotate1";
+    pay_while_paddle_unreadable(&s, &paddle, &alice, &ws.id, "team", 3, sub_id, customer).await;
+    // The prices change before the reconciliation runs.
+    s.restart_with_env(&rotated_prices()).await;
+    paddle.fail_next_gets(0);
+
+    let billing = billing_when(&s, &alice, &ws.id, "team plan active, 3 seats", |b| {
+        b.plan == "team" && b.plan_status == PlanStatus::Active
+    })
+    .await;
+    assert_eq!(billing.seats, 3);
+    assert!(billing.can_push);
+    for (plan, seats) in [("team", 3), ("personal", 1)] {
+        checkout_refused_as_paid(&s, &alice, &ws.id, plan, seats).await;
+    }
+    assert_eq!(paddle.calls("create_transaction"), 1);
+    assert!(paddle.payable_transactions().is_empty());
+    // The paid subscription is left as the customer bought it.
+    assert_eq!(paddle.calls("cancel"), 0);
+    assert_eq!(paddle.calls("update"), 0);
+    assert_eq!(paddle.subscription(sub_id).unwrap()["status"], "active");
+}
+
+/// After a price rotation, a subscription is granted only when Paddle's
+/// checkout transaction proves it is this workspace's. Each workspace here
+/// has no customer bound yet, so only that proof decides: a transaction
+/// that created another subscription, that another customer (or no
+/// customer) paid, or a subscription without the checkout's price grants
+/// nothing, and the workspace may check out again.
+#[tokio::test]
+async fn a_subscription_the_checkout_transaction_does_not_prove_is_refused_after_a_price_rotation()
+{
+    let paddle = start_paddle().await;
+    let mut s = stack_with_paddle(&paddle).await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+
+    type Tamper = fn(&PaddleFixture, &str, &str);
+    let cases: [(&str, Tamper); 4] = [
+        ("transaction names another subscription", |p, txn, _| {
+            p.edit_transaction(txn, |t| {
+                t["subscription_id"] = "sub_01h8vzp8f4kek3yd4g1another".into()
+            })
+        }),
+        ("no item carries the checkout's price", |p, _, sub| {
+            p.update_subscription(sub, "subscription.updated", |sub| {
+                sub["items"][0]["price"]["id"] = "pri_01h8vzp8f4kek3yd4g1unknwn".into();
+            });
+        }),
+        ("transaction paid by another customer", |p, txn, _| {
+            p.edit_transaction(txn, |t| {
+                t["customer_id"] = "ctm_01h8vzp8f4kek3yd4g1another".into()
+            })
+        }),
+        ("transaction without a customer", |p, txn, _| {
+            p.edit_transaction(txn, |t| t["customer_id"] = serde_json::Value::Null)
+        }),
+    ];
+    let mut paid = Vec::new();
+    for (n, (case, _)) in cases.iter().enumerate() {
+        let ws = create_workspace(&s, &alice, &format!("Unproven WS {n}")).await;
+        let sub_id = format!("sub_01h8vzp8f4kek3yd4g1unprv{n}");
+        let customer = format!("ctm_01h8vzp8f4kek3yd4g1unprv{n}");
+        let txn =
+            pay_while_paddle_unreadable(&s, &paddle, &alice, &ws.id, "team", 2, &sub_id, &customer)
+                .await;
+        paid.push((*case, ws, txn, sub_id));
+    }
+    s.restart_with_env(&rotated_prices()).await;
+    for ((_, tamper), (_, _, txn, sub_id)) in cases.iter().zip(&paid) {
+        tamper(&paddle, txn, sub_id);
+    }
+    paddle.fail_next_gets(0);
+
+    for (case, ws, _, sub_id) in &paid {
+        refused_and_offered_again(&s, &alice, &ws.id, case).await;
+        assert_ne!(
+            paddle.subscription(sub_id).unwrap()["status"],
+            "canceled",
+            "{case}"
+        );
+    }
+    // Refused subscriptions are never changed at Paddle.
+    assert_eq!(paddle.calls("cancel"), 0);
+    assert_eq!(paddle.calls("update"), 0);
+}
+
+/// Paddle cannot find the checkout transaction (`404`) when a subscription
+/// with a rotated price is reconciled: nothing is granted yet, but the
+/// payment is not dropped either. No second checkout is offered, the
+/// reconciliation keeps retrying, and once the transaction can be read the
+/// subscription is granted.
+#[tokio::test]
+async fn an_unreadable_checkout_transaction_keeps_the_payment_pending_after_a_price_rotation() {
+    let paddle = start_paddle().await;
+    let mut s = stack_with_paddle(&paddle).await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let ws = create_workspace(&s, &alice, "Unreadable txn WS").await;
+
+    let sub_id = "sub_01h8vzp8f4kek3yd4g1txn4041";
+    let customer = "ctm_01h8vzp8f4kek3yd4g1txn4041";
+    let txn =
+        pay_while_paddle_unreadable(&s, &paddle, &alice, &ws.id, "team", 4, sub_id, customer).await;
+    s.restart_with_env(&rotated_prices()).await;
+    let entity = paddle.forget_transaction(&txn);
+    let reads = paddle.calls("get_transaction");
+    paddle.fail_next_gets(0);
+
+    // Retried, not settled: still no second checkout.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while paddle.calls("get_transaction") < reads + 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the reconciliation was not retried"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    checkout_refused_as_paid(&s, &alice, &ws.id, "personal", 1).await;
+    assert_eq!(billing_of(&s, &alice, &ws.id).await.plan, "trial");
+    assert_eq!(paddle.calls("create_transaction"), 1);
+
+    // Readable again: the next checkout request (still refused: the
+    // checkout is paid, not settled) reconciles it at once instead of
+    // waiting for the retry's backoff.
+    paddle.restore_transaction(&txn, entity);
+    checkout_refused_as_paid(&s, &alice, &ws.id, "personal", 1).await;
+    let billing = billing_when(&s, &alice, &ws.id, "team plan active, 4 seats", |b| {
+        b.plan == "team" && b.plan_status == PlanStatus::Active
+    })
+    .await;
+    assert_eq!(billing.seats, 4);
+}
+
+/// A subscription granted after a price rotation keeps following Paddle
+/// without proving its origin again: its cancellation and seat change are
+/// applied even when its checkout transaction can no longer be read.
+#[tokio::test]
+async fn a_subscription_granted_after_a_price_rotation_follows_paddle_without_its_checkout() {
+    let paddle = start_paddle().await;
+    let mut s = stack_with_paddle(&paddle).await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let ws = create_workspace(&s, &alice, "Rotated cancel WS").await;
+
+    let sub_id = "sub_01h8vzp8f4kek3yd4g1rotcnl1";
+    let customer = "ctm_01h8vzp8f4kek3yd4g1rotcnl1";
+    let txn =
+        pay_while_paddle_unreadable(&s, &paddle, &alice, &ws.id, "team", 3, sub_id, customer).await;
+    s.restart_with_env(&rotated_prices()).await;
+    paddle.fail_next_gets(0);
+    billing_when(&s, &alice, &ws.id, "team plan active", |b| {
+        b.plan == "team" && b.plan_status == PlanStatus::Active
+    })
+    .await;
+
+    paddle.forget_transaction(&txn);
+    let canceled = paddle.update_subscription(sub_id, "subscription.canceled", |sub| {
+        sub["status"] = "canceled".into();
+        sub["canceled_at"] = support::paddle_fixture::now_rfc3339().into();
+        sub["items"][0]["quantity"] = 5.into();
+    });
+    assert_eq!(post_webhook(&s, &paddle, &canceled).await, 200);
+    let billing = billing_when(&s, &alice, &ws.id, "canceled team plan, 5 seats", |b| {
+        b.plan_status == PlanStatus::Canceled && b.seats == 5
+    })
+    .await;
+    assert_eq!(billing.plan, "team");
+    assert!(!billing.can_push);
+}
+
+/// A workspace already bound to a Paddle customer is not granted a
+/// subscription another customer paid through its checkout, even after a
+/// price rotation; the subscription is left alone at Paddle.
+#[tokio::test]
+async fn a_subscription_paid_by_a_customer_other_than_the_bound_one_is_refused_after_a_price_rotation(
+) {
+    let paddle = start_paddle().await;
+    let mut s = stack_with_paddle(&paddle).await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let ws = create_workspace(&s, &alice, "Rotated bound WS").await;
+
+    let own = "sub_01h8vzp8f4kek3yd4g1rotown1";
+    let txn1 = checkout(&s, &alice, &ws.id, "personal", 1).await;
+    let first = paddle.complete_checkout(&txn1, own, "ctm_01h8vzp8f4kek3yd4g1rotownA");
+    assert_eq!(post_webhook(&s, &paddle, &first).await, 200);
+    let canceled = paddle.update_subscription(own, "subscription.canceled", |sub| {
+        sub["status"] = "canceled".into();
+    });
+    assert_eq!(post_webhook(&s, &paddle, &canceled).await, 200);
+    billing_when(&s, &alice, &ws.id, "canceled", |b| {
+        b.plan_status == PlanStatus::Canceled
+    })
+    .await;
+
+    // Someone else pays a checkout of this workspace with their own
+    // customer; the prices rotate before it is reconciled.
+    let foreign = "sub_01h8vzp8f4kek3yd4g1rotfor1";
+    let other = "ctm_01h8vzp8f4kek3yd4g1rotothB";
+    pay_while_paddle_unreadable(&s, &paddle, &alice, &ws.id, "team", 10, foreign, other).await;
+    s.restart_with_env(&rotated_prices()).await;
+    let gets = paddle.calls("get_subscription");
+    paddle.fail_next_gets(0);
+
+    // The reconciliation runs (Paddle is read again) and grants nothing.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while paddle.calls("get_subscription") == gets {
+        assert!(std::time::Instant::now() < deadline, "never reconciled");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let billing = billing_of(&s, &alice, &ws.id).await;
+    assert_eq!(billing.plan_status, PlanStatus::Canceled);
+    assert_eq!(billing.plan, "personal");
+    assert!(!billing.can_push);
+    // Never canceled or changed by this service: it is not provably ours.
+    assert_eq!(paddle.calls("cancel"), 0);
+    assert_eq!(paddle.calls("update"), 0);
+    assert_eq!(paddle.subscription(foreign).unwrap()["status"], "active");
+}
+
+/// A subscription granted after a price rotation that Paddle later moves to
+/// another price that is not configured either: the plan and seats stored
+/// for it are kept (never guessed from an item of unknown price), while its
+/// other changes still apply.
+#[tokio::test]
+async fn a_granted_subscription_moved_to_an_unknown_price_keeps_its_stored_seats() {
+    let paddle = start_paddle().await;
+    let mut s = stack_with_paddle(&paddle).await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let ws = create_workspace(&s, &alice, "Moved price WS").await;
+
+    let sub_id = "sub_01h8vzp8f4kek3yd4g1movedp1";
+    let customer = "ctm_01h8vzp8f4kek3yd4g1movedp1";
+    pay_while_paddle_unreadable(&s, &paddle, &alice, &ws.id, "team", 3, sub_id, customer).await;
+    s.restart_with_env(&rotated_prices()).await;
+    paddle.fail_next_gets(0);
+    billing_when(&s, &alice, &ws.id, "team plan active, 3 seats", |b| {
+        b.plan == "team" && b.seats == 3 && b.plan_status == PlanStatus::Active
+    })
+    .await;
+
+    let moved = paddle.update_subscription(sub_id, "subscription.updated", |sub| {
+        sub["items"] = serde_json::json!([{
+            "status": "active",
+            "quantity": 7,
+            "price": { "id": "pri_01h8vzp8f4kek3yd4g1elsewh" }
+        }]);
+        sub["scheduled_change"] = serde_json::json!({
+            "action": "cancel",
+            "effective_at": sub["current_billing_period"]["ends_at"].clone(),
+            "resume_at": null
+        });
+    });
+    assert_eq!(post_webhook(&s, &paddle, &moved).await, 200);
+    let billing = billing_when(&s, &alice, &ws.id, "cancel at period end", |b| {
+        b.cancel_at_period_end
+    })
+    .await;
+    assert_eq!(billing.plan, "team");
+    assert_eq!(billing.seats, 3);
+}
+
+fn with_env(
+    env: &[(&'static str, String)],
+    name: &'static str,
+    value: String,
+) -> Vec<(&'static str, String)> {
+    let mut env: Vec<(&'static str, String)> =
+        env.iter().filter(|(k, _)| *k != name).cloned().collect();
+    env.push((name, value));
+    env
+}
+
+/// The development setting that makes the Paddle key check repeat quickly.
+fn fast_key_check() -> (&'static str, String) {
+    ("MUSTER_DEV_PADDLE_KEY_CHECK_SECS", "1".into())
+}
+
+/// Polls `GET /billing` for up to `secs` seconds until `done` holds.
+async fn billing_within(
+    s: &Stack,
+    u: &UserSession,
+    ws_id: &str,
+    what: &str,
+    secs: u64,
+    done: impl Fn(&WorkspaceBilling) -> bool,
+) -> WorkspaceBilling {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        let billing = billing_of(s, u, ws_id).await;
+        if done(&billing) {
+            return billing;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "billing never reached `{what}`; last observed {billing:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+/// Every billing action of `ws_id` answers `503 billing_unconfigured` with a
+/// message containing each of `expected`. Returns nothing; asserts.
+async fn billing_actions_unavailable(s: &Stack, u: &UserSession, ws_id: &str, expected: &[&str]) {
+    let base = format!("/v1/workspaces/{ws_id}/billing");
+    let checkout = serde_json::to_value(CreateCheckout {
+        plan: "team".into(),
+        seats: 2,
+    })
+    .unwrap();
+    let plan = serde_json::to_value(UpdatePlan {
+        plan: "team".into(),
+        seats: 2,
+    })
+    .unwrap();
+    for (action, body) in [
+        ("checkout", checkout),
+        ("plan", plan),
+        ("cancel", serde_json::json!({})),
+        ("portal", serde_json::json!({})),
+    ] {
+        let (status, resp) = session_post(s, u, &format!("{base}/{action}"), &body).await;
+        assert_eq!(status, 503, "{action}");
+        let error = resp.json::<ApiError>().await.unwrap().error;
+        assert_eq!(error.code, error_codes::BILLING_UNCONFIGURED, "{action}");
+        for needle in expected {
+            assert!(
+                error.message.contains(needle),
+                "{action}: {}",
+                error.message
+            );
+        }
+    }
+}
+
+/// A Paddle API key that lacks permissions the service needs never takes
+/// the service down: sync, sign-in and health keep working, billing actions
+/// answer `503 billing_unconfigured` naming every missing permission (without
+/// calling Paddle), and `GET /billing` shows billing as unavailable. The key
+/// is checked again in the background; once Paddle accepts it, billing comes
+/// back by itself.
+#[tokio::test]
+async fn a_paddle_key_without_needed_permissions_degrades_billing_and_recovers_by_itself() {
+    let paddle = start_paddle().await;
+    let mut s = stack_with_paddle(&paddle).await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let token = account_token(&s, &alice).await;
+    let ws = create_workspace(&s, &alice, "Degraded billing WS").await;
+
+    paddle.revoke_permission("subscription.read");
+    paddle.revoke_permission("transaction.read");
+    s.restart_with_env(&[fast_key_check()]).await;
+    billing_within(&s, &alice, &ws.id, "billing unavailable", 30, |b| {
+        !b.billing_configured
+    })
+    .await;
+    billing_actions_unavailable(
+        &s,
+        &alice,
+        &ws.id,
+        &["subscription.read", "transaction.read"],
+    )
+    .await;
+    for endpoint in ["create_transaction", "portal_session", "cancel", "update"] {
+        assert_eq!(paddle.calls(endpoint), 0, "{endpoint}");
+    }
+
+    // Everything that does not depend on billing keeps working.
+    let ready = http().get(s.url("/readyz")).send().await.unwrap();
+    assert_eq!(ready.status(), 200);
+    let key = MachineKey::new("node-degraded");
+    let dev = link(&s, &token, &ws.id, &key).await;
+    let repo = FleetRepo::genesis(&key);
+    assert_eq!(
+        dev.send(&s, &dev.push(repo.bundle(None), None))
+            .await
+            .status(),
+        200
+    );
+
+    paddle.restore_permission("subscription.read");
+    paddle.restore_permission("transaction.read");
+    billing_within(&s, &alice, &ws.id, "billing available again", 30, |b| {
+        b.billing_configured
+    })
+    .await;
+    checkout(&s, &alice, &ws.id, "team", 2).await;
+}
+
+/// A key Paddle does not recognise at all (revoked, or another account's)
+/// degrades billing the same way, with a message that says so and never
+/// contains the key.
+#[tokio::test]
+async fn a_key_paddle_rejects_degrades_billing_without_naming_the_key() {
+    let paddle = start_paddle().await;
+    let mut s = stack_with_paddle(&paddle).await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let ws = create_workspace(&s, &alice, "Rejected key WS").await;
+    let other_key = format!(
+        "pdl_{}_apikey_{}",
+        "sdbx", "01synthetic0000000000000000_synthetic000000000000000_rv"
+    );
+    s.restart_with_env(&[
+        fast_key_check(),
+        ("MUSTER_PADDLE_API_KEY", other_key.clone()),
+    ])
+    .await;
+    billing_within(&s, &alice, &ws.id, "billing unavailable", 30, |b| {
+        !b.billing_configured
+    })
+    .await;
+    billing_actions_unavailable(&s, &alice, &ws.id, &["MUSTER_PADDLE_API_KEY", "rejected"]).await;
+    let (_, resp) = session_post(
+        &s,
+        &alice,
+        &format!("/v1/workspaces/{}/billing/portal", ws.id),
+        &serde_json::json!({}),
+    )
+    .await;
+    let message = resp.json::<ApiError>().await.unwrap().error.message;
+    for leaked in [API_KEY, other_key.as_str(), "incorrectly formatted"] {
+        assert!(!message.contains(leaked), "message leaks {leaked:?}");
+    }
+    assert_eq!(paddle.calls("create_transaction"), 0);
+}
+
+/// A refusal that does not last (a brief Paddle incident), or one that does
+/// not come from Paddle (an API gateway's own JSON error in front of it),
+/// never degrades billing.
+#[tokio::test]
+async fn a_passing_or_non_paddle_refusal_never_degrades_billing() {
+    let run = |case: &'static str, setup: fn(&PaddleFixture)| async move {
+        let paddle = start_paddle().await;
+        let mut s = stack_with_paddle(&paddle).await;
+        let alice = s.login_user("alice", "alice@example.com").await;
+        let ws = create_workspace(&s, &alice, case).await;
+        setup(&paddle);
+        let reads = paddle.calls("list_subscriptions") + paddle.calls("list_transactions");
+        s.restart_with_env(&[fast_key_check()]).await;
+        // Several checks have run (each one reads both).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while paddle.calls("list_subscriptions") + paddle.calls("list_transactions") < reads + 8 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{case}: no key check ran"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            billing_of(&s, &alice, &ws.id).await.billing_configured,
+            "{case}"
+        );
+        checkout(&s, &alice, &ws.id, "personal", 1).await;
+    };
+    tokio::join!(
+        run("Brief refusal WS", |p| p
+            .revoke_permission_briefly("transaction.read", 2)),
+        run("Gateway refusal WS", |p| p
+            .deny_before_paddle("subscription.read")),
+    );
+}
+
+/// The fast key-check interval is development-only: production refuses it.
+#[tokio::test]
+async fn production_refuses_the_development_key_check_interval() {
+    let (code, output) = support::run_cloud_expecting_exit(&[
+        ("MUSTER_ENV", "production".into()),
+        ("MUSTER_BIND", "127.0.0.1:0".into()),
+        ("MUSTER_REPO_ROOT", "/nonexistent/muster-repos".into()),
+        ("MUSTER_PUBLIC_URL", "https://app.example.com".into()),
+        ("MUSTER_DATABASE_URL", "postgres://localhost/db".into()),
+        ("MUSTER_OIDC_ISSUER", "https://idp.example.com".into()),
+        ("MUSTER_OIDC_CLIENT_ID", "client_123".into()),
+        ("MUSTER_OIDC_CLIENT_SECRET", "secret_123".into()),
+        fast_key_check(),
+    ])
+    .await;
+    assert_eq!(code, Some(78), "{output}");
+    assert!(
+        output.contains("MUSTER_DEV_PADDLE_KEY_CHECK_SECS is invalid"),
+        "{output}"
+    );
+}
+
+/// The key check calls Paddle only from an instance that may serve: one
+/// whose lifecycle authority refuses it stops first, without using the key.
+#[tokio::test]
+async fn an_instance_that_may_not_serve_never_checks_the_paddle_key() {
+    let paddle = start_paddle().await;
+    let mut s = stack_with_paddle(&paddle).await;
+    s.cloud.kill().await;
+    let calls = paddle.calls("list_transactions") + paddle.calls("list_subscriptions");
+    let elsewhere = tempfile::tempdir().unwrap();
+    let env = with_env(
+        &s.env,
+        "MUSTER_CONTROL_DIR",
+        elsewhere.path().join("control").display().to_string(),
+    );
+    let env = with_env(
+        &env,
+        "MUSTER_CONTROL_WITNESS",
+        elsewhere.path().join("witness.json").display().to_string(),
+    );
+    let (code, output) = support::run_cloud_expecting_exit(&env).await;
+    assert_eq!(code, Some(78), "{output}");
+    assert_eq!(
+        paddle.calls("list_transactions") + paddle.calls("list_subscriptions"),
+        calls,
+        "{output}"
+    );
+}
+
+/// Paddle being unreachable at startup never keeps the service down: it
+/// starts, with billing configured, and checks again on use.
+#[tokio::test]
+async fn an_unreachable_paddle_does_not_block_startup() {
+    let closed = format!("http://127.0.0.1:{}", support::free_port());
+    let s = support::stack_with_env(&[
+        ("MUSTER_PADDLE_API_KEY", API_KEY.into()),
+        (
+            "MUSTER_PADDLE_WEBHOOK_SECRET",
+            support::paddle_fixture::WEBHOOK_SECRET.into(),
+        ),
+        ("MUSTER_PADDLE_PRICE_PERSONAL", PRICE_PERSONAL.into()),
+        (
+            "MUSTER_PADDLE_PRICE_TEAM_SEAT",
+            support::paddle_fixture::PRICE_TEAM_SEAT.into(),
+        ),
+        ("MUSTER_PADDLE_BASE_URL", closed),
+        ("MUSTER_PADDLE_ENVIRONMENT", "sandbox".into()),
+    ])
+    .await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let ws = create_workspace(&s, &alice, "Offline Paddle WS").await;
+    assert!(billing_of(&s, &alice, &ws.id).await.billing_configured);
 }

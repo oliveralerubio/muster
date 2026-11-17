@@ -61,6 +61,11 @@ pub struct Config {
     /// expire. Never shortens the replay-nonce retention. Refused in
     /// production.
     pub dev_idempotency_retention_secs: Option<u64>,
+    /// Development only (`MUSTER_DEV_PADDLE_KEY_CHECK_SECS`): how often the
+    /// Paddle API key is checked again, instead of
+    /// [`PADDLE_KEY_CHECK_EVERY`], so tests can see billing come back.
+    /// Refused in production.
+    pub dev_paddle_key_check_secs: Option<u64>,
     /// Lifecycle authority (`crate::control`): journal directory and its
     /// independent witness file. Mandatory everywhere; never created by
     /// the service.
@@ -74,6 +79,9 @@ pub struct Config {
     pub trusted_proxies: Vec<crate::rate_limit::IpNet>,
 }
 
+/// How often a production service checks its Paddle API key again.
+pub const PADDLE_KEY_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
+
 #[derive(Clone)]
 pub struct PaddleConfig {
     pub environment: String,
@@ -82,6 +90,9 @@ pub struct PaddleConfig {
     pub price_personal: String,
     pub price_team_seat: String,
     pub base_url: String,
+    /// `base_url` is the official API of `environment` (not a development
+    /// provider fixture).
+    pub official_api: bool,
 }
 
 impl std::fmt::Debug for PaddleConfig {
@@ -93,6 +104,7 @@ impl std::fmt::Debug for PaddleConfig {
             .field("price_personal", &self.price_personal)
             .field("price_team_seat", &self.price_team_seat)
             .field("base_url", &self.base_url)
+            .field("official_api", &self.official_api)
             .finish()
     }
 }
@@ -233,6 +245,7 @@ impl Config {
                     // Development only: a local provider fixture.
                     Some(url) => url.trim_end_matches('/').to_string(),
                 };
+                let official_api = base_url == official_url;
                 Some(PaddleConfig {
                     environment,
                     api_key,
@@ -240,6 +253,7 @@ impl Config {
                     price_personal,
                     price_team_seat,
                     base_url,
+                    official_api,
                 })
             }
             None => None,
@@ -339,6 +353,22 @@ impl Config {
             })?),
         };
 
+        let dev_paddle_key_check_secs = match get("MUSTER_DEV_PADDLE_KEY_CHECK_SECS") {
+            None => None,
+            Some(_) if env.is_production() => return Err(ConfigError::Invalid {
+                name: "MUSTER_DEV_PADDLE_KEY_CHECK_SECS",
+                reason:
+                    "is a development-only setting; the key check interval is fixed in production"
+                        .into(),
+            }),
+            Some(v) => Some(v.parse::<u64>().ok().filter(|s| *s >= 1).ok_or_else(|| {
+                ConfigError::Invalid {
+                    name: "MUSTER_DEV_PADDLE_KEY_CHECK_SECS",
+                    reason: "expected a whole number of seconds, at least 1".into(),
+                }
+            })?),
+        };
+
         let control = control_paths(&get, &repo_root)?;
 
         let per_minute = |name: &'static str, default: u32| -> Result<u32, ConfigError> {
@@ -395,6 +425,7 @@ impl Config {
             dev_purge_crash,
             dev_ack_pause_file,
             dev_idempotency_retention_secs,
+            dev_paddle_key_check_secs,
             control,
             rate_limits,
             trusted_proxies,
@@ -407,6 +438,21 @@ impl Config {
 
     pub fn oidc_client_secret(&self) -> &str {
         &self.oidc_client_secret
+    }
+
+    /// The billing configuration whose API key is checked against Paddle in
+    /// the background: always in production; in development only against a
+    /// local provider fixture, never Paddle's own API.
+    pub fn paddle_key_check(&self) -> Option<&PaddleConfig> {
+        self.paddle
+            .as_ref()
+            .filter(|p| self.env.is_production() || !p.official_api)
+    }
+
+    /// How often the Paddle API key is checked again.
+    pub fn paddle_key_check_every(&self) -> std::time::Duration {
+        self.dev_paddle_key_check_secs
+            .map_or(PADDLE_KEY_CHECK_EVERY, std::time::Duration::from_secs)
     }
 }
 

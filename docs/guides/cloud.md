@@ -95,6 +95,37 @@ Paddle answers again. Billing actions on one workspace run one at a time; one
 that waits more than 10 seconds for its turn answers "not ready", so retry it
 shortly.
 
+Changing the configured prices (`MUSTER_PADDLE_PRICE_PERSONAL`,
+`MUSTER_PADDLE_PRICE_TEAM_SEAT`) never strands a payment already made. A
+subscription Paddle created from a checkout of the workspace keeps that
+checkout's plan (a team keeps the seat count Paddle bills), even when its
+price is no longer configured. The workspace gets the plan it paid for, and
+it is not offered a second checkout. Paddle's checkout transaction must show
+that it created the subscription and that the subscription's customer paid
+it. Once granted, the subscription keeps following Paddle: a cancellation or
+a seat change applies without that proof being repeated. If Paddle cannot
+return the checkout transaction, the payment stays pending and is retried;
+no second checkout is offered meanwhile. A subscription that cannot be
+traced to a checkout of the workspace, or that a customer other than the
+workspace's paid, grants nothing. The server never cancels or changes such a
+subscription at Paddle.
+
+The server checks its Paddle API key in the background, shortly after it
+starts and then every 10 minutes, by reading subscriptions and
+transactions; it creates nothing. Only an instance that is allowed to serve
+runs the check. A refusal counts only when Paddle itself sends it, and it is
+asked again three times in about 15 seconds. If Paddle keeps rejecting the
+key, or the key lacks `subscription.read` or `transaction.read`, the server
+keeps running: sync, sign-in and Paddle notifications are not affected. Only
+checkout, plan changes, cancellation and the customer portal answer "billing
+unconfigured", with a message that lists every missing permission (never the
+key), and the billing page shows billing as unavailable. Once Paddle accepts
+the key, billing comes back by itself at the next check. If Paddle cannot be
+reached, answers with a server error, or a refusal comes from something in
+front of Paddle, the server logs a warning and nothing changes. In
+development the check runs only against a local Paddle fixture
+(`MUSTER_PADDLE_BASE_URL`), never Paddle's own API.
+
 The workspace list shows the same plan status as the billing page. Limits
 follow the subscription's status: when a subscription is canceled or paused, the
 workspace returns to the base limits. Existing machines and stored data stay in

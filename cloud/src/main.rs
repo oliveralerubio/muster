@@ -130,6 +130,17 @@ async fn main() -> ExitCode {
             Duration::from_secs(1),
         ));
     }
+    if state.config.paddle_key_check().is_some() {
+        // Checks the Paddle API key now and then periodically, while the
+        // service already serves: a key Paddle refuses (or one without a
+        // permission billing needs) only makes billing actions unavailable,
+        // logged as an error, until Paddle accepts it again. Sync, sign-in,
+        // health and webhooks never depend on it.
+        tokio::spawn(muster_cloud::billing::key_check_worker(
+            state.clone(),
+            state.config.paddle_key_check_every(),
+        ));
+    }
     // Retries pending immediate cancellations of deletion requests,
     // including those left by a previous process.
     tokio::spawn(muster_cloud::lifecycle_provider::worker(

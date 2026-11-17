@@ -164,6 +164,7 @@ Run (environment injected, never baked):
 
 ```
 docker run -d --name muster-cloud \
+  --restart unless-stopped \
   -p 127.0.0.1:8080:8080 \
   -v muster-cloud-data:/var/lib/muster \
   --env-file /etc/muster-cloud/env \
@@ -258,6 +259,53 @@ Billing/provider configuration (price IDs, webhook signing secret, fixture
 IdP) is still being finalized in `cloud/src/config.rs` — placeholders only
 here; **coordinate the exact variable names with the backend owner before
 deploying** and do not hardcode credentials anywhere in this directory.
+
+Paddle API key check: when billing is configured (`MUSTER_PADDLE_API_KEY`), a
+production service checks its key in the background. The first check runs
+right after startup, without delaying it, and then every 10 minutes. It runs
+only while the instance is the active one, so a candidate or fenced instance
+never uses the key. Each check makes one authenticated read of
+subscriptions and one of transactions (one-item list pages; nothing is
+created).
+
+- A `401` (key invalid, revoked, or from another account or environment) or a
+  `403` (the key lacks `subscription.read` or `transaction.read`) counts only
+  when Paddle itself sends it: the service reads Paddle's error shape
+  (`error.code` and `meta.request_id`) and nothing else, and logs neither
+  the fields nor the body. A refusal is asked again, three attempts in
+  about 15 seconds, before it counts.
+- A refusal that holds on every attempt never stops the service. Sync,
+  sign-in, health checks and Paddle webhooks keep working, and
+  reconciliation keeps retrying. Only billing actions (checkout, plan
+  change, cancellation, customer portal) answer `503 billing_unconfigured`
+  without calling Paddle, and `GET /billing` reports `billing_configured:
+  false`. The service logs one error that names every missing permission
+  (never the key). Grant them to the key in Paddle; the next check makes
+  billing available again by itself, with no restart.
+- A network error, a timeout, a rate limit, a `5xx`, or a `401`/`403` that is
+  not Paddle's (for example an API gateway or WAF in front of it) logs a
+  warning and changes nothing.
+
+Development services run the check only against a local provider fixture
+(`MUSTER_PADDLE_BASE_URL`), never Paddle's own API.
+`MUSTER_DEV_PADDLE_KEY_CHECK_SECS` shortens its interval in development and
+is refused in production (exit 78).
+
+Restart policy: run the service under a supervisor that restarts it after a
+failure, so a failure that clears by itself also heals by itself. With
+Docker, use `--restart unless-stopped`, as in the `docker run` example above.
+With systemd, set `Restart=on-failure` and `RestartSec=30s` in the service
+unit. A refused configuration exits 78 and the last log line before the exit
+names the setting. A brief incident, such as the database restarting, is
+cured by the next restart without anyone stepping in.
+
+Rotating `MUSTER_PADDLE_PRICE_*` needs no cleanup. A subscription created
+from a workspace's own checkout keeps that checkout's plan. Once granted,
+it keeps following Paddle (cancellation, seat changes) without being traced
+to its checkout again. Any other subscription with an unknown price is
+refused and left untouched at Paddle. If Paddle cannot return the checkout
+transaction, the payment stays pending and is retried. No second checkout
+is offered meanwhile.
 
 ## Health endpoints
 

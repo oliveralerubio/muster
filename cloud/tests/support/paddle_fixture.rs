@@ -5,9 +5,11 @@
 //! (`GET /subscriptions/{id}`), and a call log. Tests drive what a customer
 //! does at Paddle (`complete_checkout`, `update_subscription`) and get the
 //! signed webhook Paddle would send. Endpoints follow the Paddle Billing API
-//! shapes the service uses: `POST /transactions`,
-//! `POST /customers/{id}/portal-sessions`, `GET`/`PATCH /subscriptions/{id}`,
-//! `POST /subscriptions/{id}/cancel`.
+//! shapes the service uses: `GET`/`POST /transactions`,
+//! `GET`/`PATCH /transactions/{id}`, `POST /customers/{id}/portal-sessions`,
+//! `GET /subscriptions`, `GET`/`PATCH /subscriptions/{id}`,
+//! `POST /subscriptions/{id}/cancel`. Read permissions of the API key can be
+//! revoked ([`PaddleFixture::revoke_permission`]): Paddle then answers `403`.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -45,6 +47,18 @@ struct Inner {
     failing_gets: usize,
     /// How the upcoming `POST /transactions` calls fail, in order.
     create_failures: std::collections::VecDeque<CreateFailure>,
+    /// API key permissions revoked (`transaction.read`, `subscription.read`).
+    revoked: HashMap<&'static str, Revocation>,
+}
+
+/// How reads covered by a revoked permission are refused.
+#[derive(Clone, Copy)]
+struct Revocation {
+    /// How many more reads are refused; `None`: all of them.
+    remaining: Option<usize>,
+    /// Refused by Paddle (its JSON error) or by something in front of it (a
+    /// CDN or WAF page without Paddle's error).
+    by_paddle: bool,
 }
 
 /// A way `POST /transactions` can fail, injected with
@@ -278,6 +292,66 @@ impl PaddleFixture {
             .push_back(failure);
     }
 
+    /// The API key loses `permission` (`transaction.read` or
+    /// `subscription.read`): every read it covers answers `403 forbidden`.
+    pub fn revoke_permission(&self, permission: &'static str) {
+        self.revoke(permission, None, true);
+    }
+
+    /// Paddle refuses the next `reads` reads covered by `permission` with
+    /// `403 forbidden`, then accepts them again (a brief incident).
+    pub fn revoke_permission_briefly(&self, permission: &'static str, reads: usize) {
+        self.revoke(permission, Some(reads), true);
+    }
+
+    /// Something in front of Paddle (an API gateway or WAF) answers every
+    /// read covered by `permission` with a `403` JSON error of its own: it
+    /// has an `error.code`, but not Paddle's error shape (`meta.request_id`).
+    pub fn deny_before_paddle(&self, permission: &'static str) {
+        self.revoke(permission, None, false);
+    }
+
+    /// The API key gets `permission` back.
+    pub fn restore_permission(&self, permission: &'static str) {
+        self.inner.lock().unwrap().revoked.remove(permission);
+    }
+
+    fn revoke(&self, permission: &'static str, remaining: Option<usize>, by_paddle: bool) {
+        self.inner.lock().unwrap().revoked.insert(
+            permission,
+            Revocation {
+                remaining,
+                by_paddle,
+            },
+        );
+    }
+
+    /// Changes transaction `txn_id` as Paddle holds it.
+    pub fn edit_transaction(&self, txn_id: &str, change: impl FnOnce(&mut serde_json::Value)) {
+        let mut g = self.inner.lock().unwrap();
+        change(g.transactions.get_mut(txn_id).expect("known transaction"));
+    }
+
+    /// Paddle no longer finds transaction `txn_id` (`404`). Returns it as
+    /// it was, for [`PaddleFixture::restore_transaction`].
+    pub fn forget_transaction(&self, txn_id: &str) -> serde_json::Value {
+        self.inner
+            .lock()
+            .unwrap()
+            .transactions
+            .remove(txn_id)
+            .expect("known transaction")
+    }
+
+    /// Paddle finds transaction `txn_id` again, as `entity`.
+    pub fn restore_transaction(&self, txn_id: &str, entity: serde_json::Value) {
+        self.inner
+            .lock()
+            .unwrap()
+            .transactions
+            .insert(txn_id.to_string(), entity);
+    }
+
     /// Paddle cancels transaction `txn_id` on its own side (a dashboard
     /// action, or a cancel whose answer the service never got).
     pub fn cancel_at_paddle(&self, txn_id: &str) {
@@ -318,7 +392,11 @@ pub async fn start() -> PaddleFixture {
     let inner: Shared = Arc::new(Mutex::new(Inner::default()));
 
     let app = Router::new()
-        .route("/transactions", post(create_transaction))
+        .route(
+            "/transactions",
+            get(list_transactions).post(create_transaction),
+        )
+        .route("/subscriptions", get(list_subscriptions))
         .route(
             "/transactions/{transaction_id}",
             get(get_transaction).patch(update_transaction),
@@ -367,7 +445,103 @@ fn authorized(headers: &HeaderMap) -> bool {
 }
 
 fn unauthorized() -> Response {
-    (StatusCode::UNAUTHORIZED, "invalid api key").into_response()
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({
+            "error": {
+                "type": "request_error",
+                "code": "authentication_malformed",
+                "detail": "Authentication header included, but incorrectly formatted"
+            },
+            "meta": { "request_id": new_id("req") }
+        })),
+    )
+        .into_response()
+}
+
+/// `403` when the key lacks `permission`, as Paddle answers it.
+fn forbidden(inner: &Shared, permission: &str) -> Option<Response> {
+    let mut g = inner.lock().unwrap();
+    let revocation = g.revoked.get_mut(permission)?;
+    match &mut revocation.remaining {
+        Some(0) => return None,
+        Some(n) => *n -= 1,
+        None => {}
+    }
+    if !revocation.by_paddle {
+        return Some(
+            (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": {
+                        "code": "AuthorizationFailed",
+                        "message": "The client is not authorized by the gateway policy."
+                    }
+                })),
+            )
+                .into_response(),
+        );
+    }
+    Some(
+        (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": {
+                    "type": "request_error",
+                    "code": "forbidden",
+                    "detail": format!("You aren't permitted to perform this request: {permission}")
+                },
+                "meta": { "request_id": new_id("req") }
+            })),
+        )
+            .into_response(),
+    )
+}
+
+/// A Paddle list page of `entities` (only the first `per_page` are kept).
+fn list_page(entities: Vec<serde_json::Value>) -> Response {
+    let entities: Vec<serde_json::Value> = entities.into_iter().take(1).collect();
+    Json(serde_json::json!({
+        "data": entities,
+        "meta": { "pagination": { "per_page": 1, "has_more": false } }
+    }))
+    .into_response()
+}
+
+async fn list_transactions(State(inner): State<Shared>, headers: HeaderMap) -> Response {
+    count(&inner, "list_transactions");
+    if !authorized(&headers) {
+        return unauthorized();
+    }
+    if let Some(denied) = forbidden(&inner, "transaction.read") {
+        return denied;
+    }
+    let all = inner
+        .lock()
+        .unwrap()
+        .transactions
+        .values()
+        .cloned()
+        .collect();
+    list_page(all)
+}
+
+async fn list_subscriptions(State(inner): State<Shared>, headers: HeaderMap) -> Response {
+    count(&inner, "list_subscriptions");
+    if !authorized(&headers) {
+        return unauthorized();
+    }
+    if let Some(denied) = forbidden(&inner, "subscription.read") {
+        return denied;
+    }
+    let all = inner
+        .lock()
+        .unwrap()
+        .subscriptions
+        .values()
+        .cloned()
+        .collect();
+    list_page(all)
 }
 
 fn not_found() -> Response {
@@ -455,6 +629,9 @@ async fn get_subscription(
     count(&inner, "get_subscription");
     if !authorized(&headers) {
         return unauthorized();
+    }
+    if let Some(denied) = forbidden(&inner, "subscription.read") {
+        return denied;
     }
     let mut g = inner.lock().unwrap();
     if g.failing_gets > 0 {
@@ -586,6 +763,9 @@ async fn get_transaction(
     count(&inner, "get_transaction");
     if !authorized(&headers) {
         return unauthorized();
+    }
+    if let Some(denied) = forbidden(&inner, "transaction.read") {
+        return denied;
     }
     match inner.lock().unwrap().transactions.get(&txn_id) {
         Some(txn) => Json(serde_json::json!({ "data": txn })).into_response(),

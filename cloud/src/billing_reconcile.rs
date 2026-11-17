@@ -6,6 +6,10 @@
 //! - the workspace binding comes from server-side state (the checkout
 //!   transaction this server created, or an existing binding);
 //! - the plan comes from the configured price ids, seats from the quantity;
+//!   when no item carries a configured price (the operator rotated
+//!   `MUSTER_PADDLE_PRICE_*` after the customer paid), a subscription Paddle
+//!   created from a checkout this workspace recorded keeps that checkout's
+//!   plan, so the payment is honoured instead of offering a second checkout;
 //! - a customer different from the one already bound to the workspace or
 //!   subscription grants nothing;
 //! - an entity older (`updated_at`) than the one already applied is ignored,
@@ -26,6 +30,8 @@ use crate::state::AppState;
 
 /// Longest wait between two attempts for the same subscription.
 const MAX_BACKOFF_SECS: i64 = 3600;
+/// From this many failed attempts on, a retried job is logged as an error.
+const LOUD_AFTER_ATTEMPTS: i32 = 8;
 /// How long a claimed job stays reserved for one worker.
 const LEASE_SECS: i64 = 60;
 
@@ -182,8 +188,16 @@ async fn process(state: &AppState, sub_id: &str, ws: Uuid, generation: i64, atte
             let backoff = 2i64
                 .saturating_pow((attempts + 1).min(12) as u32)
                 .min(MAX_BACKOFF_SECS);
-            tracing::warn!(subscription = sub_id, attempt = attempts + 1, retry_in_secs = backoff,
-                reason = %why, "billing reconcile: will retry");
+            if attempts + 1 >= LOUD_AFTER_ATTEMPTS {
+                // Long stuck (Paddle down for long, or a checkout
+                // transaction it keeps not returning): make it visible.
+                tracing::error!(subscription = sub_id, workspace = %ws, attempts = attempts + 1,
+                    retry_in_secs = backoff, reason = %why,
+                    "billing reconcile: still failing after many attempts; will retry");
+            } else {
+                tracing::warn!(subscription = sub_id, attempt = attempts + 1,
+                    retry_in_secs = backoff, reason = %why, "billing reconcile: will retry");
+            }
             sqlx::query(
                 "UPDATE billing_reconcile_jobs
                     SET attempts = attempts + 1,
@@ -248,15 +262,27 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 async fn fetch(paddle: &PaddleConfig, sub_id: &str) -> Result<serde_json::Value, Failure> {
+    fetch_entity(paddle, "subscriptions", sub_id).await
+}
+
+/// `GET /{kind}/{id}` from Paddle: its `data`. Not found is final; anything
+/// else unanswered is retried.
+async fn fetch_entity(
+    paddle: &PaddleConfig,
+    kind: &str,
+    id: &str,
+) -> Result<serde_json::Value, Failure> {
     let resp = paddle_http()
-        .get(format!("{}/subscriptions/{sub_id}", paddle.base_url))
+        .get(format!("{}/{kind}/{id}", paddle.base_url))
         .bearer_auth(&paddle.api_key)
         .send()
         .await
         .map_err(|e| Failure::Transient(format!("paddle unreachable: {}", e.without_url())))?;
     let status = resp.status();
     if status == reqwest::StatusCode::NOT_FOUND {
-        return Err(Failure::Refused("subscription not found at paddle".into()));
+        return Err(Failure::Refused(format!(
+            "{kind} entity not found at paddle"
+        )));
     }
     if !status.is_success() {
         return Err(Failure::Transient(format!("paddle answered {status}")));
@@ -274,8 +300,8 @@ async fn fetch(paddle: &PaddleConfig, sub_id: &str) -> Result<serde_json::Value,
 struct Canonical {
     customer_id: String,
     status: String,
-    plan: &'static str,
-    seats: i32,
+    /// From the configured price ids; `None` when no item carries one.
+    plan_seats: Option<(&'static str, i32)>,
     period_start: Option<OffsetDateTime>,
     period_end: Option<OffsetDateTime>,
     cancel_at_period_end: bool,
@@ -315,20 +341,164 @@ fn parse(paddle: &PaddleConfig, sub_id: &str, e: &serde_json::Value) -> Result<C
             plan_seats = Some(("personal", 1));
         }
     }
-    let (plan, seats) = plan_seats.ok_or_else(|| refuse("no item with a configured price"))?;
     let updated_at =
         ts(&e["updated_at"]).ok_or_else(|| refuse("subscription without updated_at"))?;
     Ok(Canonical {
         customer_id,
         status: status.to_string(),
-        plan,
-        seats,
+        plan_seats,
         period_start: ts(&e["current_billing_period"]["starts_at"]),
         period_end: ts(&e["current_billing_period"]["ends_at"]),
         cancel_at_period_end: e["scheduled_change"]["action"].as_str() == Some("cancel"),
         canceled_at: ts(&e["canceled_at"]),
         updated_at,
     })
+}
+
+/// The plan of a subscription none of whose items carries a configured
+/// price, for instance because the operator rotated `MUSTER_PADDLE_PRICE_*`
+/// between the payment and this reconciliation. It is granted only when it
+/// provably comes from a checkout workspace `ws` recorded itself: that
+/// checkout names it, Paddle's transaction for that checkout created it for
+/// the same customer, and one of the subscription's items carries the price
+/// the checkout was created with. The plan is the checkout's; a team's seats are Paddle's
+/// quantity. The customer association rules of [`apply`] still follow.
+/// Anything else stays refused, and nothing is ever changed at Paddle. A
+/// transaction Paddle does not return (any failure, `404` included) proves
+/// nothing either way: the job is retried, never settled, so the payment
+/// keeps blocking a second checkout instead of being dropped.
+async fn origin_plan(
+    state: &AppState,
+    paddle: &PaddleConfig,
+    sub_id: &str,
+    ws: Uuid,
+    customer_id: &str,
+    entity: &serde_json::Value,
+) -> Result<(&'static str, i32), Failure> {
+    let refuse =
+        |why: &str| Failure::Refused(format!("no item with a configured price, and {why}"));
+    let origin: Option<(String, String, String)> = sqlx::query_as(
+        "SELECT transaction_id, plan, price_id FROM billing_checkouts
+          WHERE workspace_id = $1 AND subscription_id = $2
+          ORDER BY created_at DESC
+          LIMIT 1",
+    )
+    .bind(ws)
+    .bind(sub_id)
+    .fetch_optional(&state.db)
+    .await?;
+    let Some((txn_id, plan, price_id)) = origin else {
+        return Err(refuse("no checkout of this workspace created it"));
+    };
+    let txn = fetch_entity(paddle, "transactions", &txn_id)
+        .await
+        .map_err(|f| match f {
+            Failure::Refused(why) | Failure::Transient(why) => {
+                Failure::Transient(format!("checkout transaction unreadable: {why}"))
+            }
+        })?;
+    if txn["id"].as_str() != Some(txn_id.as_str())
+        || txn["subscription_id"].as_str() != Some(sub_id)
+    {
+        return Err(refuse("Paddle's checkout transaction did not create it"));
+    }
+    // Fails closed: a transaction that names no customer proves nothing.
+    if txn["customer_id"].as_str() != Some(customer_id) {
+        return Err(refuse(
+            "its checkout transaction was not paid by the subscription's customer",
+        ));
+    }
+    let quantity = entity["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| item["price"]["id"].as_str() == Some(price_id.as_str()))
+        .filter_map(|item| item["quantity"].as_i64())
+        .find(|q| *q >= 1)
+        .ok_or_else(|| refuse("no item carries its checkout's price"))?;
+    let plan_seats = match plan.as_str() {
+        "team" => ("team", quantity.min(i32::MAX as i64) as i32),
+        "personal" => ("personal", 1),
+        _ => return Err(refuse("its checkout has an unknown plan")),
+    };
+    tracing::info!(subscription = sub_id, workspace = %ws, transaction = %txn_id,
+        plan = plan_seats.0,
+        "billing reconcile: price no longer configured; granted from this workspace's checkout");
+    Ok(plan_seats)
+}
+
+/// The plan of a subscription with no configured price that is already
+/// registered for workspace `ws` and customer `customer_id` (its origin was
+/// proven when it was first granted): the plan stored then; a team's seats
+/// are Paddle's quantity of the item carrying its checkout's price. When no
+/// item carries that price any more (moved at Paddle to another price that
+/// is not configured either), nothing is guessed: the stored plan and seats
+/// are kept. Either way it is logged as a warning. Its later changes (a
+/// cancellation, a seat change) are applied without proving its origin
+/// again, so they never wait on, or are lost to, its checkout transaction.
+/// `None` when it is not registered so.
+async fn bound_plan(
+    state: &AppState,
+    sub_id: &str,
+    ws: Uuid,
+    customer_id: &str,
+    entity: &serde_json::Value,
+) -> Result<Option<(&'static str, i32)>, Failure> {
+    let stored: Option<(String, i32)> = sqlx::query_as(
+        "SELECT plan, seats FROM subscriptions
+          WHERE paddle_subscription_id = $1 AND workspace_id = $2 AND customer_id = $3",
+    )
+    .bind(sub_id)
+    .bind(ws)
+    .bind(customer_id)
+    .fetch_optional(&state.db)
+    .await?;
+    let Some((plan, stored_seats)) = stored else {
+        return Ok(None);
+    };
+    let plan: &'static str = match plan.as_str() {
+        "team" => "team",
+        "personal" => "personal",
+        _ => return Ok(None),
+    };
+    let checkout_price: Option<(String,)> = sqlx::query_as(
+        "SELECT price_id FROM billing_checkouts
+          WHERE workspace_id = $1 AND subscription_id = $2
+          ORDER BY created_at DESC
+          LIMIT 1",
+    )
+    .bind(ws)
+    .bind(sub_id)
+    .fetch_optional(&state.db)
+    .await?;
+    let quantity = checkout_price.and_then(|(price,)| {
+        entity["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|item| item["price"]["id"].as_str() == Some(price.as_str()))
+            .filter_map(|item| item["quantity"].as_i64())
+            .find(|q| *q >= 1)
+    });
+    let seats = match quantity {
+        Some(q) => {
+            tracing::warn!(subscription = sub_id, workspace = %ws, plan,
+                "billing reconcile: price no longer configured; plan kept as registered, \
+                 seats from the item carrying its checkout's price");
+            if plan == "team" {
+                q.min(i32::MAX as i64) as i32
+            } else {
+                1
+            }
+        }
+        None => {
+            tracing::warn!(subscription = sub_id, workspace = %ws, plan, seats = stored_seats,
+                "billing reconcile: no item carries a configured price or its checkout's \
+                 price (moved at Paddle?); plan and seats kept as registered");
+            stored_seats
+        }
+    };
+    Ok(Some((plan, seats)))
 }
 
 async fn apply(
@@ -339,6 +509,13 @@ async fn apply(
     entity: &serde_json::Value,
 ) -> Result<(), Failure> {
     let c = parse(paddle, sub_id, entity)?;
+    let (plan, seats) = match c.plan_seats {
+        Some(plan_seats) => plan_seats,
+        None => match bound_plan(state, sub_id, ws, &c.customer_id, entity).await? {
+            Some(plan_seats) => plan_seats,
+            None => origin_plan(state, paddle, sub_id, ws, &c.customer_id, entity).await?,
+        },
+    };
     let mut tx = state.db.begin().await?;
 
     type Existing = (Uuid, String, Option<OffsetDateTime>);
@@ -409,8 +586,8 @@ async fn apply(
     .bind(ws)
     .bind(sub_id)
     .bind(&c.customer_id)
-    .bind(c.plan)
-    .bind(c.seats)
+    .bind(plan)
+    .bind(seats)
     .bind(&c.status)
     .bind(c.period_start)
     .bind(c.period_end)

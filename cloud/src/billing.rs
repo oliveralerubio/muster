@@ -235,6 +235,237 @@ pub(crate) async fn ensure_storage_fits(
     Ok(())
 }
 
+/// The reads the service makes with the Paddle API key, by the permission
+/// each needs, and a cheap authenticated call that exercises it (one-item
+/// list pages; nothing is created or changed).
+const KEY_READS: [(&str, &str); 2] = [
+    ("subscription.read", "/subscriptions?per_page=1"),
+    ("transaction.read", "/transactions?per_page=1"),
+];
+
+/// How long each startup read of the key check may take.
+const KEY_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How many times a read Paddle refuses is asked before the refusal counts:
+/// one refusal may be a brief incident at Paddle.
+const KEY_CHECK_ATTEMPTS: u32 = 3;
+/// The pause between two attempts of a refused read (about 15 s in all).
+const KEY_CHECK_PAUSE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// What a check of the Paddle API key found.
+#[derive(Debug)]
+pub enum KeyCheck {
+    /// Paddle accepted every read the service relies on.
+    Accepted,
+    /// Paddle itself refused the key (`401`) or permissions of it (`403`)
+    /// on every attempt: billing actions cannot work until the key is
+    /// fixed. Names every missing permission, never the key or Paddle's
+    /// answer.
+    Refused(String),
+    /// Paddle could not be asked, or the answer was not Paddle's (network,
+    /// timeout, `5xx`, rate limit, a refusal from something in front of
+    /// Paddle): the key is unverified, which never changes anything.
+    Unverified(Vec<String>),
+}
+
+/// What one read of the key check found.
+enum KeyRead {
+    Accepted,
+    /// Paddle answered `401` on every attempt.
+    KeyRejected,
+    /// Paddle answered `403` on every attempt.
+    PermissionMissing,
+    Unverified(String),
+}
+
+/// Whether a `401`/`403` answer is Paddle's own: Paddle's JSON error shape,
+/// an `error.code` and a `meta.request_id` (an API gateway in front of it
+/// may send an `error.code` of its own, never Paddle's request id). Only
+/// those fields are read; neither they nor the body are kept.
+async fn is_paddle_refusal(resp: reqwest::Response) -> bool {
+    let present = |v: &serde_json::Value| v.as_str().is_some_and(|s| !s.is_empty());
+    resp.json::<serde_json::Value>()
+        .await
+        .is_ok_and(|body| present(&body["error"]["code"]) && present(&body["meta"]["request_id"]))
+}
+
+/// One read of [`KEY_READS`], retried while Paddle refuses it.
+async fn key_read(paddle: &crate::config::PaddleConfig, permission: &str, path: &str) -> KeyRead {
+    let mut refused = KeyRead::Accepted;
+    for attempt in 1..=KEY_CHECK_ATTEMPTS {
+        if attempt > 1 {
+            tokio::time::sleep(KEY_CHECK_PAUSE).await;
+        }
+        let resp = match crate::billing_reconcile::paddle_http()
+            .get(format!("{}{path}", paddle.base_url))
+            .bearer_auth(&paddle.api_key)
+            .timeout(KEY_CHECK_TIMEOUT)
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                return KeyRead::Unverified(format!(
+                    "{permission}: paddle unreachable: {}",
+                    e.without_url()
+                ))
+            }
+        };
+        let status = resp.status();
+        if status.is_success() {
+            return KeyRead::Accepted;
+        }
+        if status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN {
+            return KeyRead::Unverified(format!("{permission}: paddle answered {status}"));
+        }
+        if !is_paddle_refusal(resp).await {
+            return KeyRead::Unverified(format!(
+                "{permission}: {status} without Paddle's error (a proxy in front of Paddle?)"
+            ));
+        }
+        refused = if status == StatusCode::UNAUTHORIZED {
+            KeyRead::KeyRejected
+        } else {
+            KeyRead::PermissionMissing
+        };
+    }
+    refused
+}
+
+/// Checks once that Paddle accepts the configured API key for every read
+/// the service makes ([`KEY_READS`], all of them, concurrently), so a key
+/// without a needed permission is reported clearly instead of as later
+/// retries and errors.
+pub async fn check_api_key(paddle: &crate::config::PaddleConfig) -> KeyCheck {
+    let [(sub_perm, sub_path), (txn_perm, txn_path)] = KEY_READS;
+    let (subs, txns) = tokio::join!(
+        key_read(paddle, sub_perm, sub_path),
+        key_read(paddle, txn_perm, txn_path)
+    );
+    let reads = [(sub_perm, subs), (txn_perm, txns)];
+    if reads
+        .iter()
+        .any(|(_, read)| matches!(read, KeyRead::KeyRejected))
+    {
+        return KeyCheck::Refused(format!(
+            "Paddle rejected the API key MUSTER_PADDLE_API_KEY ({}) on {KEY_CHECK_ATTEMPTS} \
+             attempts: it is invalid, revoked or from another Paddle account or environment",
+            StatusCode::UNAUTHORIZED
+        ));
+    }
+    let missing: Vec<&str> = reads
+        .iter()
+        .filter(|(_, read)| matches!(read, KeyRead::PermissionMissing))
+        .map(|(permission, _)| *permission)
+        .collect();
+    if !missing.is_empty() {
+        return KeyCheck::Refused(format!(
+            "the API key MUSTER_PADDLE_API_KEY lacks the Paddle permission(s) {} ({} on \
+             {KEY_CHECK_ATTEMPTS} attempts); grant them to the key in Paddle > Developer tools \
+             > Authentication",
+            missing.join(", "),
+            StatusCode::FORBIDDEN
+        ));
+    }
+    let unverified: Vec<String> = reads
+        .into_iter()
+        .filter_map(|(_, read)| match read {
+            KeyRead::Unverified(why) => Some(why),
+            _ => None,
+        })
+        .collect();
+    if unverified.is_empty() {
+        KeyCheck::Accepted
+    } else {
+        KeyCheck::Unverified(unverified)
+    }
+}
+
+/// Why billing actions are unavailable although Paddle is configured: the
+/// last key check found the API key refused by Paddle. `None` while billing
+/// is available, including before the first check has a result.
+static KEY_REFUSED: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+fn key_refused() -> Option<String> {
+    match KEY_REFUSED.read() {
+        Ok(current) => current.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+/// Records the latest refusal (`None`: accepted); returns the previous one.
+fn set_key_refused(refused: Option<String>) -> Option<String> {
+    match KEY_REFUSED.write() {
+        Ok(mut current) => std::mem::replace(&mut *current, refused),
+        Err(poisoned) => std::mem::replace(&mut *poisoned.into_inner(), refused),
+    }
+}
+
+/// The Paddle configuration billing actions (checkout, plan change,
+/// cancellation, portal) may use: `503 billing_unconfigured` when billing is
+/// not configured, or while Paddle refuses the API key (without calling
+/// Paddle). Webhooks and reconciliation do not depend on this.
+fn paddle_for_actions(state: &AppState) -> Result<&crate::config::PaddleConfig, AppError> {
+    let Some(paddle) = &state.config.paddle else {
+        return Err(AppError::billing_unconfigured());
+    };
+    match key_refused() {
+        None => Ok(paddle),
+        Some(why) => Err(AppError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error_codes::BILLING_UNCONFIGURED,
+            format!(
+                "billing is temporarily unavailable: {why}. It comes back by itself once \
+                 Paddle accepts the key (checked every {} s)",
+                state.config.paddle_key_check_every().as_secs()
+            ),
+        )),
+    }
+}
+
+/// Background loop: checks the Paddle API key ([`check_api_key`]) right
+/// away and then every `every`, only while this instance is active (a
+/// fenced or candidate instance never uses the key). A refusal makes
+/// billing actions unavailable, logged once as an error; acceptance makes
+/// them available again by itself. An unverified check changes nothing.
+pub async fn key_check_worker(state: AppState, every: std::time::Duration) {
+    let Some(paddle) = state.config.paddle_key_check().cloned() else {
+        return;
+    };
+    let mut warned_unverified = false;
+    loop {
+        if state
+            .role_gate
+            .allows(&state.config.control, &state.db, "paddle key check")
+            .await
+        {
+            match check_api_key(&paddle).await {
+                KeyCheck::Accepted => {
+                    warned_unverified = false;
+                    if set_key_refused(None).is_some() {
+                        tracing::info!("paddle API key accepted again; billing available");
+                    }
+                }
+                KeyCheck::Refused(why) => {
+                    if set_key_refused(Some(why.clone())).as_deref() != Some(why.as_str()) {
+                        tracing::error!(reason = %why, recheck_in_secs = every.as_secs(),
+                            "billing unavailable: Paddle refuses the API key; sync, sign-in and \
+                             webhooks keep working");
+                    }
+                }
+                KeyCheck::Unverified(why) => {
+                    if !warned_unverified {
+                        tracing::warn!(reasons = ?why,
+                            "paddle API key not verified (Paddle unreachable, or an answer \
+                             that was not Paddle's); billing unchanged");
+                        warned_unverified = true;
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(every).await;
+    }
+}
+
 /// `GET /v1/workspaces/{ws}/billing`: plan, trial, limits, and capabilities.
 pub async fn get_billing(
     State(state): State<AppState>,
@@ -256,7 +487,8 @@ pub async fn get_billing(
     let (trial_ends_at,) = ws_row.ok_or_else(AppError::not_found)?;
 
     let now = OffsetDateTime::now_utc();
-    let billing_configured = state.config.paddle.is_some();
+    // Configured and not refused by Paddle: billing actions can be used.
+    let billing_configured = state.config.paddle.is_some() && key_refused().is_none();
 
     let sub = current_subscription(&state.db, ws).await?;
     let limits = limits_for(&state.config, sub.as_ref());
@@ -399,9 +631,7 @@ pub async fn create_checkout(
     let ws = parse_uuid(&ws_str)?;
     require_admin_or_owner(&state, ws, account.user_id).await?;
 
-    if state.config.paddle.is_none() {
-        return Err(AppError::billing_unconfigured());
-    }
+    paddle_for_actions(&state)?;
 
     let req: CreateCheckout = parse_json(&body)?;
     let is_team = req.plan == "team";
@@ -863,9 +1093,7 @@ pub async fn customer_portal(
     let ws = parse_uuid(&ws_str)?;
     require_admin_or_owner(&state, ws, account.user_id).await?;
 
-    let Some(paddle) = &state.config.paddle else {
-        return Err(AppError::billing_unconfigured());
-    };
+    let paddle = paddle_for_actions(&state)?;
 
     // Refused after a deletion request like every other billing action: the
     // provider objects are being canceled and nothing is left to manage.
@@ -931,9 +1159,7 @@ pub async fn cancel_subscription(
     let ws = parse_uuid(&ws_str)?;
     require_admin_or_owner(&state, ws, account.user_id).await?;
 
-    let Some(paddle) = &state.config.paddle else {
-        return Err(AppError::billing_unconfigured());
-    };
+    let paddle = paddle_for_actions(&state)?;
 
     // Billing actions of the workspace are serialised (concurrent cancels
     // ask Paddle once) without holding the workspace row during the call.
@@ -995,9 +1221,7 @@ pub async fn update_plan(
     let ws = parse_uuid(&ws_str)?;
     require_admin_or_owner(&state, ws, account.user_id).await?;
 
-    let Some(paddle) = &state.config.paddle else {
-        return Err(AppError::billing_unconfigured());
-    };
+    let paddle = paddle_for_actions(&state)?;
 
     let req: UpdatePlan = parse_json(&body)?;
     let is_team = req.plan == "team";
