@@ -2161,7 +2161,7 @@ fn render_prompt_html(
     )
 }
 
-fn resolve_recipients(
+pub(crate) fn resolve_recipients(
     ctx: &Context,
     vault: &Vault,
     group: &str,

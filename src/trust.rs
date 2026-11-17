@@ -75,6 +75,43 @@ pub fn guard(ctx: &mut Context, command: &str, mutating: bool) -> Result<(), Mus
             }
         }
     }
+    // Likewise a Cloud pull interrupted while it changed local history is
+    // rolled back to where it started; the next pull redoes it. Commands that
+    // diagnose or repair trust are never blocked by it.
+    if !ctx.dry_run && crate::sync_transport::pull_interrupted(&ctx.state_dir) {
+        if let Some(_lock) = crate::lock::try_acquire(&ctx.state_dir)? {
+            use crate::sync_transport::PullRecovery;
+            let exempt =
+                matches!(command, "init" | "uninstall" | "doctor") || command.starts_with("trust.");
+            match crate::sync_transport::recover_interrupted_pull(&ctx.state_dir) {
+                Ok(PullRecovery::None) => {}
+                Ok(PullRecovery::RolledBack(dir)) => ctx.diag(Diagnostic::new(
+                    Severity::Warning,
+                    "cloud_pull_recovered",
+                    format!(
+                        "an interrupted Cloud pull was rolled back to the previous history of \
+                         {}; `muster sync --pull` redoes it",
+                        dir.display()
+                    ),
+                )),
+                Ok(PullRecovery::SetAside(name)) => ctx.diag(Diagnostic::new(
+                    Severity::Warning,
+                    "cloud_pull_journal_unusable",
+                    format!(
+                        "the journal of an interrupted Cloud pull could not be used and was \
+                         kept as {name} in the Cloud state directory; the repository is \
+                         verified as it is"
+                    ),
+                )),
+                Err(e) if exempt => ctx.diag(Diagnostic::new(
+                    Severity::Warning,
+                    "cloud_pull_journal_unusable",
+                    format!("an interrupted Cloud pull could not be rolled back: {e}"),
+                )),
+                Err(e) => return Err(e),
+            }
+        }
+    }
     if command == "init" || command == "uninstall" || command.starts_with("trust.") {
         return Ok(());
     }
@@ -732,6 +769,38 @@ pub fn verify_pulled(
         return Err(rollout_note_err(e, restored));
     }
     Ok(())
+}
+
+/// [`verify_pulled`] for a recovered signed fork: the checked-out accepted
+/// state is verified against `anchor` (this machine's accepted state before
+/// its own never-accepted seals, established by the caller's rollback rule)
+/// instead of the pin on disk, and the accepted state becomes the pin. A
+/// refusal restores `previous` and leaves the pin untouched.
+pub(crate) fn verify_pulled_from(
+    ctx: &mut Context,
+    previous: Option<&str>,
+    anchor: &TrustAnchor,
+    rolled_back: &str,
+) -> Result<(), MusterError> {
+    let result = Manifest::load(&ctx.config_dir)
+        .and_then(|m| verify_anchored(ctx, &m, true, Anchor::Explicit(Some(anchor))));
+    match result {
+        Ok(Verification::Pending { .. }) => {
+            // The accepted tip waits for co-signatures and no newer accepted
+            // state was adopted: the pin falls back to the anchor, never
+            // stays on the rolled-back own seal.
+            let pinned = TrustAnchor::load(&ctx.state_dir)?;
+            if pinned.is_none_or(|p| p.payload_hash == rolled_back) {
+                anchor.save(&ctx.state_dir)?;
+            }
+            Ok(())
+        }
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let restored = git::restore_after_pull(&ctx.config_dir, previous);
+            Err(rollout_note_err(e, restored))
+        }
+    }
 }
 
 /// Appends the outcome of the HEAD rollback to a refusal message: rollback

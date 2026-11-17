@@ -255,6 +255,10 @@ fn format_text(result: &Value) -> String {
             (Some(p), Some(true)) => text.push_str(&format!("Transport: pulled {p}, pushed.\n")),
             (Some(p), _) => text.push_str(&format!("Transport: pulled {p}.\n")),
             (None, Some(true)) => text.push_str("Transport: pushed.\n"),
+            (None, Some(false)) if transport.contains_key("held") => text.push_str(&format!(
+                "Transport: held by Cloud as proposal {}.\n",
+                transport["held"]["proposal_id"].as_str().unwrap_or("?")
+            )),
             _ => {}
         }
     }
@@ -346,8 +350,9 @@ fn transport(
         crate::receipts::drain(ctx, &link);
         let committed = git::commit_if_configured(&ctx.config_dir, "chore(muster): sync")?;
         if only_push {
-            crate::sync_transport::push(ctx, &link)?;
-            return Ok((json!({"committed": committed, "pushed": true}), Vec::new()));
+            let mut report = crate::sync_transport::push(ctx, &link)?.report();
+            report["committed"] = json!(committed);
+            return Ok((report, Vec::new()));
         }
         let outcome = crate::sync_transport::pull(ctx, &link)?;
         return Ok((

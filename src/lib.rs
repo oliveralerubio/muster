@@ -37,6 +37,7 @@ pub mod usage;
 pub mod vault;
 pub mod web;
 
+pub mod signed_replay;
 pub mod sync_transport;
 #[cfg(kani)]
 mod verification;
