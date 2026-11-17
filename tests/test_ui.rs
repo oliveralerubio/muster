@@ -1742,7 +1742,13 @@ fn ui_sync_on_first_use_surfaces_the_security_error_and_accepts_expect_signer() 
     let git_ok = |args: &[&str]| {
         assert!(Command::new("git").args(args).status().unwrap().success());
     };
-    git_ok(&["init", "--bare", "--quiet", remote.to_str().unwrap()]);
+    git_ok(&[
+        "init",
+        "--bare",
+        "--quiet",
+        "--initial-branch=main",
+        remote.to_str().unwrap(),
+    ]);
     let alice = support::MusterEnv::new();
     alice.run(&["--yes", "init"]).assert().success();
     alice

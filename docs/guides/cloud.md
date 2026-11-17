@@ -104,6 +104,50 @@ Logout attempts remote account-token revocation and reports `server_revoked`.
 It removes the local login even if the service is unreachable. It does not
 revoke fleet keys or cancel billing.
 
+## Export a verified copy and leave Cloud
+
+`muster cloud export` downloads the workspace's complete Git bundle with your
+account session, verifies it against the service's export manifest (the bundle
+hash, the accepted revision and epoch, and the bundle tip must all agree), and
+writes it atomically with private permissions:
+
+```sh
+muster --format json cloud export --output fleet.bundle
+```
+
+The result reports the written `path`, the `revision`, and the full `manifest`
+(revision, epoch, signer, sha256). Use `--workspace <id>` to export another
+workspace your account can read — that works on a login-only machine and
+after `cloud unlink`; only the default (linked) workspace needs the link. A
+workspace the account cannot read is refused with the service's own status
+and no file is written. Account and device tokens never appear in argv, URLs
+or output. Export stays available to members regardless of plan status.
+
+The verified bundle is your exit from Cloud. After `muster cloud unlink`, a
+fresh machine restores the fleet from the bundle alone — no Cloud involved:
+
+```sh
+muster sync --pull --remote /path/to/fleet.bundle --expect-state <trusted-payload-hash>
+muster enroll --name laptop
+```
+
+The join needs no prior `muster init`: it creates the config repo on `main`
+(the branch fleet bundles publish) and verifies the complete signed history
+against the exact `--expect-state` (or `--expect-signer`) read from
+`muster trust show` on a machine you already trust before anything is
+applied. From there the fleet works like any open-source team: enrollment
+requests and approvals travel over plain Git remotes, and `muster sync`
+applies and commits locally. If no original machine survives, the offline
+recovery key `init` returned (or showed once) approves the fresh machine:
+
+```sh
+muster enroll --name laptop
+cat recovery.key | muster approve laptop --recovery-key-stdin
+```
+
+Keep the exported bundle private — it contains the full configuration and
+vault ciphertext history.
+
 See [ADR 0006](../adr/0006-cloud-service.md) for the data and trust boundaries,
 and the [deployment guide](../../deploy/README.md) for service configuration and
 backup tools. Workspace deletion and automated backup retention remain under

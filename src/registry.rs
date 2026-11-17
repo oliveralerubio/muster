@@ -63,6 +63,7 @@ impl CommandSpec {
             | "cloud.login"
             | "cloud.logout"
             | "cloud.workspaces"
+            | "cloud.export"
             | "cloud.proposals"
             | "cloud.proposals.resolve" => CommandScope::LocalAccount,
             _ => CommandScope::Fleet,
@@ -141,6 +142,7 @@ pub static COMMANDS: &[CommandSpec] = &[
     crate::commands::cloud::WORKSPACES,
     crate::commands::cloud::LOGIN,
     crate::commands::cloud::LOGOUT,
+    crate::commands::cloud::EXPORT,
     crate::commands::cloud::STATUS,
     crate::commands::cloud::UNLINK,
     crate::commands::cloud::PROPOSALS,

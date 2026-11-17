@@ -11,7 +11,14 @@ fn bare_remote() -> (TempDir, PathBuf) {
     let dir = TempDir::new().expect("remote tempdir");
     let path = dir.path().join("central.git");
     let status = Command::new("git")
-        .args(["init", "--bare", path.to_str().unwrap()])
+        // Muster repositories publish `refs/heads/main`; the bare central's
+        // HEAD must name that branch so plain `git clone` checks it out.
+        .args([
+            "init",
+            "--bare",
+            "--initial-branch=main",
+            path.to_str().unwrap(),
+        ])
         .status()
         .expect("git init --bare");
     assert!(status.success());

@@ -2,6 +2,7 @@ use crate::context::Context;
 use crate::errors::MusterError;
 use crate::registry::{CommandSpec, Params};
 use serde_json::{json, Value};
+use std::path::Path;
 
 pub const STATUS: CommandSpec = CommandSpec {
     name: "cloud.status",
@@ -18,6 +19,269 @@ fn status(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
         ),
         None => Ok(json!({"status": "unlinked"})),
     }
+}
+
+pub const EXPORT: CommandSpec = CommandSpec {
+    name: "cloud.export",
+    about: "Download a full verified export bundle of a Cloud workspace",
+    params: &[
+        crate::registry::ParamSpec {
+            name: "output",
+            about: "File to write the bundle to [default: muster-export-<revision>.bundle]",
+            kind: crate::registry::ParamKind::String,
+            required: false,
+            positional: false,
+        },
+        crate::registry::ParamSpec {
+            name: "workspace",
+            about: "Workspace ID to export [default: the linked workspace]",
+            kind: crate::registry::ParamKind::String,
+            required: false,
+            positional: false,
+        },
+    ],
+    mutating: true,
+    handler: export,
+};
+
+/// `muster cloud export`: downloads the workspace's complete Git bundle with
+/// the account session (`workspaces.read` scope; a member-only route), checks
+/// it against the `x-muster-export-manifest` header, and only then moves a
+/// 0600 staging file into place. The verified bundle is the OSS exit: it can
+/// restore a fleet without Cloud (see docs/guides/cloud.md). Tokens travel in
+/// the Authorization header only — never in argv, URLs, logs or the result.
+fn export(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
+    use crate::cloud_protocol::{self as protocol, ExportManifest};
+    let account = crate::cloud_client::CloudAccount::load(&ctx.state_dir)?;
+    // The endpoint needs only the account token; the local link merely
+    // supplies the DEFAULT workspace. `--workspace` therefore works on
+    // login-only machines and on machines that already left Cloud.
+    let workspace = match params.get_string("workspace") {
+        Some(id) => {
+            if id.is_empty()
+                || id.len() > 64
+                || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            {
+                return Err(MusterError::Usage("invalid workspace id".into()));
+            }
+            id.to_owned()
+        }
+        None => {
+            let link = crate::cloud_client::CloudLink::load(&ctx.state_dir)?.ok_or_else(|| {
+                MusterError::Usage(
+                    "this machine has no Cloud link; pass --workspace <id> or run \
+                     muster cloud link first"
+                        .into(),
+                )
+            })?;
+            link.workspace.clone()
+        }
+    };
+    if ctx.dry_run {
+        return Ok(json!({"status": "would_export", "workspace": workspace}));
+    }
+    let path = format!("/v1/workspaces/{workspace}/export");
+    let agent: ureq::Agent = ureq::config::Config::builder()
+        .max_redirects(0)
+        .http_status_as_error(false)
+        .timeout_global(Some(std::time::Duration::from_secs(30)))
+        .build()
+        .into();
+    let mut response = agent
+        .get(format!("{}{path}", account.endpoint))
+        .header("Authorization", format!("Bearer {}", account.token()))
+        .call()
+        .map_err(|_| MusterError::Operational("the Cloud service did not answer; retry".into()))?;
+    let status = response.status().as_u16();
+    if status == 204 {
+        return Err(MusterError::Operational(
+            "the workspace has no accepted history to export yet".into(),
+        ));
+    }
+    if status != 200 {
+        return Err(MusterError::Operational(format!(
+            "the Cloud service refused the export of workspace {workspace} (HTTP {status}); \
+             no export was written"
+        )));
+    }
+    let media_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .map(|v| v.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    if media_type != protocol::GIT_BUNDLE_MEDIA_TYPE {
+        return Err(MusterError::Security(
+            "the Cloud service answered with an unexpected content type; no export was written"
+                .into(),
+        ));
+    }
+    let manifest: ExportManifest = response
+        .headers()
+        .get(protocol::HEADER_EXPORT_MANIFEST)
+        .and_then(|v| v.to_str().ok())
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|_| MusterError::Security("invalid Cloud export manifest".into()))?
+        .ok_or_else(|| {
+            MusterError::Security(
+                "the Cloud export carried no export manifest; no export was written".into(),
+            )
+        })?;
+    let served_revision = response
+        .headers()
+        .get(protocol::HEADER_REVISION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .unwrap_or_default();
+    let served_epoch = response
+        .headers()
+        .get(protocol::HEADER_EPOCH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    if served_revision != manifest.revision || served_epoch != Some(manifest.epoch) {
+        return Err(MusterError::Security(
+            "the Cloud export manifest contradicts the served revision or epoch; \
+             no export was written"
+                .into(),
+        ));
+    }
+    let bytes = response
+        .body_mut()
+        .read_to_vec()
+        .map_err(|_| MusterError::Operational("cannot read the Cloud export response".into()))?;
+    if protocol::body_sha256_hex(&bytes) != manifest.sha256 {
+        return Err(MusterError::Security(
+            "the export bundle does not match its export manifest (sha256); \
+             no export was written"
+                .into(),
+        ));
+    }
+    if !crate::sync_transport::is_canonical_object_id(&manifest.revision) {
+        return Err(MusterError::Security(
+            "the Cloud export manifest names a non-canonical revision; no export was written"
+                .into(),
+        ));
+    }
+    // Absolute target: a path with a leading dash must never reach git as a
+    // flag, and the staging file next to it must not depend on the cwd.
+    let target = match params.get_string("output") {
+        Some(file) => std::path::absolute(file)
+            .map_err(|_| MusterError::Operational("cannot resolve the export path".into()))?,
+        None => std::env::current_dir()
+            .map_err(|_| MusterError::Operational("cannot resolve the working directory".into()))?
+            .join(format!("muster-export-{}.bundle", &manifest.revision[..12])),
+    };
+    let parent = target
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| MusterError::Usage("the export target has no parent directory".into()))?;
+    std::fs::create_dir_all(&parent)
+        .map_err(|_| MusterError::Operational("cannot create the export directory".into()))?;
+    // Never replace a directory or a symlink: the final rename does not
+    // follow symlinks, so following one would silently bypass it, and a
+    // directory target can never hold the bundle.
+    if let Ok(meta) = std::fs::symlink_metadata(&target) {
+        if meta.is_dir() {
+            return Err(MusterError::Usage(format!(
+                "the export target {} is a directory; pass a file path",
+                target.display()
+            )));
+        }
+        if meta.file_type().is_symlink() {
+            return Err(MusterError::Usage(format!(
+                "the export target {} is a symlink; muster does not replace symlinks",
+                target.display()
+            )));
+        }
+    }
+    // Validate the bundle BEFORE anything exists at the target: the bytes are
+    // staged privately (0600), the manifest revision is checked against the
+    // bundle tip, and only a fully verified export is moved into place.
+    let staging = parent.join(format!(".muster-export-{}", random_suffix()?));
+    let result = crate::vault::write_atomic(&staging, &bytes)
+        .map_err(|_| MusterError::Operational("cannot stage the export bundle".into()))
+        .and_then(|()| verify_bundle_tip(&staging, &manifest.revision))
+        .and_then(|()| {
+            std::fs::rename(&staging, &target)
+                .map_err(|_| MusterError::Operational("cannot write the export bundle".into()))
+        })
+        .and_then(|()| sync_directory(&parent));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&staging);
+    }
+    result?;
+    Ok(json!({
+        "path": target.display().to_string(),
+        "revision": manifest.revision,
+        "workspace": workspace,
+        "manifest": manifest,
+    }))
+}
+
+/// Fsyncs the directory holding the renamed bundle, so the verified export
+/// survives a crash like the other fleet artifacts do.
+fn sync_directory(parent: &Path) -> Result<(), MusterError> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(parent)
+            .and_then(|handle| handle.sync_all())
+            .map_err(|e| MusterError::Operational(format!("cannot flush the export: {e}")))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = parent;
+        Ok(())
+    }
+}
+
+/// Whether `bundle` is a readable Git bundle listing exactly one
+/// `refs/heads/main` whose tip is exactly `revision`. Every (sha, refname)
+/// pair is parsed: filtering by pattern alone would tail-match decoy names
+/// such as `refs/tags/refs/heads/main`, and taking the first line would
+/// depend on git's listing order.
+fn verify_bundle_tip(bundle: &Path, revision: &str) -> Result<(), MusterError> {
+    let output = std::process::Command::new("git")
+        .args(["ls-remote", "--", &bundle.to_string_lossy()])
+        .output()
+        .map_err(|_| MusterError::Operational("cannot run git to verify the export".into()))?;
+    if !output.status.success() {
+        return Err(MusterError::Security(
+            "the export is not a readable Git bundle; no export was written".into(),
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut mains = 0;
+    for line in stdout.lines() {
+        let Some((sha, refname)) = line.split_once('\t') else {
+            continue;
+        };
+        if refname.trim() != "refs/heads/main" {
+            continue;
+        }
+        mains += 1;
+        if mains > 1 || sha.trim().to_ascii_lowercase() != revision {
+            return Err(MusterError::Security(
+                "the export bundle tip does not match the export manifest revision; \
+                 no export was written"
+                    .into(),
+            ));
+        }
+    }
+    if mains == 0 {
+        return Err(MusterError::Security(
+            "the export bundle carries no refs/heads/main; no export was written".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn random_suffix() -> Result<String, MusterError> {
+    let mut bytes = [0u8; 8];
+    getrandom::getrandom(&mut bytes)
+        .map_err(|_| MusterError::Operational("no randomness available".into()))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 pub const UNLINK: CommandSpec = CommandSpec {
