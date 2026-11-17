@@ -2832,8 +2832,14 @@ async fn assert_unpublished_local_change_is_not_attested(
 }
 
 fn git_in(config: &std::path::Path, args: &[&str]) {
+    // Commit identity must not depend on the host's git config (CI runners
+    // have no global identity).
     let status = std::process::Command::new("git")
         .current_dir(config)
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
         .args(args)
         .status()
         .unwrap();
