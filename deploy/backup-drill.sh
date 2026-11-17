@@ -118,7 +118,7 @@ fail_inner() { printf "backup-drill.sh: %s\n" "$1" >&2; exit "${2:-1}"; }
 IDP=$!
 ISSUER=""
 for _ in $(seq 1 60); do
-  ISSUER=$(sed -n "s/^issuer=//p" "$D/idp.log" | head -1)
+  ISSUER=$(sed -n "/^issuer=/{s///;p;q;}" "$D/idp.log")
   [ -n "$ISSUER" ] && break
   sleep 0.5
 done

@@ -261,16 +261,32 @@ if [ -n "$heads" ]; then
       failed=1
       continue
     fi
-    if ! git -C "$repo" for-each-ref --format='%(refname)' refs/muster/uploads/ \
-      | grep -q .; then
+    # Capture ref lists instead of piping into `grep -q` / early-exiting readers:
+    # under pipefail, an early reader exit SIGPIPEs the producer (141) and a
+    # reachable head would be reported unreachable.
+    upload_refs=$(git -C "$repo" for-each-ref --format='%(refname)' refs/muster/uploads/) \
+      || upload_refs=""
+    if [ -z "$upload_refs" ]; then
       printf 'pg-restore.sh: FAIL workspace %s: no upload refs restored\n' "$ws" >&2
       failed=1
       continue
     fi
-    upload_refs=$(git -C "$repo" for-each-ref --format='%(refname)' refs/muster/uploads/)
-    if ! printf '%s\n' "$upload_refs" \
-      | xargs git -C "$repo" rev-list \
-      | grep -qx "$head"; then
+    reachable=""
+    while IFS= read -r ref; do
+      [ -n "$ref" ] || continue
+      git -C "$repo" merge-base --is-ancestor "$head" "$ref"
+      ancestor_rc=$?
+      if [ "$ancestor_rc" -eq 0 ]; then
+        reachable=1
+        break
+      elif [ "$ancestor_rc" -ne 1 ]; then
+        teardown_fail
+        fail "cannot check reachability of head $head from $ref for workspace $ws" "$PG_RESTORE_EXIT_HEAD"
+      fi
+    done <<REFS
+$upload_refs
+REFS
+    if [ -z "$reachable" ]; then
       printf 'pg-restore.sh: FAIL workspace %s: head %s not reachable from upload refs\n' "$ws" "$head" >&2
       failed=1
       continue
