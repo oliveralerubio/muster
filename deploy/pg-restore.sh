@@ -5,7 +5,7 @@
 #                        --admin-url <libpq-url-to-existing-maintenance-db> \
 #                        --new-db <name> --new-repo-root <dir> \
 #                        --control-dir <dir> --control-witness <file> \
-#                        [--age-identity-file <path>]
+#                        [--age-identity-file <path>] [--legacy-format1]
 #
 # (or export MUSTER_RESTORE_ADMIN_URL instead of --admin-url so a password in
 # the URL never appears in argv on multi-user hosts; MUSTER_CONTROL_DIR and
@@ -39,8 +39,13 @@
 #     MUSTER_REPO_ROOT of a NEW service instance at these targets. This script
 #     never restarts or reconfigures any service.
 #   - Encrypted backups (age) are decrypted with the identity in
-#     --age-identity-file (a PATH, never a secret value); plaintext backups
-#     restore as-is.
+#     --age-identity-file (a PATH, never a secret value), streaming into tar
+#     and pg_restore: no plaintext copy on disk. A format 2 snapshot
+#     (muster-cloud-ops backup run) is verified first: strict manifest and
+#     every artifact hash, and verification is mandatory: anything it
+#     rejects is refused (67) before any target exists. Legacy format 1
+#     directories restore only with the explicit --legacy-format1.
+#     Synthetic plaintext snapshots restore as-is.
 #   - Prints only target names and counts; never connection strings.
 #
 # Exit codes: 64 usage; 66 target already exists; 67 invalid/missing backup;
@@ -75,6 +80,7 @@ admin_url=""
 new_db=""
 new_repo_root=""
 age_identity=""
+legacy_format1=""
 control_dir="${MUSTER_CONTROL_DIR:-}"
 control_witness="${MUSTER_CONTROL_WITNESS:-}"
 
@@ -101,6 +107,8 @@ while [ "$#" -gt 0 ]; do
     --age-identity-file)
       [ "$#" -ge 2 ] || fail "--age-identity-file needs a value" "$PG_RESTORE_EXIT_USAGE"
       age_identity=$2; shift 2 ;;
+    --legacy-format1)
+      legacy_format1=1; shift ;;
     *)
       fail "unknown argument: $1" "$PG_RESTORE_EXIT_USAGE" ;;
   esac
@@ -146,33 +154,6 @@ command -v git >/dev/null 2>&1 || fail "git not found" "$PG_RESTORE_EXIT_USAGE"
 [ -f "$backup_dir/manifest.json" ] \
   || fail "backup is incomplete (no manifest.json): $backup_dir" "$PG_RESTORE_EXIT_BACKUP"
 
-# Artifacts, encrypted or not, per the manifest's claim.
-if grep -q '"encrypted": true' "$backup_dir/manifest.json"; then
-  age_bin=$(command -v age 2>/dev/null || true)
-  [ -n "$age_bin" ] \
-    || fail "backup is age-encrypted but the age CLI is not installed" \
-      "$PG_RESTORE_EXIT_NOAGE"
-  [ -n "$age_identity" ] && [ -f "$age_identity" ] \
-    || fail "encrypted backup needs --age-identity-file pointing at an identity file" \
-      "$PG_RESTORE_EXIT_DECRYPT"
-  work=$(mktemp -d "${TMPDIR:-/tmp}/muster-restore.XXXXXX") \
-    || fail "mktemp failed" "$PG_RESTORE_EXIT_USAGE"
-  chmod 0700 "$work"
-  age --decrypt -i "$age_identity" -o "$work/db.dump" "$backup_dir/db.dump.age" \
-    && age --decrypt -i "$age_identity" -o "$work/git.tar" "$backup_dir/git.tar.age" \
-    || { rm -rf -- "$work"; fail "age decryption failed" "$PG_RESTORE_EXIT_DECRYPT"; }
-  db_dump=$work/db.dump
-  git_tar=$work/git.tar
-else
-  [ -s "$backup_dir/db.dump" ] \
-    || fail "backup has no db.dump" "$PG_RESTORE_EXIT_BACKUP"
-  [ -s "$backup_dir/git.tar" ] \
-    || fail "backup has no git.tar" "$PG_RESTORE_EXIT_BACKUP"
-  db_dump=$backup_dir/db.dump
-  git_tar=$backup_dir/git.tar
-  work=""
-fi
-
 # Never touch anything that exists: this run creates only new resources.
 pg_conn_export "$admin_url" \
   || fail "invalid admin connection URL" "$PG_RESTORE_EXIT_USAGE"
@@ -200,6 +181,71 @@ case $authority_rc in
   *) fail "lifecycle authority check failed (rc=$authority_rc): ${authority_out#muster-cloud-ops: }" "$PG_RESTORE_EXIT_AUTHORITY" ;;
 esac
 
+# Artifacts, after the authority opened cleanly. Every snapshot is verified
+# by `muster-cloud-ops backup verify` (strict format 2 manifest, every
+# artifact hash); anything it rejects is refused (67). Legacy format 1
+# directories (old pg-backup.sh, no hashes) restore ONLY with the explicit
+# --legacy-format1. Either way each artifact is decrypted while streaming
+# straight into tar / pg_restore (no plaintext on disk).
+age_needed=""
+if [ -z "$legacy_format1" ]; then
+  verify_err_file=$(mktemp "${TMPDIR:-/tmp}/muster-restore-verify.XXXXXX") \
+    || fail "mktemp failed" "$PG_RESTORE_EXIT_USAGE"
+  verify_json=$(MUSTER_CONTROL_DIR=$control_dir MUSTER_CONTROL_WITNESS=$control_witness \
+    MUSTER_REPO_ROOT=$new_repo_root "$ops_bin" backup verify --snapshot "$backup_dir" \
+    2>"$verify_err_file")
+  verify_rc=$?
+  verify_err=$(cat "$verify_err_file" 2>/dev/null); rm -f -- "$verify_err_file"
+  [ "$verify_rc" = 0 ] \
+    || fail "backup failed verification: ${verify_err#muster-cloud-ops: }" "$PG_RESTORE_EXIT_BACKUP"
+  case $verify_json in
+    *'"scheme":"age-x25519"'*)
+      age_needed=1
+      db_dump=$backup_dir/db.dump.age
+      git_tar=$backup_dir/git.tar.age ;;
+    *'"scheme":"none"'*)
+      db_dump=$backup_dir/db.dump
+      git_tar=$backup_dir/git.tar ;;
+    *) fail "backup has an unknown encryption scheme" "$PG_RESTORE_EXIT_BACKUP" ;;
+  esac
+elif ! grep -q '"format_version": 1' "$backup_dir/manifest.json"; then
+  fail "--legacy-format1 given but the manifest is not format 1" "$PG_RESTORE_EXIT_BACKUP"
+elif grep -q '"encrypted": true' "$backup_dir/manifest.json"; then
+  age_needed=1
+  db_dump=$backup_dir/db.dump.age
+  git_tar=$backup_dir/git.tar.age
+else
+  [ -s "$backup_dir/db.dump" ] \
+    || fail "backup has no db.dump" "$PG_RESTORE_EXIT_BACKUP"
+  [ -s "$backup_dir/git.tar" ] \
+    || fail "backup has no git.tar" "$PG_RESTORE_EXIT_BACKUP"
+  db_dump=$backup_dir/db.dump
+  git_tar=$backup_dir/git.tar
+fi
+if [ -n "$age_needed" ]; then
+  age_bin=$(command -v age 2>/dev/null || true)
+  [ -n "$age_bin" ] \
+    || fail "backup is age-encrypted but the age CLI is not installed" \
+      "$PG_RESTORE_EXIT_NOAGE"
+  [ -n "$age_identity" ] && [ -f "$age_identity" ] \
+    || fail "encrypted backup needs --age-identity-file pointing at an identity file" \
+      "$PG_RESTORE_EXIT_DECRYPT"
+fi
+
+# Streams an artifact (decrypted when encrypted) into a reader command.
+# Returns the reader's status, or 171 when decryption itself failed.
+stream_into() {
+  local artifact=$1
+  shift
+  if [ -n "$age_needed" ]; then
+    age --decrypt -i "$age_identity" "$artifact" | "$@"
+    local st=("${PIPESTATUS[@]}")
+    [ "${st[0]}" = 0 ] || return 171
+    return "${st[1]}"
+  fi
+  "$@" <"$artifact"
+}
+
 # Targets this run owns; torn down if any step below fails.
 created_db=""
 created_root=""
@@ -213,7 +259,6 @@ teardown_fail() {
     rm -rf -- "$created_root" \
       || printf 'pg-restore.sh: warning: could not remove created repo root %s\n' "$created_root" >&2
   fi
-  [ -z "$work" ] || rm -rf -- "$work"
 }
 
 if [ -e "$new_repo_root" ]; then
@@ -230,12 +275,16 @@ created_db=$new_db
 
 # Untar first (restore order does not affect the consistent cut: both
 # artifacts are complete files from one pg-backup.sh run).
-tar -xf "$git_tar" -C "$new_repo_root" \
-  || { teardown_fail; fail "git.tar extraction failed" "$PG_RESTORE_EXIT_BACKUP"; }
+stream_into "$git_tar" tar -xf - -C "$new_repo_root"
+tar_rc=$?
+[ "$tar_rc" = 171 ] && { teardown_fail; fail "age decryption of the Git archive failed" "$PG_RESTORE_EXIT_DECRYPT"; }
+[ "$tar_rc" = 0 ] || { teardown_fail; fail "git.tar extraction failed" "$PG_RESTORE_EXIT_BACKUP"; }
 find "$new_repo_root" -type d -exec chmod go-rwx {} + 2>/dev/null
 
-pg_restore --no-owner --dbname="$new_db" "$db_dump" \
-  || { teardown_fail; fail "pg_restore failed" "$PG_RESTORE_EXIT_PGRESTORE"; }
+stream_into "$db_dump" pg_restore --no-owner --dbname="$new_db"
+restore_rc=$?
+[ "$restore_rc" = 171 ] && { teardown_fail; fail "age decryption of the database dump failed" "$PG_RESTORE_EXIT_DECRYPT"; }
+[ "$restore_rc" = 0 ] || { teardown_fail; fail "pg_restore failed" "$PG_RESTORE_EXIT_PGRESTORE"; }
 
 # Pre-cutover integrity gate: PG-referenced heads must exist in the restored
 # git store, reachable from upload refs; every restored repo must fsck clean.
@@ -319,8 +368,6 @@ if [ "$gate_rc" != 0 ]; then
   fail "lifecycle authority refused the restored database (targets torn down): ${gate_err#muster-cloud-ops: }" \
     "$PG_RESTORE_EXIT_AUTHORITY"
 fi
-
-[ -z "$work" ] || rm -rf -- "$work"
 
 printf 'pg-restore.sh: authority verified: %s\n' "$gate_json"
 printf 'pg-restore.sh: restore complete (NEW resources only; cutover is manual)\n'

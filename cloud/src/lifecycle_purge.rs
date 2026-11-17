@@ -44,17 +44,18 @@ use crate::error::AppError;
 
 const LOCKS: &str = "locks";
 const TRASH: &str = "trash";
+const CAPTURE_LOCK: &str = "capture.lock";
 /// Longest a Git request waits for its workspace lock (held exclusive only
 /// by a purge).
 const ACCESS_WAIT: Duration = Duration::from_secs(10);
 const MAX_BACKOFF_SECS: i64 = 300;
 
 #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "x86")))]
-const O_NOFOLLOW: i32 = 0o400000;
+pub(crate) const O_NOFOLLOW: i32 = 0o400000;
 #[cfg(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "arm")))]
-const O_NOFOLLOW: i32 = 0o100000;
+pub(crate) const O_NOFOLLOW: i32 = 0o100000;
 #[cfg(target_os = "macos")]
-const O_NOFOLLOW: i32 = 0x0100;
+pub(crate) const O_NOFOLLOW: i32 = 0x0100;
 
 /// Development-only crash points (`MUSTER_DEV_PURGE_CRASH`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,6 +212,47 @@ async fn take_lock(
         }
         if start.elapsed() > wait {
             return Ok(None);
+        }
+    }
+}
+
+/// The backup/purge coordination lock, `<root>/locks/capture.lock`: a
+/// capture holds it exclusive from its database snapshot through its Git
+/// archive; a purge holds it shared from its move to trash until its trash
+/// is erased. Never unlinked. `None`: not taken within `wait`.
+pub async fn capture_lock(
+    root: &Path,
+    exclusive: bool,
+    wait: Duration,
+) -> std::io::Result<Option<fs::File>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let owned = root.to_path_buf();
+    let file = tokio::task::spawn_blocking(move || {
+        let dir = owned_dir(&owned, LOCKS)?;
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .custom_flags(O_NOFOLLOW)
+            .open(dir.join(CAPTURE_LOCK))
+    })
+    .await
+    .map_err(std::io::Error::other)??;
+    let start = Instant::now();
+    loop {
+        let got = if exclusive {
+            file.try_lock()
+        } else {
+            file.try_lock_shared()
+        };
+        match got {
+            Ok(()) => return Ok(Some(file)),
+            Err(fs::TryLockError::WouldBlock) if start.elapsed() > wait => return Ok(None),
+            Err(fs::TryLockError::WouldBlock) => {
+                tokio::time::sleep(Duration::from_millis(50)).await
+            }
+            Err(fs::TryLockError::Error(e)) => return Err(e),
         }
     }
 }
@@ -590,6 +632,12 @@ async fn complete(ctx: &PurgeCtx, ws: Uuid, request_id: Uuid) -> Result<(), Stri
 pub async fn purge_one(ctx: &PurgeCtx, ws: Uuid, request_id: Uuid) -> Result<(), String> {
     tombstone(ctx, ws, request_id).await?;
     let lock = drain(ctx, ws).await?;
+    // No backup capture may see this workspace half-erased: hold the
+    // coordination lock from the move to trash until the trash is erased.
+    let capture = capture_lock(&ctx.repo_root, false, ctx.drain_wait)
+        .await
+        .map_err(io_err("backup coordination lock"))?
+        .ok_or("waiting for a running backup capture to finish")?;
     let root = ctx.repo_root.clone();
     tokio::task::spawn_blocking(move || to_trash(&root, ws, request_id))
         .await
@@ -604,6 +652,7 @@ pub async fn purge_one(ctx: &PurgeCtx, ws: Uuid, request_id: Uuid) -> Result<(),
         .map_err(|e| e.to_string())?
         .map_err(io_err("erasing the trash"))?;
     crash_if(ctx, PurgeCrash::AfterTrash);
+    drop(capture);
     let result = complete(ctx, ws, request_id).await;
     drop(lock);
     result
@@ -640,6 +689,17 @@ async fn state_of(db: &PgPool, ws: Uuid) -> &'static str {
 /// rows came back (a restored database). Failures are recorded on the
 /// request and retried with backoff.
 pub async fn run_due(ctx: &PurgeCtx) -> Vec<PurgeOutcome> {
+    run_due_with(ctx, false).await
+}
+
+/// [`run_due`], also retrying now (ignoring the backoff) every workspace
+/// already past its backup cap: a backup must not capture it, so the
+/// capture purges it first (`muster-cloud-ops backup run`).
+pub async fn run_due_past_cap(ctx: &PurgeCtx) -> Vec<PurgeOutcome> {
+    run_due_with(ctx, true).await
+}
+
+async fn run_due_with(ctx: &PurgeCtx, past_cap_now: bool) -> Vec<PurgeOutcome> {
     let on_disk = match ids_on_disk(&ctx.repo_root).await {
         Ok(ids) => ids,
         Err(e) => {
@@ -649,11 +709,13 @@ pub async fn run_due(ctx: &PurgeCtx) -> Vec<PurgeOutcome> {
     };
     let due: Vec<(Uuid, Uuid, i32)> = match sqlx::query_as(&format!(
         "SELECT workspace_id, request_id, purge_attempts FROM workspace_lifecycle l
-          WHERE primary_purge_at <= now() AND purge_next_attempt_at <= now()
+          WHERE primary_purge_at <= now()
+            AND (purge_next_attempt_at <= now() OR ($2 AND backup_cap_at <= now()))
             AND (purged_at IS NULL OR {RESURRECTED})
           ORDER BY primary_purge_at LIMIT 20"
     ))
     .bind(&on_disk)
+    .bind(past_cap_now)
     .fetch_all(&ctx.db)
     .await
     {

@@ -1,0 +1,12 @@
+# Staged by deploy/install-systemd.sh; never installed by CI.
+[Unit]
+Description=Muster Cloud: daily backup
+
+[Timer]
+OnCalendar=*-*-* 03:17:00
+RandomizedDelaySec=15m
+Persistent=true
+Unit=muster-cloud-backup.service
+
+[Install]
+WantedBy=timers.target

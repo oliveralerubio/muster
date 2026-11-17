@@ -409,6 +409,37 @@ pub fn control_paths(
     Ok(crate::control::ControlPaths { dir, witness })
 }
 
+/// `MUSTER_BACKUP_ROOT`, resolved: absolute and disjoint from the
+/// repository root and from the lifecycle authority (journal and witness).
+pub fn backup_root(
+    get: &impl Fn(&str) -> Option<String>,
+    repo_root: &std::path::Path,
+    control: &crate::control::ControlPaths,
+) -> Result<std::path::PathBuf, ConfigError> {
+    let name = "MUSTER_BACKUP_ROOT";
+    let invalid = |reason: &str| ConfigError::Invalid {
+        name,
+        reason: reason.into(),
+    };
+    let root = std::path::PathBuf::from(get(name).ok_or(ConfigError::Missing(name))?);
+    if !root.is_absolute() {
+        return Err(invalid("must be an absolute path"));
+    }
+    let root = resolve_identity(&root).map_err(|r| invalid(&r))?;
+    let repo = resolve_identity(repo_root).map_err(|r| ConfigError::Invalid {
+        name: "MUSTER_REPO_ROOT",
+        reason: r,
+    })?;
+    for other in [&repo, &control.dir, &control.witness] {
+        if within(&root, other) || within(other, &root) {
+            return Err(invalid(
+                "must be disjoint from MUSTER_REPO_ROOT, MUSTER_CONTROL_DIR and MUSTER_CONTROL_WITNESS",
+            ));
+        }
+    }
+    Ok(root)
+}
+
 /// True for `localhost`, `*.localhost`, 127.0.0.0/8 and `[::1]`.
 fn is_loopback(url: &Url) -> bool {
     match url.host() {

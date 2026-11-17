@@ -185,7 +185,7 @@ secret store; never bake them into the image or commit them.
 | `MUSTER_OIDC_ISSUER` | **yes** | OIDC issuer URL of the identity provider (https, non-loopback in production). |
 | `MUSTER_OIDC_CLIENT_ID` | **yes** | OIDC client id. |
 | `MUSTER_OIDC_CLIENT_SECRET` | **yes** | OIDC client secret. Secret — inject via secret store. |
-| `MUSTER_REPO_ROOT` | **yes** | Absolute path of the per-workspace bare Git object store (one `<workspace-id>.git` repo per workspace). There is no default: the service refuses to start without it. Back up this directory together with the database — see `pg-backup.sh` below. |
+| `MUSTER_REPO_ROOT` | **yes** | Absolute path of the per-workspace bare Git object store (one `<workspace-id>.git` repo per workspace). There is no default: the service refuses to start without it. Back up this directory together with the database — see `muster-cloud-ops backup run` below. |
 | `MUSTER_CONTROL_DIR` | **yes** | Absolute directory of the lifecycle authority's control store (hash-chained journal + lock). Must be disjoint from `MUSTER_REPO_ROOT` (neither inside the other). Not secret. |
 | `MUSTER_CONTROL_WITNESS` | **yes** | Absolute path of the authority's independent witness file; not inside the control dir or the repo root. Put it on a DIFFERENT volume/device than the control dir. Not secret. |
 
@@ -287,49 +287,132 @@ that terminates TLS. Requirements:
 ## Backups and restore (`pg-backup.sh`, `pg-restore.sh`, `backup-drill.sh`)
 
 The Cloud database (PostgreSQL) and the Git object store (`MUSTER_REPO_ROOT`)
-are two stores that must be backed up together. Both tools here are plain
-POSIX shell driving real `pg_dump`/`pg_restore`, `tar` and `git` — no SQL is
-invented by them.
+are backed up together, as ONE snapshot, by `muster-cloud-ops backup run`
+(`cloud/src/backup.rs`); `pg-backup.sh` is a thin wrapper around it.
+Retention is `muster-cloud-ops retention run`. Both run from systemd timers
+(`deploy/systemd/`, staged by `deploy/install-systemd.sh`).
 
-### Consistent cut
+### Snapshot-bound capture
 
-`pg-backup.sh` dumps the database FIRST, then tars the repo root. That order
-is what makes the pair consistent while the service keeps running: every
-accepted head the dump captured was committed to PostgreSQL before the dump
-snapshot, and the service's durability order (`cloud/src/repo_store.rs`)
-writes Git objects plus the immutable `refs/muster/uploads/<id>` ref BEFORE
-the PostgreSQL transaction commits — so all objects any captured head needs
-are already on disk when the tar runs. Upload refs are never deleted and
-`gc.auto=0` in service repos, so nothing captured can be GC'd in between.
-Concurrent writers during the tar can only add objects (uploads are
-immutable); transient git files (`*.lock`, `*.tmp`, `tmp_obj_*`) are excluded.
+- The backup/purge coordination lock (`<repo_root>/locks/capture.lock`) is
+  held exclusive from the database snapshot through the Git archive. A purge
+  holds it shared from its move to trash until its trash is erased, so no
+  workspace is ever captured half-erased (the purge reports `waiting for a
+  running backup capture to finish` and retries on its own).
+- A read-only repeatable-read transaction exports a PostgreSQL snapshot;
+  `pg_dump --snapshot` dumps exactly that state, and the tenant list (and
+  their heads and deletion caps) is read in the same snapshot.
+- The Git archive holds exactly those tenants' `<uuid>.git` trees: no root
+  scratch, no orphan repository, no tenant created after the snapshot.
+  Symlinks and special files are refused; transient Git files (`*.lock`,
+  `*.tmp`, `tmp_*`, `incoming-*`) are skipped. Git objects are written before
+  their PostgreSQL commit (`cloud/src/repo_store.rs`), so every captured head
+  has its objects on disk.
+- Before the snapshot, `backup run` reapplies the lifecycle journal (a crash
+  between journal and projection, or a restored database; the authority and
+  incarnation are checked) and purges every workspace already past its
+  backup cap, ignoring the purge backoff. It refuses (exit 65) only if such a
+  workspace still cannot be purged (e.g. live Git access never drains); the
+  next timer run retries on its own.
+- Per repository, everything but `objects/` (refs, `HEAD`, `config`) is
+  copied into staging first and `objects/` is read live afterwards: a push
+  writes objects before refs, so a push during the capture never leaves an
+  archived ref without its objects (the restore's `git fsck` passes).
+- Artifacts stream through `age -r` (no plaintext on disk) and are hashed
+  while written. A strict, versioned manifest (`format: muster-backup`,
+  `version: 2`: snapshot time, tenants and heads, encryption scheme and a
+  hash of the recipient, normal expiry, artifact sizes and sha256, archive
+  entry count and list hash) is written atomically; the snapshot is then
+  published by renaming its staging directory.
 
-### pg-backup.sh
+### Managed backup root (`MUSTER_BACKUP_ROOT`)
+
+Absolute, and disjoint from `MUSTER_REPO_ROOT`, `MUSTER_CONTROL_DIR` and
+`MUSTER_CONTROL_WITNESS`. One host per root (leases are `flock`s).
+
+```
+snapshots/<backup_id>/   manifest.json, db.dump.age, git.tar.age
+staging/<op_id>/         a capture in progress
+ops/<op_id>.json|.lock   owned operations; a held lock is a live lease
+trash/                   removals in progress
+audit/                   one JSON result per retention run
+```
+
+Every run first cleans dead operations (nobody holds their lease: a crash),
+removing only their staging and trash entries. Anything this tool does not
+recognise — in `snapshots/` or at the root, such as legacy
+`muster-backup-*` directories — is **uncatalogued**: never removed, always
+reported, and it makes the backup status of a deletion `unknown`.
+
+### pg-backup.sh / `muster-cloud-ops backup run`
 
 ```
 deploy/pg-backup.sh --database-url <libpq-url> --repo-root <dir> \
-                    --output-dir <dir> [--plaintext]
+                    --output-dir <managed-backup-root> [--plaintext]
 ```
 
-(Or export `MUSTER_BACKUP_DATABASE_URL` so a password in the URL never
-appears in argv; the script moves the connection string into the standard
-`PG*` environment variables before invoking `pg_dump`.)
+(Or export `MUSTER_BACKUP_DATABASE_URL`/`MUSTER_DATABASE_URL`; the URL is
+passed to `pg_dump` through `PG*` environment variables, never argv.) Needs
+`MUSTER_CONTROL_DIR`, `MUSTER_CONTROL_WITNESS` and
+`MUSTER_BACKUP_AGE_RECIPIENT` (a recipient PUBLIC key). Prints one JSON line
+(`backup_id`, `path`, `snapshot_at`, `tenants`, `encryption`).
 
-- Creates `<output-dir>/muster-backup-<UTC>/` (0700) containing `db.dump`
-  (pg_dump custom format), `git.tar`, and `manifest.json` written LAST: a
-  backup directory without a manifest is incomplete and must not be used.
-- Never touches the source database or repo root; never deletes or overwrites
-  anything — each run makes a NEW timestamped directory.
-- **Encryption**: with the `age` CLI installed and
-  `MUSTER_BACKUP_AGE_RECIPIENT` set (a recipient PUBLIC key), both artifacts
-  are encrypted and the plaintext intermediates removed. Without `age`, the
-  script refuses to run unless `--plaintext` is passed explicitly — workspace
-  content is not end-to-end encrypted by design (ADR 0006), so plaintext
-  backups are for dev/synthetic data only.
-- **Retention/purge is NOT implemented.** The "export 30 days after
-  cancellation / backups expire within 35 days" figures from the product
-  research are proposed, configurable policy — this tool never deletes old
-  backup directories. Do not promise purge behavior that does not exist yet.
+- **Encryption is the default and required**: no recipient → refused (65).
+  `--plaintext` (`--plaintext-synthetic`) is for synthetic data in
+  development (`MUSTER_ENV=development`) only, and refused in production (65).
+- Normal retention: `MUSTER_BACKUP_RETENTION_DAYS` (default 30).
+- Development only (refused in production, 78):
+  `MUSTER_DEV_BACKUP_RETENTION_SECS`, `MUSTER_DEV_BACKUP_CRASH`
+  (`after_snapshot|after_db|after_git|before_publish`),
+  `MUSTER_DEV_BACKUP_PAUSE_FILE` (pauses after the snapshot until the file
+  exists; announces `<file>.waiting`).
+- Exit codes: 0 ok; 64 usage; 65 refused; 74 I/O; 75 busy (a purge is
+  erasing; the timer retries); 78 configuration.
+
+### Retention (`muster-cloud-ops retention run`)
+
+- Reapplies the lifecycle journal first, then inventories the root.
+- A snapshot's effective expiry is `min(normal expiry, the backup cap of
+  every current deletion request of one of its tenants)` (cap = request +
+  35 days). It is never extended; a request made after (or during) a capture
+  shortens that snapshot too. Expiring a whole snapshot also shortens the
+  history kept for its other tenants.
+- Removes only catalogued, published, expired snapshots (rename into
+  `trash/`, then delete), at most 100 per run; uncatalogued entries and live
+  operations are never touched.
+- Writes `audit/retention-<time>-<op>.json` and prints the same JSON
+  (`removed`, `kept`, `uncatalogued`, `errors`); exit 74 when any removal
+  failed.
+- Projects the inventory into the database (`backup_snapshots`,
+  `backup_inventory`), which `GET /v1/workspaces/{id}/lifecycle` reports as
+  `deletion.backups`: `status` (`unknown`, `none`, `scheduled`, `due`,
+  `overdue` — past the deadline by more than 24 h —, `error`, `purged`),
+  `deadline` (the latest effective expiry of the snapshots still holding the
+  workspace), `purged_at`, `cap_at`, `reason`, `last_error`.
+
+### Timers (`deploy/systemd/`, `deploy/install-systemd.sh`)
+
+`muster-cloud-backup.{service,timer}` (daily) and
+`muster-cloud-retention.{service,timer}` (hourly): oneshot, `Persistent=true`,
+hardened (`ProtectSystem=strict`), reading `/etc/muster-cloud/ops.env`.
+Writable paths, none optional: both units get the backup root, the control
+dir and the witness's directory (the authority may advance its witness); the
+backup unit also gets the repository root (its coordination lock and the
+purge of overdue workspaces). The installer stages `<repo>/locks`; create it
+on the host, owned by the service user, before enabling.
+
+```
+deploy/install-systemd.sh --root <staging-dir> --env-file <ops.env> \
+                          [--bin /usr/local/bin/muster-cloud-ops]
+```
+
+Validates the environment file (mode 0600; `KEY=VALUE` only; absolute,
+pairwise disjoint `MUSTER_REPO_ROOT`, `MUSTER_CONTROL_DIR`,
+`MUSTER_CONTROL_WITNESS`, `MUSTER_BACKUP_ROOT`; an `age1…` recipient; no
+`MUSTER_DEV_*`, no plaintext), renders the units, checks them with
+`systemd-analyze verify` when available, and stages them under
+`<staging-dir>/etc/systemd/system/`. It never runs `systemctl` and never
+copies the environment file; installing is the manual step it prints.
 
 ### pg-restore.sh
 
@@ -368,6 +451,12 @@ deploy/pg-restore.sh --backup <backup-dir> \
   the restored database and repo root (`MUSTER_DATABASE_URL`,
   `MUSTER_REPO_ROOT`). The script never restarts or reconfigures a service,
   and never overwrites the running one.
+- Every snapshot is verified by `muster-cloud-ops backup verify` (strict
+  format 2 manifest, every sha256), after the authority check and before any
+  target exists; whatever it rejects is refused (67). Each artifact is then
+  decrypted with `--age-identity-file` while streaming into `tar` and
+  `pg_restore`: no plaintext copy on disk. Legacy format 1 directories
+  (old `pg-backup.sh`) restore only with the explicit `--legacy-format1`.
 - Exit codes: 64 usage; 66 target exists; 67 invalid backup; 68 pg_restore
   failed; 69 git fsck failed; 70 head-presence check failed; 71 age decrypt
   failed; 72 age missing for an encrypted backup; 73 lifecycle authority
@@ -404,12 +493,8 @@ public API only:
 - the ORIGINAL instance still serves the untouched original head;
 - restoring into the now-existing targets is refused (66).
 
-The drill runs `pg-backup.sh` with `--plaintext` because the data is
-synthetic; wherever `age` + `MUSTER_BACKUP_AGE_RECIPIENT` are available, run
-it without the flag through `pg-backup.sh` to exercise encryption. Override
-the service binary location with `MUSTER_DRILL_CLOUD_BIN`. This workflow runs
-in CI as the `backup-drill` job of `.github/workflows/cloud.yml`.
-
-A scheduler (cron/systemd timer/container) that runs `pg-backup.sh` on a
-schedule is a policy decision for the operator: nothing here installs one,
-and retention/purge remains unimplemented (see above).
+The drill backs up through `pg-backup.sh` on the encrypted path a
+deployment takes (production-mode ops, a synthetic `age-keygen` key pair) and
+restores with its identity file; `age` is required. Override the service
+binary location with `MUSTER_DRILL_CLOUD_BIN`. This workflow runs in CI as the
+`backup-drill` job of `.github/workflows/cloud.yml`, which installs `age`.

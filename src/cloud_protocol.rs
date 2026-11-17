@@ -367,13 +367,17 @@ pub struct PrimaryPurge {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BackupPurge {
-    /// `unknown` while no backup catalog exists: no deadline is promised.
+    /// `unknown` (no catalogue yet, or uncatalogued backups: no deadline is
+    /// promised), `none`, `scheduled`, `due`, `overdue`, `error`, `purged`.
     pub status: String,
     pub deadline: Option<String>,
     /// Policy cap for catalogued snapshots (request + 35 days).
     pub cap_at: String,
     pub purged_at: Option<String>,
     pub reason: Option<String>,
+    /// Why expired snapshots are not being removed (status `error`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

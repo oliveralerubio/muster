@@ -8,6 +8,7 @@
 pub mod protocol;
 
 pub mod auth;
+pub mod backup;
 pub mod billing;
 pub mod billing_reconcile;
 pub mod config;

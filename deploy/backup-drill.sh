@@ -14,7 +14,10 @@
 #   2. `seed`: OIDC browser-style login, workspace creation, RFC 8628 device
 #      flow, machine link with a real link proof, signed genesis push plus one
 #      signed incremental push — everything through the public HTTP API.
-#   3. `deploy/pg-backup.sh` (consistent cut: pg_dump first, git tar second).
+#   3. `deploy/pg-backup.sh` → `muster-cloud-ops backup run`: one exported
+#      PostgreSQL snapshot, its tenants' Git only, age-encrypted while
+#      streaming to a synthetic recipient, strict manifest, published into a
+#      managed backup root (production-mode ops: no development settings).
 #   4. `deploy/pg-restore.sh` refuses a missing witness, a rolled-back journal
 #      and a foreign authority (exit 73, targets torn down), then restores
 #      into a NEW database + NEW repo root against the deployment's existing
@@ -40,10 +43,10 @@
 # on the fenced source (readiness alone does not block direct writes), are
 # the restore/fencing unit's job; this drill does not claim them.
 #
-# Encryption: the drill runs pg-backup.sh with --plaintext because the data is
-# synthetic and `age` may be absent (see pg-backup.sh: without age, plaintext
-# is refused unless explicitly allowed). The age code path is exercised
-# wherever age + MUSTER_BACKUP_AGE_RECIPIENT are available.
+# Encryption: the drill takes the encrypted path a deployment takes: a
+# synthetic age key pair (age-keygen, in the drill dir) is the recipient, and
+# the restore decrypts with its identity file while streaming. `age` and
+# `age-keygen` are required.
 #
 # Exit status: non-zero on the first failed check (message on stderr). Prints
 # a DRILL-OK line and the service binary hash on success.
@@ -71,6 +74,8 @@ ops_bin=${MUSTER_DRILL_OPS_BIN:-$drill_target/debug/muster-cloud-ops}
 [ -x "$ops_bin" ] || fail "muster-cloud-ops binary not found at $ops_bin (set MUSTER_DRILL_OPS_BIN)" "$DRILL_EXIT_MISSING"
 command -v git >/dev/null 2>&1 || fail "git not found" "$DRILL_EXIT_MISSING"
 command -v curl >/dev/null 2>&1 || fail "curl not found" "$DRILL_EXIT_MISSING"
+command -v age >/dev/null 2>&1 || fail "age not found (encrypted backups)" "$DRILL_EXIT_MISSING"
+command -v age-keygen >/dev/null 2>&1 || fail "age-keygen not found" "$DRILL_EXIT_MISSING"
 
 drill_dir=$(mktemp -d "${TMPDIR:-/tmp}/muster-drill.XXXXXX")
 chmod 0700 "$drill_dir"
@@ -168,16 +173,25 @@ HEAD2=$(sed -n "s/^head2=//p" "$D/state")
 printf "backup-drill.sh: seeded ws=%s head1=%s head2=%s\n" \
   "$(sed -n "s/^ws=//p" "$D/state")" "$HEAD1" "$HEAD2" >&2
 
-# --- 3) backup (consistent cut) ---
-"$HERE/pg-backup.sh" --database-url "$MUSTER_TEST_PG" --repo-root "$D/repos" \
-  --output-dir "$D/backups" --plaintext || fail_inner "backup failed" 1
-BK=$(find "$D/backups" -maxdepth 1 -type d -name "muster-backup-*" | sort | tail -1)
-[ -n "$BK" ] || fail_inner "no backup produced" 1
+# --- 3) backup: snapshot-bound, encrypted to a synthetic age recipient ---
+age-keygen -o "$D/backup-identity.txt" 2>/dev/null || fail_inner "age-keygen failed" 1
+RECIPIENT=$(sed -n "s/^# public key: //p" "$D/backup-identity.txt")
+[ -n "$RECIPIENT" ] || fail_inner "no age recipient" 1
+MUSTER_BACKUP_AGE_RECIPIENT="$RECIPIENT" \
+MUSTER_CONTROL_DIR="$CONTROL" MUSTER_CONTROL_WITNESS="$WITNESS" \
+  "$HERE/pg-backup.sh" --database-url "$MUSTER_TEST_PG" --repo-root "$D/repos" \
+  --output-dir "$D/backups" >"$D/backup.json" || fail_inner "backup failed" 1
+BK=$(sed -n "s/.*\"path\":\"\([^\"]*\)\".*/\1/p" "$D/backup.json")
+[ -n "$BK" ] && [ -f "$BK/manifest.json" ] || fail_inner "no backup produced" 1
+[ -f "$BK/db.dump.age" ] && [ -f "$BK/git.tar.age" ] && [ ! -e "$BK/db.dump" ] \
+  || fail_inner "backup is not encrypted" 1
+printf "backup-drill.sh: encrypted snapshot %s\n" "$BK" >&2
 
 # --- 4) restore: refusals first, then into NEW targets ---
 expect_refused() { # <label> <control-dir> <witness>
   "$HERE/pg-restore.sh" --backup "$BK" --admin-url "$MUSTER_TEST_PG" \
     --new-db drill_restored --new-repo-root "$D/restored-repos" \
+  --age-identity-file "$D/backup-identity.txt" \
     --control-dir "$2" --control-witness "$3" >"$D/refused-$1.log" 2>&1
   rc=$?
   [ "$rc" = "73" ] || { cat "$D/refused-$1.log" >&2; fail_inner "restore with $1 authority: expected 73, got $rc" 1; }
@@ -207,6 +221,7 @@ expect_refused foreign "$D/foreign/control" "$D/foreign/witness/witness.json"
 
 "$HERE/pg-restore.sh" --backup "$BK" --admin-url "$MUSTER_TEST_PG" \
   --new-db drill_restored --new-repo-root "$D/restored-repos" \
+  --age-identity-file "$D/backup-identity.txt" \
   --control-dir "$CONTROL" --control-witness "$WITNESS" \
   || fail_inner "restore failed" 1
 
@@ -243,6 +258,7 @@ printf "backup-drill.sh: service 2 (restored) ready on %s\n" "$PORT2" >&2
 # --- 7) refuse overwrite ---
 "$HERE/pg-restore.sh" --backup "$BK" --admin-url "$MUSTER_TEST_PG" \
   --new-db drill_restored --new-repo-root "$D/restored-repos" \
+  --age-identity-file "$D/backup-identity.txt" \
   --control-dir "$CONTROL" --control-witness "$WITNESS" >/dev/null 2>&1
 RRC=$?
 [ "$RRC" = "66" ] || fail_inner "overwrite refusal expected 66, got $RRC" 1

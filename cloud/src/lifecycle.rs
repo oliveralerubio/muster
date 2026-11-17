@@ -223,12 +223,23 @@ where
                     None
                 },
             },
-            backups: BackupPurge {
-                status: "unknown".into(),
-                deadline: None,
-                cap_at: rfc3339(cap_at)?,
-                purged_at: None,
-                reason: Some(BACKUP_UNKNOWN_REASON.into()),
+            backups: match crate::backup::view(db, ws, now).await? {
+                None => BackupPurge {
+                    status: "unknown".into(),
+                    deadline: None,
+                    cap_at: rfc3339(cap_at)?,
+                    purged_at: None,
+                    reason: Some(BACKUP_UNKNOWN_REASON.into()),
+                    last_error: None,
+                },
+                Some(b) => BackupPurge {
+                    status: b.status.into(),
+                    deadline: b.deadline.map(rfc3339).transpose()?,
+                    cap_at: rfc3339(cap_at)?,
+                    purged_at: b.purged_at.map(rfc3339).transpose()?,
+                    reason: b.reason,
+                    last_error: b.last_error,
+                },
             },
             provider: ProviderCancellation {
                 status: provider_status.into(),

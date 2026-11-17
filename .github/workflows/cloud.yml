@@ -47,7 +47,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install build tools (cc, git)
+      - name: Install build tools (cc, git, age)
         run: |
           set -eu
           apt="apt-get"
@@ -55,6 +55,9 @@ jobs:
           install=""
           command -v cc >/dev/null 2>&1 || install="$install build-essential"
           command -v git >/dev/null 2>&1 || install="$install git"
+          # Backups are age-encrypted by default: deploy_restore and the
+          # drill take that path (synthetic key pairs from age-keygen).
+          command -v age-keygen >/dev/null 2>&1 || install="$install age"
           if [ -n "$install" ]; then
             $apt update
             $apt install -y --no-install-recommends $install
@@ -222,7 +225,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install build tools (cc, git, curl)
+      - name: Install build tools (cc, git, curl, age)
         run: |
           set -eu
           apt="apt-get"
@@ -231,6 +234,8 @@ jobs:
           command -v cc >/dev/null 2>&1 || install="$install build-essential"
           command -v git >/dev/null 2>&1 || install="$install git"
           command -v curl >/dev/null 2>&1 || install="$install curl"
+          # The drill backs up encrypted (synthetic age key pair).
+          command -v age-keygen >/dev/null 2>&1 || install="$install age"
           if [ -n "$install" ]; then
             $apt update
             $apt install -y --no-install-recommends $install
