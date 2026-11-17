@@ -943,6 +943,7 @@ async fn lifecycle_development_settings_are_refused_in_production() {
     for (name, value) in [
         ("MUSTER_DEV_DELETION_GRACE_SECS", "1"),
         ("MUSTER_DEV_LIFECYCLE_CRASH", "after_journal"),
+        ("MUSTER_DEV_ACK_PAUSE_FILE", "/tmp/muster-ack-pause"),
     ] {
         // An otherwise acceptable production configuration.
         let env: Vec<(&str, String)> = vec![

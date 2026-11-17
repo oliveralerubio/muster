@@ -373,6 +373,11 @@ pub struct Status {
     /// journal prefix (a crash between journal and witness), if it did.
     pub witness_advanced_from: Option<u64>,
     pub truncated_torn_bytes: u64,
+    /// An activation journaled but never witnessed (its `activate` crashed
+    /// before acknowledging): discarded by this open, so it never fenced
+    /// anyone; rerun `activate`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discarded_activation: Option<Uuid>,
     pub db: Option<DbStatus>,
 }
 
@@ -450,9 +455,17 @@ impl Journal {
     }
 
     fn role_of(&self, inc: Uuid) -> Result<Role, ControlError> {
+        role_in(&self.entries, inc)
+    }
+}
+
+/// The role of `inc` according to `entries` (the whole journal, or only the
+/// prefix a witness covers).
+fn role_in(entries: &[Entry], inc: Uuid) -> Result<Role, ControlError> {
+    {
         let mut known = false;
         let mut was_active = false;
-        for e in &self.entries {
+        for e in entries {
             match e.record {
                 Record::IncarnationRegistered { incarnation_id } if incarnation_id == inc => {
                     known = true
@@ -469,13 +482,19 @@ impl Journal {
                 "database incarnation {inc} is unknown to this authority"
             )));
         }
-        Ok(match self.active() {
+        let active = entries.iter().rev().find_map(|e| match e.record {
+            Record::IncarnationActivated { incarnation_id } => Some(incarnation_id),
+            _ => None,
+        });
+        Ok(match active {
             Some(a) if a == inc => Role::Active,
             _ if was_active => Role::Fenced,
             _ => Role::Candidate,
         })
     }
+}
 
+impl Journal {
     fn read(path: &Path) -> Result<Self, ControlError> {
         let bytes = match fs::read(path) {
             Ok(b) => b,
@@ -551,6 +570,7 @@ pub struct Authority {
     _lock: fs::File,
     witness_advanced_from: Option<u64>,
     truncated: u64,
+    discarded_activation: Option<Uuid>,
 }
 
 fn lock(dir: &Path) -> Result<fs::File, ControlError> {
@@ -630,6 +650,39 @@ impl Authority {
             truncated = journal.torn as u64;
             journal.torn = 0;
         }
+        // An activation is committed only once the witness covers it: one
+        // beyond the witness was never acknowledged (its `activate` died
+        // between journal and witness; appends are serialised by the lock,
+        // so nothing can follow it) and is discarded, never completed, so a
+        // failed activation fences nobody. Other unwitnessed records are
+        // validated and adopted below, as before.
+        let mut discarded_activation = None;
+        let covered = usize::try_from(witness.sequence).unwrap_or(usize::MAX);
+        if let Some(pos) = journal
+            .entries
+            .iter()
+            .skip(covered)
+            .position(|e| matches!(e.record, Record::IncarnationActivated { .. }))
+        {
+            let keep = covered + pos;
+            if let Record::IncarnationActivated { incarnation_id } = journal.entries[keep].record {
+                discarded_activation = Some(incarnation_id);
+            }
+            let bytes: u64 = journal.lines[..keep]
+                .iter()
+                .map(|l| l.len() as u64 + 1)
+                .sum();
+            let f = fs::OpenOptions::new()
+                .write(true)
+                .open(&journal_path)
+                .map_err(io("opening journal"))?;
+            f.set_len(bytes)
+                .map_err(io("discarding an unwitnessed activation"))?;
+            f.sync_all().map_err(io("syncing journal"))?;
+            journal.lines.truncate(keep);
+            journal.entries.truncate(keep);
+        }
+        let (head_seq, _) = journal.head();
         let mut witness_advanced_from = None;
         if witness.sequence < head_seq {
             let (seq, hash) = journal.head();
@@ -649,6 +702,7 @@ impl Authority {
             _lock: lock,
             witness_advanced_from,
             truncated,
+            discarded_activation,
         })
     }
 
@@ -664,6 +718,7 @@ impl Authority {
             active_incarnation: self.journal.active(),
             witness_advanced_from: self.witness_advanced_from,
             truncated_torn_bytes: self.truncated,
+            discarded_activation: self.discarded_activation,
             db: None,
         }
     }
@@ -960,10 +1015,45 @@ impl Authority {
                 "--database-url is not the database of that incarnation".into(),
             ));
         }
-        self.journal.role_of(incarnation_id)?;
+        if self.journal.role_of(incarnation_id)? == Role::Fenced {
+            return Err(fail(format!(
+                "incarnation {incarnation_id} is fenced: a fenced database is never active again (restore it as a new incarnation)"
+            )));
+        }
         self.bind_db(db, false).await?;
         self.append(Record::IncarnationActivated { incarnation_id }, crash)?;
         self.bind_db(db, false).await
+    }
+
+    /// A database restored from a backup joins as a NEW candidate
+    /// incarnation, never under its source's identity: checked read-only
+    /// first (same deployment and store, not ahead of the journal, not
+    /// diverging), then `incarnation_registered` is journaled, the binding is
+    /// moved to it and the journal is replayed into it (current deletion
+    /// requests, tombstones and purges) in one transaction. Interrupted
+    /// before that commit, the restored database keeps its old identity and
+    /// is discarded by the restore; the journaled id is never bound.
+    pub async fn rebind_restored(
+        &mut self,
+        db: &PgPool,
+        crash: Option<CrashPoint>,
+    ) -> Result<DbStatus, ControlError> {
+        let mut tx = db.begin().await.map_err(db_err)?;
+        self.bind_in(&mut tx, true).await?;
+        tx.rollback().await.map_err(db_err)?;
+        let incarnation_id = Uuid::new_v4();
+        self.append(Record::IncarnationRegistered { incarnation_id }, crash)?;
+        let mut tx = db.begin().await.map_err(db_err)?;
+        sqlx::query(
+            "UPDATE control_binding SET incarnation_id = $1, updated_at = now() WHERE singleton",
+        )
+        .bind(incarnation_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        let status = self.bind_in(&mut tx, false).await?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(status)
     }
 
     async fn insert_binding(&self, db: &PgPool, incarnation_id: Uuid) -> Result<(), ControlError> {
@@ -1193,4 +1283,132 @@ pub async fn check_for_service(paths: &ControlPaths, db: &PgPool) -> Result<Stat
         db: Some(db_status),
         ..authority.status()
     })
+}
+
+/// Fencing for every request a running service handles: the role of its
+/// own database incarnation according to the journal. Read without the
+/// control lock (witness first, then journal, so a concurrent append never
+/// looks like a rollback) and cached until either file changes; anything
+/// but `active` (fenced by a later activation, or a candidate) is refused.
+#[derive(Default)]
+pub struct RoleGate {
+    incarnation: std::sync::Mutex<Option<Uuid>>,
+    cached: std::sync::Mutex<Option<(GateKey, Role)>>,
+}
+
+type FileKey = (u64, u64, i64, i64);
+type GateKey = (FileKey, FileKey);
+
+fn file_key(path: &Path) -> Result<FileKey, ControlError> {
+    use std::os::unix::fs::MetadataExt;
+    let m = fs::metadata(path).map_err(|e| fail(format!("{}: {e}", path.display())))?;
+    Ok((m.ino(), m.len(), m.mtime(), m.mtime_nsec()))
+}
+
+fn role_from_files(paths: &ControlPaths, inc: Uuid) -> Result<Role, ControlError> {
+    let witness = read_witness(&paths.witness)?;
+    let journal = Journal::read(&paths.dir.join(JOURNAL))?;
+    let (deployment_id, control_store_id) = journal.ids()?;
+    if witness.deployment_id != deployment_id || witness.control_store_id != control_store_id {
+        return Err(fail(
+            "witness and journal belong to different deployments or control stores",
+        ));
+    }
+    if journal.hash_at(witness.sequence).as_deref() != Some(witness.journal_hash.as_str()) {
+        return Err(fail(
+            "control journal is behind or diverges from its witness",
+        ));
+    }
+    // Only what the witness covers is committed: an activation still
+    // between journal and witness (or never witnessed) fences nobody.
+    let covered = usize::try_from(witness.sequence).unwrap_or(usize::MAX);
+    role_in(&journal.entries[..covered.min(journal.entries.len())], inc)
+}
+
+/// A consistent role: both files unchanged across the read. A read racing
+/// a normal append (or an open repairing the files) is retried, so an
+/// active instance is never refused because of it; only a failure that
+/// persists is reported.
+fn stable_role(paths: &ControlPaths, inc: Uuid) -> Result<(Option<GateKey>, Role), ControlError> {
+    let key = || -> Result<GateKey, ControlError> {
+        Ok((
+            file_key(&paths.witness)?,
+            file_key(&paths.dir.join(JOURNAL))?,
+        ))
+    };
+    let mut last = None;
+    for _ in 0..20 {
+        let before = key();
+        let role = role_from_files(paths, inc);
+        let after = key();
+        match (before, role, after) {
+            (Ok(b), Ok(role), Ok(a)) if a == b => return Ok((Some(a), role)),
+            (_, Err(e), _) | (Err(e), _, _) | (_, _, Err(e)) => last = Some(Err(e)),
+            (_, Ok(role), _) => last = Some(Ok(role)),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    match last {
+        Some(Ok(role)) => Ok((None, role)),
+        Some(Err(e)) => Err(e),
+        None => Err(fail("control store unreadable")),
+    }
+}
+
+impl RoleGate {
+    /// For background workers: `true` only while this instance is active
+    /// (a fenced or candidate instance claims nothing and calls no
+    /// provider).
+    pub async fn allows(&self, paths: &ControlPaths, db: &PgPool, what: &str) -> bool {
+        match self.check(paths, db).await {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(worker = what, error = %e, "fenced: background work skipped");
+                false
+            }
+        }
+    }
+
+    /// `Ok` only while this service's database is the active incarnation.
+    pub async fn check(&self, paths: &ControlPaths, db: &PgPool) -> Result<(), ControlError> {
+        let known = *self.incarnation.lock().expect("role gate");
+        let inc = match known {
+            Some(inc) => inc,
+            None => {
+                let inc: Uuid = sqlx::query_scalar(
+                    "SELECT incarnation_id FROM control_binding WHERE singleton",
+                )
+                .fetch_one(db)
+                .await
+                .map_err(db_err)?;
+                *self.incarnation.lock().expect("role gate") = Some(inc);
+                inc
+            }
+        };
+        let key = (
+            file_key(&paths.witness)?,
+            file_key(&paths.dir.join(JOURNAL))?,
+        );
+        let cached = *self.cached.lock().expect("role gate");
+        let role = match cached {
+            Some((k, role)) if k == key => role,
+            _ => {
+                let owned = paths.clone();
+                let (key, role) = tokio::task::spawn_blocking(move || stable_role(&owned, inc))
+                    .await
+                    .map_err(|e| ControlError::Io(format!("control store task: {e}")))??;
+                if let Some(key) = key {
+                    *self.cached.lock().expect("role gate") = Some((key, role));
+                }
+                role
+            }
+        };
+        if role == Role::Active {
+            Ok(())
+        } else {
+            Err(fail(
+                format!("this database incarnation is {role:?}, not active").to_lowercase(),
+            ))
+        }
+    }
 }

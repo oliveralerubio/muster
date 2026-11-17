@@ -11,6 +11,9 @@ pub struct AppState {
     pub db: PgPool,
     pub oidc: Arc<Oidc>,
     pub repos: Arc<crate::repo_store::RepoStore>,
+    /// Refuses every request once this database incarnation is not the
+    /// active one (fenced by a cutover).
+    pub role_gate: Arc<crate::control::RoleGate>,
 }
 
 impl AppState {
@@ -21,6 +24,9 @@ impl AppState {
             control: self.config.control.clone(),
             repo_root: self.config.repo_root.clone(),
             crash: self.config.dev_purge_crash,
+            journal: true,
+            dev_fail_erase: false,
+            gate: Some(self.role_gate.clone()),
             drain_wait: if self.config.env.is_production() {
                 std::time::Duration::from_secs(30)
             } else {

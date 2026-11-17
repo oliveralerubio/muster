@@ -202,6 +202,7 @@ muster-cloud-ops init        # env: MUSTER_DATABASE_URL, MUSTER_REPO_ROOT,
                              #      MUSTER_CONTROL_DIR, MUSTER_CONTROL_WITNESS
 muster-cloud-ops status [--database-url URL]
 muster-cloud-ops restore-check [--database-url URL]   # read-only gate
+muster-cloud-ops restore-finalize [--database-url URL] # restored db: new candidate + reconcile
 muster-cloud-ops register --database-url URL          # new candidate incarnation
 muster-cloud-ops activate --incarnation ID --database-url URL
 ```
@@ -236,10 +237,21 @@ or rolling back journal and witness together, along with an equally old
 database, cannot be detected; keeping them apart is what makes rollback,
 divergence or a foreign store detectable.
 
-Known limit (scheduled for the restore/fencing unit): an instance whose
-incarnation is fenced reports `not_ready` and refuses to start, but a process
-that keeps running does not yet refuse direct write requests on its own;
-take fenced instances out of the load balancer.
+Fencing: only the active incarnation serves. A service whose database is a
+candidate or fenced refuses to start (78); one that keeps running after
+another incarnation is activated refuses every request except `/healthz`
+and `/readyz` with 503 `not_ready`, and checks again right before
+answering, so a request that entered before the activation (a long push)
+is never acknowledged. Its background workers (purge, billing
+reconciliation, provider cancellations) check before every job and claim
+nothing and call no provider once fenced. The check re-reads journal and
+witness only when either file changed, honours only what the witness
+covers, and retries a read that races a normal append. An activation that
+died between journal and witness was never acknowledged: the next open
+discards it (`status` reports `discarded_activation`), the source keeps
+serving, and `activate` is simply rerun. A fenced incarnation can never be
+activated again (65), and `purge-due`, `backup run` and `retention run`
+refuse (65) on any database that is not the active one.
 
 Billing/provider configuration (price IDs, webhook signing secret, fixture
 IdP) is still being finalized in `cloud/src/config.rs` — placeholders only
@@ -436,9 +448,14 @@ deploy/pg-restore.sh --backup <backup-dir> \
   store, not ahead of the journal, not diverging from it); otherwise the
   targets are torn down (exit 73). Backups taken before the authority
   existed carry no binding and are refused.
-- The restored database keeps its source's incarnation; promoting it and
-  fencing the source is the cutover of the restore unit (not yet). Never
-  serve the source and the restore at the same time.
+- Reconciliation, right after `pg_restore` and before the integrity gate
+  (`muster-cloud-ops restore-finalize`): the restored database joins the
+  authority as a NEW **candidate** incarnation (journaled), the journal is
+  replayed into it, and every workspace the journal tombstoned or purged
+  after the backup was taken is erased from the new database and repo root,
+  so a deleted tenant never comes back. If any of them cannot be erased
+  (tombstoned or purged alike) the targets are torn down (73). A candidate never serves and never
+  journals.
 
 - Creates ONLY new resources: refuses (exit 66) if the database or repo root
   already exist. The active database and repo root are never modified.
@@ -447,10 +464,13 @@ deploy/pg-restore.sh --backup <backup-dir> \
   `workspace_heads` must exist in the restored Git store AND be reachable
   from `refs/muster/uploads/*`; every restored repo must pass `git fsck`.
   Any failure tears down the targets created in that run.
-- Cutover is a separate MANUAL step: start a NEW service instance pointed at
-  the restored database and repo root (`MUSTER_DATABASE_URL`,
-  `MUSTER_REPO_ROOT`). The script never restarts or reconfigures a service,
-  and never overwrites the running one.
+- Cutover is a separate MANUAL step: `muster-cloud-ops activate
+  --incarnation <id printed by the restore> --database-url <new db>`, which
+  fences the source incarnation (its running service starts refusing every
+  request), then start a NEW service instance pointed at the restored
+  database and repo root (`MUSTER_DATABASE_URL`, `MUSTER_REPO_ROOT`). The
+  script never restarts or reconfigures a service, and never overwrites the
+  running one.
 - Every snapshot is verified by `muster-cloud-ops backup verify` (strict
   format 2 manifest, every sha256), after the authority check and before any
   target exists; whatever it rejects is refused (67). Each artifact is then
@@ -473,14 +493,17 @@ cluster (`deploy/pg-test.sh`) with the real `muster-cloud` binary: a reusable
 fixture OIDC provider plus a signed-request client
 (`deploy/harness/drill.rs`, built by `deploy/harness/build.sh` through the
 optional Cargo feature `backup-drill`) seed a
-workspace through the PUBLIC HTTP API (OIDC login, workspace, RFC 8628 device
+TWO tenants (T1, T2) through the PUBLIC HTTP API (OIDC login, workspace, RFC 8628 device
 flow, machine link with a real link proof, signed genesis + incremental
 pushes), after creating the deployment's lifecycle authority with an explicit
-`muster-cloud-ops init`. Then: backup → restore refused with a missing,
-rolled-back and foreign authority (73, nothing left behind) → restore into new
-targets under the unchanged authority → a SECOND real service
-instance starts on the restored data, and recovery is accredited through the
-public API only:
+`muster-cloud-ops init`. Then: encrypted backup → T1 deleted and purged
+through the API AFTER the backup → restore refused with a missing,
+rolled-back and foreign authority (73, nothing left behind) → the
+pre-deletion snapshot restored into new targets as a new candidate (T1
+erased by the reconciliation) → a service on the unactivated candidate
+refuses to start (78) → `activate` → a SECOND real service instance starts
+on the restored data, and recovery is accredited through the public API
+only:
 
 - `/readyz` ready; the pre-backup browser session still authenticates
   (`GET /v1/me`); the pre-backup account token still lists the workspace;
@@ -490,11 +513,15 @@ public API only:
   restored trust anchor and Git objects verify the machine key server-side
   (the `GET /export` route is contract-only so far; this drill uses the
   implemented sync pull/push API);
-- the ORIGINAL instance still serves the untouched original head;
+- T1 stays gone on the restore: not listed, no repository, and
+  `lifecycle-report` shows it purged with no residue;
+- the ORIGINAL instance is fenced: `/readyz` 503 and a write
+  (`POST /v1/workspaces`) refused with 503;
 - restoring into the now-existing targets is refused (66).
 
 The drill backs up through `pg-backup.sh` on the encrypted path a
 deployment takes (production-mode ops, a synthetic `age-keygen` key pair) and
 restores with its identity file; `age` is required. Override the service
 binary location with `MUSTER_DRILL_CLOUD_BIN`. This workflow runs in CI as the
-`backup-drill` job of `.github/workflows/cloud.yml`, which installs `age`.
+`backup-drill` job of `.github/workflows/cloud.yml`, which installs `age`
+and `jq`.

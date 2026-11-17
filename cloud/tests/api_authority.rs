@@ -444,11 +444,12 @@ async fn activating_a_new_incarnation_fences_the_old_one() {
 }
 
 /// Crash after the activation reached the journal but before the witness:
-/// the next reader validates the journal prefix against the witness,
-/// advances the witness, and the activation holds (old fenced, new serves
-/// after replaying its projection).
+/// the activation was never acknowledged, so it never takes effect. The
+/// next reader discards it (the source keeps serving, nobody is left
+/// without an active instance) and rerunning `activate` completes the
+/// cutover.
 #[tokio::test]
-async fn an_activation_journaled_before_a_crash_is_recovered_from_the_prefix() {
+async fn an_activation_interrupted_before_the_witness_never_fences_the_source() {
     let mut s = stack().await;
     let (b, b_id) = register(&s.env).await;
     let out = run_ops(
@@ -461,29 +462,39 @@ async fn an_activation_journaled_before_a_crash_is_recovered_from_the_prefix() {
         Some(0),
         "the crash point must interrupt activate"
     );
-
+    // The running source is never fenced by the unacknowledged record
+    // (its requests read the witnessed prefix only), and the next open
+    // discards it.
+    assert_ne!(
+        http().get(s.url("/v1/me")).send().await.unwrap().status(),
+        503
+    );
     let status = ops_ok(&s.env, &["status"]).await;
-    assert_eq!(status["witness_advanced_from"], 3);
-    assert_eq!(status["sequence"], 4);
-    assert_eq!(status["active_incarnation"], b_id.as_str());
+    assert_eq!(status["sequence"], 3, "{status}");
+    assert_ne!(status["active_incarnation"], b_id.as_str(), "{status}");
+    assert_eq!(status["discarded_activation"], b_id.as_str(), "{status}");
+    assert_eq!(
+        http().get(s.url("/readyz")).send().await.unwrap().status(),
+        200
+    );
 
+    // Rerunning the activation completes the cutover.
+    let done = ops_ok(
+        &s.env,
+        &["activate", "--incarnation", &b_id, "--database-url", &b],
+    )
+    .await;
+    assert_eq!(done["db"]["role"], "active", "{done}");
     assert_eq!(
         http().get(s.url("/readyz")).send().await.unwrap().status(),
         503
     );
-    // B's projection stopped before the activation; restore-check (read
-    // only) sees it behind, the service replays it before it is ready.
-    let check = ops_ok(&s.env, &["restore-check", "--database-url", &b]).await;
-    assert_eq!(check["db"]["applied_sequence"], 3);
     s.restart_with_env(&[("MUSTER_DATABASE_URL", b.clone())])
         .await;
     assert_eq!(
         http().get(s.url("/readyz")).send().await.unwrap().status(),
         200
     );
-    let after = ops_ok(&s.env, &["restore-check", "--database-url", &b]).await;
-    assert_eq!(after["db"]["applied_sequence"], 4);
-    assert_eq!(after["db"]["role"], "active");
 }
 
 /// Crash after journal and witness, before the database projection: the

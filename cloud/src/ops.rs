@@ -8,6 +8,10 @@
 //! muster-cloud-ops register --database-url URL        new candidate incarnation
 //! muster-cloud-ops activate --incarnation ID --database-url URL
 //! muster-cloud-ops restore-check [--database-url URL] read-only restore gate
+//! muster-cloud-ops restore-finalize [--database-url URL]
+//!                     a restored database joins as a NEW candidate incarnation,
+//!                     the journal is replayed into it and what it tombstoned
+//!                     is erased (database and MUSTER_REPO_ROOT)
 //!                     (URL from MUSTER_DATABASE_URL when the flag is absent)
 //! muster-cloud-ops purge-due [--database-url URL]     one purge pass (due deletions)
 //! muster-cloud-ops lifecycle-report --workspace ID [--database-url URL]
@@ -122,6 +126,9 @@ async fn main() -> ExitCode {
         Err(e) => return config_error(e.to_string()),
     };
 
+    if command == "restore-finalize" {
+        return restore_finalize(flag, &paths, repo_root, production, crash).await;
+    }
     if command == "backup" || command == "retention" {
         return backup_command(&args, &paths, repo_root, production).await;
     }
@@ -248,9 +255,10 @@ async fn lifecycle_command(
         // request, or a crash after journaling): the purge reads the
         // projection.
         let bound = match Authority::open(paths) {
-            Ok(authority) => authority.bind_db(&db, false).await.map(|_| ()),
+            Ok(authority) => authority.bind_db(&db, false).await.map(|d| d.role),
             Err(e) => Err(e),
         };
+        let bound = bound.and_then(|role| require_active(role, "purge-due"));
         if let Err(e) = bound {
             eprintln!("muster-cloud-ops: {e}");
             return ExitCode::from(e.exit_code());
@@ -261,6 +269,9 @@ async fn lifecycle_command(
             repo_root,
             crash: None,
             drain_wait: std::time::Duration::from_secs(if production { 30 } else { 2 }),
+            journal: true,
+            dev_fail_erase: false,
+            gate: None,
         };
         serde_json::json!({ "workspaces": purge::run_due(&ctx).await })
     } else {
@@ -438,9 +449,12 @@ async fn backup_command(
     // between journal and projection, or a restored database), which also
     // checks the authority and the database's incarnation.
     let bound = match Authority::open(paths) {
-        Ok(authority) => authority.bind_db(&db, false).await.map(|_| ()),
+        Ok(authority) => authority.bind_db(&db, false).await.map(|d| d.role),
         Err(e) => Err(e),
     };
+    // Only the active incarnation is backed up or decides retention: a
+    // fenced or candidate database holds stale lifecycle state.
+    let bound = bound.and_then(|role| require_active(role, "backup and retention"));
     if let Err(e) = bound {
         eprintln!("muster-cloud-ops: {e}");
         return ExitCode::from(e.exit_code());
@@ -455,6 +469,9 @@ async fn backup_command(
                 repo_root: settings.repo_root.clone(),
                 crash: None,
                 drain_wait: std::time::Duration::from_secs(if production { 30 } else { 2 }),
+                journal: true,
+                dev_fail_erase: false,
+                gate: None,
             };
             for o in muster_cloud::lifecycle_purge::run_due_past_cap(&ctx).await {
                 if let Some(why) = &o.last_error {
@@ -474,5 +491,74 @@ async fn backup_command(
             ExitCode::SUCCESS
         }
         Err(e) => fail(e),
+    }
+}
+
+fn require_active(role: muster_cloud::control::Role, what: &str) -> Result<(), ControlError> {
+    if role == muster_cloud::control::Role::Active {
+        Ok(())
+    } else {
+        Err(ControlError::FailClosed(
+            format!("{what} runs only on the active incarnation; this database is {role:?}")
+                .to_lowercase(),
+        ))
+    }
+}
+
+/// `restore-finalize`: run by `deploy/pg-restore.sh` on its NEW targets,
+/// after `pg_restore` and the Git extraction, before the integrity gate.
+async fn restore_finalize(
+    flag: impl Fn(&str) -> Option<String>,
+    paths: &muster_cloud::control::ControlPaths,
+    repo_root: std::path::PathBuf,
+    production: bool,
+    crash: Option<CrashPoint>,
+) -> ExitCode {
+    use muster_cloud::lifecycle_purge as purge;
+    let Some(url) = flag("--database-url").or_else(|| env("MUSTER_DATABASE_URL")) else {
+        return usage("--database-url (or MUSTER_DATABASE_URL) is required");
+    };
+    let dev_fail_erase = match env("MUSTER_DEV_RESTORE_ERASE_FAIL") {
+        None => false,
+        Some(_) if production => {
+            eprintln!(
+                "muster-cloud-ops: MUSTER_DEV_RESTORE_ERASE_FAIL is a development-only fault hook"
+            );
+            return ExitCode::from(78);
+        }
+        Some(_) => true,
+    };
+    let result: Result<serde_json::Value, ControlError> = async {
+        let db = connect(&url, DbAccess::Existing).await?;
+        let mut authority = Authority::open(paths)?;
+        let status = authority.rebind_restored(&db, crash).await?;
+        drop(authority);
+        let ctx = purge::PurgeCtx {
+            db,
+            control: paths.clone(),
+            repo_root,
+            crash: None,
+            drain_wait: std::time::Duration::from_secs(if production { 30 } else { 2 }),
+            journal: false,
+            dev_fail_erase,
+            gate: None,
+        };
+        // Everything the journal tombstoned is erased now, before the
+        // integrity gate and before anything could serve it.
+        let erased = purge::reconcile_before_serving(&ctx)
+            .await
+            .map_err(|e| ControlError::FailClosed(format!("restored residue: {e}")))?;
+        Ok(serde_json::json!({ "db": status, "erased": erased }))
+    }
+    .await;
+    match result {
+        Ok(json) => {
+            println!("{json}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("muster-cloud-ops: {e}");
+            ExitCode::from(e.exit_code())
+        }
     }
 }

@@ -49,6 +49,12 @@ pub struct Config {
     /// purge step (`after_tombstone`, `after_rename`, `after_db`,
     /// `after_trash`). Refused in production.
     pub dev_purge_crash: Option<crate::lifecycle_purge::PurgeCrash>,
+    /// Development only (`MUSTER_DEV_ACK_PAUSE_FILE`): while this file
+    /// exists, a write request (any method but GET/HEAD) waits after its
+    /// handler and before its response is sent, writing `<file>.reached`
+    /// first, so tests can fence an instance under an in-flight write.
+    /// Refused in production.
+    pub dev_ack_pause_file: Option<std::path::PathBuf>,
     /// Lifecycle authority (`crate::control`): journal directory and its
     /// independent witness file. Mandatory everywhere; never created by
     /// the service.
@@ -292,6 +298,17 @@ impl Config {
             ),
         };
 
+        let dev_ack_pause_file = match get("MUSTER_DEV_ACK_PAUSE_FILE") {
+            None => None,
+            Some(_) if env.is_production() => {
+                return Err(ConfigError::Invalid {
+                    name: "MUSTER_DEV_ACK_PAUSE_FILE",
+                    reason: "is a development-only test hook".into(),
+                })
+            }
+            Some(v) => Some(std::path::PathBuf::from(v)),
+        };
+
         let control = control_paths(&get, &repo_root)?;
 
         Ok(Self {
@@ -308,6 +325,7 @@ impl Config {
             dev_deletion_grace_secs,
             dev_lifecycle_crash,
             dev_purge_crash,
+            dev_ack_pause_file,
             control,
         })
     }

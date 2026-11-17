@@ -94,6 +94,7 @@ async fn main() -> ExitCode {
         db,
         oidc,
         repos,
+        role_gate: Arc::new(muster_cloud::control::RoleGate::default()),
     };
     // Before serving: tombstoned workspaces with residue (a database or root
     // restored from before their purge, or a purge cut short) are erased

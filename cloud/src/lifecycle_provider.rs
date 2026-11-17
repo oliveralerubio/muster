@@ -64,6 +64,13 @@ pub async fn attempt_workspace(state: &AppState, ws: Uuid) {
             return;
         }
         for item in claimed {
+            if !state
+                .role_gate
+                .allows(&state.config.control, &state.db, "lifecycle provider")
+                .await
+            {
+                return;
+            }
             process(state, paddle, item).await;
         }
     }
@@ -74,9 +81,24 @@ pub async fn run_due(state: &AppState) -> usize {
     let Some(paddle) = &state.config.paddle else {
         return 0;
     };
+    // A fenced instance claims nothing and calls no provider.
+    if !state
+        .role_gate
+        .allows(&state.config.control, &state.db, "lifecycle provider")
+        .await
+    {
+        return 0;
+    }
     let claimed = claim(state, None).await;
     let n = claimed.len();
     for item in claimed {
+        if !state
+            .role_gate
+            .allows(&state.config.control, &state.db, "lifecycle provider")
+            .await
+        {
+            break;
+        }
         process(state, paddle, item).await;
     }
     n

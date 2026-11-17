@@ -32,9 +32,14 @@
 #     it; otherwise the targets are torn down (exit 73). This script never
 #     creates or initialises an authority. A backup taken before the
 #     authority existed has no binding and is refused.
-#   - The restored database keeps the incarnation of its source. Promoting
-#     it to a new incarnation (and fencing the source) is the cutover step of
-#     the restore unit; until then, never serve source and restore at once.
+#   - Reconciliation (`muster-cloud-ops restore-finalize`, right after
+#     pg_restore, before the integrity gate): the restored database joins as
+#     a NEW candidate incarnation (journaled), the journal is replayed into
+#     it, and every workspace the journal tombstoned or purged after the
+#     backup is erased from the new targets. A candidate never serves and
+#     never journals; `muster-cloud-ops activate` makes it active and fences
+#     the source incarnation (its service then refuses every request, and a
+#     fenced incarnation can never be activated again).
 #   - Cutover itself is a separate, manual step: point MUSTER_DATABASE_URL and
 #     MUSTER_REPO_ROOT of a NEW service instance at these targets. This script
 #     never restarts or reconfigures any service.
@@ -286,6 +291,26 @@ restore_rc=$?
 [ "$restore_rc" = 171 ] && { teardown_fail; fail "age decryption of the database dump failed" "$PG_RESTORE_EXIT_DECRYPT"; }
 [ "$restore_rc" = 0 ] || { teardown_fail; fail "pg_restore failed" "$PG_RESTORE_EXIT_PGRESTORE"; }
 
+# Reconciliation, before the integrity gate and before anything can serve:
+# the restored database joins the authority as a NEW candidate incarnation
+# (journaled), the journal is replayed into it, and every workspace the
+# journal tombstoned after this backup was taken is erased from the new
+# database and repo root, so a deleted tenant never comes back. Any failure
+# to erase one (tombstoned or purged alike) tears the targets down (73).
+new_db_url=$(pg_conn_with_db "$admin_url" "$new_db")
+fin_err_file=$(mktemp "${TMPDIR:-/tmp}/muster-restore-fin.XXXXXX") \
+  || { teardown_fail; fail "mktemp failed" "$PG_RESTORE_EXIT_USAGE"; }
+fin_json=$(MUSTER_DATABASE_URL=$new_db_url authority_ops restore-finalize 2>"$fin_err_file")
+fin_rc=$?
+fin_err=$(cat "$fin_err_file" 2>/dev/null); rm -f -- "$fin_err_file"
+unset new_db_url
+if [ "$fin_rc" != 0 ]; then
+  teardown_fail
+  fail "restored database could not join the lifecycle authority (targets torn down): ${fin_err#muster-cloud-ops: }" \
+    "$PG_RESTORE_EXIT_AUTHORITY"
+fi
+printf 'pg-restore.sh: reconciled: %s\n' "$fin_json"
+
 # Pre-cutover integrity gate: PG-referenced heads must exist in the restored
 # git store, reachable from upload refs; every restored repo must fsck clean.
 heads=$(psql -d "$new_db" -Atc \
@@ -373,5 +398,7 @@ printf 'pg-restore.sh: authority verified: %s\n' "$gate_json"
 printf 'pg-restore.sh: restore complete (NEW resources only; cutover is manual)\n'
 printf 'pg-restore.sh: database=%s repo_root=%s heads_checked=%s repos_fscked=%s\n' \
   "$new_db" "$new_repo_root" "$heads_checked" "$repos_fscked"
-printf 'pg-restore.sh: next step (manual): point a NEW service instance at these targets via\n'
-printf 'pg-restore.sh: MUSTER_DATABASE_URL and MUSTER_REPO_ROOT; never repoint the active one directly.\n'
+printf 'pg-restore.sh: the restore is a CANDIDATE incarnation: it refuses to serve until activated.\n'
+printf 'pg-restore.sh: next step (manual): muster-cloud-ops activate --incarnation <db.incarnation_id above>\n'
+printf 'pg-restore.sh: --database-url <the new database>; activation FENCES the source instance, which\n'
+printf 'pg-restore.sh: then refuses every request. Start a NEW service on MUSTER_DATABASE_URL/MUSTER_REPO_ROOT.\n'

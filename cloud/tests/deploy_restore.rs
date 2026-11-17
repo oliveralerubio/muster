@@ -195,17 +195,14 @@ async fn seeded_stack() -> support::Stack {
     s
 }
 
-/// The restored targets pass the ops gate and a real service on them is
-/// ready under the same (unchanged) authority.
-async fn assert_restored_serves(s: &support::Stack, t: &Target) {
-    let gate = run_ops(&s.env, &["restore-check", "--database-url", &t.url]).await;
-    assert!(gate.status.success(), "{}", text(&gate));
+/// Environment of a service on the restored targets `t`.
+fn target_env(s: &support::Stack, t: &Target) -> Env {
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
         .unwrap()
         .port();
-    let env = with(
+    with(
         &with(
             &with(
                 &with(&s.env, "MUSTER_DATABASE_URL", &t.url),
@@ -217,14 +214,65 @@ async fn assert_restored_serves(s: &support::Stack, t: &Target) {
         ),
         "MUSTER_PUBLIC_URL",
         &format!("http://127.0.0.1:{port}"),
-    );
+    )
+}
+
+/// `(incarnation_id, role)` of the database at `url`, from the read-only
+/// ops gate.
+async fn incarnation(env: &Env, url: &str) -> (String, String) {
+    let out = run_ops(env, &["restore-check", "--database-url", url]).await;
+    assert!(out.status.success(), "{}", text(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    (
+        v["db"]["incarnation_id"].as_str().unwrap().to_string(),
+        v["db"]["role"].as_str().unwrap().to_string(),
+    )
+}
+
+/// The cutover: the restored candidate is activated (fencing every other
+/// incarnation, the source included) and a real service starts on it.
+async fn cutover(s: &support::Stack, t: &Target) -> (support::Cloud, Env) {
+    let (id, role) = incarnation(&s.env, &t.url).await;
+    assert_eq!(role, "candidate", "a restore must join as a new candidate");
+    let out = run_ops(
+        &s.env,
+        &["activate", "--incarnation", &id, "--database-url", &t.url],
+    )
+    .await;
+    assert!(out.status.success(), "{}", text(&out));
+    let env = target_env(s, t);
     let cloud = spawn_cloud(&env).await;
+    (cloud, env)
+}
+
+/// The restored targets pass the ops gate as a new candidate incarnation;
+/// after the cutover a real service on them is ready.
+async fn assert_restored_serves(s: &support::Stack, t: &Target) {
+    let (cloud, _) = cutover(s, t).await;
     let ready = http()
         .get(format!("{}/readyz", cloud.base))
         .send()
         .await
         .unwrap();
     assert_eq!(ready.status(), 200);
+}
+
+/// Exit code of a service started with `env` (it must refuse to serve).
+async fn refused_start(env: &Env) -> Option<i32> {
+    let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_muster-cloud"));
+    cmd.env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().unwrap();
+    match tokio::time::timeout(std::time::Duration::from_secs(30), child.wait()).await {
+        Ok(status) => status.unwrap().code(),
+        Err(_) => panic!("the service kept running on a database it must not serve"),
+    }
 }
 
 #[tokio::test]
@@ -366,25 +414,7 @@ async fn a_restored_older_backup_still_carries_a_later_deletion_request() {
     let t = new_target();
     let out = restore(&bk, &t, Some(&s.env)).await;
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let env = with(
-        &with(
-            &with(
-                &with(&s.env, "MUSTER_DATABASE_URL", &t.url),
-                "MUSTER_REPO_ROOT",
-                &t.repos.display().to_string(),
-            ),
-            "MUSTER_BIND",
-            &format!("127.0.0.1:{port}"),
-        ),
-        "MUSTER_PUBLIC_URL",
-        &format!("http://127.0.0.1:{port}"),
-    );
-    let cloud = spawn_cloud(&env).await;
+    let (cloud, _) = cutover(&s, &t).await;
     let resp = http()
         .get(format!("{}/v1/workspaces/{}/lifecycle", cloud.base, ws.id))
         .header("Cookie", format!("__Host-mc_session={}", alice.cookie))
@@ -505,29 +535,13 @@ async fn a_pre_request_backup_restores_without_resurrecting_a_purged_tenant() {
     let t = new_target();
     let out = restore(&bk, &t, Some(&s.env)).await;
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    // The restore itself reapplied the journal and erased A (the backup
+    // held it) before its integrity gate: nothing waits for a service.
     assert!(
-        t.repos.join(format!("{}.git", a.id)).exists(),
-        "the backup does hold A"
+        !t.repos.join(format!("{}.git", a.id)).exists(),
+        "A's repository restored"
     );
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let env = with(
-        &with(
-            &with(
-                &with(&s.env, "MUSTER_DATABASE_URL", &t.url),
-                "MUSTER_REPO_ROOT",
-                &t.repos.display().to_string(),
-            ),
-            "MUSTER_BIND",
-            &format!("127.0.0.1:{port}"),
-        ),
-        "MUSTER_PUBLIC_URL",
-        &format!("http://127.0.0.1:{port}"),
-    );
-    let cloud = spawn_cloud(&env).await;
+    let (cloud, env) = cutover(&s, &t).await;
     let ready = http()
         .get(format!("{}/readyz", cloud.base))
         .send()
@@ -601,10 +615,9 @@ async fn a_pre_request_backup_restores_without_resurrecting_a_purged_tenant() {
     );
 }
 
-/// Review F5: on a database restored from before the request, the
-/// operator commands reapply the external journal themselves (no service
-/// started): `lifecycle-report` reports what the journal says (purged)
-/// with the restored residue, and `purge-due` erases it.
+/// Review F5, then unit 5: on a database restored from before the request,
+/// the restore itself reapplies the external journal and erases the
+/// restored residue (no service started); `lifecycle-report` agrees.
 #[tokio::test]
 async fn ops_reapply_the_journal_on_a_pre_request_restore_without_the_service() {
     use support::fleet::{account_token, create_workspace, link, FleetRepo, MachineKey};
@@ -670,24 +683,17 @@ async fn ops_reapply_the_journal_on_a_pre_request_restore_without_the_service() 
             serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()
         }
     };
-    let before = report(env.clone()).await;
-    assert_eq!(before["lifecycle"]["primary"], "purged", "{before}");
-    assert_eq!(before["residue"], true, "{before}");
-
-    let out = run_ops(&env, &["purge-due"]).await;
-    assert!(out.status.success(), "{}", text(&out));
-    let ran: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert!(
-        ran["workspaces"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|w| w["workspace_id"] == a.id.as_str() && w["state"] == "purged"),
-        "{ran}"
-    );
+    // The restore reapplied the journal and erased A's restored residue
+    // itself, without any service; the report agrees with the journal.
     let after = report(env.clone()).await;
+    assert_eq!(after["lifecycle"]["primary"], "purged", "{after}");
     assert_eq!(after["residue"], false, "{after}");
+    assert_eq!(after["lifecycle"]["projection_behind"], false, "{after}");
     assert!(!t.repos.join(format!("{}.git", a.id)).exists());
+    // A candidate never journals: purge-due refuses it (only the active
+    // incarnation purges).
+    let out = run_ops(&env, &["purge-due"]).await;
+    assert_eq!(out.status.code(), Some(65), "{}", text(&out));
 }
 
 // ---------------------------------------------------------------------------
@@ -1432,10 +1438,10 @@ async fn a_push_during_the_git_capture_still_restores_clean() {
     assert_restored_serves(&s, &t).await;
 }
 
-/// `backup run` reapplies the journal and purges what is overdue before its
-/// snapshot: a database restored from before a deletion never puts the
-/// deleted tenant into a new backup. It refuses (65) only while a workspace
-/// past its cap still cannot be purged, and succeeds on its own afterwards.
+/// `backup run` purges what is overdue before its snapshot: a workspace
+/// past its backup cap never enters a new backup. It refuses (65) only
+/// while such a workspace still cannot be purged (here a live reader blocks
+/// the drain), and succeeds on its own afterwards.
 #[tokio::test]
 async fn a_backup_reapplies_the_journal_and_purges_what_is_overdue_first() {
     let s = support::stack_with_env(&[("MUSTER_DEV_DELETION_GRACE_SECS", "1".into())]).await;
@@ -1444,28 +1450,12 @@ async fn a_backup_reapplies_the_journal_and_purges_what_is_overdue_first() {
     let (ka, kb) = (MachineKey::new("a-node"), MachineKey::new("b-node"));
     let (a, _) = pushed(&s, &alice, &token, "Gone", &ka).await;
     let (b, _) = pushed(&s, &alice, &token, "Kept", &kb).await;
+    let repos = PathBuf::from(value(&s.env, "MUSTER_REPO_ROOT"));
     let dir = tempfile::tempdir().unwrap();
-    let before = backup(&s, dir.path()).await;
-    delete_ws(&s, &alice, &a, "Gone").await;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while lifecycle(&s, &alice, &a).await["deletion"]["primary"]["status"] != "purged" {
-        assert!(std::time::Instant::now() < deadline, "never purged");
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    }
-
-    // The pre-request backup restored into new targets; no service on them.
-    let t = new_target();
-    let out = restore(&before, &t, Some(&s.env)).await;
-    assert!(out.status.success(), "{}", text(&out));
-    let target = with(
-        &with(&s.env, "MUSTER_DATABASE_URL", &t.url),
-        "MUSTER_REPO_ROOT",
-        &t.repos.display().to_string(),
-    );
     let root = dir.path().join("after");
 
-    // A live reader on the restored repository: the purge cannot drain.
-    let locks = t.repos.join("locks");
+    // A live reader on the repository: the purge cannot drain.
+    let locks = repos.join("locks");
     std::fs::create_dir_all(&locks).unwrap();
     let held = std::fs::OpenOptions::new()
         .create(true)
@@ -1474,20 +1464,84 @@ async fn a_backup_reapplies_the_journal_and_purges_what_is_overdue_first() {
         .open(locks.join(format!("{a}.lock")))
         .unwrap();
     held.lock_shared().unwrap();
-    let refused = backup_run(&target, &root, &[], &[]).await;
-    assert_eq!(refused.status.code(), Some(65), "{}", text(&refused));
-    assert!(
-        text(&refused).contains("past its backup cap"),
-        "{}",
-        text(&refused)
-    );
+    delete_ws(&s, &alice, &a, "Gone").await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
+    loop {
+        let out = backup_run(&s.env, &root, &[], &[]).await;
+        if out.status.code() == Some(65) {
+            assert!(text(&out).contains("past its backup cap"), "{}", text(&out));
+            break;
+        }
+        assert!(out.status.success(), "{}", text(&out));
+        assert!(std::time::Instant::now() < deadline, "never past its cap");
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
     drop(held);
 
-    let snap = published(&backup_run(&target, &root, &[], &[]).await);
+    let snap = published(&backup_run(&s.env, &root, &[], &[]).await);
     assert_eq!(tenant_ids(&manifest(&snap)), vec![b.clone()]);
     assert!(
-        !t.repos.join(format!("{a}.git")).exists(),
+        !repos.join(format!("{a}.git")).exists(),
         "deleted tenant left in the root"
+    );
+}
+
+/// A restore whose reconciliation cannot erase a tenant the journal
+/// tombstoned (here not purged yet: the purge stopped right after its
+/// tombstone) fails closed (73) and tears its targets down; the fault hook
+/// that forces the erase failure is refused in production.
+#[tokio::test]
+async fn a_restore_that_cannot_erase_a_tombstoned_tenant_fails_closed() {
+    let s = support::stack_with_env(&[
+        ("MUSTER_DEV_DELETION_GRACE_SECS", "1".into()),
+        ("MUSTER_DEV_PURGE_CRASH", "after_tombstone".into()),
+    ])
+    .await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let token = account_token(&s, &alice).await;
+    let (a, _) = pushed(&s, &alice, &token, "Gone", &MachineKey::new("a-node")).await;
+    let dir = tempfile::tempdir().unwrap();
+    let before = backup(&s, dir.path()).await;
+    delete_ws(&s, &alice, &a, "Gone").await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let out = run_ops(&s.env, &["lifecycle-report", "--workspace", &a]).await;
+        if out.status.success()
+            && serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["lifecycle"]
+                ["primary"]
+                == "purge_committed"
+        {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "never tombstoned");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    let t = new_target();
+    let out = restore_with(
+        &before,
+        &t,
+        &s.env,
+        &[
+            ("MUSTER_ENV", "development".into()),
+            ("MUSTER_DEV_RESTORE_ERASE_FAIL", "1".into()),
+        ],
+    )
+    .await;
+    assert_eq!(out.status.code(), Some(73), "{}", text(&out));
+    assert!(!t.repos.exists(), "targets left behind");
+
+    let prod = with(
+        &with(&target_env(&s, &t), "MUSTER_ENV", "production"),
+        "MUSTER_DEV_RESTORE_ERASE_FAIL",
+        "1",
+    );
+    let out = run_ops(&prod, &["restore-finalize"]).await;
+    assert_eq!(out.status.code(), Some(78), "{}", text(&out));
+    assert!(
+        text(&out).contains("MUSTER_DEV_RESTORE_ERASE_FAIL"),
+        "{}",
+        text(&out)
     );
 }
 
@@ -1595,4 +1649,158 @@ async fn a_corrupt_snapshot_is_not_reported_removed_while_its_files_remain() {
         purged_at >= removed,
         "purged_at {purged_at} before the files went away ({removed})"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle unit 5: restore reconciliation and fencing
+// ---------------------------------------------------------------------------
+
+async fn restore_with(bk: &Path, t: &Target, authority: &Env, extra: &[(&str, String)]) -> Output {
+    let mut args = vec![
+        "--backup".to_string(),
+        bk.display().to_string(),
+        "--admin-url".into(),
+        test_pg_url(),
+        "--new-db".into(),
+        t.db.clone(),
+        "--new-repo-root".into(),
+        t.repos.display().to_string(),
+        "--control-dir".into(),
+        value(authority, "MUSTER_CONTROL_DIR"),
+        "--control-witness".into(),
+        value(authority, "MUSTER_CONTROL_WITNESS"),
+    ];
+    let root = bk.parent().and_then(Path::parent).map(Path::to_path_buf);
+    if let Some(key) = root.map(|r| identity_for(&r)).filter(|k| k.exists()) {
+        args.extend(["--age-identity-file".into(), key.display().to_string()]);
+    }
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    run(&script("pg-restore.sh"), &args, extra).await
+}
+
+/// A restore joins the authority as a NEW candidate incarnation (never the
+/// source's identity), and no service serves it until it is activated; the
+/// source stays active and ready meanwhile.
+#[tokio::test]
+async fn a_restore_is_a_new_candidate_that_never_serves_until_activated() {
+    let s = seeded_stack().await;
+    let dir = tempfile::tempdir().unwrap();
+    let bk = backup(&s, dir.path()).await;
+    let (source, role) = incarnation(&s.env, &value(&s.env, "MUSTER_DATABASE_URL")).await;
+    assert_eq!(role, "active");
+    let t = new_target();
+    let out = restore(&bk, &t, Some(&s.env)).await;
+    assert!(out.status.success(), "{}", text(&out));
+    let (restored, role) = incarnation(&s.env, &t.url).await;
+    assert_ne!(
+        restored, source,
+        "the restore kept the source's incarnation"
+    );
+    assert_eq!(role, "candidate");
+    assert_eq!(refused_start(&target_env(&s, &t)).await, Some(78));
+    let ready = http().get(s.url("/readyz")).send().await.unwrap();
+    assert_eq!(ready.status(), 200, "the source stopped serving");
+}
+
+/// Activating a restore fences the old incarnation: its running service
+/// refuses every request (reads and writes, not only readiness); its
+/// database can never be activated again; operator backups refuse it.
+#[tokio::test]
+async fn activating_a_restore_fences_the_old_instance() {
+    let s = seeded_stack().await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let dir = tempfile::tempdir().unwrap();
+    let bk = backup(&s, dir.path()).await;
+    let (source, _) = incarnation(&s.env, &value(&s.env, "MUSTER_DATABASE_URL")).await;
+    let t = new_target();
+    let out = restore(&bk, &t, Some(&s.env)).await;
+    assert!(out.status.success(), "{}", text(&out));
+    let (cloud, _) = cutover(&s, &t).await;
+    assert_eq!(
+        http()
+            .get(format!("{}/readyz", cloud.base))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+
+    // The old instance, still running: every request refused.
+    assert_eq!(
+        http().get(s.url("/readyz")).send().await.unwrap().status(),
+        503
+    );
+    let write = http()
+        .post(s.url("/v1/workspaces"))
+        .header("Cookie", format!("__Host-mc_session={}", alice.cookie))
+        .header("Origin", s.origin())
+        .header("X-CSRF-Token", &alice.csrf_token)
+        .header("Idempotency-Key", uuid::Uuid::new_v4().to_string())
+        .json(&serde_json::json!({"name": "After the cutover"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(write.status(), 503, "the fenced instance accepted a write");
+    let read = http()
+        .get(s.url("/v1/workspaces"))
+        .header("Cookie", format!("__Host-mc_session={}", alice.cookie))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(read.status(), 503, "the fenced instance served a read");
+
+    // Never active again, and no operator backup of it.
+    let src_url = value(&s.env, "MUSTER_DATABASE_URL");
+    let again = run_ops(
+        &s.env,
+        &[
+            "activate",
+            "--incarnation",
+            &source,
+            "--database-url",
+            &src_url,
+        ],
+    )
+    .await;
+    assert_eq!(again.status.code(), Some(65), "{}", text(&again));
+    let refused = backup_run(&s.env, &dir.path().join("fenced"), &[], &[]).await;
+    assert_eq!(refused.status.code(), Some(65), "{}", text(&refused));
+}
+
+static ONE_RESTORE_CRASH_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// A restore killed while joining the authority (after the journal, after
+/// the witness) tears its targets down and leaves the source active; the
+/// next restore succeeds.
+#[tokio::test]
+async fn a_restore_killed_while_joining_leaves_the_source_active() {
+    let _one = ONE_RESTORE_CRASH_AT_A_TIME.lock().await;
+    let s = seeded_stack().await;
+    let dir = tempfile::tempdir().unwrap();
+    let bk = backup(&s, dir.path()).await;
+    for point in ["after_journal", "after_witness"] {
+        let t = new_target();
+        let out = restore_with(
+            &bk,
+            &t,
+            &s.env,
+            &[
+                ("MUSTER_ENV", "development".into()),
+                ("MUSTER_DEV_CONTROL_CRASH", point.into()),
+            ],
+        )
+        .await;
+        assert_eq!(out.status.code(), Some(73), "{point}: {}", text(&out));
+        assert!(!t.repos.exists(), "{point}: targets left behind");
+        assert_eq!(
+            http().get(s.url("/readyz")).send().await.unwrap().status(),
+            200,
+            "{point}: the source stopped serving"
+        );
+    }
+    let t = new_target();
+    let out = restore(&bk, &t, Some(&s.env)).await;
+    assert!(out.status.success(), "{}", text(&out));
+    assert_restored_serves(&s, &t).await;
 }

@@ -107,6 +107,14 @@ pub async fn run_now(state: &AppState, sub_id: &str) {
 
 /// Runs every due job once. Returns how many were attempted.
 pub async fn run_due(state: &AppState, limit: i64) -> usize {
+    // A fenced instance claims nothing and calls no provider.
+    if !state
+        .role_gate
+        .allows(&state.config.control, &state.db, "billing reconcile")
+        .await
+    {
+        return 0;
+    }
     let due: Vec<(String, Uuid, i64, i32)> = match sqlx::query_as(
         "UPDATE billing_reconcile_jobs
             SET locked_until = now() + make_interval(secs => $2)
@@ -132,6 +140,13 @@ pub async fn run_due(state: &AppState, limit: i64) -> usize {
     };
     let n = due.len();
     for (sub_id, ws, generation, attempts) in due {
+        if !state
+            .role_gate
+            .allows(&state.config.control, &state.db, "billing reconcile")
+            .await
+        {
+            break;
+        }
         process(state, &sub_id, ws, generation, attempts).await;
     }
     n

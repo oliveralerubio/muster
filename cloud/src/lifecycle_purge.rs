@@ -88,6 +88,24 @@ pub struct PurgeCtx {
     pub crash: Option<PurgeCrash>,
     /// How long one attempt waits for live Git access to drain.
     pub drain_wait: Duration,
+    /// `false` for a candidate incarnation (a restore being reconciled):
+    /// it erases what the journal already tombstoned, never journals.
+    pub journal: bool,
+    /// Development only (`MUSTER_DEV_RESTORE_ERASE_FAIL` for
+    /// `restore-finalize`, refused in production): every erase attempt
+    /// fails before touching anything, to test that a restore whose
+    /// reconciliation cannot erase a tenant fails closed.
+    pub dev_fail_erase: bool,
+    /// The service's fencing gate: a fenced instance's worker claims and
+    /// erases nothing. `None` for ops commands, which check the role first.
+    pub gate: Option<std::sync::Arc<crate::control::RoleGate>>,
+}
+
+async fn fenced(ctx: &PurgeCtx) -> bool {
+    match &ctx.gate {
+        Some(gate) => !gate.allows(&ctx.control, &ctx.db, "purge").await,
+        None => false,
+    }
 }
 
 fn crash_if(ctx: &PurgeCtx, here: PurgeCrash) {
@@ -484,6 +502,15 @@ fn authority_err(e: control::ControlError) -> String {
 /// Step 1: the irreversible tombstone (journal, then projection).
 async fn tombstone(ctx: &PurgeCtx, ws: Uuid, request_id: Uuid) -> Result<(), String> {
     let dbe = |e: sqlx::Error| format!("database: {e}");
+    if !ctx.journal {
+        // A candidate only erases what the journal already tombstoned
+        // (projected by replay); it never records anything.
+        return if is_tombstoned(&ctx.db, ws).await.map_err(dbe)? {
+            Ok(())
+        } else {
+            Err("not tombstoned by the journal: left to the active incarnation".into())
+        };
+    }
     let mut tx = ctx.db.begin().await.map_err(dbe)?;
     sqlx::query("SELECT id FROM workspaces WHERE id = $1 FOR UPDATE")
         .bind(ws)
@@ -604,6 +631,9 @@ async fn complete(ctx: &PurgeCtx, ws: Uuid, request_id: Uuid) -> Result<(), Stri
         ));
     }
     let dbe = |e: sqlx::Error| format!("database: {e}");
+    if !ctx.journal {
+        return Ok(());
+    }
     let mut tx = ctx.db.begin().await.map_err(dbe)?;
     let mut authority = control::open_for_write(&ctx.control, &mut tx)
         .await
@@ -629,6 +659,9 @@ async fn complete(ctx: &PurgeCtx, ws: Uuid, request_id: Uuid) -> Result<(), Stri
 
 /// Runs every step for one workspace whose grace has expired.
 pub async fn purge_one(ctx: &PurgeCtx, ws: Uuid, request_id: Uuid) -> Result<(), String> {
+    if ctx.dev_fail_erase {
+        return Err("development fault: erase refused (MUSTER_DEV_RESTORE_ERASE_FAIL)".into());
+    }
     tombstone(ctx, ws, request_id).await?;
     let lock = drain(ctx, ws).await?;
     // No backup capture may see this workspace half-erased: hold the
@@ -726,6 +759,9 @@ async fn run_due_with(ctx: &PurgeCtx, past_cap_now: bool) -> Vec<PurgeOutcome> {
     };
     let mut out = Vec::new();
     for (ws, request_id, attempts) in due {
+        if fenced(ctx).await {
+            break;
+        }
         let result = purge_one(ctx, ws, request_id).await;
         let last_error = result.err();
         if let Some(why) = &last_error {
@@ -769,7 +805,9 @@ async fn run_due_with(ctx: &PurgeCtx, past_cap_now: bool) -> Vec<PurgeOutcome> {
 /// Background loop for the service.
 pub async fn worker(ctx: PurgeCtx, every: Duration) {
     loop {
-        run_due(&ctx).await;
+        if !fenced(&ctx).await {
+            run_due(&ctx).await;
+        }
         tokio::time::sleep(every).await;
     }
 }
@@ -794,6 +832,9 @@ pub async fn reconcile_before_serving(ctx: &PurgeCtx) -> Result<usize, String> {
         }
         match purge_one(ctx, ws, request_id).await {
             Ok(()) => reconciled += 1,
+            // A restore being reconciled (no journal): whatever cannot be
+            // erased fails the restore, tombstoned or purged alike.
+            Err(e) if !ctx.journal => stuck.push(format!("{ws}: {e}")),
             // Left to the worker (it selects it again: residue of a purged
             // workspace keeps /readyz at 503 until it is gone).
             Err(e) if purged => stuck.push(format!("{ws}: {e}")),
@@ -804,7 +845,7 @@ pub async fn reconcile_before_serving(ctx: &PurgeCtx) -> Result<usize, String> {
         Ok(reconciled)
     } else {
         Err(format!(
-            "purged workspaces with restored data not erased yet: {}",
+            "workspaces with restored data not erased yet: {}",
             stuck.join("; ")
         ))
     }

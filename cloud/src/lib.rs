@@ -154,8 +154,66 @@ pub fn router(state: AppState) -> Router {
         .merge(web::routes())
         .fallback(|| async { AppError::not_found() })
         .method_not_allowed_fallback(|| async { AppError::method_not_allowed() })
+        .layer(middleware::from_fn_with_state(state.clone(), fence_layer))
         .layer(middleware::from_fn(error::request_id_layer))
         .with_state(state)
+}
+
+/// Write (and read) fencing: a running service whose database incarnation
+/// is no longer the active one — a restore was activated in its place —
+/// refuses every request but liveness and readiness (which reports it),
+/// so it can neither accept writes nor serve stale or deleted data.
+async fn fence_layer(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+    next: middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let path = req.uri().path();
+    if path == protocol::routes::HEALTHZ || path == protocol::routes::READYZ {
+        return next.run(req).await;
+    }
+    let write = req.method() != axum::http::Method::GET && req.method() != axum::http::Method::HEAD;
+    if let Err(err) = state
+        .role_gate
+        .check(&state.config.control, &state.db)
+        .await
+    {
+        tracing::warn!(error = %err, "fenced: request refused");
+        return AppError::not_ready(err.to_string()).into_response();
+    }
+    let response = next.run(req).await;
+    if write {
+        if let Some(pause) = &state.config.dev_ack_pause_file {
+            dev_ack_pause(pause).await;
+        }
+    }
+    // Checked again right before acknowledging: a request that entered
+    // before another incarnation was activated (a long push, say) is never
+    // acknowledged by the fenced instance. Its client gets 503 and retries
+    // against the active one; what it changed here is on a database that
+    // will never serve again.
+    if let Err(err) = state
+        .role_gate
+        .check(&state.config.control, &state.db)
+        .await
+    {
+        tracing::warn!(error = %err, "fenced while handling: acknowledgement withheld");
+        return AppError::not_ready(err.to_string()).into_response();
+    }
+    response
+}
+
+/// Development hook (`MUSTER_DEV_ACK_PAUSE_FILE`, refused in production).
+async fn dev_ack_pause(pause: &std::path::Path) {
+    if !pause.exists() {
+        return;
+    }
+    let _ = std::fs::write(pause.with_extension("reached"), b"");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while pause.exists() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
 }
 
 async fn healthz() -> Json<HealthResponse> {

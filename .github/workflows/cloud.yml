@@ -236,6 +236,8 @@ jobs:
           command -v curl >/dev/null 2>&1 || install="$install curl"
           # The drill backs up encrypted (synthetic age key pair).
           command -v age-keygen >/dev/null 2>&1 || install="$install age"
+          # It reads the restore's JSON (incarnation, residue).
+          command -v jq >/dev/null 2>&1 || install="$install jq"
           if [ -n "$install" ]; then
             $apt update
             $apt install -y --no-install-recommends $install
