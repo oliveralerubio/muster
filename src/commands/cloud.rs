@@ -396,3 +396,112 @@ fn establish_receipt_sequence(
     }
     Ok(())
 }
+
+pub const PROPOSALS: CommandSpec = CommandSpec {
+    name: "cloud.proposals",
+    about: "List the open Cloud proposals of the linked workspace (conflicts, enrollment, quorum)",
+    params: &[],
+    mutating: false,
+    handler: proposals,
+};
+
+fn linked(ctx: &Context) -> Result<crate::cloud_client::CloudLink, MusterError> {
+    crate::cloud_client::CloudLink::load(&ctx.state_dir)?
+        .ok_or_else(|| MusterError::Usage("link this machine first: muster cloud link".into()))
+}
+
+fn proposals(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError> {
+    let link = linked(ctx)?;
+    let open: Vec<crate::cloud_protocol::Proposal> =
+        crate::cloud_client::list_proposals(&ctx.state_dir, &link)?
+            .into_iter()
+            .filter(|p| p.status == crate::cloud_protocol::ProposalStatus::Open)
+            .collect();
+    if ctx.format == crate::output::Format::Text {
+        return Ok(Value::String(proposals_text(&open)));
+    }
+    Ok(json!({"proposals": open}))
+}
+
+fn proposals_text(open: &[crate::cloud_protocol::Proposal]) -> String {
+    if open.is_empty() {
+        return "No open Cloud proposals.".to_owned();
+    }
+    let short = |rev: &str| match rev {
+        "" => "-".to_owned(),
+        rev => rev.chars().take(12).collect(),
+    };
+    let mut text = String::from("ID  KIND  AUTHOR DEVICE  BASE  REVISION  CREATED\n");
+    for p in open {
+        text.push_str(&format!(
+            "{}  {}  {}  {}  {}  {}\n",
+            p.id,
+            p.kind.as_str(),
+            p.device_id.as_deref().unwrap_or("-"),
+            short(&p.base_revision),
+            short(&p.revision),
+            p.created_at
+        ));
+    }
+    text.trim_end().to_owned()
+}
+
+pub const PROPOSALS_RESOLVE: CommandSpec = CommandSpec {
+    name: "cloud.proposals.resolve",
+    about: "Close an open Cloud proposal (the service decides who may)",
+    params: &[
+        crate::registry::ParamSpec {
+            name: "id",
+            about: "Proposal ID (see muster cloud proposals)",
+            kind: crate::registry::ParamKind::String,
+            required: true,
+            positional: true,
+        },
+        crate::registry::ParamSpec {
+            name: "reject",
+            about: "Mark the proposal rejected without incorporating it",
+            kind: crate::registry::ParamKind::Bool,
+            required: false,
+            positional: false,
+        },
+    ],
+    mutating: true,
+    handler: proposals_resolve,
+};
+
+fn proposals_resolve(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
+    let id = params.get_string("id").unwrap_or_default();
+    if !is_uuid(id) {
+        return Err(MusterError::Usage(
+            "the proposal ID is a UUID; list them with muster cloud proposals".into(),
+        ));
+    }
+    if !params.get_bool("reject") {
+        return Err(MusterError::Usage(
+            "pass --reject: closing a proposal without incorporating it is the only resolution \
+             this command offers"
+                .into(),
+        ));
+    }
+    let link = linked(ctx)?;
+    if ctx.dry_run {
+        return Ok(json!({"id": id, "status": "would_reject"}));
+    }
+    let proposal = crate::cloud_client::reject_proposal(&ctx.state_dir, &link, id)?;
+    if ctx.format == crate::output::Format::Text {
+        return Ok(Value::String(format!(
+            "Proposal {} is now {}.",
+            proposal.id,
+            proposal.status.as_str()
+        )));
+    }
+    Ok(serde_json::to_value(&proposal).unwrap_or(Value::Null))
+}
+
+fn is_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.char_indices().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => c == '-',
+            _ => c.is_ascii_hexdigit(),
+        })
+}

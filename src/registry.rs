@@ -58,8 +58,13 @@ pub enum CommandScope {
 impl CommandSpec {
     pub fn scope(&self) -> CommandScope {
         match self.name {
-            "cloud.status" | "cloud.unlink" | "cloud.login" | "cloud.logout"
-            | "cloud.workspaces" => CommandScope::LocalAccount,
+            "cloud.status"
+            | "cloud.unlink"
+            | "cloud.login"
+            | "cloud.logout"
+            | "cloud.workspaces"
+            | "cloud.proposals"
+            | "cloud.proposals.resolve" => CommandScope::LocalAccount,
             _ => CommandScope::Fleet,
         }
     }
@@ -138,6 +143,8 @@ pub static COMMANDS: &[CommandSpec] = &[
     crate::commands::cloud::LOGOUT,
     crate::commands::cloud::STATUS,
     crate::commands::cloud::UNLINK,
+    crate::commands::cloud::PROPOSALS,
+    crate::commands::cloud::PROPOSALS_RESOLVE,
     crate::commands::provider::LIST,
     crate::commands::provider::ADD,
     crate::commands::provider::RM,

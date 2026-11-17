@@ -17,6 +17,11 @@ pub enum MusterError {
     Unavailable(String),
     #[error("{0}")]
     Security(String),
+    /// The Cloud accepted another publication first (`409 revision_conflict`):
+    /// this machine's bundle is retained there as a conflict proposal and its
+    /// local history is untouched.
+    #[error("{0}")]
+    Conflict(String),
     #[error("interrupted")]
     Interrupted,
     /// A typed secret-provider failure; its kind decides code and exit code.
@@ -33,6 +38,7 @@ impl MusterError {
             Self::InvalidConfig { .. } => 3,
             Self::Unavailable(_) => 4,
             Self::Security(_) => 5,
+            Self::Conflict(_) => 1,
             Self::Interrupted => 130,
             Self::Provider(e) => e.exit_code(),
         }
@@ -46,6 +52,7 @@ impl MusterError {
             Self::InvalidConfig { .. } => "invalid_config",
             Self::Unavailable(_) => "unavailable",
             Self::Security(_) => "security",
+            Self::Conflict(_) => "revision_conflict",
             Self::Interrupted => "interrupted",
             Self::Provider(e) => e.code(),
         }
@@ -80,6 +87,7 @@ mod tests {
             ),
             (Unavailable("x".into()), 4),
             (Security("x".into()), 5),
+            (Conflict("x".into()), 1),
             (Interrupted, 130),
         ];
         for (err, code) in cases {

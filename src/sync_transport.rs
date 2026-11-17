@@ -455,6 +455,19 @@ fn verify_and_checkout(
     Ok((outcome, fetched_tip))
 }
 
+/// The conflict details of a `409 revision_conflict` response, recognized by
+/// the status and the structured error `code` only.
+fn revision_conflict(status: u16, body: &str) -> Option<protocol::ConflictDetails> {
+    if status != 409 {
+        return None;
+    }
+    let error: protocol::ApiError = serde_json::from_str(body).ok()?;
+    if error.error.code != protocol::error_codes::REVISION_CONFLICT {
+        return None;
+    }
+    serde_json::from_value(error.error.details).ok()
+}
+
 /// Publish a persistent exact bundle; a retry uses the same key and bytes.
 pub fn push(ctx: &Context, link: &CloudLink) -> Result<(), MusterError> {
     let dir = ctx.state_dir.join("cloud");
@@ -594,6 +607,19 @@ pub fn push(ctx: &Context, link: &CloudLink) -> Result<(), MusterError> {
         if (400..500).contains(&status) {
             let _ = std::fs::remove_file(&meta);
             let _ = std::fs::remove_file(&bundle);
+        }
+        // A lost race is told apart by the service's structured error code,
+        // never by its wording: the refused bundle is retained there as a
+        // conflict proposal the operator can name and close.
+        if let Some(conflict) = revision_conflict(status, detail) {
+            return Err(MusterError::Conflict(format!(
+                "Another machine published first: Cloud's accepted head is {}, so this \
+                 publication was kept as conflict proposal {} and your local commits are \
+                 untouched. Next: run `muster sync --pull` to rebase them on the accepted \
+                 head, then `muster sync --push`; afterwards close the stale proposal with \
+                 `muster cloud proposals resolve {} --reject`.",
+                conflict.head, conflict.proposal_id, conflict.proposal_id
+            )));
         }
         return Err(failure(&format!(
             "Cloud did not accept the publication (HTTP {status}){}; local history is preserved",

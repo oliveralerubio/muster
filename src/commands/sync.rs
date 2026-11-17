@@ -86,6 +86,7 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     if !ctx.dry_run {
         let outcome = match &result {
             Ok(_) if !ctx.failed() => "ok",
+            Err(MusterError::Conflict(_)) => "conflict",
             Err(e) if e.to_string().contains("conflict with") => "conflict",
             _ => "error",
         };

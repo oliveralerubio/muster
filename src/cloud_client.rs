@@ -450,3 +450,64 @@ pub fn fetch_open_enrollment_proposal(
     }
     Ok(None)
 }
+
+/// The service's own refusal, rendered for the operator: HTTP status, the
+/// stable error code and its message (the wording is the service's).
+fn api_refusal(action: &str, status: u16, body: &[u8]) -> MusterError {
+    let detail = match serde_json::from_slice::<crate::cloud_protocol::ApiError>(body) {
+        Ok(api) => format!(", {}): {}", api.error.code, api.error.message),
+        Err(_) => ")".to_owned(),
+    };
+    MusterError::Operational(format!(
+        "the Cloud service refused to {action} (HTTP {status}{detail}"
+    ))
+}
+
+fn signed_link_request(
+    state_dir: &Path,
+    link: &CloudLink,
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> Result<(u16, Vec<u8>), MusterError> {
+    let signer = crate::signing::Signer::load(state_dir)?
+        .ok_or_else(|| MusterError::Operational("machine signing key missing".into()))?;
+    device_request(link, &signer, method, path, body, "none", "")
+}
+
+/// Every proposal of the linked workspace, newest first (any linked device may
+/// read them).
+pub fn list_proposals(
+    state_dir: &Path,
+    link: &CloudLink,
+) -> Result<Vec<crate::cloud_protocol::Proposal>, MusterError> {
+    let path = crate::cloud_protocol::routes::WORKSPACE_PROPOSALS.replace("{ws}", &link.workspace);
+    let (status, body) = signed_link_request(state_dir, link, "GET", &path, &[])?;
+    if status != 200 {
+        return Err(api_refusal("list proposals", status, &body));
+    }
+    serde_json::from_slice(&body)
+        .map_err(|_| MusterError::Operational("invalid proposal list response".into()))
+}
+
+/// Closes the open proposal `id` as rejected. Who may do that is decided by
+/// the service (owner/admin role or a machine the signed governance authorizes).
+pub fn reject_proposal(
+    state_dir: &Path,
+    link: &CloudLink,
+    id: &str,
+) -> Result<crate::cloud_protocol::Proposal, MusterError> {
+    let path = crate::cloud_protocol::routes::WORKSPACE_PROPOSAL_RESOLVE
+        .replace("{ws}", &link.workspace)
+        .replace("{id}", id);
+    let body = serde_json::to_vec(&crate::cloud_protocol::ResolveProposal {
+        result_revision: None,
+    })
+    .map_err(|_| MusterError::Operational("cannot encode the proposal resolution".into()))?;
+    let (status, response) = signed_link_request(state_dir, link, "POST", &path, &body)?;
+    if status != 200 {
+        return Err(api_refusal("resolve the proposal", status, &response));
+    }
+    serde_json::from_slice(&response)
+        .map_err(|_| MusterError::Operational("invalid proposal resolution response".into()))
+}
