@@ -170,6 +170,38 @@ async fn device(
     authenticate_device_request(state, method, uri.path(), uri.query(), ws, headers, body).await
 }
 
+/// Records the outcome of a push under its `Idempotency-Key`, in the
+/// transaction that makes it durable: `200` accepted, `202` held and `409`
+/// conflict (each names what the service kept). A retry with the same key
+/// and bytes replays it instead of retaining the upload again.
+#[allow(clippy::too_many_arguments)]
+async fn remember(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    device: &AuthenticatedDevice,
+    idem_key: uuid::Uuid,
+    path: &str,
+    base: &str,
+    body_hash: &[u8],
+    status: StatusCode,
+    response: &serde_json::Value,
+) -> Result<(), AppError> {
+    sqlx::query(
+        "INSERT INTO sync_idempotency (workspace_id, device_id, idem_key, method, path, base_revision, body_sha256, status, headers, response)
+         VALUES ($1, $2, $3, 'POST', $4, $5, $6, $7, '{}', $8)",
+    )
+    .bind(device.workspace_id)
+    .bind(device.id)
+    .bind(idem_key)
+    .bind(path)
+    .bind(base)
+    .bind(body_hash)
+    .bind(i32::from(status.as_u16()))
+    .bind(response)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 /// `GET /v1/workspaces/{ws}/sync[?since=<rev>]`.
 pub async fn get_sync(
     State(state): State<AppState>,
@@ -266,6 +298,16 @@ pub async fn post_sync(
         if prev_path != path || prev_base != base || prev_hash != body_hash {
             return Err(AppError::idempotency_mismatch());
         }
+        if status_code == i32::from(StatusCode::CONFLICT.as_u16()) {
+            // A stored conflict replays as the same error: same proposal.
+            let message = resp_val["message"].as_str().unwrap_or_default().to_string();
+            return Err(AppError::new(
+                StatusCode::CONFLICT,
+                error_codes::REVISION_CONFLICT,
+                message,
+            )
+            .with_details(resp_val["details"].clone()));
+        }
         let status = StatusCode::from_u16(status_code as u16).map_err(AppError::internal)?;
         let mut resp = (status, Json(resp_val)).into_response();
         if let Ok(Some(h)) = load_head(&mut tx, ws_id).await {
@@ -313,9 +355,26 @@ pub async fn post_sync(
         })));
     }
 
+    let head = load_head(&mut tx, ws_id).await?;
+    // Authorization before anything is staged or kept: a linked machine the
+    // accepted governance does not authorize (or, before the first state,
+    // one without the bootstrap claim) cannot make the service retain a
+    // conflict or a held proposal either.
+    let allowed = match &head {
+        Some(h) => authorized(&h.anchor, &device.signing_key),
+        None => device.bootstrap,
+    };
+    if !allowed {
+        return Err(not_approved(if head.is_some() {
+            "the accepted governance does not authorize this machine"
+        } else {
+            "only the machine holding the bootstrap claim may publish the first state"
+        }));
+    }
+
     // The upload is unpacked in private staging first: a push refused from
-    // here on (quota, invalid history, authorization) leaves nothing in the
-    // workspace repository.
+    // here on (quota, invalid history) leaves nothing in the workspace
+    // repository.
     let upload = uuid::Uuid::new_v4();
     let repos = state.repos.clone();
     let bundle = body.clone();
@@ -328,8 +387,6 @@ pub async fn post_sync(
     .map_err(AppError::internal)??;
     let tip = staged.tip.clone();
 
-    let head = load_head(&mut tx, ws_id).await?;
-
     // Storage counts the bytes keeping this upload really adds (object
     // files plus refs), retained conflicts and proposals included. The
     // workspace lock serialises this check with the move below.
@@ -339,14 +396,7 @@ pub async fn post_sync(
     let anchor = head.as_ref().map(|h| h.anchor.clone());
     let conflict = match &head {
         None if base != BASE_REVISION_NONE => Some(BASE_REVISION_NONE.to_string()),
-        None => {
-            if !device.bootstrap {
-                return Err(not_approved(
-                    "only the machine holding the bootstrap claim may publish the first state",
-                ));
-            }
-            None
-        }
+        None => None,
         Some(h) if base != h.revision => Some(h.revision.clone()),
         Some(_) => None,
     };
@@ -364,19 +414,36 @@ pub async fn post_sync(
         .bind(&tip)
         .execute(&mut *tx)
         .await?;
-        tx.commit().await?;
         let epoch = head.as_ref().map(|h| h.epoch as u64).unwrap_or(0);
         let details = crate::protocol::ConflictDetails {
             head: accepted_head,
             epoch,
             proposal_id: proposal_id.to_string(),
         };
-        return Err(AppError::new(
+        let err = AppError::new(
             StatusCode::CONFLICT,
             error_codes::REVISION_CONFLICT,
             "base revision does not match the accepted head",
         )
-        .with_details(serde_json::to_value(details).unwrap()));
+        .with_details(serde_json::to_value(details).map_err(AppError::internal)?);
+        let stored = serde_json::json!({
+            "code": err.code,
+            "message": err.message,
+            "details": err.details,
+        });
+        remember(
+            &mut tx,
+            &device,
+            idem_key,
+            &path,
+            &base,
+            &body_hash,
+            StatusCode::CONFLICT,
+            &stored,
+        )
+        .await?;
+        tx.commit().await?;
+        return Err(err);
     }
 
     let (staged, verdict) = verify_upload(&state, staged, anchor).await?;
@@ -403,7 +470,6 @@ pub async fn post_sync(
             .bind(epoch as i64)
             .execute(&mut *tx)
             .await?;
-            tx.commit().await?;
             let held = SyncHeld {
                 proposal_id: proposal_id.to_string(),
                 status: ProposalStatus::Open,
@@ -413,6 +479,19 @@ pub async fn post_sync(
                     epoch: h.epoch as u64,
                 }),
             };
+            let stored = serde_json::to_value(&held).map_err(AppError::internal)?;
+            remember(
+                &mut tx,
+                &device,
+                idem_key,
+                &path,
+                &base,
+                &body_hash,
+                StatusCode::ACCEPTED,
+                &stored,
+            )
+            .await?;
+            tx.commit().await?;
             return Ok((StatusCode::ACCEPTED, Json(held)).into_response());
         }
     };
@@ -423,13 +502,6 @@ pub async fn post_sync(
                 "the first state's governance does not authorize this machine's key",
             ));
         }
-    } else if !authorized(
-        head.as_ref().map(|h| &h.anchor).unwrap(),
-        &device.signing_key,
-    ) {
-        return Err(not_approved(
-            "the accepted governance does not authorize this machine",
-        ));
     }
 
     keep(&state, ws_id, staged).await?;
@@ -472,18 +544,16 @@ pub async fn post_sync(
         epoch,
     };
     let accepted_val = serde_json::to_value(&accepted_dto).map_err(AppError::internal)?;
-    sqlx::query(
-        "INSERT INTO sync_idempotency (workspace_id, device_id, idem_key, method, path, base_revision, body_sha256, status, headers, response)
-         VALUES ($1, $2, $3, 'POST', $4, $5, $6, 200, '{}', $7)",
+    remember(
+        &mut tx,
+        &device,
+        idem_key,
+        &path,
+        &base,
+        &body_hash,
+        StatusCode::OK,
+        &accepted_val,
     )
-    .bind(ws_id)
-    .bind(device.id)
-    .bind(idem_key)
-    .bind(&path)
-    .bind(&base)
-    .bind(&body_hash)
-    .bind(&accepted_val)
-    .execute(&mut *tx)
     .await?;
     tx.commit().await?;
 

@@ -21,8 +21,10 @@ pub mod history;
 pub mod lifecycle;
 pub mod lifecycle_provider;
 pub mod lifecycle_purge;
+pub mod maintenance;
 pub mod members;
 pub mod proposals;
+pub mod rate_limit;
 pub mod receipts;
 pub mod repo_store;
 pub mod state;
@@ -78,7 +80,9 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             protocol::routes::DEVICE_AUTHORIZE,
-            axum::routing::post(auth::device_flow::authorize),
+            axum::routing::post(auth::device_flow::authorize).route_layer(
+                middleware::from_fn_with_state(state.clone(), rate_limit::login_flow_layer),
+            ),
         )
         .route(
             protocol::routes::DEVICE_APPROVE,
@@ -86,7 +90,9 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             protocol::routes::DEVICE_TOKEN,
-            axum::routing::post(auth::device_flow::token),
+            axum::routing::post(auth::device_flow::token).route_layer(
+                middleware::from_fn_with_state(state.clone(), rate_limit::login_flow_layer),
+            ),
         )
         .route(
             protocol::routes::WORKSPACE_DEVICES,

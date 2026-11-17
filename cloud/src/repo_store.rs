@@ -9,8 +9,10 @@
 //! happens **before** the PostgreSQL transaction that records it commits.
 //! Refused uploads leave nothing behind. PostgreSQL is the only
 //! authority on the accepted head; `refs/heads/main` is a derived ref that is
-//! repaired to the PostgreSQL head before it is served. Upload refs are never
-//! deleted, so retained proposals (and every accepted state) survive `git gc`.
+//! repaired to the PostgreSQL head before it is served. The upload refs of
+//! accepted states and of open proposals are never deleted, so they survive
+//! any repack; only a closed proposal's upload is released
+//! ([`RepoStore::release_uploads`]).
 //! Ref and database are not updated atomically together; a crash between them
 //! leaves an unreferenced-by-PG upload ref, which is harmless.
 //!
@@ -472,6 +474,49 @@ impl RepoStore {
                 break;
             }
             path = parent.to_path_buf();
+        }
+        Ok(())
+    }
+
+    /// Releases the uploads of closed proposals `ids`: deletes their refs,
+    /// then repacks so objects no remaining ref reaches (accepted uploads,
+    /// `main`, open proposals) stop taking space. Idempotent; a crash at any
+    /// point leaves a valid repository (Git writes the new pack before it
+    /// removes the old ones) and the next pass finishes. The caller holds
+    /// the workspace row lock (no push stages or keeps meanwhile) and the
+    /// backup coordination lock shared (no capture lists objects meanwhile).
+    pub fn release_uploads(&self, ws: uuid::Uuid, ids: &[uuid::Uuid]) -> Result<(), AppError> {
+        let repo = self.repo(ws);
+        if !repo.join("HEAD").exists() {
+            return Ok(());
+        }
+        for id in ids {
+            git_ok(&repo, &["update-ref", "-d", &upload_ref(*id)])?;
+        }
+        sync_path(&repo.join("refs/muster/uploads")).or_else(|e| {
+            if repo.join("refs/muster/uploads").exists() {
+                Err(e)
+            } else {
+                Ok(())
+            }
+        })?;
+        // `-a -d`: one pack of everything reachable; packs it makes
+        // redundant (with the unreachable objects they held) are removed.
+        git_ok(
+            &repo,
+            &[
+                "-c",
+                "core.fsync=objects,derived-metadata,reference",
+                "repack",
+                "-a",
+                "-d",
+                "-q",
+            ],
+        )?;
+        git_ok(&repo, &["prune", "--expire=now"])?;
+        let pack = repo.join("objects/pack");
+        if pack.exists() {
+            sync_path(&pack)?;
         }
         Ok(())
     }

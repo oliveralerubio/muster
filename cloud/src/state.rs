@@ -14,6 +14,8 @@ pub struct AppState {
     /// Refuses every request once this database incarnation is not the
     /// active one (fenced by a cutover).
     pub role_gate: Arc<crate::control::RoleGate>,
+    /// In-process request rate limits (`crate::rate_limit`).
+    pub rate_limits: Arc<crate::rate_limit::RateLimits>,
 }
 
 impl AppState {

@@ -91,6 +91,12 @@ pub async fn authenticate_device_request(
         ));
     }
 
+    // Per-machine budget, keyed by the identity the bearer token proved and
+    // taken before any further work (nonce write, signature check).
+    if let Err(retry) = state.rate_limits.device.check(&dev_id) {
+        return Err(crate::rate_limit::limited(retry));
+    }
+
     // 3. X-Muster-Timestamp must be within +/- 300s
     let timestamp_str = headers
         .get(HEADER_TIMESTAMP)

@@ -17,6 +17,7 @@ struct Intent {
 fn failure(message: &str) -> MusterError {
     MusterError::Operational(message.into())
 }
+
 fn random_hex() -> Result<String, MusterError> {
     let mut b = [0u8; 16];
     getrandom::getrandom(&mut b).map_err(|_| failure("cannot create Cloud request nonce"))?;
@@ -114,41 +115,44 @@ pub fn pull(ctx: &mut Context, link: &CloudLink) -> Result<PullOutcome, MusterEr
     let path = format!("/v1/workspaces/{}/sync", link.workspace);
     let path_and_query = protocol::canonical_path_and_query(&path, query.as_deref());
     let hash = protocol::body_sha256_hex(b"");
-    let timestamp = time::OffsetDateTime::now_utc().unix_timestamp().to_string();
-    let nonce = random_hex()?;
     let signer = crate::signing::Signer::load(&ctx.state_dir)?
         .ok_or_else(|| failure("machine signing key missing"))?;
-    let signed = protocol::SignedRequestV1 {
-        method: "GET",
-        path_and_query: &path_and_query,
-        workspace_id: &link.workspace,
-        device_id: &link.device,
-        body_sha256_hex: &hash,
-        base_revision: "",
-        idempotency_key: "",
-        timestamp: &timestamp,
-        nonce: &nonce,
-    };
-    let signature = format!(
-        "v1={}",
-        signer.sign(&protocol::canonical_request_v1(&signed))
-    );
     let agent: ureq::Agent = ureq::config::Config::builder()
         .max_redirects(0)
         .http_status_as_error(false)
         .timeout_global(Some(std::time::Duration::from_secs(30)))
         .build()
         .into();
-    let mut response = agent
-        .get(format!("{}{}", link.endpoint, path_and_query))
-        .header("Authorization", format!("Bearer {}", link.token()))
-        .header(protocol::HEADER_DEVICE_ID, &link.device)
-        .header(protocol::HEADER_TIMESTAMP, &timestamp)
-        .header(protocol::HEADER_NONCE, &nonce)
-        .header(protocol::HEADER_CONTENT_SHA256, &hash)
-        .header(protocol::HEADER_SIGNATURE, &signature)
-        .call()
-        .map_err(|_| failure("Cloud download failed; retry muster sync --pull"))?;
+    // A read is safe to repeat; each attempt is signed afresh.
+    let mut response = crate::cloud_client::send_with_rate_limit(true, || {
+        let timestamp = time::OffsetDateTime::now_utc().unix_timestamp().to_string();
+        let nonce = random_hex()?;
+        let signed = protocol::SignedRequestV1 {
+            method: "GET",
+            path_and_query: &path_and_query,
+            workspace_id: &link.workspace,
+            device_id: &link.device,
+            body_sha256_hex: &hash,
+            base_revision: "",
+            idempotency_key: "",
+            timestamp: &timestamp,
+            nonce: &nonce,
+        };
+        let signature = format!(
+            "v1={}",
+            signer.sign(&protocol::canonical_request_v1(&signed))
+        );
+        agent
+            .get(format!("{}{}", link.endpoint, path_and_query))
+            .header("Authorization", format!("Bearer {}", link.token()))
+            .header(protocol::HEADER_DEVICE_ID, &link.device)
+            .header(protocol::HEADER_TIMESTAMP, &timestamp)
+            .header(protocol::HEADER_NONCE, &nonce)
+            .header(protocol::HEADER_CONTENT_SHA256, &hash)
+            .header(protocol::HEADER_SIGNATURE, &signature)
+            .call()
+            .map_err(|_| failure("Cloud download failed; retry muster sync --pull"))
+    })?;
     // The service names the accepted head it served; after the verified
     // checkout this becomes this machine's base revision for its next
     // publication (a machine that joined by pulling could otherwise never
@@ -1366,21 +1370,64 @@ fn load_held(link: &CloudLink, path: &Path) -> Option<HeldRecord> {
     (held.workspace == link.workspace && held.device == link.device).then_some(held)
 }
 
-/// Whether `id` is still an open proposal (`None`: Cloud could not say).
-fn proposal_open(ctx: &Context, link: &CloudLink, id: &str) -> Option<bool> {
-    let all = crate::cloud_client::list_proposals(&ctx.state_dir, link).ok()?;
-    Some(
-        all.iter()
-            .any(|p| p.id == id && p.status == protocol::ProposalStatus::Open),
-    )
+/// What Cloud says about the proposal a held record names.
+#[derive(Debug, PartialEq, Eq)]
+enum HeldProposal {
+    /// Cloud could not say (the request failed).
+    Unknown,
+    /// Not listed, or already resolved (whoever created it).
+    Closed,
+    /// Open and created by this machine's device.
+    OpenOwn,
+    /// Open under that id but not created by this machine's device (or
+    /// without a creator at all): it must never be closed from here.
+    NotOurs,
+}
+
+fn held_proposal(ctx: &Context, link: &CloudLink, id: &str) -> HeldProposal {
+    let Ok(all) = crate::cloud_client::list_proposals(&ctx.state_dir, link) else {
+        return HeldProposal::Unknown;
+    };
+    match all.iter().find(|p| p.id == id) {
+        Some(p) if p.status == protocol::ProposalStatus::Open => {
+            if p.device_id.as_deref() == Some(link.device.as_str()) {
+                HeldProposal::OpenOwn
+            } else {
+                HeldProposal::NotOurs
+            }
+        }
+        _ => HeldProposal::Closed,
+    }
+}
+
+/// The held record names a proposal this machine did not create: the record
+/// is forgotten by the caller (never rejected) and the operator is told.
+fn warn_not_ours(ctx: &mut Context, old: &HeldRecord) {
+    ctx.diag(crate::output::Diagnostic::new(
+        crate::output::Severity::Warning,
+        "cloud_proposal_not_ours",
+        format!(
+            "Cloud lists the earlier held proposal {} as created by another device, so this \
+             machine did not close it and forgot its record; an admin can close it with \
+             `muster cloud proposals resolve {} --reject` if it is stale",
+            old.proposal_id, old.proposal_id
+        ),
+    ));
 }
 
 /// The held proposal this publication replaces is closed, so exactly one
-/// stays open. Best effort: Cloud decides who may close it, and a refusal is
-/// reported instead.
+/// stays open. Only a proposal this machine's device created is ever closed;
+/// one that belongs to another device is left open and reported (the caller
+/// has already replaced or removed its record). Best effort: Cloud decides
+/// who may close it, and a refusal is reported instead.
 fn supersede_held(ctx: &mut Context, link: &CloudLink, old: &HeldRecord, revision: &str) {
-    if old.revision == revision || proposal_open(ctx, link, &old.proposal_id) != Some(true) {
+    if old.revision == revision {
         return;
+    }
+    match held_proposal(ctx, link, &old.proposal_id) {
+        HeldProposal::OpenOwn => {}
+        HeldProposal::NotOurs => return warn_not_ours(ctx, old),
+        HeldProposal::Unknown | HeldProposal::Closed => return,
     }
     if crate::cloud_client::reject_proposal(&ctx.state_dir, link, &old.proposal_id).is_err() {
         ctx.diag(crate::output::Diagnostic::new(
@@ -1404,7 +1451,7 @@ pub fn push(ctx: &mut Context, link: &CloudLink) -> Result<PushOutcome, MusterEr
     let bundle = dir.join("push-intent.bundle");
     let base_path = dir.join("accepted.json");
     let held_path = dir.join("held.json");
-    let previous_held = load_held(link, &held_path);
+    let mut previous_held = load_held(link, &held_path);
     let current = crate::git::head_commit(&ctx.config_dir)?;
     let intent: Intent = match std::fs::read(&meta) {
         Ok(bytes) => serde_json::from_slice(&bytes)
@@ -1435,8 +1482,15 @@ pub fn push(ctx: &mut Context, link: &CloudLink) -> Result<PushOutcome, MusterEr
                 .filter(|h| h.revision == current && h.base == base)
             {
                 // Still waiting (or Cloud cannot say right now): report the
-                // existing proposal instead of opening a duplicate.
-                if proposal_open(ctx, link, &held.proposal_id) != Some(false) {
+                // existing proposal instead of opening a duplicate. A record
+                // that points at another device's proposal is not ours to
+                // report or close: forget it and publish normally.
+                let state = held_proposal(ctx, link, &held.proposal_id);
+                if state == HeldProposal::NotOurs {
+                    let _ = std::fs::remove_file(&held_path);
+                    warn_not_ours(ctx, held);
+                    previous_held = None;
+                } else if matches!(state, HeldProposal::Unknown | HeldProposal::OpenOwn) {
                     ctx.diag(crate::output::Diagnostic::new(
                         crate::output::Severity::Warning,
                         "cloud_proposal_held",
@@ -1509,44 +1563,49 @@ pub fn push(ctx: &mut Context, link: &CloudLink) -> Result<PushOutcome, MusterEr
         std::fs::read(&bundle).map_err(|_| failure("cannot read pending Cloud publication"))?;
     let path = format!("/v1/workspaces/{}/sync", link.workspace);
     let hash = protocol::body_sha256_hex(&body);
-    let timestamp = time::OffsetDateTime::now_utc().unix_timestamp().to_string();
-    let nonce = random_hex()?;
     let signer = crate::signing::Signer::load(&ctx.state_dir)?
         .ok_or_else(|| failure("machine signing key missing"))?;
-    let signed = protocol::SignedRequestV1 {
-        method: "POST",
-        path_and_query: &path,
-        workspace_id: &link.workspace,
-        device_id: &link.device,
-        body_sha256_hex: &hash,
-        base_revision: &intent.base,
-        idempotency_key: &intent.key,
-        timestamp: &timestamp,
-        nonce: &nonce,
-    };
-    let signature = format!(
-        "v1={}",
-        signer.sign(&protocol::canonical_request_v1(&signed))
-    );
     let agent: ureq::Agent = ureq::config::Config::builder()
         .max_redirects(0)
         .http_status_as_error(false)
         .timeout_global(Some(std::time::Duration::from_secs(30)))
         .build()
         .into();
-    let mut response = agent
-        .post(format!("{}{path}", link.endpoint))
-        .header("Authorization", format!("Bearer {}", link.token()))
-        .header(protocol::HEADER_DEVICE_ID, &link.device)
-        .header(protocol::HEADER_TIMESTAMP, &timestamp)
-        .header(protocol::HEADER_NONCE, &nonce)
-        .header(protocol::HEADER_CONTENT_SHA256, &hash)
-        .header(protocol::HEADER_BASE_REVISION, &intent.base)
-        .header(protocol::HEADER_IDEMPOTENCY_KEY, &intent.key)
-        .header(protocol::HEADER_SIGNATURE, &signature)
-        .header("Content-Type", protocol::GIT_BUNDLE_MEDIA_TYPE)
-        .send(body.as_slice())
-        .map_err(|_| failure("Cloud publication failed; retry muster sync --push"))?;
+    // The publication carries its idempotency key, so repeating it is safe
+    // (the same key and bytes); each attempt is signed afresh. A limit that
+    // outlasts the retry leaves the intent in place for the next run.
+    let mut response = crate::cloud_client::send_with_rate_limit(true, || {
+        let timestamp = time::OffsetDateTime::now_utc().unix_timestamp().to_string();
+        let nonce = random_hex()?;
+        let signed = protocol::SignedRequestV1 {
+            method: "POST",
+            path_and_query: &path,
+            workspace_id: &link.workspace,
+            device_id: &link.device,
+            body_sha256_hex: &hash,
+            base_revision: &intent.base,
+            idempotency_key: &intent.key,
+            timestamp: &timestamp,
+            nonce: &nonce,
+        };
+        let signature = format!(
+            "v1={}",
+            signer.sign(&protocol::canonical_request_v1(&signed))
+        );
+        agent
+            .post(format!("{}{path}", link.endpoint))
+            .header("Authorization", format!("Bearer {}", link.token()))
+            .header(protocol::HEADER_DEVICE_ID, &link.device)
+            .header(protocol::HEADER_TIMESTAMP, &timestamp)
+            .header(protocol::HEADER_NONCE, &nonce)
+            .header(protocol::HEADER_CONTENT_SHA256, &hash)
+            .header(protocol::HEADER_BASE_REVISION, &intent.base)
+            .header(protocol::HEADER_IDEMPOTENCY_KEY, &intent.key)
+            .header(protocol::HEADER_SIGNATURE, &signature)
+            .header("Content-Type", protocol::GIT_BUNDLE_MEDIA_TYPE)
+            .send(body.as_slice())
+            .map_err(|_| failure("Cloud publication failed; retry muster sync --push"))
+    })?;
     let status = response.status().as_u16();
     if status == 202 {
         // Held as a proposal: Cloud did not move its head, so the
@@ -1640,7 +1699,27 @@ pub fn push(ctx: &mut Context, link: &CloudLink) -> Result<PushOutcome, MusterEr
         .read_json()
         .map_err(|_| failure("invalid Cloud publication response"))?;
     if accepted.revision != intent.revision {
-        return Err(failure("Cloud returned an unexpected revision"));
+        // The same key and bytes would only replay this same answer, so
+        // keeping the intent would fail every retry forever. Drop it (the
+        // commit stays in the local history, nothing is recorded as
+        // accepted) and let the next pull reconcile with whatever Cloud
+        // really accepted.
+        let _ = std::fs::remove_file(&meta);
+        let _ = std::fs::remove_file(&bundle);
+        ctx.diag(crate::output::Diagnostic::new(
+            crate::output::Severity::Warning,
+            "cloud_publication_unconfirmed",
+            format!(
+                "Cloud accepted the publication but named revision `{}` instead of `{}`; the \
+                 pending publication was dropped and nothing was recorded as accepted. Your \
+                 local commit is untouched. Run `muster sync --pull` to reconcile with what \
+                 Cloud holds, then `muster sync --push` if it is still needed.",
+                accepted.revision, intent.revision
+            ),
+        ));
+        return Err(failure(
+            "Cloud's answer did not confirm the publication; run muster sync --pull",
+        ));
     }
     let state = serde_json::to_vec(&serde_json::json!({"workspace": link.workspace, "device": link.device, "revision": accepted.revision})).map_err(|_| failure("cannot encode Cloud revision"))?;
     crate::vault::write_atomic(&base_path, &state)

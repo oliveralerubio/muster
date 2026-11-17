@@ -89,12 +89,16 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let config_rate_limits = config.rate_limits;
     let state = AppState {
         config: Arc::new(config),
         db,
         oidc,
         repos,
         role_gate: Arc::new(muster_cloud::control::RoleGate::default()),
+        rate_limits: Arc::new(muster_cloud::rate_limit::RateLimits::new(
+            &config_rate_limits,
+        )),
     };
     // Before serving: tombstoned workspaces with residue (a database or root
     // restored from before their purge, or a purge cut short) are erased
@@ -132,8 +136,21 @@ async fn main() -> ExitCode {
         state.clone(),
         Duration::from_secs(1),
     ));
+    // Upkeep: releases closed proposals' retained uploads and deletes
+    // bookkeeping past its retention.
+    tokio::spawn(muster_cloud::maintenance::worker(
+        state.clone(),
+        if state.config.env.is_production() {
+            Duration::from_secs(60)
+        } else {
+            Duration::from_secs(1)
+        },
+    ));
     println!("muster-cloud listening on http://{addr}");
-    if let Err(err) = axum::serve(listener, muster_cloud::router(state)).await {
+    // The peer address feeds the per-client rate limits.
+    let app =
+        muster_cloud::router(state).into_make_service_with_connect_info::<std::net::SocketAddr>();
+    if let Err(err) = axum::serve(listener, app).await {
         eprintln!("muster-cloud: server error: {err}");
         return ExitCode::FAILURE;
     }

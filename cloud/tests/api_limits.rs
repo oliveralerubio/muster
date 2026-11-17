@@ -826,3 +826,152 @@ async fn the_first_upload_counts_repository_metadata_in_its_quota() {
     assert_eq!(billing.storage_used_bytes, needed);
     assert!(billing.storage_used_bytes <= billing.max_storage_bytes);
 }
+
+/// A linked machine the accepted governance does not authorize cannot make
+/// the service keep anything: its stale push is `403 device_not_approved`,
+/// no proposal is retained and storage use is unchanged.
+#[tokio::test]
+async fn an_unauthorized_machine_cannot_retain_proposals() {
+    let s = stack().await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let key = MachineKey::new("node-0");
+    let (ws, dev, repo) = genesis_workspace(&s, &alice, &key).await;
+    let genesis = repo.head();
+    let token = account_token(&s, &alice).await;
+    let outsider_key = MachineKey::new("node-x");
+    let outsider = link(&s, &token, &ws, &outsider_key).await;
+    let next = repo.touch("next.txt", "moves the head");
+    let resp = dev
+        .send(&s, &dev.push(repo.bundle(Some(&genesis)), Some(&genesis)))
+        .await;
+    assert_eq!(resp.status(), 200);
+    let before = billing_of(&s, &alice, &ws).await.storage_used_bytes;
+
+    let stale = FleetRepo::clone_from_bundle(&repo.bundle(None));
+    git_reset(&stale, &genesis);
+    std::fs::write(stale.config.join("junk.bin"), noise(512 * 1024, 11)).unwrap();
+    stale.commit("junk");
+    let resp = outsider
+        .send(
+            &s,
+            &outsider.push(stale.bundle(Some(&genesis)), Some(&genesis)),
+        )
+        .await;
+    assert_eq!(resp.status(), 403);
+    assert_eq!(
+        resp.json::<ApiError>().await.unwrap().error.code,
+        error_codes::DEVICE_NOT_APPROVED
+    );
+    let resp = dev
+        .send(&s, &dev.get(&format!("/v1/workspaces/{ws}/proposals")))
+        .await;
+    let list: Vec<muster_cloud::protocol::Proposal> = resp.json().await.unwrap();
+    assert!(list.is_empty(), "retained: {list:?}");
+    assert_eq!(billing_of(&s, &alice, &ws).await.storage_used_bytes, before);
+    assert_eq!(pulled_head(&s, &dev).await, next);
+}
+
+/// Closing a retained proposal gives its storage back without an operator
+/// step: once rejected, its bytes stop counting and a push the limit
+/// refused fits again. Open proposals and the accepted history stay intact.
+/// Precondition: the development-only small storage limit.
+#[tokio::test]
+async fn closed_proposals_release_their_storage() {
+    const LIMIT: u64 = 1536 * 1024;
+    let s = stack_with_env(&[("MUSTER_DEV_STORAGE_LIMIT_BYTES", LIMIT.to_string())]).await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let key = MachineKey::new("node-0");
+    let (ws, dev, repo) = genesis_workspace(&s, &alice, &key).await;
+    let genesis = repo.head();
+    let head = repo.touch("next.txt", "moves the head");
+    let resp = dev
+        .send(&s, &dev.push(repo.bundle(Some(&genesis)), Some(&genesis)))
+        .await;
+    assert_eq!(resp.status(), 200);
+    let baseline = billing_of(&s, &alice, &ws).await.storage_used_bytes;
+
+    // A small open conflict that must survive, then a big one that fills.
+    let stale_push = |text: &str, bytes: usize, seed: u64| {
+        let stale = FleetRepo::clone_from_bundle(&repo.bundle(None));
+        git_reset(&stale, &genesis);
+        std::fs::write(stale.config.join("big.bin"), noise(bytes, seed)).unwrap();
+        let tip = stale.touch("why.txt", text);
+        (tip, dev.push(stale.bundle(Some(&genesis)), Some(&genesis)))
+    };
+    let conflict_id = |e: ApiError| e.error.details["proposal_id"].as_str().unwrap().to_string();
+    let (keep_tip, push) = stale_push("kept", 4 * 1024, 20);
+    let resp = dev.send(&s, &push).await;
+    assert_eq!(resp.status(), 409);
+    let kept = conflict_id(resp.json().await.unwrap());
+    let (_, push) = stale_push("big", 1 << 20, 21);
+    let resp = dev.send(&s, &push).await;
+    assert_eq!(resp.status(), 409);
+    let big = conflict_id(resp.json().await.unwrap());
+    let full = billing_of(&s, &alice, &ws).await.storage_used_bytes;
+    assert!(full >= baseline + (1 << 20));
+    let (_, refused) = stale_push("another", 1 << 20, 22);
+    let resp = dev.send(&s, &refused).await;
+    assert_eq!(resp.status(), 507);
+
+    // Rejecting the big proposal releases its bytes (automatically).
+    let resolve = format!("/v1/workspaces/{ws}/proposals/{big}/resolve");
+    let resp = dev
+        .send(
+            &s,
+            &dev.post_json(
+                &resolve,
+                &muster_cloud::protocol::ResolveProposal {
+                    result_revision: None,
+                },
+            ),
+        )
+        .await;
+    assert_eq!(resp.status(), 200);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let used = billing_of(&s, &alice, &ws).await.storage_used_bytes;
+        if used + (1 << 20) <= full {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "storage not released: {used} (was {full})"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+
+    // The refused push fits now (fresh key: the refusal was not stored).
+    let (_, retry) = stale_push("another", 1 << 20, 22);
+    let resp = dev.send(&s, &retry).await;
+    assert_eq!(resp.status(), 409);
+
+    // The open proposal and the accepted history are intact.
+    let bundle = format!("/v1/workspaces/{ws}/proposals/{kept}/bundle");
+    let resp = dev.send(&s, &dev.get(&bundle)).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        FleetRepo::clone_from_bundle(&resp.bytes().await.unwrap()).head(),
+        keep_tip
+    );
+    assert_eq!(pulled_head(&s, &dev).await, head);
+    let resp = dev.send(&s, &dev.get(&dev.sync_path())).await;
+    assert_eq!(
+        FleetRepo::clone_from_bundle(&resp.bytes().await.unwrap()).head(),
+        head
+    );
+    // The closed proposal is still listed, without a downloadable bundle.
+    let resp = dev
+        .send(
+            &s,
+            &dev.get(&format!("/v1/workspaces/{ws}/proposals/{big}")),
+        )
+        .await;
+    assert_eq!(resp.status(), 200);
+    let resp = dev
+        .send(
+            &s,
+            &dev.get(&format!("/v1/workspaces/{ws}/proposals/{big}/bundle")),
+        )
+        .await;
+    assert_eq!(resp.status(), 404);
+}

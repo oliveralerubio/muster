@@ -167,7 +167,7 @@ pub(crate) async fn storage_used<'e>(
         .map_err(AppError::internal)??;
     let proposals: i64 = sqlx::query_scalar(
         "SELECT COALESCE(sum(octet_length(payload::text)), 0)::int8
-           FROM proposals WHERE workspace_id = $1",
+           FROM proposals WHERE workspace_id = $1 AND status = 'open'",
     )
     .bind(ws)
     .fetch_one(db)
@@ -819,18 +819,6 @@ pub async fn handle_webhook(
 
     let mut tx = state.db.begin().await?;
 
-    // Transactional idempotency check on event_id.
-    let existing: Option<(String,)> =
-        sqlx::query_as("SELECT event_id FROM billing_events WHERE event_id = $1")
-            .bind(event_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-
-    if existing.is_some() {
-        tx.commit().await?;
-        return Ok(StatusCode::OK);
-    }
-
     let data = event.get("data");
     let ws_id = associated_workspace(&mut tx, data).await?;
     // An event about a tombstoned workspace (associated with it, naming it in
@@ -867,9 +855,13 @@ pub async fn handle_webhook(
         event.clone()
     };
 
-    sqlx::query(
+    // Dedupe on event_id by the insert itself: a concurrent delivery of the
+    // same event waits for this one and then inserts nothing. A duplicate
+    // is acknowledged (Paddle stops retrying) and changes nothing.
+    let inserted = sqlx::query(
         "INSERT INTO billing_events (event_id, event_type, workspace_id, occurred_at, payload, processed_at)
-         VALUES ($1, $2, $3, $4, $5, now())",
+         VALUES ($1, $2, $3, $4, $5, now())
+         ON CONFLICT (event_id) DO NOTHING",
     )
     .bind(event_id)
     .bind(event_type)
@@ -877,7 +869,12 @@ pub async fn handle_webhook(
     .bind(occurred_at)
     .bind(&stored)
     .execute(&mut *tx)
-    .await?;
+    .await?
+    .rows_affected();
+    if inserted == 0 {
+        tx.rollback().await?;
+        return Ok(StatusCode::OK);
+    }
 
     // Subscription events for an associated workspace trigger a canonical
     // re-read from Paddle; the payload itself never writes entitlements.

@@ -267,3 +267,86 @@ async fn pending_quorum_change_is_retained_as_proposal_not_accepted() {
         pending
     );
 }
+
+/// Same `Idempotency-Key` and same bytes after a lost `409` or `202`
+/// response: the stored outcome is replayed (same proposal, nothing new is
+/// retained); the same key with other bytes is `422 idempotency_mismatch`.
+#[tokio::test]
+async fn retried_conflict_and_held_pushes_replay_their_outcome() {
+    use muster_cloud::protocol::{error_codes, ApiError, Proposal, SyncHeld};
+
+    let s = stack().await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let token = account_token(&s, &alice).await;
+    let ws = create_workspace(&s, &alice, "Replays").await;
+    let key_a = MachineKey::new("node-a");
+    let key_b = MachineKey::new("node-b");
+    let dev_a = link(&s, &token, &ws.id, &key_a).await;
+    let proposals =
+        |dev: &support::fleet::Device<'_>| dev.get(&format!("/v1/workspaces/{}/proposals", ws.id));
+
+    // Team genesis (two admins, quorum of two), accepted.
+    let mut repo = FleetRepo::team_genesis(&key_a, &key_b);
+    let genesis = repo.head();
+    let genesis_bundle = repo.bundle(None);
+    let resp = dev_a
+        .send(&s, &dev_a.push(genesis_bundle.clone(), None))
+        .await;
+    assert_eq!(resp.status(), 200);
+
+    // 202: a governance change one admin signed, held; then replayed.
+    repo.revoke_recipient(&key_a, "age1gone");
+    let mut held_push = dev_a.push(repo.bundle(Some(&genesis)), Some(&genesis));
+    let resp = dev_a.send(&s, &held_push).await;
+    assert_eq!(resp.status(), 202);
+    let held: SyncHeld = resp.json().await.unwrap();
+    held_push.nonce = support::fleet::fresh_nonce();
+    held_push.timestamp = support::fleet::now();
+    let resp = dev_a.send(&s, &held_push).await;
+    assert_eq!(resp.status(), 202);
+    let again: SyncHeld = resp.json().await.unwrap();
+    assert_eq!(again.proposal_id, held.proposal_id);
+
+    // 409: a stale push on genesis after the head moved (a plain change is
+    // not a governance change); then replayed.
+    let next = FleetRepo::clone_from_bundle(&genesis_bundle);
+    let head = next.touch("ok.txt", "accepted");
+    let resp = dev_a
+        .send(&s, &dev_a.push(next.bundle(Some(&genesis)), Some(&genesis)))
+        .await;
+    assert_eq!(resp.status(), 200);
+    let stale = FleetRepo::clone_from_bundle(&genesis_bundle);
+    stale.touch("stale.txt", "lost the race");
+    let mut stale_push = dev_a.push(stale.bundle(Some(&genesis)), Some(&genesis));
+    let resp = dev_a.send(&s, &stale_push).await;
+    assert_eq!(resp.status(), 409);
+    let first: ApiError = resp.json().await.unwrap();
+    stale_push.nonce = support::fleet::fresh_nonce();
+    stale_push.timestamp = support::fleet::now();
+    let resp = dev_a.send(&s, &stale_push).await;
+    assert_eq!(resp.status(), 409);
+    let second: ApiError = resp.json().await.unwrap();
+    assert_eq!(second.error.code, error_codes::REVISION_CONFLICT);
+    assert_eq!(second.error.details, first.error.details);
+    assert_eq!(second.error.details["head"], head);
+
+    // Exactly the two proposals: the retries retained nothing new.
+    let resp = dev_a.send(&s, &proposals(&dev_a)).await;
+    let list: Vec<Proposal> = resp.json().await.unwrap();
+    assert_eq!(list.len(), 2, "retries created proposals: {list:?}");
+
+    // Same keys with other bytes: 422 idempotency_mismatch.
+    for mut push in [held_push, stale_push] {
+        let other = FleetRepo::clone_from_bundle(&genesis_bundle);
+        other.touch("other.txt", &uuid::Uuid::new_v4().to_string());
+        push.body = other.bundle(Some(&genesis));
+        push.nonce = support::fleet::fresh_nonce();
+        push.timestamp = support::fleet::now();
+        let resp = dev_a.send(&s, &push).await;
+        assert_eq!(resp.status(), 422);
+        assert_eq!(
+            resp.json::<ApiError>().await.unwrap().error.code,
+            error_codes::IDEMPOTENCY_MISMATCH
+        );
+    }
+}

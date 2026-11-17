@@ -87,11 +87,13 @@ fn export(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         .timeout_global(Some(std::time::Duration::from_secs(30)))
         .build()
         .into();
-    let mut response = agent
-        .get(format!("{}{path}", account.endpoint))
-        .header("Authorization", format!("Bearer {}", account.token()))
-        .call()
-        .map_err(|_| MusterError::Operational("the Cloud service did not answer; retry".into()))?;
+    let mut response = crate::cloud_client::send_with_rate_limit(true, || {
+        agent
+            .get(format!("{}{path}", account.endpoint))
+            .header("Authorization", format!("Bearer {}", account.token()))
+            .call()
+            .map_err(|_| MusterError::Operational("the Cloud service did not answer; retry".into()))
+    })?;
     let status = response.status().as_u16();
     if status == 204 {
         return Err(MusterError::Operational(
@@ -336,12 +338,16 @@ fn login(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         .http_status_as_error(false)
         .build()
         .into();
-    let mut response = agent
-        .post(format!("{endpoint}{}", protocol::routes::DEVICE_AUTHORIZE))
-        .send_json(&DeviceAuthorizeRequest {
-            client_name: "muster CLI".into(),
-        })
-        .map_err(|_| MusterError::Operational("Cloud authorization request failed".into()))?;
+    // Not keyed: a second request would start a second authorization, so a
+    // limit is reported, never retried.
+    let mut response = crate::cloud_client::send_with_rate_limit(false, || {
+        agent
+            .post(format!("{endpoint}{}", protocol::routes::DEVICE_AUTHORIZE))
+            .send_json(&DeviceAuthorizeRequest {
+                client_name: "muster CLI".into(),
+            })
+            .map_err(|_| MusterError::Operational("Cloud authorization request failed".into()))
+    })?;
     if !response.status().is_success() {
         return Err(MusterError::Operational(
             "Cloud authorization request failed".into(),
@@ -404,7 +410,11 @@ fn login(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
             .map_err(|_| MusterError::Operational("Cloud login request failed".into()))?;
         match error.error.code.as_str() {
             protocol::error_codes::AUTHORIZATION_PENDING => {}
-            protocol::error_codes::SLOW_DOWN => interval = interval.saturating_add(5),
+            // Polling slower is the answer to both: the loop only ever
+            // widens its interval, so it cannot spin against a limit.
+            protocol::error_codes::SLOW_DOWN | protocol::error_codes::RATE_LIMITED => {
+                interval = interval.saturating_add(5)
+            }
             protocol::error_codes::EXPIRED_TOKEN => {
                 return Err(MusterError::Operational(
                     "Cloud login expired; try again".into(),
@@ -478,15 +488,17 @@ fn workspaces(ctx: &mut Context, _params: &Params) -> Result<Value, MusterError>
         .http_status_as_error(false)
         .build()
         .into();
-    let mut response = agent
-        .get(format!(
-            "{}{}",
-            account.endpoint,
-            crate::cloud_protocol::routes::WORKSPACES
-        ))
-        .header("Authorization", format!("Bearer {}", account.token()))
-        .call()
-        .map_err(|_| MusterError::Operational("cannot list Cloud workspaces".into()))?;
+    let mut response = crate::cloud_client::send_with_rate_limit(true, || {
+        agent
+            .get(format!(
+                "{}{}",
+                account.endpoint,
+                crate::cloud_protocol::routes::WORKSPACES
+            ))
+            .header("Authorization", format!("Bearer {}", account.token()))
+            .call()
+            .map_err(|_| MusterError::Operational("cannot list Cloud workspaces".into()))
+    })?;
     if !response.status().is_success() {
         return Err(MusterError::Operational(
             "cannot list Cloud workspaces".into(),
@@ -590,17 +602,20 @@ fn link(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         .http_status_as_error(false)
         .build()
         .into();
-    let mut response = agent
-        .post(format!(
-            "{}/v1/workspaces/{}/devices",
-            account.endpoint, workspace.id
-        ))
-        .header("Authorization", format!("Bearer {}", account.token()))
-        .header("Idempotency-Key", &intent)
-        .send_json(&request)
-        .map_err(|_| {
-            MusterError::Operational("Cloud link request failed; retry the same command".into())
-        })?;
+    // Keyed by the persisted link intent: repeating it is safe.
+    let mut response = crate::cloud_client::send_with_rate_limit(true, || {
+        agent
+            .post(format!(
+                "{}/v1/workspaces/{}/devices",
+                account.endpoint, workspace.id
+            ))
+            .header("Authorization", format!("Bearer {}", account.token()))
+            .header("Idempotency-Key", &intent)
+            .send_json(&request)
+            .map_err(|_| {
+                MusterError::Operational("Cloud link request failed; retry the same command".into())
+            })
+    })?;
     if !response.status().is_success() {
         return Err(MusterError::Operational(
             "Cloud link request failed; retry the same command".into(),
@@ -638,9 +653,23 @@ fn establish_receipt_sequence(
     link: &crate::cloud_client::CloudLink,
     save: bool,
 ) -> Result<(), MusterError> {
-    let remote =
-        crate::cloud_client::device_last_receipt_sequence(account, &link.workspace, &link.device)
-            .ok();
+    let remote = match crate::cloud_client::device_last_receipt_sequence(
+        account,
+        &link.workspace,
+        &link.device,
+    ) {
+        Ok(sequence) => Some(sequence),
+        // Not fatal (the sequence stays deferred), but say why.
+        Err(e @ MusterError::RateLimited(_)) => {
+            ctx.diag(crate::output::Diagnostic::new(
+                crate::output::Severity::Warning,
+                e.code(),
+                e.to_string(),
+            ));
+            None
+        }
+        Err(_) => None,
+    };
     let state_dir = ctx.state_dir.clone();
     let sequence = crate::receipts::with_sync_lock(&state_dir, || {
         if save {

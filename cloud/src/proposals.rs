@@ -297,12 +297,16 @@ pub async fn bundle(
     // Shared hold on the Git storage, before any row lock: a purge drains it.
     let _access = state.repo_access(ws).await?;
 
-    let row: Option<(bool,)> =
-        sqlx::query_as("SELECT has_bundle FROM proposals WHERE workspace_id = $1 AND id = $2")
-            .bind(ws)
-            .bind(id)
-            .fetch_optional(&state.db)
-            .await?;
+    // A closed proposal's upload is released by the maintenance worker:
+    // from closing on, its bundle is no longer served.
+    let row: Option<(bool,)> = sqlx::query_as(
+        "SELECT has_bundle AND status = 'open' AND bundle_released_at IS NULL
+           FROM proposals WHERE workspace_id = $1 AND id = $2",
+    )
+    .bind(ws)
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await?;
     let (has_bundle,) = row.ok_or_else(AppError::not_found)?;
     if !has_bundle {
         return Err(AppError::not_found());

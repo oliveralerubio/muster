@@ -22,6 +22,10 @@ pub enum MusterError {
     /// local history is untouched.
     #[error("{0}")]
     Conflict(String),
+    /// Cloud answered `429 rate_limited` and the request was not applied
+    /// (after the one allowed retry, or because it is not safe to repeat).
+    #[error("{0}")]
+    RateLimited(String),
     #[error("interrupted")]
     Interrupted,
     /// A typed secret-provider failure; its kind decides code and exit code.
@@ -39,6 +43,7 @@ impl MusterError {
             Self::Unavailable(_) => 4,
             Self::Security(_) => 5,
             Self::Conflict(_) => 1,
+            Self::RateLimited(_) => 1,
             Self::Interrupted => 130,
             Self::Provider(e) => e.exit_code(),
         }
@@ -53,6 +58,7 @@ impl MusterError {
             Self::Unavailable(_) => "unavailable",
             Self::Security(_) => "security",
             Self::Conflict(_) => "revision_conflict",
+            Self::RateLimited(_) => "cloud_rate_limited",
             Self::Interrupted => "interrupted",
             Self::Provider(e) => e.code(),
         }
@@ -88,6 +94,7 @@ mod tests {
             (Unavailable("x".into()), 4),
             (Security("x".into()), 5),
             (Conflict("x".into()), 1),
+            (RateLimited("x".into()), 1),
             (Interrupted, 130),
         ];
         for (err, code) in cases {

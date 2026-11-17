@@ -925,3 +925,36 @@ async fn concurrent_checkouts_for_different_plans_leave_one_payable_transaction(
     assert_eq!(offered_now, offered_again);
     assert_eq!(paddle.payable_transactions(), vec![offered_now]);
 }
+
+/// Paddle may deliver one event several times at once: every delivery is
+/// acknowledged with `200` (one is processed, the others are duplicates),
+/// never a `500` from a dedupe race.
+#[tokio::test]
+async fn concurrent_duplicate_deliveries_are_all_acknowledged() {
+    let paddle = start_paddle().await;
+    let s = stack_with_paddle(&paddle).await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let ws = create_workspace(&s, &alice, "Duplicates").await;
+    for round in 0..5 {
+        let event = paddle.subscription_event(&SubscriptionEvent {
+            event_id: &format!("evt_01h8vzp8f4kek3yd4g1duplic{round}"),
+            event_type: "subscription.updated",
+            sub_id: "sub_01h8vzp8f4kek3yd4g1unknown",
+            customer_id: "ctm_01h8vzp8f4kek3yd4g1nobody0",
+            ws_id: &ws.id,
+            plan: "personal",
+            seats: 1,
+            status: "active",
+            occurred_at: "2026-11-14T00:00:00Z",
+            period_start: "2026-11-14T00:00:00Z",
+            period_end: "2026-12-14T00:00:00Z",
+            transaction_id: None,
+        });
+        let deliveries = (0..8).map(|_| post_webhook(&s, &paddle, &event));
+        let statuses = futures::future::join_all(deliveries).await;
+        assert!(
+            statuses.iter().all(|st| *st == 200),
+            "round {round}: {statuses:?}"
+        );
+    }
+}

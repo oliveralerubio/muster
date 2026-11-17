@@ -148,6 +148,43 @@ cat recovery.key | muster approve laptop --recovery-key-stdin
 Keep the exported bundle private — it contains the full configuration and
 vault ciphertext history.
 
+## Limits, retries and retention
+
+The service limits request rates in memory and answers `429 rate_limited` with
+a `Retry-After` header (seconds) when a budget is spent. Each budget refills
+continuously over one minute:
+
+| Budget | Default | Setting |
+|---|---|---|
+| Signed requests per machine | 60/min | `MUSTER_RATE_LIMIT_DEVICE_PER_MINUTE` |
+| Link codes (`POST /v1/device/authorize`) per client address | 10/min | `MUSTER_RATE_LIMIT_LINK_CODES_PER_MINUTE` |
+| Login polls (`POST /v1/device/token`) per client address | 60/min | `MUSTER_RATE_LIMIT_DEVICE_TOKEN_PER_MINUTE` |
+
+`0` disables a budget. Background sync of a normal fleet makes a few signed
+requests per run and stays far below the machine budget. The client address is
+the TCP peer. Behind a reverse proxy, list the proxy in `MUSTER_TRUSTED_PROXIES`
+(comma-separated addresses or CIDR networks, for example `127.0.0.1,10.0.0.0/8`):
+only then is `X-Forwarded-For` read, and its rightmost hop that is not a listed
+proxy is the client. Without it, every client behind the proxy shares one
+address budget. IPv6 clients share a budget per `/64`.
+
+A publication retried with the same `Idempotency-Key` and the same bytes gets
+the original outcome again: the accepted revision, or the same held or conflict
+proposal. The same key with other bytes is `422 idempotency_mismatch`. A
+machine the accepted governance does not authorize gets `403` and the service
+keeps nothing from its upload.
+
+When a proposal is closed (rejected, resolved or superseded), the service
+releases its retained upload automatically within about a minute: its bytes
+stop counting as storage use, a push refused with `507 quota_exceeded` fits
+again, and its bundle is no longer downloadable. Open proposals and the
+accepted history are never released.
+
+Bookkeeping is deleted automatically: replay nonces 15 minutes after use
+(longer than a signature stays valid), idempotency records after 30 days
+(longer than any client retries a request), and expired account tokens,
+sessions and logins.
+
 See [ADR 0006](../adr/0006-cloud-service.md) for the data and trust boundaries,
 and the [deployment guide](../../deploy/README.md) for service configuration and
 backup tools. Workspace deletion and automated backup retention remain under

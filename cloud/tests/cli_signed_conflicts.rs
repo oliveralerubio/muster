@@ -627,6 +627,9 @@ struct Proxy {
     /// When set, the next `POST .../sync` never reaches the service and is
     /// answered `502`: the publication's fate is unknown to the machine.
     drop_next_publication: Arc<std::sync::atomic::AtomicBool>,
+    /// When set, the service really accepts the next `POST .../sync` but the
+    /// `200` the machine sees names a different revision.
+    skew_next_acceptance: Arc<std::sync::atomic::AtomicBool>,
 }
 
 async fn proxy_handler(
@@ -658,6 +661,7 @@ async fn proxy_handler(
             return (axum::http::StatusCode::BAD_GATEWAY, "upstream timed out").into_response();
         }
     }
+    let method_is_publication = method == axum::http::Method::POST && is_sync;
     let query = uri.query().map(|q| format!("?{q}")).unwrap_or_default();
     let mut request = proxy
         .client
@@ -689,7 +693,18 @@ async fn proxy_handler(
             out = out.header(name, value);
         }
     }
-    let bytes = response.bytes().await.expect("upstream body");
+    let status = response.status();
+    let mut bytes = response.bytes().await.expect("upstream body").to_vec();
+    if method_is_publication
+        && status == 200
+        && proxy
+            .skew_next_acceptance
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+    {
+        let mut accepted: Value = serde_json::from_slice(&bytes).expect("accepted body");
+        accepted["revision"] = Value::String("d".repeat(40));
+        bytes = serde_json::to_vec(&accepted).unwrap();
+    }
     out.body(axum::body::Body::from(bytes)).unwrap()
 }
 
@@ -728,6 +743,7 @@ async fn start_proxy(upstream: String) -> (String, Proxy) {
         last_publication: Arc::new(Mutex::new(None)),
         serve: Arc::new(Mutex::new(None)),
         drop_next_publication: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        skew_next_acceptance: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -811,6 +827,54 @@ async fn fork_of_an_accepted_own_state_is_still_refused() {
         assert_eq!((head_of(home), trust(home).await), before);
     }
     *proxy.serve.lock().unwrap() = None;
+}
+
+/// Cloud accepts the publication but answers `200` naming another revision.
+/// The machine must not stay stuck replaying that cached answer: the pending
+/// publication is dropped with a clear diagnostic, the commit stays in the
+/// local history, and the next pull reconciles with what Cloud accepted.
+#[tokio::test]
+async fn acceptance_naming_another_revision_heals_on_the_next_pull() {
+    let stack = stack().await;
+    let alice = stack.login_user("alice", "alice@example.com").await;
+    let ws = create_workspace(&stack, &alice, "Signed unexpected revision").await;
+    let (endpoint, proxy) = start_proxy(stack.cloud.base.clone()).await;
+    let (a, b) = two_writers(&stack, &alice, &ws.id, &endpoint).await;
+    let before = accepted_revision_of(&a);
+
+    std::fs::write(config_of(&a).join("AGENTS.md"), "Published by A.\n").unwrap();
+    proxy
+        .skew_next_acceptance
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (code, push) = failing_json(&a, &["sync", "--push"]).await;
+    assert_eq!(code, 1, "{push}");
+    assert!(
+        has_diagnostic(&push, "cloud_publication_unconfirmed"),
+        "{push}"
+    );
+    let committed = head_of(&a);
+    assert_ne!(committed, before, "the local commit exists");
+    assert!(
+        !a.join("state/muster/cloud/push-intent.json").exists(),
+        "the pending publication was dropped: {push}"
+    );
+    assert!(!a.join("state/muster/cloud/push-intent.bundle").exists());
+    assert_eq!(accepted_revision_of(&a), before, "nothing was recorded");
+
+    // The next pull reconciles; the commit was never lost.
+    ok_json(&a, &["sync", "--pull"]).await;
+    // (`sync` may add its own bookkeeping commit on top.)
+    git_out(&a, &["merge-base", "--is-ancestor", &committed, "HEAD"]);
+    assert_eq!(accepted_revision_of(&a), committed);
+    let again = ok_json(&a, &["sync", "--push"]).await;
+    assert_eq!(again["result"]["transport"]["pushed"], true, "{again}");
+
+    // Cloud did accept it: the other machine receives it.
+    ok_json(&b, &["sync", "--pull"]).await;
+    assert_eq!(
+        std::fs::read_to_string(config_of(&b).join("AGENTS.md")).unwrap(),
+        "Published by A.\n"
+    );
 }
 
 /// Only B sealed (A published a non-signed edit): the served tip carries the

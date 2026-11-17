@@ -48,17 +48,17 @@ async fn pending_machine_proposes_its_own_enrollment_and_admin_resolves_after_si
     assert!(!dev_b.linked.bootstrap);
 
     // It still cannot publish fleet changes: a governance change it signed
-    // itself is refused by the verifier (its key is not in the accepted
-    // governance), and the accepted head does not move...
+    // itself is refused before anything is staged (its key is not in the
+    // accepted governance), and the accepted head does not move...
     let mut own = FleetRepo::clone_from_bundle(&repo.bundle(None));
     own.add_machine(&key_b, &key_b);
     let resp = dev_b
         .send(&s, &dev_b.push(own.bundle(Some(&genesis)), Some(&genesis)))
         .await;
-    assert_eq!(resp.status(), 422);
+    assert_eq!(resp.status(), 403);
     assert_eq!(
         resp.json::<ApiError>().await.unwrap().error.code,
-        error_codes::INVALID_HISTORY
+        error_codes::DEVICE_NOT_APPROVED
     );
     let resp = dev_a.send(&s, &dev_a.get(&dev_a.sync_path())).await;
     assert_eq!(

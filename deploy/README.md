@@ -180,6 +180,7 @@ secret store; never bake them into the image or commit them.
 | --- | --- | --- |
 | `MUSTER_ENV` | no | `production` (default when unset) or `development`. Production enforces https and rejects loopback OIDC. |
 | `MUSTER_BIND` | no | Socket address to listen on, default `127.0.0.1:8080`. In a container use `0.0.0.0:8080` so the port mapping can reach it. |
+| `MUSTER_TRUSTED_PROXIES` | no | Comma-separated addresses or CIDR networks of the reverse proxies in front (e.g. `127.0.0.1,10.0.0.0/8`). Only requests from these peers have `X-Forwarded-For` read; its rightmost hop that is not a listed proxy is the client the per-address rate limits apply to. Unset: the TCP peer is the client. Not secret. |
 | `MUSTER_DATABASE_URL` | **yes** | libpq URL of the managed PostgreSQL. Secret — inject via secret store. |
 | `MUSTER_PUBLIC_URL` | **yes** | Public base URL of the service (https in production). Used for OIDC redirects and cookies. |
 | `MUSTER_OIDC_ISSUER` | **yes** | OIDC issuer URL of the identity provider (https, non-loopback in production). |
@@ -284,6 +285,10 @@ that terminates TLS. Requirements:
   from the same public URL (`MUSTER_PUBLIC_URL/auth/callback`).
 - Do not cache or log request bodies at the proxy (workspace history and
   secrets travel inside them).
+- Set `MUSTER_TRUSTED_PROXIES` to the proxy's address so the per-address
+  rate limits (link codes, login polls) apply to the real client; if it is
+  not set, every client behind the proxy shares the proxy's single budget,
+  and one busy client can get the others refused with `429 rate_limited`.
 
 ## Managed PostgreSQL prerequisites
 

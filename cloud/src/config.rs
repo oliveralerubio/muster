@@ -55,10 +55,23 @@ pub struct Config {
     /// first, so tests can fence an instance under an in-flight write.
     /// Refused in production.
     pub dev_ack_pause_file: Option<std::path::PathBuf>,
+    /// Development only (`MUSTER_DEV_IDEMPOTENCY_RETENTION_SECS`): how long
+    /// idempotency records are kept, instead of
+    /// [`crate::maintenance::IDEMPOTENCY_RETENTION`], so tests can see them
+    /// expire. Never shortens the replay-nonce retention. Refused in
+    /// production.
+    pub dev_idempotency_retention_secs: Option<u64>,
     /// Lifecycle authority (`crate::control`): journal directory and its
     /// independent witness file. Mandatory everywhere; never created by
     /// the service.
     pub control: crate::control::ControlPaths,
+    /// Request rate limits per minute (`MUSTER_RATE_LIMIT_*_PER_MINUTE`;
+    /// `0` disables one).
+    pub rate_limits: crate::rate_limit::RateLimitConfig,
+    /// Reverse proxies whose `X-Forwarded-For` names the client
+    /// (`MUSTER_TRUSTED_PROXIES`: comma-separated addresses or CIDR
+    /// networks). Empty: the TCP peer is the client.
+    pub trusted_proxies: Vec<crate::rate_limit::IpNet>,
 }
 
 #[derive(Clone)]
@@ -309,7 +322,62 @@ impl Config {
             Some(v) => Some(std::path::PathBuf::from(v)),
         };
 
+        let dev_idempotency_retention_secs = match get("MUSTER_DEV_IDEMPOTENCY_RETENTION_SECS") {
+            None => None,
+            Some(_) if env.is_production() => {
+                return Err(ConfigError::Invalid {
+                    name: "MUSTER_DEV_IDEMPOTENCY_RETENTION_SECS",
+                    reason: "is a development-only setting; the retention is fixed in production"
+                        .into(),
+                })
+            }
+            Some(v) => Some(v.parse::<u64>().ok().filter(|s| *s >= 1).ok_or_else(|| {
+                ConfigError::Invalid {
+                    name: "MUSTER_DEV_IDEMPOTENCY_RETENTION_SECS",
+                    reason: "expected a whole number of seconds, at least 1".into(),
+                }
+            })?),
+        };
+
         let control = control_paths(&get, &repo_root)?;
+
+        let per_minute = |name: &'static str, default: u32| -> Result<u32, ConfigError> {
+            match get(name) {
+                None => Ok(default),
+                Some(v) => v.trim().parse::<u32>().map_err(|_| ConfigError::Invalid {
+                    name,
+                    reason: "expected a whole number of requests per minute (0 disables)".into(),
+                }),
+            }
+        };
+        let defaults = crate::rate_limit::RateLimitConfig::default();
+        let rate_limits = crate::rate_limit::RateLimitConfig {
+            device_per_minute: per_minute(
+                "MUSTER_RATE_LIMIT_DEVICE_PER_MINUTE",
+                defaults.device_per_minute,
+            )?,
+            link_codes_per_minute: per_minute(
+                "MUSTER_RATE_LIMIT_LINK_CODES_PER_MINUTE",
+                defaults.link_codes_per_minute,
+            )?,
+            device_token_per_minute: per_minute(
+                "MUSTER_RATE_LIMIT_DEVICE_TOKEN_PER_MINUTE",
+                defaults.device_token_per_minute,
+            )?,
+        };
+        let trusted_proxies = match get("MUSTER_TRUSTED_PROXIES") {
+            None => Vec::new(),
+            Some(list) => list
+                .split(',')
+                .filter(|p| !p.trim().is_empty())
+                .map(|p| {
+                    crate::rate_limit::IpNet::parse(p).ok_or_else(|| ConfigError::Invalid {
+                        name: "MUSTER_TRUSTED_PROXIES",
+                        reason: format!("{:?} is not an IP address or CIDR network", p.trim()),
+                    })
+                })
+                .collect::<Result<_, _>>()?,
+        };
 
         Ok(Self {
             env,
@@ -326,7 +394,10 @@ impl Config {
             dev_lifecycle_crash,
             dev_purge_crash,
             dev_ack_pause_file,
+            dev_idempotency_retention_secs,
             control,
+            rate_limits,
+            trusted_proxies,
         })
     }
 
@@ -498,6 +569,8 @@ impl fmt::Debug for Config {
             .field("repo_root", &self.repo_root)
             .field("paddle", &self.paddle)
             .field("control", &self.control)
+            .field("rate_limits", &self.rate_limits)
+            .field("trusted_proxies", &self.trusted_proxies)
             .finish()
     }
 }

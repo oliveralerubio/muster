@@ -41,6 +41,15 @@ async fn caller_role(db: &PgPool, ws: Uuid, user: Uuid) -> Result<Role, AppError
     Role::parse(&role_str).ok_or_else(|| AppError::internal("corrupt role in db"))
 }
 
+/// Order of authority of a Cloud role (higher is more).
+fn rank(role: Role) -> u8 {
+    match role {
+        Role::Member => 0,
+        Role::Admin => 1,
+        Role::Owner => 2,
+    }
+}
+
 /// `GET /v1/workspaces/{ws}/members`: all members of the workspace, oldest first.
 pub async fn list_members(
     State(state): State<AppState>,
@@ -269,7 +278,21 @@ pub async fn accept_invitation(
     }
 
     crate::lifecycle::lock_writable(&mut tx, ws_id, false).await?;
-    let role = Role::parse(&role_str).unwrap_or(Role::Member);
+    let invited = Role::parse(&role_str).unwrap_or(Role::Member);
+    // Accepting never lowers a role the caller already holds: an owner
+    // accepting a member invitation stays owner, so this path can never
+    // take a workspace's owner count down (to zero, say).
+    let current: Option<String> = sqlx::query_scalar(
+        "SELECT role FROM memberships WHERE workspace_id = $1 AND user_id = $2 FOR UPDATE",
+    )
+    .bind(ws_id)
+    .bind(account.user_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let role = match current.as_deref().and_then(Role::parse) {
+        Some(held) if rank(held) >= rank(invited) => held,
+        _ => invited,
+    };
     sqlx::query(
         "INSERT INTO memberships (workspace_id, user_id, role)
          VALUES ($1, $2, $3)
@@ -304,9 +327,29 @@ pub async fn remove_member(
     account.require_scope(scopes::WORKSPACES_WRITE)?;
     let ws = parse_uuid(&ws_str)?;
     let target = parse_uuid(&member_str)?;
-    let caller = caller_role(&state.db, ws, account.user_id).await?;
+    caller_role(&state.db, ws, account.user_id).await?;
 
     let mut tx = state.db.begin().await?;
+    // Every removal in a workspace is serialised on its row (as a deletion
+    // request is): the owner count and the caller's role below are read
+    // after any concurrent removal committed, so two owners removing each
+    // other can never both succeed and leave the workspace without one.
+    sqlx::query("SELECT id FROM workspaces WHERE id = $1 FOR UPDATE")
+        .bind(ws)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(AppError::not_found)?;
+    let caller: Option<String> =
+        sqlx::query_scalar("SELECT role FROM memberships WHERE workspace_id = $1 AND user_id = $2")
+            .bind(ws)
+            .bind(account.user_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let caller = caller
+        .as_deref()
+        .map(|r| Role::parse(r).ok_or_else(|| AppError::internal("corrupt role in db")))
+        .transpose()?
+        .ok_or_else(AppError::not_found)?;
 
     let target_row: Option<(String,)> = sqlx::query_as(
         "SELECT role FROM memberships WHERE workspace_id = $1 AND user_id = $2 FOR UPDATE",

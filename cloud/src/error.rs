@@ -128,7 +128,16 @@ pub async fn request_id_layer(mut request: Request, next: Next) -> Response {
             request_id: request_id.clone(),
         };
         let headers = std::mem::take(response.headers_mut());
+        // `429 rate_limited` carries its wait as `Retry-After` too.
+        let retry_after = (err.code == error_codes::RATE_LIMITED)
+            .then(|| body.error.details["retry_after_secs"].as_u64())
+            .flatten();
         response = (err.status, Json(body)).into_response();
+        if let Some(secs) = retry_after {
+            response
+                .headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, HeaderValue::from(secs));
+        }
         for (name, value) in headers.iter() {
             if name != axum::http::header::CONTENT_TYPE
                 && name != axum::http::header::CONTENT_LENGTH

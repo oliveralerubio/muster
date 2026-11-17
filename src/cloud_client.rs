@@ -251,6 +251,69 @@ pub fn clear_link_intent(state_dir: &Path) -> Result<(), MusterError> {
     }
 }
 
+/// Longest `Retry-After` this client sits out. A longer limit is reported at
+/// once (a timer-driven sync tries again on its own schedule) instead of
+/// holding the sync lock for minutes.
+const RATE_LIMIT_WAIT_CAP_SECS: u64 = 60;
+/// Pause when Cloud limits a request without saying for how long.
+const RATE_LIMIT_DEFAULT_WAIT_SECS: u64 = 1;
+
+/// `Retry-After` of a `429`, in whole seconds (at least 1). `None` when the
+/// header is absent or not a number of seconds.
+fn retry_after_secs(response: &ureq::http::Response<ureq::Body>) -> Option<u64> {
+    response
+        .headers()
+        .get("retry-after")?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(|secs| secs.max(1))
+}
+
+/// The `cloud_rate_limited` error: the request was not applied and nothing
+/// local changed.
+fn rate_limited(retry_after: Option<u64>) -> MusterError {
+    let when = match retry_after {
+        Some(secs) => format!("retry in {secs} s"),
+        None => "retry in a few moments".to_owned(),
+    };
+    MusterError::RateLimited(format!(
+        "Cloud is rate limiting this machine ({when}); the request was not applied and local \
+         data is untouched"
+    ))
+}
+
+/// Sends a Cloud request through `attempt`. Cloud answers `429 rate_limited`
+/// with `Retry-After` (seconds): when the request is safe to repeat
+/// (`repeatable`: a read, or a write carrying its idempotency key) the
+/// client waits that long (at most [`RATE_LIMIT_WAIT_CAP_SECS`]) and sends it
+/// ONCE more, built afresh by `attempt` (a signed request needs a new
+/// timestamp and nonce). Anything else, or a second `429`, ends with a
+/// [`MusterError::RateLimited`] (`cloud_rate_limited`): there is never a loop.
+pub(crate) fn send_with_rate_limit(
+    repeatable: bool,
+    mut attempt: impl FnMut() -> Result<ureq::http::Response<ureq::Body>, MusterError>,
+) -> Result<ureq::http::Response<ureq::Body>, MusterError> {
+    let first = attempt()?;
+    if first.status().as_u16() != 429 {
+        return Ok(first);
+    }
+    let advised = retry_after_secs(&first);
+    let wait = advised.unwrap_or(RATE_LIMIT_DEFAULT_WAIT_SECS);
+    if !repeatable || wait > RATE_LIMIT_WAIT_CAP_SECS {
+        return Err(rate_limited(advised));
+    }
+    drop(first);
+    std::thread::sleep(std::time::Duration::from_secs(wait));
+    let second = attempt()?;
+    if second.status().as_u16() == 429 {
+        return Err(rate_limited(retry_after_secs(&second)));
+    }
+    Ok(second)
+}
+
 /// The newest receipt sequence the service holds for `device` (`0` when it
 /// has none), read with the account session from the workspace's device
 /// listing. Any failure is an error: the caller must not guess a sequence.
@@ -268,11 +331,14 @@ pub fn device_last_receipt_sequence(
         .build()
         .into();
     let path = crate::cloud_protocol::routes::WORKSPACE_DEVICES.replace("{ws}", workspace);
-    let mut response = agent
-        .get(format!("{}{path}", account.endpoint))
-        .header("Authorization", format!("Bearer {}", account.token()))
-        .call()
-        .map_err(|_| unavailable())?;
+    // A read is safe to repeat once after a rate limit.
+    let mut response = send_with_rate_limit(true, || {
+        agent
+            .get(format!("{}{path}", account.endpoint))
+            .header("Authorization", format!("Bearer {}", account.token()))
+            .call()
+            .map_err(|_| unavailable())
+    })?;
     if !response.status().is_success() {
         return Err(unavailable());
     }
@@ -300,28 +366,6 @@ pub(crate) fn device_request(
     idempotency_key: &str,
 ) -> Result<(u16, Vec<u8>), MusterError> {
     let hash = crate::cloud_protocol::body_sha256_hex(body);
-    let timestamp = time::OffsetDateTime::now_utc().unix_timestamp().to_string();
-    let nonce = {
-        let mut nonce = [0u8; 16];
-        getrandom::getrandom(&mut nonce)
-            .map_err(|e| MusterError::Operational(format!("no randomness available: {e}")))?;
-        signing_hex(&nonce)
-    };
-    let signed = crate::cloud_protocol::SignedRequestV1 {
-        method,
-        path_and_query,
-        workspace_id: &link.workspace,
-        device_id: &link.device,
-        body_sha256_hex: &hash,
-        base_revision,
-        idempotency_key,
-        timestamp: &timestamp,
-        nonce: &nonce,
-    };
-    let signature = format!(
-        "v1={}",
-        signer.sign(&crate::cloud_protocol::canonical_request_v1(&signed))
-    );
     let agent: ureq::Agent = ureq::config::Config::builder()
         .max_redirects(0)
         .http_status_as_error(false)
@@ -329,33 +373,62 @@ pub(crate) fn device_request(
         .build()
         .into();
     let url = format!("{}{path_and_query}", link.endpoint);
-    macro_rules! headers {
-        ($request:expr) => {
-            $request
-                .header("Authorization", format!("Bearer {}", link.token()))
-                .header(crate::cloud_protocol::HEADER_DEVICE_ID, &link.device)
-                .header(crate::cloud_protocol::HEADER_TIMESTAMP, &timestamp)
-                .header(crate::cloud_protocol::HEADER_NONCE, &nonce)
-                .header(crate::cloud_protocol::HEADER_CONTENT_SHA256, &hash)
-                .header(crate::cloud_protocol::HEADER_BASE_REVISION, base_revision)
-                .header(
-                    crate::cloud_protocol::HEADER_IDEMPOTENCY_KEY,
-                    idempotency_key,
-                )
-                .header(crate::cloud_protocol::HEADER_SIGNATURE, &signature)
-        };
+    if !matches!(method, "GET" | "POST") {
+        return Err(MusterError::Operational(format!(
+            "unsupported device request method {method}"
+        )));
     }
-    let outcome = match method {
-        "GET" => headers!(agent.get(&url)).call(),
-        "POST" => headers!(agent.post(&url)).send(body),
-        _ => {
-            return Err(MusterError::Operational(format!(
-                "unsupported device request method {method}"
-            )))
+    // A read, or a write carrying its idempotency key, is safe to repeat once
+    // after a rate limit; every attempt is signed afresh (new timestamp and
+    // nonce). An unkeyed write is reported, never repeated.
+    let repeatable = method == "GET" || !idempotency_key.is_empty();
+    let response = send_with_rate_limit(repeatable, || {
+        let timestamp = time::OffsetDateTime::now_utc().unix_timestamp().to_string();
+        let nonce = {
+            let mut nonce = [0u8; 16];
+            getrandom::getrandom(&mut nonce)
+                .map_err(|e| MusterError::Operational(format!("no randomness available: {e}")))?;
+            signing_hex(&nonce)
+        };
+        let signed = crate::cloud_protocol::SignedRequestV1 {
+            method,
+            path_and_query,
+            workspace_id: &link.workspace,
+            device_id: &link.device,
+            body_sha256_hex: &hash,
+            base_revision,
+            idempotency_key,
+            timestamp: &timestamp,
+            nonce: &nonce,
+        };
+        let signature = format!(
+            "v1={}",
+            signer.sign(&crate::cloud_protocol::canonical_request_v1(&signed))
+        );
+        macro_rules! headers {
+            ($request:expr) => {
+                $request
+                    .header("Authorization", format!("Bearer {}", link.token()))
+                    .header(crate::cloud_protocol::HEADER_DEVICE_ID, &link.device)
+                    .header(crate::cloud_protocol::HEADER_TIMESTAMP, &timestamp)
+                    .header(crate::cloud_protocol::HEADER_NONCE, &nonce)
+                    .header(crate::cloud_protocol::HEADER_CONTENT_SHA256, &hash)
+                    .header(crate::cloud_protocol::HEADER_BASE_REVISION, base_revision)
+                    .header(
+                        crate::cloud_protocol::HEADER_IDEMPOTENCY_KEY,
+                        idempotency_key,
+                    )
+                    .header(crate::cloud_protocol::HEADER_SIGNATURE, &signature)
+            };
         }
-    };
-    let response = outcome
-        .map_err(|_| MusterError::Operational("the Cloud service did not answer; retry".into()))?;
+        let outcome = if method == "GET" {
+            headers!(agent.get(&url)).call()
+        } else {
+            headers!(agent.post(&url)).send(body)
+        };
+        outcome
+            .map_err(|_| MusterError::Operational("the Cloud service did not answer; retry".into()))
+    })?;
     let status = response.status().as_u16();
     let bytes = response
         .into_body()

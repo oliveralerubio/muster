@@ -1091,6 +1091,11 @@ struct Proxy {
     upstream: String,
     client: reqwest::Client,
     serve: Arc<Mutex<Option<Served>>>,
+    /// When set, `GET .../proposals` lists every proposal as created by
+    /// another device.
+    foreign_proposals: Arc<std::sync::atomic::AtomicBool>,
+    /// Every `POST .../proposals/{id}/resolve` that went through.
+    resolutions: Arc<Mutex<Vec<String>>>,
 }
 
 async fn proxy_handler(
@@ -1112,6 +1117,10 @@ async fn proxy_handler(
                 .unwrap();
         }
     }
+    if method == axum::http::Method::POST && path.ends_with("/resolve") {
+        proxy.resolutions.lock().unwrap().push(path.clone());
+    }
+    let lists_proposals = method == axum::http::Method::GET && path.ends_with("/proposals");
     let query = uri.query().map(|q| format!("?{q}")).unwrap_or_default();
     let mut request = proxy
         .client
@@ -1143,7 +1152,18 @@ async fn proxy_handler(
             out = out.header(name, value);
         }
     }
-    let bytes = response.bytes().await.expect("upstream body");
+    let mut bytes = response.bytes().await.expect("upstream body").to_vec();
+    if lists_proposals
+        && proxy
+            .foreign_proposals
+            .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        let mut listed: serde_json::Value = serde_json::from_slice(&bytes).expect("proposal list");
+        for proposal in listed.as_array_mut().expect("proposal array") {
+            proposal["device_id"] = serde_json::json!("another-device");
+        }
+        bytes = serde_json::to_vec(&listed).unwrap();
+    }
     out.body(axum::body::Body::from(bytes)).unwrap()
 }
 
@@ -1152,6 +1172,8 @@ async fn start_proxy(upstream: String) -> (String, Proxy) {
         upstream,
         client: support::http(),
         serve: Arc::new(Mutex::new(None)),
+        foreign_proposals: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        resolutions: Arc::new(Mutex::new(Vec::new())),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -1751,4 +1773,65 @@ async fn repeated_push_of_a_held_proposal_never_duplicates_it() {
         .filter(|p| !before.contains(p))
         .collect();
     assert_eq!(open, vec![(newer, "pending_quorum".into(), head_of(&a))]);
+}
+
+/// The proposal Cloud lists under the held record's id was not created by
+/// this machine (its device id differs): replacing the held publication must
+/// never close it. The record is forgotten with a warning; the foreign
+/// proposal stays open.
+#[tokio::test]
+async fn a_held_proposal_of_another_device_is_never_rejected() {
+    let stack = stack().await;
+    let alice = stack.login_user("alice", "alice@example.com").await;
+    let ws = create_workspace(&stack, &alice, "Quorum held foreign").await;
+    let (endpoint, proxy) = start_proxy(stack.cloud.base.clone()).await;
+    let (a, _b, _signer) = team_fleet(&stack, &alice, &ws.id, &endpoint).await;
+
+    ok_json(&a, &["--yes", "member", "rm", "charlie"]).await;
+    let first = ok_json(&a, &["sync", "--push"]).await;
+    let id = first["result"]["transport"]["held"]["proposal_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{first}"))
+        .to_owned();
+
+    // Cloud now lists that proposal as another device's.
+    proxy
+        .foreign_proposals
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    std::fs::write(config_of(&a).join("AGENTS.md"), "while held\n").unwrap();
+    let changed = ok_json(&a, &["sync", "--push"]).await;
+    assert!(
+        messages(&changed).contains("cloud_proposal_not_ours"),
+        "{changed}"
+    );
+    assert!(
+        !messages(&changed).contains("cloud_proposal_not_superseded"),
+        "{changed}"
+    );
+    assert!(
+        proxy.resolutions.lock().unwrap().is_empty(),
+        "a proposal of another device must never be rejected: {:?}",
+        proxy.resolutions.lock().unwrap()
+    );
+    let newer = changed["result"]["transport"]["held"]["proposal_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{changed}"))
+        .to_owned();
+    assert_ne!(newer, id, "{changed}");
+    let record: Value = serde_json::from_str(
+        &std::fs::read_to_string(a.join("state/muster/cloud/held.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        record["proposal_id"],
+        newer.as_str(),
+        "the old record is forgotten"
+    );
+
+    // Both proposals are open in the real service.
+    proxy
+        .foreign_proposals
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let open: Vec<String> = open_proposals(&a).await.into_iter().map(|p| p.0).collect();
+    assert!(open.contains(&id) && open.contains(&newer), "{open:?}");
 }

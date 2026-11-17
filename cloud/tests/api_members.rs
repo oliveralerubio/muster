@@ -194,3 +194,104 @@ async fn role_authorization_and_member_removal() {
         error_codes::LAST_OWNER
     );
 }
+
+/// Fixture only (precondition, nothing is read back): `user` becomes a
+/// second owner of `ws`. The public API never invites an owner, but a
+/// workspace with several owners must still never lose its last one.
+async fn fixture_make_owner(s: &Stack, ws: &str, user: &str) {
+    use sqlx::Connection;
+    let url = s
+        .env
+        .iter()
+        .find(|(k, _)| *k == "MUSTER_DATABASE_URL")
+        .map(|(_, v)| v.clone())
+        .unwrap();
+    let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
+    let ws: uuid::Uuid = ws.parse().unwrap();
+    let user: uuid::Uuid = user.parse().unwrap();
+    let done = sqlx::query(
+        "UPDATE memberships SET role = 'owner' WHERE workspace_id = $1 AND user_id = $2",
+    )
+    .bind(ws)
+    .bind(user)
+    .execute(&mut conn)
+    .await
+    .unwrap();
+    assert_eq!(done.rows_affected(), 1);
+}
+
+/// Invites `email` to `ws` as `role` and accepts it as `who`.
+async fn join(s: &Stack, by: &UserSession, who: &UserSession, ws: &str, role: Role) {
+    let (status, resp) = session_post(
+        s,
+        by,
+        &format!("/v1/workspaces/{ws}/invitations"),
+        &CreateInvitation {
+            email: who.email.clone(),
+            role,
+        },
+    )
+    .await;
+    assert_eq!(status, 201);
+    let created: CreatedInvitation = resp.json().await.unwrap();
+    let (status, _) = session_post(s, who, &created.accept_path, &serde_json::json!({})).await;
+    assert_eq!(status, 200);
+}
+
+/// Two owners removing each other at the same moment: at most one removal
+/// succeeds, and the workspace always keeps an owner who can still manage it.
+#[tokio::test]
+async fn concurrent_owner_removals_never_leave_a_workspace_without_an_owner() {
+    let s = stack().await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let bob = s.login_user("bob", "bob@example.com").await;
+    for round in 0..12 {
+        let ws = create_workspace(&s, &alice, &format!("Owners {round}")).await;
+        join(&s, &alice, &bob, &ws.id, Role::Admin).await;
+        fixture_make_owner(&s, &ws.id, &bob.user_id).await;
+
+        let remove_bob = format!("/v1/workspaces/{}/members/{}", ws.id, bob.user_id);
+        let remove_alice = format!("/v1/workspaces/{}/members/{}", ws.id, alice.user_id);
+        let (a, b) = tokio::join!(
+            session_delete(&s, &alice, &remove_bob),
+            session_delete(&s, &bob, &remove_alice),
+        );
+        let removed = [a, b].iter().filter(|st| **st == 204).count();
+        assert!(
+            removed <= 1,
+            "round {round}: both owners removed ({a}, {b})"
+        );
+
+        let members_path = format!("/v1/workspaces/{}/members", ws.id);
+        let mut owners = 0;
+        for who in [&alice, &bob] {
+            if let (reqwest::StatusCode::OK, Some(list)) =
+                session_get::<Vec<WorkspaceMember>>(&s, who, &members_path).await
+            {
+                owners = list.iter().filter(|m| m.role == Role::Owner).count();
+            }
+        }
+        assert!(owners >= 1, "round {round}: no owner left ({a}, {b})");
+    }
+}
+
+/// Accepting an invitation never lowers an existing role: the last owner
+/// cannot be demoted (leaving the workspace ownerless) through one.
+#[tokio::test]
+async fn accepting_an_invitation_never_demotes_the_last_owner() {
+    let s = stack().await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let ws = create_workspace(&s, &alice, "Self invite").await;
+    join(&s, &alice, &alice, &ws.id, Role::Member).await;
+
+    let (status, list) = session_get::<Vec<WorkspaceMember>>(
+        &s,
+        &alice,
+        &format!("/v1/workspaces/{}/members", ws.id),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let list = list.unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].role, Role::Owner, "the only owner was demoted");
+}
