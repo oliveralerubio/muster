@@ -138,11 +138,32 @@ impl PausePoint {
 
 #[derive(Debug, Clone)]
 pub enum Encryption {
-    Age {
-        recipient: String,
-    },
+    /// Encrypted to every recipient: the first is the primary one
+    /// (`MUSTER_BACKUP_AGE_RECIPIENT`), any further one is an additional
+    /// identity that can decrypt too (`MUSTER_BACKUP_AGE_RECIPIENTS`).
+    Age { recipients: Vec<String> },
     /// Explicit, development only: synthetic data.
     PlaintextSynthetic,
+}
+
+/// The recipients of an encrypted backup: the primary one first, then the
+/// comma-separated extra ones, each an `age1...` public key, without
+/// duplicates. An empty extra list means just the primary recipient.
+pub fn age_recipients(primary: &str, extra: Option<&str>) -> Result<Vec<String>, String> {
+    let mut all = vec![primary.to_string()];
+    for item in extra.unwrap_or("").split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        if !item.starts_with("age1") || item.chars().any(|c| !c.is_ascii_alphanumeric()) {
+            return Err("MUSTER_BACKUP_AGE_RECIPIENTS must be a comma-separated list of age recipients (age1...)".into());
+        }
+        if !all.iter().any(|r| r == item) {
+            all.push(item.to_string());
+        }
+    }
+    Ok(all)
 }
 
 #[derive(Debug, Clone)]
@@ -185,7 +206,14 @@ pub struct Manifest {
 pub struct EncryptionInfo {
     /// `age-x25519` or `none` (synthetic, development only).
     pub scheme: String,
+    /// SHA-256 of the primary recipient (the first one).
     pub recipient_sha256: Option<String>,
+    /// SHA-256 of every recipient, the primary one first. Present only when a
+    /// backup is encrypted to more than one recipient (a manifest with one
+    /// recipient is exactly what it always was); to find out whether a given
+    /// key can decrypt a snapshot, look in both fields.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recipients_sha256: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -671,10 +699,12 @@ fn capture_stream(
     let produced = child.stdout.take().expect("piped stdout");
     let mut age = None;
     let mut source: Box<dyn Read> = match enc {
-        Encryption::Age { recipient } => {
-            let mut a = Command::new("age")
-                .arg("-r")
-                .arg(recipient)
+        Encryption::Age { recipients } => {
+            let mut cmd = Command::new("age");
+            for recipient in recipients {
+                cmd.arg("-r").arg(recipient);
+            }
+            let mut a = cmd
                 .stdin(Stdio::from(produced))
                 .stdout(Stdio::piped())
                 .stderr(Stdio::inherit())
@@ -1015,13 +1045,24 @@ pub async fn run_backup(
         snapshot_at: rfc(snapshot_at),
         created_at: rfc(OffsetDateTime::now_utc()),
         encryption: match enc {
-            Encryption::Age { recipient } => EncryptionInfo {
+            Encryption::Age { recipients } => EncryptionInfo {
                 scheme: "age-x25519".into(),
-                recipient_sha256: Some(hex(&Sha256::digest(recipient.as_bytes()))),
+                recipient_sha256: recipients
+                    .first()
+                    .map(|r| hex(&Sha256::digest(r.as_bytes()))),
+                recipients_sha256: if recipients.len() > 1 {
+                    recipients
+                        .iter()
+                        .map(|r| hex(&Sha256::digest(r.as_bytes())))
+                        .collect()
+                } else {
+                    Vec::new()
+                },
             },
             Encryption::PlaintextSynthetic => EncryptionInfo {
                 scheme: "none".into(),
                 recipient_sha256: None,
+                recipients_sha256: Vec::new(),
             },
         },
         normal_expires_at: rfc(snapshot_at + s.retention),
@@ -1344,4 +1385,35 @@ where
         reason: None,
         last_error: if status == "error" { last_error } else { None },
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::age_recipients;
+
+    const A: &str = "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p";
+    const B: &str = "age1lggyhqrw2nlhcxprm67z43rta597azn8gknawjehu9d9dl0jq3yqqvfafg";
+
+    #[test]
+    fn extra_recipients_follow_the_primary_without_duplicates() {
+        assert_eq!(age_recipients(A, None).unwrap(), [A]);
+        assert_eq!(age_recipients(A, Some("")).unwrap(), [A]);
+        assert_eq!(
+            age_recipients(A, Some(&format!(" {B} , {A},,"))).unwrap(),
+            [A, B]
+        );
+    }
+
+    #[test]
+    fn a_malformed_extra_recipient_is_refused() {
+        for bad in [
+            "ssh-ed25519 AAAA",
+            "age1abc def",
+            "-r",
+            "age1abc;rm",
+            "notakey",
+        ] {
+            assert!(age_recipients(A, Some(bad)).is_err(), "{bad}");
+        }
+    }
 }

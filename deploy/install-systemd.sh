@@ -19,7 +19,9 @@
 #   - hold only KEY=VALUE lines (comments and blank lines allowed);
 #   - set MUSTER_DATABASE_URL, MUSTER_REPO_ROOT, MUSTER_CONTROL_DIR,
 #     MUSTER_CONTROL_WITNESS, MUSTER_BACKUP_ROOT (absolute, pairwise
-#     disjoint) and MUSTER_BACKUP_AGE_RECIPIENT (an age1… public key);
+#     disjoint) and MUSTER_BACKUP_AGE_RECIPIENT (an age1… public key); it may
+#     also set MUSTER_BACKUP_AGE_RECIPIENTS (comma-separated age1… public keys
+#     the backups are encrypted to as well);
 #   - set no MUSTER_DEV_* setting, no MUSTER_ENV other than production, and
 #     nothing about plaintext.
 #
@@ -100,6 +102,14 @@ case ${conf[MUSTER_BACKUP_AGE_RECIPIENT]} in
   age1*) ;;
   *) fail "MUSTER_BACKUP_AGE_RECIPIENT is not an age recipient (age1…)" 65 ;;
 esac
+if [ -n "${conf[MUSTER_BACKUP_AGE_RECIPIENTS]:-}" ]; then
+  IFS=',' read -ra extra_recipients <<<"${conf[MUSTER_BACKUP_AGE_RECIPIENTS]}"
+  for recipient in "${extra_recipients[@]}"; do
+    recipient=${recipient//[[:space:]]/}
+    [ -z "$recipient" ] || [[ $recipient =~ ^age1[a-z0-9]+$ ]] \
+      || fail "MUSTER_BACKUP_AGE_RECIPIENTS must be a comma-separated list of age recipients (age1…)" 65
+  done
+fi
 
 paths=(MUSTER_REPO_ROOT MUSTER_CONTROL_DIR MUSTER_CONTROL_WITNESS MUSTER_BACKUP_ROOT)
 for key in "${paths[@]}"; do

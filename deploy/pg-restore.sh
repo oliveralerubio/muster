@@ -51,6 +51,12 @@
 #     rejects is refused (67) before any target exists. Legacy format 1
 #     directories restore only with the explicit --legacy-format1.
 #     Synthetic plaintext snapshots restore as-is.
+#   - Ownership of the authority: this script runs as root, and `muster-cloud-
+#     ops` replaces the witness and may create control.lock as root:root 0600,
+#     which the service (uid 10001) could not read. After every ops call and
+#     on exit, the journal, the lock, the witness and any temporary file next
+#     to them get the owner and group of their directory and mode 0600
+#     (deploy/pg-control-owner.sh).
 #   - Prints only target names and counts; never connection strings.
 #
 # Exit codes: 64 usage; 66 target already exists; 67 invalid/missing backup;
@@ -64,6 +70,8 @@ umask 077
 
 # shellcheck source=pg-conn.sh
 . "$(dirname "$0")/pg-conn.sh"
+# shellcheck source=pg-control-owner.sh
+. "$(dirname "$0")/pg-control-owner.sh"
 
 readonly PG_RESTORE_EXIT_USAGE=64
 readonly PG_RESTORE_EXIT_EXISTS=66
@@ -174,9 +182,17 @@ fi
 # The authority must open cleanly before anything is created. `ops` exit
 # 65 is a refusal; 78 a configuration error (e.g. overlapping paths).
 authority_ops() {
+  local ops_rc=0
   MUSTER_CONTROL_DIR=$control_dir MUSTER_CONTROL_WITNESS=$control_witness \
-    MUSTER_REPO_ROOT=$new_repo_root "$ops_bin" "$@"
+    MUSTER_REPO_ROOT=$new_repo_root "$ops_bin" "$@" || ops_rc=$?
+  # Whatever ops rewrote as this user goes back to the directory's owner. (It
+  # runs in command substitutions, so a failure is reported by the final check
+  # below rather than remembered here.)
+  fix_control_ownership "$control_dir" "$control_witness" || true
+  return "$ops_rc"
 }
+# Also when this script stops early (a failure, a signal).
+trap 'fix_control_ownership "$control_dir" "$control_witness" >/dev/null 2>&1' EXIT
 authority_out=$(authority_ops status 2>&1 >/dev/null)
 authority_rc=$?
 case $authority_rc in
@@ -399,6 +415,9 @@ if [ "$gate_rc" != 0 ]; then
     "$PG_RESTORE_EXIT_AUTHORITY"
 fi
 
+fix_control_ownership "$control_dir" "$control_witness" \
+  || fail "the authority files could not be given back to the service's owner (see above); fix their owner and group by hand before activating" \
+    "$PG_RESTORE_EXIT_AUTHORITY"
 printf 'pg-restore.sh: authority verified: %s\n' "$gate_json"
 printf 'pg-restore.sh: restore complete (NEW resources only; cutover is manual)\n'
 printf 'pg-restore.sh: database=%s repo_root=%s heads_checked=%s repos_fscked=%s\n' \

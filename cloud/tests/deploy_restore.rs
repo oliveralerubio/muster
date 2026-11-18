@@ -234,12 +234,19 @@ async fn incarnation(env: &Env, url: &str) -> (String, String) {
 async fn cutover(s: &support::Stack, t: &Target) -> (support::Cloud, Env) {
     let (id, role) = incarnation(&s.env, &t.url).await;
     assert_eq!(role, "candidate", "a restore must join as a new candidate");
+    // The database URL (it holds a password) goes through the environment, not
+    // argv.
     let out = run_ops(
-        &s.env,
-        &["activate", "--incarnation", &id, "--database-url", &t.url],
+        &with(&s.env, "MUSTER_DATABASE_URL", &t.url),
+        &["activate", "--incarnation", &id],
     )
     .await;
     assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        !text(&out).contains("warning"),
+        "the env form must not warn: {}",
+        text(&out)
+    );
     let env = target_env(s, t);
     let cloud = spawn_cloud(&env).await;
     (cloud, env)
@@ -1273,6 +1280,7 @@ MUSTER_BACKUP_AGE_RECIPIENT=age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sf
         (good.replace("MUSTER_BACKUP_AGE_RECIPIENT=age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p\n", ""), "recipient"),
         (good.replace("/var/backups/muster-cloud", "backups"), "absolute"),
         (format!("{good}MUSTER_DEV_BACKUP_RETENTION_SECS=1\n"), "MUSTER_DEV_"),
+        (format!("{good}MUSTER_BACKUP_AGE_RECIPIENTS=age1abc,notakey\n"), "MUSTER_BACKUP_AGE_RECIPIENTS"),
         (good.replace("/var/backups/muster-cloud", "/var/lib/muster-cloud/repos/backups"), "disjoint"),
     ] {
         write(&bad, 0o600);
@@ -1291,6 +1299,14 @@ MUSTER_BACKUP_AGE_RECIPIENT=age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sf
     write(good, 0o600);
     let out = install(vec![]).await;
     assert!(out.status.success(), "{}", text(&out));
+    // Extra recipients (the drill key) are accepted when they are age keys.
+    write(
+        &format!("{good}MUSTER_BACKUP_AGE_RECIPIENTS=age1abc, age1def\n"),
+        0o600,
+    );
+    let out = install(vec![]).await;
+    assert!(out.status.success(), "{}", text(&out));
+    write(good, 0o600);
     for unit in [
         "muster-cloud-backup.service",
         "muster-cloud-backup.timer",
@@ -1803,4 +1819,244 @@ async fn a_restore_killed_while_joining_leaves_the_source_active() {
     let out = restore(&bk, &t, Some(&s.env)).await;
     assert!(out.status.success(), "{}", text(&out));
     assert_restored_serves(&s, &t).await;
+}
+
+/// `activate` and `register` read the database URL from MUSTER_DATABASE_URL (a
+/// password never needs to be in argv); `--database-url` keeps working but
+/// warns on stderr.
+#[tokio::test]
+async fn activate_reads_the_database_url_from_the_environment() {
+    let s = seeded_stack().await;
+    let url = value(&s.env, "MUSTER_DATABASE_URL");
+    let unknown = uuid::Uuid::new_v4().to_string();
+
+    // Neither the flag nor the variable: a usage error that names both.
+    let none: Env = s
+        .env
+        .iter()
+        .filter(|(k, _)| *k != "MUSTER_DATABASE_URL")
+        .cloned()
+        .collect();
+    let out = run_ops(&none, &["activate", "--incarnation", &unknown]).await;
+    assert_eq!(out.status.code(), Some(64), "{}", text(&out));
+    assert!(text(&out).contains("MUSTER_DATABASE_URL"), "{}", text(&out));
+
+    // The environment form reaches the database (an unknown incarnation is
+    // refused there, with no warning).
+    let out = run_ops(&s.env, &["activate", "--incarnation", &unknown]).await;
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(
+        text(&out).contains("not the database of that incarnation"),
+        "{}",
+        text(&out)
+    );
+    assert!(!text(&out).contains("warning"), "{}", text(&out));
+
+    // The flag still works, and says that it exposes the password.
+    let out = run_ops(
+        &none,
+        &[
+            "activate",
+            "--incarnation",
+            &unknown,
+            "--database-url",
+            &url,
+        ],
+    )
+    .await;
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(
+        text(&out).contains("not the database of that incarnation"),
+        "{}",
+        text(&out)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--database-url puts the database password"),
+        "{}",
+        text(&out)
+    );
+
+    // Same for register (a candidate is only created when asked: here the
+    // usage error shows the variable is what is missing).
+    let out = run_ops(&none, &["register"]).await;
+    assert_eq!(out.status.code(), Some(64), "{}", text(&out));
+    assert!(text(&out).contains("MUSTER_DATABASE_URL"), "{}", text(&out));
+}
+
+/// pg-restore.sh runs as root and the ops commands rewrite the witness (and
+/// may create the lock) as that user: the files must go back to the owner of
+/// their directory, which the script does with `chown --reference`. Without
+/// root the real ownership cannot be changed here, so a chown shim records the
+/// calls (the real owner is proven as root by deploy/tests/control-owner.sh).
+#[tokio::test]
+async fn a_restore_gives_the_authority_files_back_to_the_service() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = seeded_stack().await;
+    let dir = tempfile::tempdir().unwrap();
+    let bk = backup(&s, dir.path()).await;
+    let auth = s.env.clone();
+    let control = PathBuf::from(value(&auth, "MUSTER_CONTROL_DIR"));
+    let witness = PathBuf::from(value(&auth, "MUSTER_CONTROL_WITNESS"));
+    // A world-readable witness: the script must put 0600 back.
+    std::fs::set_permissions(&witness, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let shim = dir.path().join("shim");
+    std::fs::create_dir_all(&shim).unwrap();
+    let log = dir.path().join("chown.log");
+    let real = String::from_utf8(
+        std::process::Command::new("sh")
+            .args(["-c", "command -v chown"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let chown = shim.join("chown");
+    std::fs::write(
+        &chown,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{}'\nexec {} \"$@\"\n",
+            log.display(),
+            real.trim()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&chown, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        shim.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let t = new_target();
+    let out = restore_with(&bk, &t, &auth, &[("PATH", path)]).await;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let calls = std::fs::read_to_string(&log).unwrap_or_default();
+    let witness_dir = witness.parent().unwrap();
+    for (dir, file) in [
+        (&control, control.join("journal.v1.jsonl")),
+        (&PathBuf::from(witness_dir), witness.clone()),
+    ] {
+        let want = format!("--reference={} -- {}", dir.display(), file.display());
+        assert!(calls.contains(&want), "no `{want}` in:\n{calls}");
+    }
+    assert_eq!(
+        std::fs::metadata(&witness).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    // ... and the restored authority still opens for the service.
+    assert_restored_serves(&s, &t).await;
+}
+
+fn sha256_text(text: &str) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The public key of an age identity file (`age-keygen -o`).
+fn public_key(identity: &Path) -> String {
+    std::fs::read_to_string(identity)
+        .unwrap()
+        .lines()
+        .find_map(|l| l.strip_prefix("# public key: ").map(str::to_string))
+        .expect("public key line")
+}
+
+/// A backup encrypted to the primary recipient and to MUSTER_BACKUP_AGE_RECIPIENTS
+/// opens with either identity (the host's restore drill uses a second,
+/// drill-only key), a restore works with the second one, the manifest lists
+/// both recipients (the primary one still in `recipient_sha256`), and a
+/// single-recipient manifest is exactly what it always was.
+#[tokio::test]
+async fn a_backup_to_two_recipients_opens_with_either_identity() {
+    let s = seeded_stack().await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("backups");
+    let second = dir.path().join("drill.key");
+    let second_recipient = age_key(&second);
+    let out = backup_run(
+        &s.env,
+        &root,
+        &[],
+        &[(
+            "MUSTER_BACKUP_AGE_RECIPIENTS",
+            // Padding, an empty item and a repeat of the primary are tolerated.
+            format!(" {second_recipient} ,,"),
+        )],
+    )
+    .await;
+    let snap = published(&out);
+    let first = identity_for(&root);
+    let first_recipient = public_key(&first);
+    assert_ne!(first_recipient, second_recipient);
+
+    for art in ["db.dump.age", "git.tar.age"] {
+        let a = dir.path().join(format!("{art}.a"));
+        let b = dir.path().join(format!("{art}.b"));
+        age_decrypt(&first, &snap.join(art), &a);
+        age_decrypt(&second, &snap.join(art), &b);
+        assert_eq!(
+            std::fs::read(&a).unwrap(),
+            std::fs::read(&b).unwrap(),
+            "{art}: the two identities read different plaintext"
+        );
+    }
+
+    let m = manifest(&snap);
+    assert_eq!(
+        m["encryption"]["recipient_sha256"],
+        sha256_text(&first_recipient),
+        "{m}"
+    );
+    assert_eq!(
+        m["encryption"]["recipients_sha256"],
+        serde_json::json!([
+            sha256_text(&first_recipient),
+            sha256_text(&second_recipient)
+        ]),
+        "{m}"
+    );
+
+    // The whole restore works with only the second identity.
+    std::fs::copy(&second, &first).unwrap();
+    let t = new_target();
+    let out = restore(&snap, &t, Some(&s.env)).await;
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+
+    // One recipient: the manifest has no `recipients_sha256`.
+    let single = published(&backup_run(&s.env, &dir.path().join("single"), &[], &[]).await);
+    let m = manifest(&single);
+    assert!(m["encryption"]["recipient_sha256"].is_string(), "{m}");
+    assert!(m["encryption"].get("recipients_sha256").is_none(), "{m}");
+}
+
+/// A malformed extra recipient is a configuration error: nothing is
+/// published, and it is never passed on to `age`.
+#[tokio::test]
+async fn a_malformed_extra_recipient_is_refused_before_any_backup() {
+    let s = seeded_stack().await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("backups");
+    for bad in ["notakey", "age1abc;touch-x", "-o"] {
+        let out = backup_run(
+            &s.env,
+            &root,
+            &[],
+            &[("MUSTER_BACKUP_AGE_RECIPIENTS", bad.into())],
+        )
+        .await;
+        assert_eq!(out.status.code(), Some(78), "{bad}: {}", text(&out));
+        assert!(
+            text(&out).contains("MUSTER_BACKUP_AGE_RECIPIENTS"),
+            "{bad}: {}",
+            text(&out)
+        );
+        let published = std::fs::read_dir(root.join("snapshots"))
+            .map(|d| d.count())
+            .unwrap_or(0);
+        assert_eq!(published, 0, "{bad}: a snapshot was published");
+    }
 }
