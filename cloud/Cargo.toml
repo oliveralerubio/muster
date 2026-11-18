@@ -1,0 +1,64 @@
+[package]
+name = "muster-cloud"
+version = "0.1.0"
+edition = "2021"
+description = "Muster Cloud backend service"
+license = "Apache-2.0"
+publish = false
+
+[features]
+# Synthetic OIDC/backup helper, excluded from normal service builds.
+backup-drill = []
+
+[[bin]]
+name = "muster-cloud"
+path = "src/main.rs"
+
+[[bin]]
+# Operator tool for the lifecycle authority (init, status, register,
+# activate, restore-check). Same library as the service.
+name = "muster-cloud-ops"
+path = "src/ops.rs"
+
+[[bin]]
+name = "muster-cloud-drill"
+path = "../deploy/harness/drill.rs"
+required-features = ["backup-drill"]
+
+[lib]
+name = "muster_cloud"
+path = "src/lib.rs"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "uuid", "time", "json", "migrate", "macros"] }
+openidconnect = { version = "4.1", default-features = false, features = ["reqwest", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1", features = ["v4", "serde"] }
+time = { version = "0.3", features = ["formatting", "parsing"] }
+sha2 = "0.10"
+rand = "0.8"
+base64 = "0.22"
+url = "2"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# Fleet trust verification and signature checks (same code the CLI runs).
+muster = { path = ".." }
+# Private scratch dirs for Git quarantine checkouts and bundles.
+tempfile = "3.10"
+# HTTP client for external provider calls (Paddle Billing).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+hmac = "0.12"
+# SIGKILL for the development-only injected crashes (see dev_crash).
+libc = "0.2"
+
+[dev-dependencies]
+time = { version = "0.3", features = ["parsing"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+rsa = { version = "0.9", features = ["sha2"] }
+tokio = { version = "1", features = ["process", "io-util"] }
+futures = "0.3"

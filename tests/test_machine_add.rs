@@ -64,7 +64,9 @@ impl Fleet {
         let remote_guard = TempDir::new().unwrap();
         let remote = remote_guard.path().join("central.git");
         assert!(Std::new("git")
-            .args(["init", "--bare", "--quiet"])
+            // Muster repositories publish `refs/heads/main`; the bare
+            // central's HEAD must name that branch for clones and `git log`.
+            .args(["init", "--bare", "--quiet", "--initial-branch=main"])
             .arg(&remote)
             .status()
             .unwrap()

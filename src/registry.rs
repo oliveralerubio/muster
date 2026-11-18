@@ -47,6 +47,30 @@ pub struct CommandSpec {
     pub handler: fn(&mut Context, &Params) -> Result<Value, MusterError>,
 }
 
+/// Fleet access is the default; only explicitly listed local account operations
+/// may run without consulting or recovering fleet state.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CommandScope {
+    Fleet,
+    LocalAccount,
+}
+
+impl CommandSpec {
+    pub fn scope(&self) -> CommandScope {
+        match self.name {
+            "cloud.status"
+            | "cloud.unlink"
+            | "cloud.login"
+            | "cloud.logout"
+            | "cloud.workspaces"
+            | "cloud.export"
+            | "cloud.proposals"
+            | "cloud.proposals.resolve" => CommandScope::LocalAccount,
+            _ => CommandScope::Fleet,
+        }
+    }
+}
+
 /// Typed accessor over parsed command parameters.
 #[derive(Debug, Default, Clone)]
 pub struct Params {
@@ -114,6 +138,15 @@ impl Params {
 
 /// Every command Muster knows. Register new commands here.
 pub static COMMANDS: &[CommandSpec] = &[
+    crate::commands::cloud::LINK,
+    crate::commands::cloud::WORKSPACES,
+    crate::commands::cloud::LOGIN,
+    crate::commands::cloud::LOGOUT,
+    crate::commands::cloud::EXPORT,
+    crate::commands::cloud::STATUS,
+    crate::commands::cloud::UNLINK,
+    crate::commands::cloud::PROPOSALS,
+    crate::commands::cloud::PROPOSALS_RESOLVE,
     crate::commands::provider::LIST,
     crate::commands::provider::ADD,
     crate::commands::provider::RM,

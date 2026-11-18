@@ -41,6 +41,11 @@ pub struct Context {
     /// `--expect-signer`: full 256-bit fingerprint or full public key the fleet state's first
     /// signer must have when this machine pins it for the first time.
     pub expect_signer: Option<String>,
+    /// `sync --pull` through a Cloud link (no `--remote`): the `--expect-signer`
+    /// confirmation names the REMOTE fleet being joined, not this machine's
+    /// local scaffold, so the pre-transport guard must not apply it locally.
+    /// Set by `cli::execute`; only the guard for `sync` reads it.
+    pub sync_cloud_pull: bool,
     /// `--expect-state`: payload SHA-256 of the only state this machine may take as its
     /// origin when it pins a fleet for the first time.
     pub expect_state: Option<String>,
@@ -77,6 +82,7 @@ impl Context {
             is_tty: std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
             recovery_signer: None,
             expect_signer: None,
+            sync_cloud_pull: false,
             expect_state: None,
             enrollments: Vec::new(),
             governance_pending: false,
@@ -225,6 +231,7 @@ mod tests {
             is_tty: false,
             recovery_signer: None,
             expect_signer: None,
+            sync_cloud_pull: false,
             expect_state: None,
             enrollments: Vec::new(),
             governance_pending: false,

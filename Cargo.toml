@@ -1,3 +1,10 @@
+[workspace]
+members = [".", "cloud"]
+# `cargo build`/`cargo test` at the root keep building only the OSS CLI.
+default-members = ["."]
+exclude = ["fuzz"]
+resolver = "2"
+
 [package]
 name = "muster"
 version = "0.1.0"
@@ -33,6 +40,8 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 getrandom = "0.2"
 zeroize = "1"
 hkdf = "0.12"
+# Blocking HTTPS client for `muster cloud` (rustls, no OpenSSL).
+ureq = { version = "3.5", default-features = false, features = ["rustls", "json"] }
 
 [dev-dependencies]
 assert_cmd = "2.0"
@@ -43,3 +52,10 @@ tempfile = "3.10"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+
+# The test OIDC fixture generates an RSA key per test process; unoptimised
+# bignum arithmetic makes that take tens of seconds.
+[profile.dev.package.num-bigint-dig]
+opt-level = 3
+[profile.dev.package.rsa]
+opt-level = 3

@@ -199,18 +199,41 @@ fn git_init(dir: &Path) -> Result<(), MusterError> {
     if dir.join(".git").exists() {
         return Ok(());
     }
-    let output = Command::new("git")
-        .arg("init")
-        .arg("--quiet")
-        .arg(dir)
-        .output()
-        .map_err(|e| MusterError::Unavailable(format!("cannot run git: {e}")))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(MusterError::Operational(format!(
-            "git init failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )))
+    let init = |extra: &[&str]| {
+        Command::new("git")
+            .arg("init")
+            .args(extra)
+            .arg("--quiet")
+            .arg(dir)
+            .output()
+            .map_err(|e| MusterError::Unavailable(format!("cannot run git: {e}")))
+    };
+    // The repo starts on `main`: fleet bundles publish `refs/heads/main`, and
+    // `git pull` integrates `origin/<current branch>` — the host's configured
+    // default branch would never match what the fleet serves.
+    let started = match init(&["--initial-branch=main"]) {
+        Ok(output) if output.status.success() => return Ok(()),
+        Ok(_) => init(&[]),
+        Err(e) => Err(e),
+    }?;
+    if started.status.success() {
+        let branch = Command::new("git")
+            .arg("symbolic-ref")
+            .arg("HEAD")
+            .arg("refs/heads/main")
+            .current_dir(dir)
+            .output()
+            .map_err(|e| MusterError::Unavailable(format!("cannot run git: {e}")))?;
+        if branch.status.success() {
+            return Ok(());
+        }
+        return Err(MusterError::Operational(format!(
+            "git symbolic-ref failed: {}",
+            String::from_utf8_lossy(&branch.stderr).trim()
+        )));
     }
+    Err(MusterError::Operational(format!(
+        "git init failed: {}",
+        String::from_utf8_lossy(&started.stderr).trim()
+    )))
 }

@@ -86,6 +86,7 @@ fn run(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     if !ctx.dry_run {
         let outcome = match &result {
             Ok(_) if !ctx.failed() => "ok",
+            Err(MusterError::Conflict(_)) => "conflict",
             Err(e) if e.to_string().contains("conflict with") => "conflict",
             _ => "error",
         };
@@ -126,6 +127,22 @@ fn sync_io(e: std::io::Error) -> MusterError {
     MusterError::Operational(format!("sync state: {e}"))
 }
 
+/// Whether this machine's identity is enrolled in the manifest on disk
+/// (after a join pull, that manifest is the fleet's).
+fn enrolled(ctx: &Context) -> bool {
+    let Ok(manifest) = Manifest::load(&ctx.config_dir) else {
+        return false;
+    };
+    crate::identity::Identity::load(&ctx.state_dir)
+        .map(|identity| {
+            manifest
+                .machines
+                .values()
+                .any(|m| m.recipient == identity.recipient())
+        })
+        .unwrap_or(false)
+}
+
 /// The lock file remains in place: unlinking it would allow a second inode
 /// to be locked while a waiting process still owns the first one.
 fn sync(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
@@ -153,6 +170,17 @@ fn sync(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     } else {
         transport(ctx, params, true)?
     };
+    // A machine that just joined a fleet it is not enrolled in downloads the
+    // history but applies nothing (same rule as the Git remote join path):
+    // it proposes its enrollment first.
+    if transport.get("pulled").and_then(Value::as_str) == Some("joined") && !enrolled(ctx) {
+        return Ok(json!({
+            "joined": true,
+            "applied": false,
+            "transport": transport,
+            "skills_updated": skills_updated,
+        }));
+    }
     // A governance change is waiting for admin co-signatures: the pull above
     // may bring them, but nothing is applied from the unaccepted state.
     if ctx.governance_pending {
@@ -164,6 +192,19 @@ fn sync(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
         }));
     }
     let global = target == engine::Target::Global;
+    // Apply-receipt provenance is established BEFORE the plan, from the
+    // exact accepted revision's verified signed fleet state (read from that
+    // commit and covered by the pin): a receipt attests the applied accepted
+    // revision with clean configuration — never the worktree's latest state
+    // or a later HEAD.
+    let receipt_provenance = if global
+        && !ctx.dry_run
+        && crate::cloud_client::CloudLink::load(&ctx.state_dir)?.is_some()
+    {
+        crate::receipts::accepted_provenance(ctx)?
+    } else {
+        None
+    };
     let plan = engine::plan(
         ctx,
         &Options {
@@ -173,9 +214,19 @@ fn sync(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     )?;
     let mut result = engine::apply(ctx, plan)?;
     if global {
+        // Freeze the signed receipt BEFORE `team::record_applied` commits
+        // bookkeeping: the receipt attests the applied accepted revision,
+        // never the bookkeeping commit.
+        if let Some(provenance) = &receipt_provenance {
+            crate::receipts::freeze_applied_receipt(ctx, provenance, &result)?;
+        }
         let recorded = crate::team::record_applied(ctx, &result)?;
         if recorded && transport["pushed"] == true {
-            git::push(&ctx.config_dir)?;
+            if let Some(link) = crate::cloud_client::CloudLink::load(&ctx.state_dir)? {
+                crate::sync_transport::push(ctx, &link)?;
+            } else {
+                git::push(&ctx.config_dir)?;
+            }
         }
         if !ctx.dry_run && !params.get_bool("pull") && !params.get_bool("push") {
             let fleet = crate::commands::machine::sync_fleet_after_local_sync(ctx)?;
@@ -204,6 +255,10 @@ fn format_text(result: &Value) -> String {
             (Some(p), Some(true)) => text.push_str(&format!("Transport: pulled {p}, pushed.\n")),
             (Some(p), _) => text.push_str(&format!("Transport: pulled {p}.\n")),
             (None, Some(true)) => text.push_str("Transport: pushed.\n"),
+            (None, Some(false)) if transport.contains_key("held") => text.push_str(&format!(
+                "Transport: held by Cloud as proposal {}.\n",
+                transport["held"]["proposal_id"].as_str().unwrap_or("?")
+            )),
             _ => {}
         }
     }
@@ -276,6 +331,35 @@ fn transport(
 ) -> Result<(Value, Vec<Value>), MusterError> {
     let (only_pull, only_push) = (params.get_bool("pull"), params.get_bool("push"));
     let remote = params.get_string("remote");
+    let cloud = crate::cloud_client::CloudLink::load(&ctx.state_dir)?;
+    if let Some(link) = cloud {
+        if remote.is_some() {
+            return Err(MusterError::Usage(
+                "--remote cannot be combined with a Cloud link; unlink first".into(),
+            ));
+        }
+        if !only_pull && !only_push {
+            return Err(MusterError::Operational(
+                "Cloud sync needs an explicit --pull (download) or --push (publish)".into(),
+            ));
+        }
+        // Drain queued apply receipts FIRST, while nothing has failed: their
+        // delivery must not depend on pull/push steps that can fail later.
+        // Receipts that cannot be delivered stay queued and visible without
+        // failing this sync.
+        crate::receipts::drain(ctx, &link);
+        let committed = git::commit_if_configured(&ctx.config_dir, "chore(muster): sync")?;
+        if only_push {
+            let mut report = crate::sync_transport::push(ctx, &link)?.report();
+            report["committed"] = json!(committed);
+            return Ok((report, Vec::new()));
+        }
+        let outcome = crate::sync_transport::pull(ctx, &link)?;
+        return Ok((
+            json!({"committed": committed, "pulled": outcome.label(), "pushed": false}),
+            Vec::new(),
+        ));
+    }
     if let Some(url) = remote {
         git::set_remote(&ctx.config_dir, url)?;
     }
@@ -296,6 +380,10 @@ fn transport(
     if do_pull {
         ctx.progress("Pulling config repo…");
         let previous = git::head_commit_opt(&ctx.config_dir);
+        // Snapshot BEFORE the pull: whether the pre-pull pin covered this
+        // machine's own scaffold (documented first join) or a fleet accepted
+        // from elsewhere (antirollback boundary).
+        let own_scaffold_pin = crate::trust::pin_covers_own_scaffold(ctx);
         let pull_result = git::pull(&ctx.config_dir)?;
         // Refuse (and undo) a pull that rolls the fleet back, forges its vault or
         // changes its governance without a valid signature from an authorized signer.
@@ -305,6 +393,7 @@ fn transport(
             previous.as_deref(),
             joined,
             params.get_string("remote").is_some(),
+            own_scaffold_pin,
         )?;
         pulled = match pull_result {
             Pulled::Empty => json!("remote_empty"),

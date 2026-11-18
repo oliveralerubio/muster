@@ -65,11 +65,15 @@ pub fn execute(
 ) -> (Envelope, i32) {
     let expect_signer = params.get_string("expect-signer").map(str::to_owned);
     let expect_state = params.get_string("expect-state").map(str::to_owned);
+    // A Cloud pull joins a possibly different history: the signer the user
+    // expects is the REMOTE fleet's, never the local scaffold's own key.
+    let sync_cloud_pull =
+        spec.name == "sync" && params.get_bool("pull") && params.get_string("remote").is_none();
     execute_with(
         spec,
         globals,
         interactive,
-        (expect_signer, expect_state),
+        (expect_signer, expect_state, sync_cloud_pull),
         |ctx| (spec.handler)(ctx, params),
     )
 }
@@ -79,7 +83,7 @@ pub(crate) fn execute_with(
     spec: &'static CommandSpec,
     globals: Globals,
     interactive: bool,
-    (expect_signer, expect_state): (Option<String>, Option<String>),
+    (expect_signer, expect_state, sync_cloud_pull): (Option<String>, Option<String>, bool),
     handler: impl FnOnce(&mut Context) -> Result<Value, MusterError>,
 ) -> (Envelope, i32) {
     let (result, mut diagnostics, failed) = match Context::new(globals) {
@@ -87,6 +91,7 @@ pub(crate) fn execute_with(
             ctx.is_tty &= interactive;
             ctx.expect_signer = expect_signer;
             ctx.expect_state = expect_state;
+            ctx.sync_cloud_pull = sync_cloud_pull;
             // One mutation at a time per machine, so a concurrent command can
             // never clobber a live revocation stage or a half-written commit.
             // `init` acquires the lock after its preflight checks so a refused
@@ -112,8 +117,15 @@ pub(crate) fn execute_with(
                     Ok(serde_json::json!({"skipped": "locked", "applied": false}))
                 }
                 Err(e) => Err(e),
-                Ok(_held) => crate::trust::guard(&mut ctx, spec.name, spec.mutating)
-                    .and_then(|()| handler(&mut ctx)),
+                Ok(_held) => {
+                    let guard = match spec.scope() {
+                        registry::CommandScope::Fleet => {
+                            crate::trust::guard(&mut ctx, spec.name, spec.mutating)
+                        }
+                        registry::CommandScope::LocalAccount => Ok(()),
+                    };
+                    guard.and_then(|()| handler(&mut ctx))
+                }
             };
             (result, ctx.take_diagnostics(), ctx.failed())
         }

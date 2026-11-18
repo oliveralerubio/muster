@@ -608,6 +608,41 @@ impl Vault {
     }
 }
 
+/// The secret values of `group` from its armored ciphertext (e.g. as of an
+/// older commit), decrypted with `id` and bound to `group` like a file read.
+/// Values only live in memory; callers compare and re-encrypt them.
+pub(crate) fn decrypt_values(
+    group: &str,
+    armored: &[u8],
+    id: &Identity,
+) -> Result<std::collections::BTreeMap<String, SecretValue>, MusterError> {
+    validate_segment("group", group)?;
+    let plaintext = decrypt(armored, id)?;
+    let data: GroupData =
+        serde_json::from_slice(&plaintext).map_err(|e| MusterError::InvalidConfig {
+            message: format!("corrupt vault group: {e}"),
+            path: Some(format!("{VAULT_DIR}/{group}.age")),
+        })?;
+    if data.group != group {
+        return Err(MusterError::Security(format!(
+            "vault group binding mismatch: '{group}.age' holds another group's data"
+        )));
+    }
+    let mut values = std::collections::BTreeMap::new();
+    for (key, entry) in &data.secrets {
+        if *key != entry.name || validate_segment("secret name", key).is_err() {
+            return Err(MusterError::Security(format!(
+                "vault group '{group}' holds a secret whose name does not match its key"
+            )));
+        }
+        values.insert(
+            key.clone(),
+            SecretValue::new(entry.ciphertext_or_value.clone()),
+        );
+    }
+    Ok(values)
+}
+
 fn encrypt(plaintext: &[u8], recipients: &[String]) -> Result<Vec<u8>, MusterError> {
     if recipients.is_empty() {
         return Err(MusterError::Usage(

@@ -68,14 +68,24 @@ pub fn remote_url(dir: &Path) -> Result<String, MusterError> {
     }
 }
 
-/// Creates `dir` and a git repository in it when there is none yet.
+/// Creates `dir` and a git repository in it when there is none yet. New
+/// repositories start on `main`: fleet bundles (and every other muster repo)
+/// publish `refs/heads/main`, and `git pull` integrates `origin/<current
+/// branch>`, so the host's configured default branch would silently never
+/// match what the fleet serves.
 pub fn init_repo(dir: &Path) -> Result<(), MusterError> {
     std::fs::create_dir_all(dir)
         .map_err(|e| MusterError::Operational(format!("{}: {e}", dir.display())))?;
     if is_repo(dir) {
         return Ok(());
     }
-    check(dir, &["init", "--quiet"])
+    if check(dir, &["init", "--quiet", "--initial-branch=main"]).is_ok() {
+        return Ok(());
+    }
+    // Older git without --initial-branch: plain init, then point the unborn
+    // HEAD at the fleet branch.
+    check(dir, &["init", "--quiet"])?;
+    check(dir, &["symbolic-ref", "HEAD", "refs/heads/main"])
 }
 
 /// Adds or updates the `origin` remote.
@@ -99,7 +109,10 @@ pub fn push(dir: &Path) -> Result<(), MusterError> {
     check(dir, &["push", "--quiet", "-u", REMOTE, &refspec])
 }
 
-/// Fetches `origin` and integrates its copy of the current branch.
+/// Fetches `origin` and integrates its copy of the current branch. When the
+/// remote only serves another branch (fleet bundles publish `refs/heads/main`),
+/// an unborn repository aligns its HEAD with the remote's branch; a repository
+/// with its own history is refused by name instead of silently looking empty.
 pub fn pull(dir: &Path) -> Result<Pulled, MusterError> {
     require_remote(dir)?;
     check(dir, &["fetch", "--quiet", REMOTE])?;
@@ -110,7 +123,47 @@ pub fn pull(dir: &Path) -> Result<Pulled, MusterError> {
         .status
         .success()
     {
-        return Ok(Pulled::Empty);
+        let listing = run(
+            dir,
+            &[
+                "for-each-ref",
+                "--format=%(refname)",
+                &format!("refs/remotes/{REMOTE}/"),
+            ],
+        )?;
+        let remote_refs = String::from_utf8_lossy(&listing.stdout);
+        let remote_branches: Vec<String> = remote_refs
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.ends_with("/HEAD"))
+            .map(|line| {
+                line.strip_prefix(&format!("refs/remotes/{REMOTE}/"))
+                    .unwrap_or(line)
+                    .to_owned()
+            })
+            .collect();
+        if remote_branches.is_empty() {
+            return Ok(Pulled::Empty);
+        }
+        let served = remote_branches.join(", ");
+        if !has_commits(dir) && remote_branches.len() == 1 {
+            // Nothing local to lose: point the unborn HEAD at the branch the
+            // remote actually serves (e.g. origin/main) and integrate it.
+            let aligned = remote_branches[0]
+                .strip_prefix(&format!("{REMOTE}/"))
+                .unwrap_or(&remote_branches[0])
+                .to_owned();
+            check(
+                dir,
+                &["symbolic-ref", "HEAD", &format!("refs/heads/{aligned}")],
+            )?;
+            return pull(dir);
+        }
+        return Err(MusterError::Operational(format!(
+            "the remote serves {served} but this repository is on {branch} with its own \
+             history; muster integrates the same branch on both sides (rename the local \
+             branch, or publish the fleet on it)"
+        )));
     }
     if !has_commits(dir) {
         check(dir, &["reset", "--quiet", "--hard", &upstream])?;

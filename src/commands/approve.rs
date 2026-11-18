@@ -108,6 +108,19 @@ pub(super) fn approve_with_identity(
             "machine '{name}' is already a member of the fleet"
         )));
     }
+    // Over the Cloud transport the request travels as an OPEN enrollment
+    // proposal: fetch it from the linked workspace when it has not reached
+    // this repository yet. Without a link the request arrives via `sync`.
+    if let Some(link) = crate::cloud_client::CloudLink::load(&ctx.state_dir)? {
+        if EnrollmentRequest::load(&ctx.config_dir, name).is_err() {
+            crate::cloud_client::fetch_open_enrollment_proposal(
+                &ctx.state_dir,
+                &ctx.config_dir,
+                &link,
+                name,
+            )?;
+        }
+    }
     let mut req = EnrollmentRequest::load(&ctx.config_dir, name)?;
     // Approvals are given against, and only count for, the current fleet state.
     let state_hash = crate::fleet_state::current_hash(&ctx.config_dir)?;

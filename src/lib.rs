@@ -4,6 +4,8 @@
 pub mod adapters;
 pub mod audit;
 pub mod cli;
+pub mod cloud_client;
+pub mod cloud_protocol;
 pub mod commands;
 pub mod context;
 pub mod doctor;
@@ -22,6 +24,7 @@ pub mod manifest;
 pub mod mcp;
 pub mod output;
 pub mod providers;
+pub mod receipts;
 pub mod registry;
 pub mod revocation_tx;
 pub mod secret_leases;
@@ -34,5 +37,7 @@ pub mod usage;
 pub mod vault;
 pub mod web;
 
+pub mod signed_replay;
+pub mod sync_transport;
 #[cfg(kani)]
 mod verification;

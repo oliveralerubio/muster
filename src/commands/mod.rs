@@ -1,5 +1,6 @@
 pub mod agents;
 pub mod approve;
+pub mod cloud;
 pub mod doctor;
 pub mod effective;
 pub mod enroll;
