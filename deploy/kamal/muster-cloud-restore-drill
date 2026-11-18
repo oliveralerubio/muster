@@ -57,8 +57,16 @@
 # Restored data is plaintext inside the scratch directory (mode 0700, root) for
 # the minutes the drill runs. A drill that was killed or cut by a reboot leaves
 # it behind, so every drill starts by removing leftover muster-restore-drill.*
-# directories in the workdir and muster-drill-pg-* containers (and says so; a
-# lock in the workdir keeps two drills from removing each other's), and
+# directories (in the given workdir AND in the two places drills are known to
+# run: /var/tmp and /var/lib/muster-cloud/drill) and muster-drill-pg-*
+# containers, and says so. That cleanup is host-wide, so ONE host-wide lock
+# (/run/lock/muster-cloud-restore-drill.lock, whatever the workdir) is held for
+# the whole run of every drill, `--clean-only` included, and the cleanup runs
+# only under it: a second drill (say a manual one while the monthly timer's is
+# running) refuses with "another restore drill is running" instead of killing the
+# first one's live container. The cleanup runs before the free-space check, so
+# a leftover can never make the check fail. When Docker cannot be listed the
+# cleanup cannot be trusted: the drill (and `--clean-only`) fails.
 # host-setup.sh installs a tmpfiles.d rule that removes the directories at boot.
 # Exit 0 only when every check passed and the cleanup succeeded.
 #
@@ -71,7 +79,8 @@
 # control, witness and pgsocket directories are made traversable for it.
 #
 # Test hooks (all optional): MUSTER_OFFSITE_REMOTE, MUSTER_RCLONE, MUSTER_AGE,
-# MUSTER_AGE_KEYGEN, MUSTER_DOCKER,
+# MUSTER_AGE_KEYGEN, MUSTER_DOCKER, MUSTER_DRILL_LOCK (the lock file),
+# MUSTER_DRILL_KNOWN_WORKDIRS (colon-separated, replaces the two known ones),
 # MUSTER_OPS_BIN, MUSTER_DRILL_NOW (epoch seconds), MUSTER_DRILL_ALLOW_NONROOT=1
 # (then the PostgreSQL container runs as the calling user).
 
@@ -95,6 +104,8 @@ readonly CTRL_UID=${MUSTER_DRILL_CTRL_UID:-10001}
 readonly ID_RE='^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$'
 readonly AUTH_RE='^authority-[0-9]{8}T[0-9]{6}Z-[0-9]+\.tar\.age$'
 readonly NEW_DB=muster_restore
+readonly LOCK_FILE=${MUSTER_DRILL_LOCK:-/run/lock/muster-cloud-restore-drill.lock}
+readonly KNOWN_WORKDIRS=${MUSTER_DRILL_KNOWN_WORKDIRS:-/var/tmp:/var/lib/muster-cloud/drill}
 
 identity=""
 shred_identity=0
@@ -232,24 +243,38 @@ say() { printf 'restore-drill: %s\n' "$*" >&2; }
 
 rc_run() { "$RCLONE" "$@" --contimeout 30s --timeout 300s --retries 3 --low-level-retries 10 --stats 0 --log-level NOTICE; }
 
+# take_lock — the ONE host-wide drill lock, held until this process exits.
+take_lock() {
+  STAGE="taking the drill lock"
+  exec 8>"$LOCK_FILE" || die "cannot open the drill lock $LOCK_FILE"
+  flock -n 8 || die "another restore drill is running (lock $LOCK_FILE); nothing was touched"
+}
+
 # remove_leftovers — a drill that was killed or cut by a reboot leaves restored
-# plaintext data and a container behind: remove them. The lock keeps two drills
-# from removing each other's.
+# plaintext data and a container behind: remove them, in this drill's workdir
+# and in the known ones. Only under the host-wide lock (take_lock), which is
+# what keeps this from killing another drill's live container.
 remove_leftovers() {
-  local old
+  local old dir seen=" " real containers
   STAGE="removing leftovers of an earlier drill"
-  exec 8>"$workdir/.drill.lock"
-  flock -n 8 || die "another restore drill is running"
-  for old in "$workdir"/muster-restore-drill.*; do
-    [ -e "$old" ] || [ -L "$old" ] || continue
-    say "removing leftover scratch directory of an earlier drill: $old"
-    rm -rf --one-file-system -- "$old" && [ ! -e "$old" ] || die "cannot remove the leftover $old"
+  for dir in "$workdir" ${KNOWN_WORKDIRS//:/ }; do
+    [ -d "$dir" ] || continue
+    real=$(realpath -- "$dir") || continue
+    case $seen in *" $real "*) continue ;; esac
+    seen="$seen$real "
+    for old in "$real"/muster-restore-drill.*; do
+      [ -e "$old" ] || [ -L "$old" ] || continue
+      say "removing leftover scratch directory of an earlier drill: $old"
+      rm -rf --one-file-system -- "$old" && [ ! -e "$old" ] || die "cannot remove the leftover $old"
+    done
   done
+  containers=$("$DOCKER" ps -a --filter name=muster-drill-pg- --format '{{.Names}}' 2>&1) \
+    || die "cannot list the Docker containers, so leftovers cannot be cleaned: $(printf '%s' "$containers" | head -c 200 | tr '\n' ' ')"
   while IFS= read -r old; do
     [[ $old =~ ^muster-drill-pg-[0-9a-f]+$ ]] || continue
     say "removing leftover container of an earlier drill: $old"
     "$DOCKER" rm -f "$old" >/dev/null 2>&1 || die "cannot remove the leftover container $old"
-  done < <("$DOCKER" ps -a --filter name=muster-drill-pg- --format '{{.Names}}' 2>/dev/null)
+  done <<<"$containers"
 }
 
 # check_workdir — the scratch directory exists and is not production data.
@@ -273,9 +298,10 @@ if [ "$clean_only" -eq 1 ]; then
     command -v "$tool" >/dev/null 2>&1 || die "required tool not found: $tool"
   done
   check_workdir
+  take_lock
   remove_leftovers
   DONE=1
-  say "no leftovers of an earlier drill remain in $workdir"
+  say "no leftovers of an earlier drill remain (checked $workdir and ${KNOWN_WORKDIRS//:/, })"
   exit 0
 fi
 for tool in "$RCLONE" "$AGE" "$AGE_KEYGEN" python3 sha256sum; do
@@ -346,8 +372,19 @@ if [ "$select_only" -eq 1 ]; then
   exit 0
 fi
 
-# ---- the scratch space: refuse cleanly, before anything is downloaded -------------------
+# ---- the scratch space: clean up leftovers, then refuse cleanly before anything is downloaded ----
 check_workdir
+for tool in "$DOCKER" flock; do
+  command -v "$tool" >/dev/null 2>&1 || {
+    ERR_MSG="required tool not found: $tool"
+    printf 'restore-drill: %s\n' "$ERR_MSG" >&2
+    exit 69
+  }
+done
+# Under the host-wide lock, and BEFORE the free-space check: a leftover of an
+# earlier drill can be what takes the space.
+take_lock
+remove_leftovers
 
 STAGE="checking free space"
 snap_bytes=$(rc_run size --json "$REMOTE/snapshots/$snapshot_id" | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["bytes"])') \
@@ -358,7 +395,7 @@ if [ "$avail" -lt $((snap_bytes * 4 + 1073741824)) ]; then
 fi
 
 # ---- the rest needs the full toolset and a scratch directory ---------------------------
-for tool in "$DOCKER" tar git psql pg_restore createdb dropdb flock; do
+for tool in tar git psql pg_restore createdb dropdb; do
   command -v "$tool" >/dev/null 2>&1 || {
     ERR_MSG="required tool not found: $tool"
     printf 'restore-drill: %s\n' "$ERR_MSG" >&2
@@ -370,7 +407,6 @@ done
 pg_image=$(sed -n 's/^[[:space:]]*image:[[:space:]]*\(postgres:[^[:space:]]*\)[[:space:]]*$/\1/p' "$REPO/config/deploy.yml" | head -n 1)
 [[ $pg_image =~ ^postgres:[0-9A-Za-z._-]+@sha256:[0-9a-f]{64}$ ]] || die "cannot read the pinned postgres image from config/deploy.yml"
 
-remove_leftovers
 S=$(mktemp -d "$workdir/muster-restore-drill.XXXXXX") || die "cannot create a scratch directory in $workdir"
 mkdir -m 0700 -- "$S/snapshot" "$S/authority" "$S/control" "$S/witness" || die "cannot create the scratch layout"
 # The authority is written as its owner (the service's uid), who must reach it:

@@ -81,17 +81,34 @@ authority() { mkdir -p "$T/remote/authority"; : >"$T/remote/authority/authority-
 
 setup() {
   T=$ROOT/$1
-  mkdir -p "$T/work"
+  mkdir -p "$T/work" "$T/known1" "$T/known2"
   cp -- "$REPO/deploy/tests/fake-rclone" "$T/rclone"
   chmod +x "$T/rclone"
+  fake_docker
+  : >"$T/containers"
 }
 
+# A fake docker: `ps` lists the containers named in $T/containers, `rm -f NAME` drops the name
+# and logs it.
+fake_docker() {
+  cat >"$T/docker" <<'FAKE'
+#!/bin/sh
+dir=$(dirname "$0")
+case $1 in
+  ps) [ -z "$FAKE_DOCKER_PS_FAIL" ] || { echo 'Cannot connect to the Docker daemon' >&2; exit 1; }; cat "$dir/containers" ;;
+  rm) shift; shift; for n in "$@"; do printf '%s\n' "$n" >>"$dir/removed"; grep -vxF "$n" "$dir/containers" >"$dir/c.new"; mv "$dir/c.new" "$dir/containers"; done ;;
+  *) exit 1 ;;
+esac
+FAKE
+  chmod +x "$T/docker"
+}
 # drill identity-file args...
 drill() {
   local identity=$1
   shift
   rc=0
   MUSTER_DRILL_ALLOW_NONROOT=1 MUSTER_OFFSITE_REMOTE="$T/remote" MUSTER_RCLONE="$T/rclone" \
+    MUSTER_DRILL_LOCK="$T/drill.lock" MUSTER_DRILL_KNOWN_WORKDIRS="$T/known1:$T/known2" MUSTER_DOCKER="$T/docker" \
     MUSTER_AGE="$(command -v age)" MUSTER_AGE_KEYGEN="$(command -v age-keygen)" MUSTER_DRILL_NOW="$NOW" \
     "$SCRIPT" --age-identity "$identity" "$@" >"$T/out" 2>"$T/err" || rc=$?
   out=$(cat "$T/out")
@@ -178,24 +195,21 @@ check "no space: the JSON result says ok=false" has_out '"ok": false'
 check "no space: nothing was created in the workdir" bash -c '[ -z "$(ls -A "$1")" ]' _ "$T/work"
 check "no space: nothing was downloaded" bash -c '! grep -q "^copy" "$1" 2>/dev/null' _ "$T/rclone.log"
 
+# A leftover can be what takes the space: it is removed BEFORE the check, so
+# the check sees the space it frees (and it is gone even when the check fails).
+setup space-leftover
+snap "$A" "$MAIN" "$DRILL"
+authority
+mkdir -p "$T/work/muster-restore-drill.Old123/snapshot"
+FAKE_RCLONE_SIZE_BYTES=900000000000000000 drill "$ROOT/drill.key" --workdir "$T/work"
+check "leftover before the space check: the check still fails here" has_err "not enough free space"
+check "leftover before the space check: the leftover was removed first" test ! -e "$T/work/muster-restore-drill.Old123"
+
 # ---- leftovers of an interrupted drill are removed (plaintext restored data must not stay) ---------
-# A fake docker: `ps` lists the containers named in $T/containers, `rm -f NAME` drops the name
-# and logs it.
-fake_docker() {
-  cat >"$T/docker" <<'FAKE'
-#!/bin/sh
-dir=$(dirname "$0")
-case $1 in
-  ps) cat "$dir/containers" ;;
-  rm) shift; shift; for n in "$@"; do printf '%s\n' "$n" >>"$dir/removed"; grep -vxF "$n" "$dir/containers" >"$dir/c.new"; mv "$dir/c.new" "$dir/containers"; done ;;
-  *) exit 1 ;;
-esac
-FAKE
-  chmod +x "$T/docker"
-}
 clean() {
   rc=0
-  MUSTER_DRILL_ALLOW_NONROOT=1 MUSTER_DOCKER="$T/docker" "$SCRIPT" --clean-only --workdir "$T/work" "$@" >"$T/out" 2>"$T/err" || rc=$?
+  MUSTER_DRILL_ALLOW_NONROOT=1 MUSTER_DOCKER="$T/docker" MUSTER_DRILL_LOCK="$T/drill.lock" \
+    MUSTER_DRILL_KNOWN_WORKDIRS="$T/known1:$T/known2" "$SCRIPT" --clean-only --workdir "$T/work" "$@" >"$T/out" 2>"$T/err" || rc=$?
   out=$(cat "$T/out")
   err=$(cat "$T/err")
 }
@@ -213,6 +227,17 @@ check "leftovers: other containers are never touched" bash -c '! grep -q "unrela
 check "leftovers: says what it removed" has_err "removing leftover scratch directory"
 clean
 check "no leftovers: exits 0" rc_is 0
+# ONE host-wide cleanup: the given workdir and the known ones are all cleaned.
+setup known
+mkdir -p "$T/known1/muster-restore-drill.K1" "$T/known2/muster-restore-drill.K2" "$T/work/muster-restore-drill.W"
+clean
+check "known workdirs: all three are cleaned" bash -c '[ ! -e "$1/known1/muster-restore-drill.K1" ] && [ ! -e "$1/known2/muster-restore-drill.K2" ] && [ ! -e "$1/work/muster-restore-drill.W" ]' _ "$T"
+# --clean-only fails when Docker cannot be listed (leftover containers are unknown).
+setup docker-down
+mkdir -p "$T/work/muster-restore-drill.W"
+FAKE_DOCKER_PS_FAIL=1 clean
+check "docker enumeration fails: --clean-only exits non-zero" test "$rc" -ne 0
+check "docker enumeration fails: says why" has_err "cannot list the Docker containers"
 # A leftover that cannot be removed fails the run (so the unit fails, alerts and last-ok stays old).
 if [ "$(id -u)" -ne 0 ]; then
   setup stuck
@@ -225,17 +250,31 @@ if [ "$(id -u)" -ne 0 ]; then
   check "cannot remove: says which" has_err "cannot remove the leftover"
   chmod 0755 "$T/work/muster-restore-drill.Stuck"
 fi
-# Two drills never remove each other's directories.
+# Two drills never remove each other's directories or containers: ONE lock, whatever the workdir.
 setup locked
-fake_docker
-: >"$T/containers"
-mkdir -p "$T/work/muster-restore-drill.Live"
+mkdir -p "$T/work/muster-restore-drill.Live" "$T/other/muster-restore-drill.Live2"
+printf 'muster-drill-pg-0123abcd\n' >"$T/containers"
 (
-  exec 8>"$T/work/.drill.lock"
+  exec 8>"$T/drill.lock"
   flock -n 8 || exit 1
   clean
-  [ "$rc" -ne 0 ] && [ -d "$T/work/muster-restore-drill.Live" ] && has_err "another restore drill is running"
+  [ "$rc" -ne 0 ] && [ -d "$T/work/muster-restore-drill.Live" ] && has_err "another restore drill is running" \
+    && [ ! -e "$T/removed" ]
 ) && ok "a running drill's directory survives a second drill" || bad "a running drill's directory survives a second drill"
+
+setup locked-full
+snap "$A" "$MAIN" "$DRILL"
+authority
+mkdir -p "$T/other"
+printf 'muster-drill-pg-0123abcd\n' >"$T/containers"
+(
+  exec 8>"$T/drill.lock"
+  flock -n 8 || exit 1
+  drill "$ROOT/drill.key" --workdir "$T/other"
+  [ "$rc" -ne 0 ] && has_err "another restore drill is running" && [ ! -e "$T/removed" ] && grep -qx muster-drill-pg-0123abcd "$T/containers"
+) && ok "another workdir, same host-wide lock: the live container is not killed" || bad "another workdir, same host-wide lock: the live container is not killed"
+drill "$ROOT/drill.key" --workdir "$T/other"
+check "the lock is released with the drill that held it" bash -c '! grep -q "another restore drill" "$1"' _ "$T/err"
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
