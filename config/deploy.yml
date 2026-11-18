@@ -76,6 +76,9 @@ env:
     # ignores empty values; see deploy/KAMAL.md).
     MUSTER_PADDLE_PRICE_PERSONAL: "<%= ENV.fetch("MUSTER_PADDLE_PRICE_PERSONAL", "") %>"
     MUSTER_PADDLE_PRICE_TEAM_SEAT: "<%= ENV.fetch("MUSTER_PADDLE_PRICE_TEAM_SEAT", "") %>"
+    # Extra ID token audiences (Zitadel: its project id); not secret. Empty =
+    # strict, only the client id is accepted.
+    MUSTER_OIDC_EXTRA_AUDIENCES: "<%= ENV.fetch("MUSTER_OIDC_EXTRA_AUDIENCES", "") %>"
   secret:
     - MUSTER_DATABASE_URL
     - MUSTER_OIDC_ISSUER

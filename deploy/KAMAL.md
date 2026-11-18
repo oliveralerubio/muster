@@ -177,6 +177,7 @@ without it no backup can be restored.
 | --- | --- |
 | `MUSTER_PADDLE_PRICE_PERSONAL` | Paddle price id (`pri_...`) of the personal plan. |
 | `MUSTER_PADDLE_PRICE_TEAM_SEAT` | Paddle price id of the team seat. |
+| `MUSTER_OIDC_EXTRA_AUDIENCES` | Optional, not secret: extra audiences the ID token may carry. With Zitadel set it to the project id (Zitadel puts it in `aud` next to the client id); without it login fails with "invalid ID token". Comma-separated; empty keeps only the client id. |
 | `MUSTER_PADDLE_ENVIRONMENT` | Optional: `sandbox` (default) or `live`. |
 | `MUSTER_CLOUD_PUBLIC_URL` | Optional: defaults to `https://personal.tailbb30e7.ts.net:10000`. |
 | `ALERT_TARGET` | Optional: where alerts go, default `discord:#contabo` (`hermes send -t`). |

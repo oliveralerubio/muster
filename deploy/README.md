@@ -189,6 +189,7 @@ secret store; never bake them into the image or commit them.
 | `MUSTER_OIDC_ISSUER` | **yes** | OIDC issuer URL of the identity provider (https, non-loopback in production). |
 | `MUSTER_OIDC_CLIENT_ID` | **yes** | OIDC client id. |
 | `MUSTER_OIDC_CLIENT_SECRET` | **yes** | OIDC client secret. Secret — inject via secret store. |
+| `MUSTER_OIDC_EXTRA_AUDIENCES` | no | Comma-separated extra `aud` values the ID token may carry next to the client id (default none = strict). Zitadel needs its project id here. Not secret. |
 | `MUSTER_REPO_ROOT` | **yes** | Absolute path of the per-workspace bare Git object store (one `<workspace-id>.git` repo per workspace). There is no default: the service refuses to start without it. Back up this directory together with the database — see `muster-cloud-ops backup run` below. |
 | `MUSTER_CONTROL_DIR` | **yes** | Absolute directory of the lifecycle authority's control store (hash-chained journal + lock). Must be disjoint from `MUSTER_REPO_ROOT` (neither inside the other). Not secret. |
 | `MUSTER_CONTROL_WITNESS` | **yes** | Absolute path of the authority's independent witness file; not inside the control dir or the repo root. Put it on a DIFFERENT volume/device than the control dir. Not secret. |

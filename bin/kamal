@@ -22,11 +22,11 @@
 #     .kamal/secrets through deploy/kamal/secret;
 #   - these variables, when set: MUSTER_CLOUD_PUBLIC_URL, MUSTER_PADDLE_ENVIRONMENT,
 #     MUSTER_PADDLE_PRICE_PERSONAL, MUSTER_PADDLE_PRICE_TEAM_SEAT,
-#     MUSTER_CLOUD_SECRETS_FILE. There is no registry credential anywhere.
+#     MUSTER_OIDC_EXTRA_AUDIENCES, MUSTER_CLOUD_SECRETS_FILE. There is no registry credential anywhere.
 #
 # Non-secret settings come from /etc/muster-cloud/deploy.env when it exists
 # (override its path with MUSTER_CLOUD_DEPLOY_ENV). It is parsed, never
-# sourced: KEY=VALUE lines for the four non-secret variables above (plus
+# sourced: KEY=VALUE lines for the non-secret variables above (plus
 # ALERT_TARGET, which only the host's alert script reads and is ignored here),
 # and a variable already set in your environment wins.
 #
@@ -68,7 +68,7 @@ load_deploy_env() {
       \'*\') value=${value#\'}; value=${value%\'} ;;
     esac
     case $key in
-      MUSTER_CLOUD_PUBLIC_URL | MUSTER_PADDLE_ENVIRONMENT | MUSTER_PADDLE_PRICE_PERSONAL | MUSTER_PADDLE_PRICE_TEAM_SEAT)
+      MUSTER_CLOUD_PUBLIC_URL | MUSTER_PADDLE_ENVIRONMENT | MUSTER_PADDLE_PRICE_PERSONAL | MUSTER_PADDLE_PRICE_TEAM_SEAT | MUSTER_OIDC_EXTRA_AUDIENCES)
         if [ -z "${!key:-}" ]; then
           export "$key=$value"
         fi
@@ -118,7 +118,7 @@ fi
 # Pass by name only: values never appear on the command line.
 for name in MUSTER_CLOUD_PUBLIC_URL MUSTER_PADDLE_ENVIRONMENT \
   MUSTER_PADDLE_PRICE_PERSONAL MUSTER_PADDLE_PRICE_TEAM_SEAT \
-  MUSTER_CLOUD_SECRETS_FILE; do
+  MUSTER_OIDC_EXTRA_AUDIENCES MUSTER_CLOUD_SECRETS_FILE; do
   if [ -n "${!name:-}" ]; then
     args+=(--env "$name")
   fi

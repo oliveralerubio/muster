@@ -9,6 +9,10 @@
 //! query parameter, which the test appends to the URL the service redirected
 //! to: that stands in for the user signing in at the IdP.
 //!
+//! Optional `extra_aud=<a,b>` adds audiences next to the client id in the ID
+//! token (Zitadel adds its project id) and `azp=client|<value>` sets the
+//! authorized party (`azp` is absent by default).
+//!
 //! `token` enforces what a real provider enforces: single-use codes bound to
 //! client, redirect URI and PKCE S256 challenge, plus client authentication.
 
@@ -26,7 +30,7 @@ use openidconnect::core::{
     CoreRsaPrivateSigningKey,
 };
 use openidconnect::{
-    Audience, EmptyAdditionalClaims, EndUserEmail, IssuerUrl, JsonWebKeyId, Nonce,
+    Audience, ClientId, EmptyAdditionalClaims, EndUserEmail, IssuerUrl, JsonWebKeyId, Nonce,
     PrivateSigningKey, StandardClaims, SubjectIdentifier,
 };
 use sha2::{Digest, Sha256};
@@ -42,6 +46,8 @@ struct PendingCode {
     subject: String,
     email: Option<String>,
     email_verified: Option<bool>,
+    extra_audiences: Vec<String>,
+    azp: Option<String>,
 }
 
 struct Inner {
@@ -176,6 +182,10 @@ async fn authorize(
                 Some("missing") => None,
                 _ => Some(true),
             },
+            extra_audiences: get("extra_aud")
+                .map(|v| v.split(',').map(str::to_string).collect())
+                .unwrap_or_default(),
+            azp: get("azp").map(|v| if v == "client" { CLIENT_ID.into() } else { v }),
         },
     );
     let mut target = url::Url::parse(&redirect_uri).expect("redirect_uri");
@@ -237,7 +247,10 @@ async fn token(
     let now = time_now();
     let claims = CoreIdTokenClaims::new(
         IssuerUrl::new(inner.issuer.clone()).unwrap(),
-        vec![Audience::new(CLIENT_ID.into())],
+        std::iter::once(CLIENT_ID.to_string())
+            .chain(pending.extra_audiences)
+            .map(Audience::new)
+            .collect(),
         now + chrono::Duration::minutes(5),
         now,
         StandardClaims::new(SubjectIdentifier::new(pending.subject))
@@ -245,7 +258,8 @@ async fn token(
             .set_email_verified(pending.email_verified),
         EmptyAdditionalClaims {},
     )
-    .set_nonce(Some(Nonce::new(pending.nonce)));
+    .set_nonce(Some(Nonce::new(pending.nonce)))
+    .set_authorized_party(pending.azp.map(ClientId::new));
     let id_token = CoreIdToken::new(
         claims,
         &signing_key(),
