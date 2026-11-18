@@ -1,0 +1,476 @@
+#!/usr/bin/env bash
+# muster-cloud-autodeploy — pull-based deploy of muster Cloud. Installed by
+# deploy/kamal/host-setup.sh as /usr/local/sbin/muster-cloud-autodeploy
+# (root:root 0755) and run every 5 minutes by muster-cloud-autodeploy.timer.
+# Guide: deploy/KAMAL.md.
+#
+# Nothing outside this host can start a deploy: no GitHub runner is involved.
+# GitHub only builds and publishes the image (ghcr.io/oliveralerubio/
+# muster-cloud:<sha>, a public package) after Cloud CI is green on main. This
+# script runs as root and, on each run:
+#
+#   a. asks the public GitHub API (no token) for the HEAD of main, and
+#      confirms that the "Cloud CI" run for that exact commit finished with
+#      success on a push, and that the image for it can be pulled anonymously;
+#   b. if that commit is not what runs now, updates the root-owned checkout
+#      /var/lib/muster-cloud/source: git fetch, the commit must be an ancestor
+#      of (or equal to) origin/main, `git checkout --detach`; a dirty tree is
+#      refused. A commit that is an ANCESTOR of the running one is never
+#      deployed;
+#   c. runs that checkout's deploy/kamal/host-setup.sh in apply mode, so the
+#      host-owned files (helper scripts, units, drop-ins, directories,
+#      permissions) always match the release about to be deployed;
+#   d. pulls the image anonymously (an empty Docker config: no credential is
+#      ever sent), tags it for Kamal's local-registry naming and runs Kamal as
+#      user gha from a gha-readable export of that commit:
+#      `kamal app boot --version <sha>` (Kamal never pulls or logs in);
+#   e. installs the matching muster-cloud-ops (muster-cloud-install-ops);
+#   f. verifies /readyz through kamal-proxy and through the public URL.
+#
+# `touch /var/lib/muster-cloud/autodeploy/redeploy` boots the running commit
+# again on the next run (after editing a file in /etc/muster-cloud).
+#
+# Any failure after the switch starts (d to f) runs `kamal rollback
+# <previous sha>` (only when the previous version no longer serves) and
+# alerts. A commit whose deploy failed is retried at most 3 times, 30 minutes
+# apart; a newer commit starts afresh.
+#
+# One journal line per decision ("autodeploy: ..."). Alerts (Hermes) only on a
+# failure or on a successful deploy, one short line. Overlapping runs are
+# prevented with flock.
+#
+# Exit codes: 0 deployed, nothing to do, or waiting; 75 a failure that was
+# already alerted (the unit treats it as handled); 1 unexpected error (the
+# OnFailure alert fires); 77 not root.
+#
+# Test hooks (all optional): MUSTER_AUTODEPLOY_PATH (prepended to PATH),
+# MUSTER_AUTODEPLOY_{SOURCE,STATE,RUN,ALLOW_NONROOT,LOCAL_URL},
+# MUSTER_GITHUB_API, MUSTER_GITHUB_URL, MUSTER_SBIN, MUSTER_CLOUD_DEPLOY_ENV.
+
+set -Eeuo pipefail
+umask 022
+export LC_ALL=C
+export PATH="${MUSTER_AUTODEPLOY_PATH:+$MUSTER_AUTODEPLOY_PATH:}/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export GIT_TERMINAL_PROMPT=0
+
+readonly REPO_SLUG=oliveralerubio/muster
+readonly GITHUB_API=${MUSTER_GITHUB_API:-https://api.github.com}
+readonly GITHUB_URL=${MUSTER_GITHUB_URL:-https://github.com/$REPO_SLUG.git}
+readonly IMAGE_REPO=ghcr.io/oliveralerubio/muster-cloud
+# Kamal's name for the same image (config/deploy.yml: registry.server
+# localhost:5000 + image oliveralerubio/muster-cloud).
+readonly LOCAL_REPO=localhost:5000/oliveralerubio/muster-cloud
+readonly SOURCE=${MUSTER_AUTODEPLOY_SOURCE:-/var/lib/muster-cloud/source}
+readonly STATE=${MUSTER_AUTODEPLOY_STATE:-/var/lib/muster-cloud/autodeploy}
+readonly RUN_BASE=${MUSTER_AUTODEPLOY_RUN:-/var/lib/muster-cloud/run}
+readonly SBIN=${MUSTER_SBIN:-/usr/local/sbin}
+readonly DEPLOY_USER=gha
+readonly DEPLOY_ENV=${MUSTER_CLOUD_DEPLOY_ENV:-/etc/muster-cloud/deploy.env}
+readonly DEFAULT_PUBLIC_URL=https://personal.tailbb30e7.ts.net:10000
+readonly LOCAL_URL=${MUSTER_AUTODEPLOY_LOCAL_URL:-http://127.0.0.1:18110}
+readonly MAX_ATTEMPTS=3
+readonly ATTEMPT_GAP=1800
+readonly IMAGE_GRACE=3600
+readonly SHA_RE='^[0-9a-f]{40}$'
+
+log() { printf 'autodeploy: %s\n' "$*"; }
+decide() { printf 'autodeploy: decision: %s\n' "$*"; }
+short() { printf '%s' "${1:0:12}"; }
+
+HANDLED=0
+work=""
+run_dir=""
+# shellcheck disable=SC2329  # runs through the EXIT trap
+on_exit() {
+  local rc=$?
+  if [ "$rc" -ne 0 ] && [ "$rc" -ne 75 ] && [ "$HANDLED" -eq 0 ]; then
+    log "unexpected error (exit $rc)"
+  fi
+  [ -z "$run_dir" ] || rm -rf --one-file-system -- "$run_dir"
+  [ -z "$work" ] || rm -rf --one-file-system -- "$work"
+}
+trap on_exit EXIT
+trap 'log "unexpected error at line $LINENO"' ERR
+
+if [ "${MUSTER_AUTODEPLOY_ALLOW_NONROOT:-0}" != 1 ] && [ "$(id -u)" -ne 0 ]; then
+  log "must run as root"
+  exit 77
+fi
+
+install -d -m 0755 -- "$STATE" "$STATE/attempts"
+exec 9>"$STATE/lock"
+if ! flock -n 9; then
+  decide "skip: another autodeploy run is active"
+  exit 0
+fi
+work=$(mktemp -d "${TMPDIR:-/tmp}/muster-autodeploy.XXXXXX")
+
+alert_fire() { "$SBIN/muster-cloud-alert" fire "$@" || log "the alert could not be delivered"; }
+alert_notify() { "$SBIN/muster-cloud-alert" notify "$@" || log "the alert could not be delivered"; }
+
+# A failure that was alerted: stop with the handled exit code.
+fail_handled() { # key message
+  alert_fire "$1" "$2"
+  HANDLED=1
+  exit 75
+}
+
+# ---- GitHub, anonymously -----------------------------------------------------
+gh_get() { # path [accept]
+  curl -fsS --max-time 20 --retry 3 --retry-delay 2 --retry-all-errors \
+    -H "Accept: ${2:-application/vnd.github+json}" -H 'X-GitHub-Api-Version: 2022-11-28' \
+    -A muster-cloud-autodeploy -- "$GITHUB_API$1"
+}
+
+head_sha() {
+  local sha
+  sha=$(gh_get "/repos/$REPO_SLUG/commits/main" application/vnd.github.sha) || return 1
+  [[ $sha =~ $SHA_RE ]] || return 1
+  printf '%s' "$sha"
+}
+
+# ci_state SHA -> "success <epoch>", "pending", "none" or "failed <conclusion>"
+ci_state() {
+  gh_get "/repos/$REPO_SLUG/actions/runs?head_sha=$1&event=push&per_page=50" | python3 -I -c '
+import calendar, json, sys, time
+sha, slug = sys.argv[1], sys.argv[2]
+runs = json.load(sys.stdin).get("workflow_runs", [])
+mine = [r for r in runs
+        if r.get("name") == "Cloud CI" and r.get("event") == "push"
+        and r.get("head_branch") == "main" and r.get("head_sha") == sha
+        and (r.get("head_repository") or {}).get("full_name") == slug]
+if not mine:
+    print("none")
+    sys.exit(0)
+mine.sort(key=lambda r: r.get("created_at", ""))
+run = mine[-1]
+if run.get("status") != "completed":
+    print("pending")
+elif run.get("conclusion") != "success":
+    print("failed", run.get("conclusion"))
+else:
+    print("success", calendar.timegm(time.strptime(run["updated_at"], "%Y-%m-%dT%H:%M:%SZ")))
+' "$1" "$REPO_SLUG"
+}
+
+# The image must be readable with NO credential: an empty Docker config.
+anon_config() {
+  [ -d "$work/anon-docker" ] || mkdir -m 0700 -- "$work/anon-docker"
+  printf '%s' "$work/anon-docker"
+}
+image_available() {
+  DOCKER_CONFIG=$(anon_config) timeout 90 docker manifest inspect "$IMAGE_REPO:$1" >/dev/null 2>&1
+}
+
+# ---- what runs now ---------------------------------------------------------------
+running_version() {
+  local names name
+  names=$(docker ps --filter label=service=muster-cloud --filter label=role=web --format '{{.Names}}') || return 1
+  while IFS= read -r name; do
+    if [[ $name =~ -([0-9a-f]{40})$ ]]; then
+      printf '%s' "${BASH_REMATCH[1]}"
+      return 0
+    fi
+  done <<<"$names"
+  return 0
+}
+
+public_url() {
+  local url=""
+  if [ -f "$DEPLOY_ENV" ] && [ -r "$DEPLOY_ENV" ]; then
+    url=$(sed -n 's/^MUSTER_CLOUD_PUBLIC_URL=//p' "$DEPLOY_ENV" | tail -n 1 | tr -d "\"'\r")
+  fi
+  [ -n "$url" ] || url=$DEFAULT_PUBLIC_URL
+  printf '%s' "${url%/}"
+}
+
+verify_ready() { # base-url
+  curl -fsS --retry 10 --retry-delay 3 --retry-all-errors --max-time 20 -- "$1/readyz" >/dev/null
+}
+
+# ---- failed attempts -----------------------------------------------------------------
+attempt_file() { printf '%s/attempts/%s' "$STATE" "$1"; }
+
+attempts_allow() { # sha -> 0 when a new attempt may start
+  local file count last now
+  file=$(attempt_file "$1")
+  [ -f "$file" ] || return 0
+  read -r count last <"$file" || return 0
+  [[ $count =~ ^[0-9]+$ && $last =~ ^[0-9]+$ ]] || return 0
+  now=$(date +%s)
+  if [ "$count" -ge "$MAX_ATTEMPTS" ]; then
+    decide "skip: the deploy of $(short "$1") failed $count times; waiting for a newer commit"
+    return 1
+  fi
+  if [ $((now - last)) -lt "$ATTEMPT_GAP" ]; then
+    decide "skip: backing off $(((ATTEMPT_GAP - (now - last)) / 60)) more minutes after a failed deploy of $(short "$1")"
+    return 1
+  fi
+  return 0
+}
+
+attempt_record() { # sha
+  local file count=0 last
+  file=$(attempt_file "$1")
+  if [ -f "$file" ]; then
+    read -r count last <"$file" || count=0
+    [[ $count =~ ^[0-9]+$ ]] || count=0
+  fi
+  printf '%s %s\n' "$((count + 1))" "$(date +%s)" >"$file"
+}
+
+# Old attempt records of other commits are of no use any more.
+attempts_prune() { # keep-sha
+  local f
+  for f in "$STATE"/attempts/*; do
+    [ -f "$f" ] || continue
+    [ "${f##*/}" = "$1" ] || rm -f -- "$f"
+  done
+}
+
+# ---- the source checkout ---------------------------------------------------------------
+git_src() { git -C "$SOURCE" "$@"; }
+
+# update_source SHA RUNNING — leaves $SOURCE checked out at SHA, or returns 1.
+update_source() {
+  local sha=$1 running=$2
+  if [ ! -d "$SOURCE/.git" ]; then
+    if [ -e "$SOURCE" ] && [ -n "$(ls -A -- "$SOURCE" 2>/dev/null)" ]; then
+      log "$SOURCE exists but is not a git checkout"
+      return 1
+    fi
+    install -d -m 0755 -- "$SOURCE"
+    log "cloning $GITHUB_URL into $SOURCE"
+    timeout 600 git clone --quiet --branch main -- "$GITHUB_URL" "$SOURCE" || return 1
+  fi
+  if [ "$(git_src remote get-url origin 2>/dev/null)" != "$GITHUB_URL" ]; then
+    log "the origin of $SOURCE is not $GITHUB_URL; refusing"
+    return 1
+  fi
+  if [ -n "$(git_src status --porcelain 2>/dev/null)" ]; then
+    log "$SOURCE has local changes; refusing to use a dirty tree"
+    return 1
+  fi
+  timeout 300 git -C "$SOURCE" fetch --quiet --no-tags origin '+refs/heads/main:refs/remotes/origin/main' || {
+    log "git fetch failed"
+    return 1
+  }
+  git_src cat-file -e "$sha^{commit}" 2>/dev/null || {
+    log "commit $(short "$sha") is not in the fetched history"
+    return 1
+  }
+  git_src merge-base --is-ancestor "$sha" origin/main || {
+    log "commit $(short "$sha") is not an ancestor of origin/main; refusing"
+    return 1
+  }
+  if [ -n "$running" ] && [ "$running" != "$sha" ]; then
+    if ! git_src cat-file -e "$running^{commit}" 2>/dev/null; then
+      timeout 120 git -C "$SOURCE" fetch --quiet --no-tags origin "$running" 2>/dev/null || true
+    fi
+    if git_src cat-file -e "$running^{commit}" 2>/dev/null; then
+      if git_src merge-base --is-ancestor "$sha" "$running"; then
+        OLDER=1
+        return 1
+      fi
+    else
+      log "the running commit $(short "$running") is unknown to the checkout; it cannot be older than main's HEAD by ancestry"
+    fi
+  fi
+  git_src -c advice.detachedHead=false checkout --quiet --detach "$sha" || return 1
+  [ "$(git_src rev-parse HEAD)" = "$sha" ] || return 1
+  [ -z "$(git_src status --porcelain)" ] || return 1
+  return 0
+}
+
+# ---- Kamal, as gha, from an export of the commit ----------------------------------------
+# The export has no .git, and Kamal derives its version from git unless told
+# one: every command gets an explicit --version (KAMAL_VERSION).
+KAMAL_VERSION=""
+run_kamal() {
+  local home
+  home=$(getent passwd "$DEPLOY_USER" | cut -d: -f6) || return 1
+  timeout 1500 runuser -u "$DEPLOY_USER" -- env -i HOME="$home" PATH=/usr/local/bin:/usr/bin:/bin \
+    "$run_dir/bin/kamal" "$@" --version "$KAMAL_VERSION"
+}
+
+export_source() { # sha
+  install -d -m 0755 -- "$RUN_BASE" || return 1
+  run_dir=$(mktemp -d "$RUN_BASE/deploy.XXXXXX") || return 1
+  git_src archive --format=tar "$1" | tar -x --no-same-owner -C "$run_dir" || return 1
+  chown -R "$DEPLOY_USER:$DEPLOY_USER" "$run_dir" || return 1
+  chmod 0755 "$run_dir" || return 1
+  [ -x "$run_dir/bin/kamal" ] || return 1
+}
+
+# ---- the deploy proper ---------------------------------------------------------------------
+STAGE=""
+SWITCHED=0
+
+# deploy_steps SHA -> 0 when the new version serves and verified
+deploy_steps() {
+  local sha=$1 ref_ghcr="$IMAGE_REPO:$1" ref_local="$LOCAL_REPO:$1" revision
+  STAGE="pulling the image"
+  DOCKER_CONFIG=$(anon_config) timeout 1500 docker pull --quiet "$ref_ghcr" >/dev/null || return 1
+  docker tag "$ref_ghcr" "$ref_local" || return 1
+  docker image rm "$ref_ghcr" >/dev/null 2>&1 || true # the extra GHCR tag is not needed any more
+  STAGE="checking the image"
+  revision=$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$ref_local") || return 1
+  if [ "$revision" != "$sha" ]; then
+    log "the image is labelled revision '$revision', not $sha"
+    return 1
+  fi
+  [ "$(docker image inspect --format '{{ index .Config.Labels "service" }}' "$ref_local")" = muster-cloud ] || return 1
+
+  STAGE="exporting the release for Kamal"
+  export_source "$sha" || return 1
+
+  STAGE="switching with Kamal"
+  KAMAL_VERSION=$sha
+  attempt_record "$sha"
+  SWITCHED=1
+  log "kamal: stopping stale containers"
+  run_kamal app stale_containers --stop || return 1
+  log "kamal: booting $(short "$sha")"
+  run_kamal app boot || return 1
+  [ "$(running_version)" = "$sha" ] || {
+    log "after the boot the running version is not $(short "$sha")"
+    return 1
+  }
+
+  STAGE="installing the matching muster-cloud-ops"
+  "$SBIN/muster-cloud-install-ops" "$ref_local" || return 1
+
+  STAGE="checking /readyz"
+  verify_ready "$LOCAL_URL" || return 1
+  verify_ready "$(public_url)" || return 1
+  return 0
+}
+
+rollback() { # previous sha -> 0 when it serves again
+  local prev=$1 ok=1
+  log "rolling back to $(short "$prev")"
+  KAMAL_VERSION=$prev
+  run_kamal rollback "$prev" || ok=0
+  [ "$(running_version)" = "$prev" ] || ok=0
+  if [ "$ok" -eq 1 ]; then
+    "$SBIN/muster-cloud-install-ops" "$LOCAL_REPO:$prev" || log "could not reinstall the matching muster-cloud-ops for $(short "$prev")"
+    verify_ready "$LOCAL_URL" || ok=0
+  fi
+  [ "$ok" -eq 1 ]
+}
+
+# ================================ main ====================================================
+target=$(head_sha) || {
+  decide "skip: cannot read the HEAD of main from GitHub"
+  exit 0
+}
+touch -- "$STATE/last-ok-check"
+s=$(short "$target")
+running=$(running_version)
+
+# `touch /var/lib/muster-cloud/autodeploy/redeploy` asks for the running commit to
+# be booted again (a changed secret or settings file); it is consumed right
+# before that deploy starts, so it can never loop.
+redeploy=0
+[ ! -e "$STATE/redeploy" ] || redeploy=1
+if [ "$target" = "$running" ] && [ "$redeploy" -eq 0 ]; then
+  decide "no-op: main HEAD $s is already running"
+  exit 0
+fi
+
+ci=$(ci_state "$target") || {
+  decide "skip: cannot read the Cloud CI runs of $s from GitHub"
+  exit 0
+}
+case $ci in
+  success\ *) ci_done=${ci#success } ;;
+  pending)
+    decide "skip: Cloud CI for $s is still running"
+    exit 0
+    ;;
+  none)
+    decide "skip: no Cloud CI push run for $s yet"
+    exit 0
+    ;;
+  *)
+    decide "skip: Cloud CI for $s did not succeed ($ci)"
+    exit 0
+    ;;
+esac
+
+if ! image_available "$target"; then
+  decide "skip: $IMAGE_REPO:$s cannot be pulled anonymously (yet)"
+  waited=$(($(date +%s) - ci_done))
+  if [ "$waited" -gt "$IMAGE_GRACE" ]; then
+    alert_fire "autodeploy-image:$s" "Cloud CI has been green for $((waited / 60)) min on $s but $IMAGE_REPO:$s cannot be pulled anonymously. Is the GHCR package public, and did the Publish muster Cloud image workflow build it? (deploy/KAMAL.md)"
+  fi
+  exit 0
+fi
+
+attempts_prune "$target"
+attempts_allow "$target" || exit 0
+if [ "$redeploy" -eq 1 ]; then
+  rm -f -- "$STATE/redeploy"
+  decide "redeploy requested for $s"
+fi
+
+OLDER=0
+if ! update_source "$target" "$running"; then
+  if [ "$OLDER" -eq 1 ]; then
+    decide "refused: $s is older than the running $(short "$running")"
+    fail_handled "autodeploy-older:$s" "autodeploy refused main HEAD $s: it is OLDER than the running $(short "$running") (was main rewound?). Nothing was changed."
+  fi
+  decide "refused: the source checkout could not be moved to $s"
+  fail_handled "autodeploy-source:$s" "autodeploy could not update the source checkout to $s (see journalctl -u muster-cloud-autodeploy). Nothing was changed."
+fi
+decide "source checkout is at $s"
+
+hs_out="$work/host-setup.out"
+if "$SOURCE/deploy/kamal/host-setup.sh" >"$hs_out" 2>&1; then
+  hs_rc=0
+else
+  hs_rc=$?
+fi
+grep -E '^(done|FAIL|TODO)' "$hs_out" | sed 's/^/autodeploy: host-setup: /' || true
+if [ "$hs_rc" -ne 0 ]; then
+  decide "refused: host-setup.sh exited $hs_rc; not deploying $s"
+  fail_handled "autodeploy-hostsetup:$s" "autodeploy did not deploy $s: host-setup.sh exited $hs_rc ($(grep -E '^(FAIL|TODO)' "$hs_out" | head -n 2 | tr '\n' ' ' | head -c 300)). The running version was not touched."
+fi
+decide "host files reconciled by host-setup.sh for $s"
+
+prev_desc=none
+[ -z "$running" ] || prev_desc=$(short "$running")
+decide "deploying $s (running: $prev_desc)"
+if deploy_steps "$target"; then
+  rm -f -- "$(attempt_file "$target")"
+  for key in $("$SBIN/muster-cloud-alert" keys autodeploy); do
+    "$SBIN/muster-cloud-alert" resolve -q "$key" || true
+  done
+  decide "deployed $s"
+  subject=$(git_src log -1 --format=%s "$target" || true)
+  alert_notify "deployed $s (${subject:0:80}); was $prev_desc"
+  log "kamal: pruning old containers and images"
+  KAMAL_VERSION=$target
+  run_kamal prune all >/dev/null 2>&1 || log "kamal prune failed (ignored)"
+  exit 0
+fi
+
+# ---- failure ---------------------------------------------------------------------------------
+log "deploy of $s FAILED while $STAGE"
+outcome="the running version was not touched"
+if [ "$SWITCHED" -eq 1 ]; then
+  now_running=$(running_version)
+  if [ -n "$running" ] && { [ "$now_running" != "$running" ] || ! verify_ready "$LOCAL_URL"; }; then
+    if rollback "$running"; then
+      outcome="rolled back to $(short "$running"), which serves again"
+    else
+      outcome="ROLLBACK TO $(short "$running") FAILED: check the service now"
+    fi
+  elif [ -z "$running" ]; then
+    outcome="nothing was running before, so there is nothing to roll back to"
+  else
+    outcome="the previous version $(short "$running") is still serving"
+  fi
+fi
+decide "failed: $s while $STAGE; $outcome"
+fail_handled "autodeploy:$s" "deploy of $s FAILED while $STAGE; $outcome. Retries: at most $MAX_ATTEMPTS, 30 min apart. Details: journalctl -u muster-cloud-autodeploy -n 100"

@@ -8,16 +8,22 @@
 
 service: muster-cloud
 
-# CI builds and pushes this image tagged with the commit SHA; Kamal only
-# pulls it (`kamal deploy --skip-push`). Kamal prefixes the registry server,
-# so the full name is ghcr.io/oliveralerubio/muster-cloud:<sha>.
+# CI builds and pushes ghcr.io/oliveralerubio/muster-cloud:<sha> (a public
+# package). Kamal itself never talks to a registry and never needs a
+# credential: `registry.server: localhost:...` is Kamal's "local registry"
+# mode, in which its login step is skipped (lib/kamal/commands/registry.rb:
+# `return if registry_config.local?`) and the registry has no username or
+# password at all.
+#
+# The host's own muster-cloud-autodeploy pulls the CI image anonymously from
+# GHCR, tags it with the name below and then runs only the Kamal commands
+# that never pull (`kamal app boot`, `kamal rollback`): see deploy/KAMAL.md.
+# Never run `kamal deploy` (it pulls through an SSH tunnel to the local
+# registry, which does not exist here).
 image: oliveralerubio/muster-cloud
 
 registry:
-  server: ghcr.io
-  username: oliveralerubio
-  password:
-    - KAMAL_REGISTRY_PASSWORD
+  server: localhost:5000
 
 ssh:
   user: gha
@@ -141,6 +147,6 @@ accessories:
 builder:
   arch: amd64
   dockerfile: deploy/Dockerfile
-  # CI builds the image (.github/workflows/deploy.yml). This is only for a
-  # manual `bin/kamal deploy` without --skip-push.
+  # Not used: CI builds the image (.github/workflows/deploy.yml) and nothing
+  # here ever builds or pushes.
   context: "."

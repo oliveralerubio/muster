@@ -1,0 +1,13 @@
+# Installed by deploy/kamal/host-setup.sh (never by CI).
+[Unit]
+Description=Muster Cloud: look for a new green commit of main every 5 minutes
+
+[Timer]
+OnBootSec=3min
+# Counted from the end of the previous run, so a long deploy never overlaps.
+OnUnitInactiveSec=5min
+RandomizedDelaySec=30s
+Unit=muster-cloud-autodeploy.service
+
+[Install]
+WantedBy=timers.target

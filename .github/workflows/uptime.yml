@@ -1,0 +1,48 @@
+name: Cloud uptime
+
+# An outside view of muster Cloud: every 30 minutes a GitHub-hosted runner asks
+# the PUBLIC address (Tailscale Funnel) for /readyz. The host cannot report its
+# own death, so this is the alarm for "the whole machine or its tunnel is
+# down". A failed run sends GitHub's own failure email to the repository owner.
+# Guide: deploy/KAMAL.md.
+#
+# GitHub disables scheduled workflows in a repository after 60 days without
+# activity. The repository is active while this project is developed; if it
+# ever goes quiet, re-enable this workflow in the Actions tab (GitHub emails a
+# warning first). The host's own checks (backup-check, autodeploy alerts) do not
+# depend on it.
+#
+# It holds no secret and reads nothing from the repository.
+
+on:
+  schedule:
+    - cron: "11,41 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: cloud-uptime
+  cancel-in-progress: true
+
+jobs:
+  readyz:
+    name: public /readyz
+    if: github.repository == 'oliveralerubio/muster'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      URL: https://personal.tailbb30e7.ts.net:10000
+    steps:
+      - name: Ask /readyz, with retries
+        run: |
+          set -u
+          code=000
+          for attempt in 1 2 3 4 5; do
+            code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 "$URL/readyz" || true)
+            echo "attempt $attempt: HTTP $code"
+            [ "$code" = 200 ] && exit 0
+            [ "$attempt" -eq 5 ] || sleep 30
+          done
+          echo "::error::$URL/readyz answered HTTP $code after 5 attempts"
+          exit 1

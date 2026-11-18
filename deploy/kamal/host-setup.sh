@@ -19,17 +19,27 @@
 #                 unless that is a mounted filesystem of its own
 #   network       Docker network `kamal` with the fixed subnet 172.31.250.0/24
 #                 (refuses if a `kamal` network exists with another subnet)
-#   deploy hook   /usr/local/sbin/muster-cloud-install-ops (root:root 0755) and
-#                 the sudoers drop-in /etc/sudoers.d/muster-cloud-deploy that
-#                 lets user `gha` run exactly that one script
-#   timers        backup (every 6 h at :41), retention (hourly) and offsite copy
-#                 to Google Drive (hourly), enabled with `enable --now`
+#   host scripts  /usr/local/sbin/muster-cloud-{install-ops,alert,autodeploy,
+#                 backup-check,offsite,authority-offsite} (root:root 0755), copied
+#                 from deploy/kamal/. No sudoers rule exists or is created: user
+#                 `gha` has no privilege here, and the old drop-in
+#                 /etc/sudoers.d/muster-cloud-deploy is DELETED when found
+#   state dirs    /var/lib/muster-cloud/{alerts,offsite,authority} (root 0700)
+#   timers        backup (every 6 h at :41), retention (hourly), offsite copy to
+#                 Google Drive (hourly), authority copy (hourly and after every
+#                 backup), backup check (every 30 min), autodeploy (every 5 min);
+#                 enabled with `enable --now`. Every muster-cloud oneshot alerts
+#                 through muster-cloud-alert@.service when it fails
 #   funnel        `tailscale funnel --bg --https=10000 http://127.0.0.1:18110`
+#
+# muster-cloud-autodeploy runs this script in apply mode from the checkout it is
+# about to deploy, so everything listed above follows the release by itself.
 #
 # It refuses to proceed unless /etc/muster-cloud/ops.env is a regular file
 # owned by root with mode 0600. It also CHECKS (never creates) the secret
 # files /etc/muster-cloud/kamal.env and deploy.env, the gha account, rclone's
-# `gdrive:` remote and the loopback ports of kamal-proxy.
+# `gdrive:` remote, the loopback ports of kamal-proxy and that the GHCR package
+# can be pulled anonymously.
 #
 # Exit codes: 0 everything in place (apply: and done); 1 something is missing,
 # different or failed (see the FAIL/TODO/WOULD lines); 64 usage; 77 not root or
@@ -59,9 +69,21 @@ readonly DEPLOY_ENV=$ETC_DIR/deploy.env
 readonly KAMAL_NET=kamal
 readonly KAMAL_SUBNET=172.31.250.0/24
 readonly DEPLOY_USER=gha
-readonly INSTALL_OPS=/usr/local/sbin/muster-cloud-install-ops
-readonly SUDOERS_FILE=/etc/sudoers.d/muster-cloud-deploy
+readonly SBIN=/usr/local/sbin
+readonly OLD_SUDOERS_FILE=/etc/sudoers.d/muster-cloud-deploy
+readonly STATE_BASE=/var/lib/muster-cloud
 readonly UNIT_DIR=/etc/systemd/system
+readonly GHCR_PACKAGE=oliveralerubio/muster-cloud
+# The scripts of deploy/kamal/ that live in /usr/local/sbin.
+readonly HOST_SCRIPTS=(muster-cloud-install-ops muster-cloud-alert muster-cloud-autodeploy
+  muster-cloud-backup-check muster-cloud-offsite muster-cloud-authority-offsite)
+# The units of deploy/systemd/ that this script installs itself (backup and
+# retention come from install-systemd.sh).
+readonly OWN_UNITS=(muster-cloud-alert@.service
+  muster-cloud-autodeploy.service muster-cloud-autodeploy.timer
+  muster-cloud-backup-check.service muster-cloud-backup-check.timer
+  muster-cloud-authority-offsite.service muster-cloud-authority-offsite.timer
+  muster-cloud-offsite.service muster-cloud-offsite.timer)
 readonly FUNNEL_PORT=10000
 readonly PROXY_HTTP_PORT=18110
 readonly PROXY_HTTPS_PORT=18111
@@ -135,7 +157,7 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp}/muster-host-setup.XXXXXX") || {
   printf 'host-setup.sh: must run as root (sudo)\n' >&2
   exit 77
 }
-for tool in docker systemctl visudo install cmp stat getent flock mountpoint findmnt ss; do
+for tool in docker systemctl install cmp stat getent flock mountpoint findmnt ss; do
   command -v "$tool" >/dev/null 2>&1 || {
     printf 'host-setup.sh: required tool not found: %s\n' "$tool" >&2
     exit 77
@@ -260,6 +282,13 @@ ensure_dir "$ROOT_DIR/pg/data" "$PG_UID" "$PG_UID" 0700
 # (10001) may enter it to connect.
 ensure_dir "$ROOT_DIR/pgsocket" "$PG_UID" "$SVC_UID" 0750
 
+# State of the root-run host scripts (alerts, offsite, authority copies). The
+# autodeploy state and checkout under the same base are created by the script.
+ensure_dir "$STATE_BASE" 0 0 0755
+for sub in alerts offsite authority; do
+  ensure_dir "$STATE_BASE/$sub" 0 0 0700
+done
+
 printf '\n== witness (own filesystem, never the root disk)\n'
 if mountpoint -q "$WITNESS_MOUNT"; then
   src=$(findmnt -n -o SOURCE,FSTYPE "$WITNESS_MOUNT" | head -1)
@@ -321,8 +350,8 @@ fi
 
 if [ -f "$DEPLOY_ENV" ] && [ ! -L "$DEPLOY_ENV" ]; then
   check_keys "$DEPLOY_ENV" "$DEPLOY_ENV" MUSTER_PADDLE_PRICE_PERSONAL MUSTER_PADDLE_PRICE_TEAM_SEAT
-  if grep -Evq '^(#.*|)$|^(MUSTER_CLOUD_PUBLIC_URL|MUSTER_PADDLE_ENVIRONMENT|MUSTER_PADDLE_PRICE_PERSONAL|MUSTER_PADDLE_PRICE_TEAM_SEAT)=' "$DEPLOY_ENV"; then
-    fail "$DEPLOY_ENV has lines other than the four non-secret settings (bin/kamal refuses them)"
+  if grep -Evq '^(#.*|)$|^(MUSTER_CLOUD_PUBLIC_URL|MUSTER_PADDLE_ENVIRONMENT|MUSTER_PADDLE_PRICE_PERSONAL|MUSTER_PADDLE_PRICE_TEAM_SEAT|ALERT_TARGET)=' "$DEPLOY_ENV"; then
+    fail "$DEPLOY_ENV has lines other than the non-secret settings (bin/kamal refuses them)"
   fi
 else
   todo "$DEPLOY_ENV does not exist (deploy/KAMAL.md, step 2)"
@@ -360,33 +389,31 @@ else
     docker network create --driver bridge --subnet "$KAMAL_SUBNET" "$KAMAL_NET"
 fi
 
-# ---- 5. deploy hook: install-ops + sudoers ---------------------------------------
-printf '\n== deploy hook\n'
-src_ops=$HERE/muster-cloud-install-ops
-[ -f "$src_ops" ] || fail "missing $src_ops"
-put_file "$src_ops" "$INSTALL_OPS" 0755 || true
-[ -x "$INSTALL_OPS" ] || [ "$MODE" = check ] || fail "$INSTALL_OPS is not executable"
-
-sudoers_tmp=$WORK/sudoers
-printf '%s\n' \
-  '# Managed by deploy/kamal/host-setup.sh. The deploy workflow (user gha, on this' \
-  '# host) may run exactly this one root-owned script; it validates its argument.' \
-  "$DEPLOY_USER ALL=(root) NOPASSWD: $INSTALL_OPS" >"$sudoers_tmp"
-if visudo -cf "$sudoers_tmp" >/dev/null 2>&1; then
-  if [ -f "$SUDOERS_FILE" ] && cmp -s -- "$sudoers_tmp" "$SUDOERS_FILE" \
-    && [ "$(stat -c '%u:%g %a' -- "$SUDOERS_FILE")" = "0:0 440" ]; then
-    ok "$SUDOERS_FILE up to date"
-  else
-    change "install $SUDOERS_FILE (validated with visudo -cf)" \
-      bash -c 'install -m 0440 -o 0 -g 0 "$1" "$2.new" && visudo -cf "$2.new" >/dev/null && mv -f "$2.new" "$2" || { rm -f "$2.new"; exit 1; }' _ "$sudoers_tmp" "$SUDOERS_FILE"
+# ---- 5. host scripts (no sudoers: gha has no privilege here) ---------------------
+printf '\n== host scripts in %s\n' "$SBIN"
+for script in "${HOST_SCRIPTS[@]}"; do
+  if [ ! -f "$HERE/$script" ]; then
+    fail "missing $HERE/$script"
+    continue
   fi
+  put_file "$HERE/$script" "$SBIN/$script" 0755 || true
+done
+
+# The previous design let gha run muster-cloud-install-ops as root. Nothing
+# needs that now (autodeploy runs as root): the rule is removed, not kept.
+if [ -e "$OLD_SUDOERS_FILE" ] || [ -L "$OLD_SUDOERS_FILE" ]; then
+  change "remove $OLD_SUDOERS_FILE (user $DEPLOY_USER no longer needs any privilege)" rm -f -- "$OLD_SUDOERS_FILE"
 else
-  fail "the generated sudoers rule did not pass visudo -cf"
+  ok "no sudoers rule for $DEPLOY_USER ($OLD_SUDOERS_FILE is absent)"
+fi
+if grep -rIlE --exclude="${OLD_SUDOERS_FILE##*/}" "^[^#]*\\b$DEPLOY_USER\\b.*muster-cloud" /etc/sudoers /etc/sudoers.d 2>/dev/null | grep -q .; then
+  fail "a sudoers rule that lets $DEPLOY_USER run a muster-cloud script still exists under /etc/sudoers*; remove it by hand (grep -rn muster-cloud /etc/sudoers /etc/sudoers.d)"
 fi
 
 # ---- 6. systemd units ------------------------------------------------------------
 printf '\n== systemd timers\n'
-timers=(muster-cloud-backup.timer muster-cloud-retention.timer muster-cloud-offsite.timer)
+timers=(muster-cloud-backup.timer muster-cloud-retention.timer muster-cloud-offsite.timer
+  muster-cloud-authority-offsite.timer muster-cloud-backup-check.timer muster-cloud-autodeploy.timer)
 
 if [ "$ops_env_ok" -eq 1 ]; then
   stage=$WORK/units
@@ -405,40 +432,47 @@ else
   note "skipping backup/retention units until $OPS_ENV is valid"
 fi
 
-render_offsite() {
-  local rclone_bin
-  rclone_bin=$(command -v rclone) || {
-    fail "rclone not found in PATH (needed by muster-cloud-offsite.service)"
-    return 1
+# The other units are installed as they are in deploy/systemd/. They are checked
+# first with systemd-analyze, on a copy whose ExecStart points at /bin/true (the
+# scripts may not be installed yet in --check mode).
+verify_own_units() {
+  local vdir=$WORK/verify unit verify
+  command -v systemd-analyze >/dev/null 2>&1 || {
+    note "systemd-analyze not found; the units were not verified"
+    return 0
   }
-  local off_stage=$WORK/offsite
-  mkdir -p -- "$off_stage"
-  sed "s|@RCLONE@|$rclone_bin|g" "$REPO/deploy/systemd/muster-cloud-offsite.service" >"$off_stage/muster-cloud-offsite.service"
-  cp -- "$REPO/deploy/systemd/muster-cloud-offsite.timer" "$off_stage/muster-cloud-offsite.timer"
-  if command -v systemd-analyze >/dev/null 2>&1; then
-    local verify
-    verify=$(cd "$off_stage" && systemd-analyze verify --man=no "$off_stage/muster-cloud-offsite.service" "$off_stage/muster-cloud-offsite.timer" 2>&1)
-    if [ -n "$verify" ]; then
-      printf '%s\n' "$verify" | sed 's/^/       /'
-      fail "systemd-analyze rejected the offsite units"
+  mkdir -p -- "$vdir"
+  for unit in "${OWN_UNITS[@]}"; do
+    [ -f "$REPO/deploy/systemd/$unit" ] || {
+      fail "missing $REPO/deploy/systemd/$unit"
       return 1
-    fi
+    }
+    sed -E 's|^(ExecStart=)/usr/local/sbin/muster-cloud-[a-z-]+|\1/bin/true|' "$REPO/deploy/systemd/$unit" >"$vdir/$unit"
+  done
+  verify=$(cd "$vdir" && systemd-analyze verify --man=no "${OWN_UNITS[@]/#/$vdir/}" 2>&1) || true
+  if [ -n "$verify" ]; then
+    printf '%s\n' "$verify" | sed 's/^/       /'
+    fail "systemd-analyze rejected the muster-cloud units"
+    return 1
   fi
-  OFFSITE_STAGE=$off_stage
+  ok "muster-cloud units verified by systemd-analyze"
 }
 
-OFFSITE_STAGE=""
-if render_offsite; then
-  put_file "$OFFSITE_STAGE/muster-cloud-offsite.service" "$UNIT_DIR/muster-cloud-offsite.service" 0644 || true
-  put_file "$OFFSITE_STAGE/muster-cloud-offsite.timer" "$UNIT_DIR/muster-cloud-offsite.timer" 0644 || true
+if verify_own_units; then
+  for unit in "${OWN_UNITS[@]}"; do
+    put_file "$REPO/deploy/systemd/$unit" "$UNIT_DIR/$unit" 0644 || true
+  done
 fi
 
-# Drop-ins: a 6-hourly backup at :41 (this host has another backup at 03:17)
-# and ordering after Docker (the database is a container).
+# Drop-ins: a 6-hourly backup at :41 (this host has another backup at 03:17),
+# ordering after Docker (the database is a container), an alert when backup or
+# retention fail, and an authority copy right after every successful backup.
 dropin_tmp=$WORK/dropins
 mkdir -p -- "$dropin_tmp"
 printf '%s\n' '[Timer]' 'OnCalendar=' 'OnCalendar=*-*-* 00/6:41:00' >"$dropin_tmp/schedule.conf"
 printf '%s\n' '[Unit]' 'After=docker.service' >"$dropin_tmp/docker.conf"
+printf '%s\n' '[Unit]' 'OnFailure=muster-cloud-alert@%n.service' >"$dropin_tmp/alert.conf"
+printf '%s\n' '[Unit]' 'OnSuccess=muster-cloud-authority-offsite.service' >"$dropin_tmp/authority.conf"
 ensure_dropin() { # dir name srcfile
   local dir=$UNIT_DIR/$1 file=$2 src=$3
   if [ -f "$dir/$file" ] && cmp -s -- "$src" "$dir/$file"; then
@@ -450,6 +484,9 @@ ensure_dropin() { # dir name srcfile
 ensure_dropin muster-cloud-backup.timer.d 10-schedule.conf "$dropin_tmp/schedule.conf"
 ensure_dropin muster-cloud-backup.service.d 10-docker.conf "$dropin_tmp/docker.conf"
 ensure_dropin muster-cloud-retention.service.d 10-docker.conf "$dropin_tmp/docker.conf"
+ensure_dropin muster-cloud-backup.service.d 20-alert.conf "$dropin_tmp/alert.conf"
+ensure_dropin muster-cloud-retention.service.d 20-alert.conf "$dropin_tmp/alert.conf"
+ensure_dropin muster-cloud-backup.service.d 30-authority-copy.conf "$dropin_tmp/authority.conf"
 
 if [ "$MODE" = apply ] && [ "$n_change" -gt 0 ]; then
   # Cheap and idempotent: pick up any unit or drop-in written above.
@@ -469,23 +506,32 @@ done
 
 # ---- 7. host tools the timers need -------------------------------------------------
 printf '\n== host tools for backups\n'
-for tool in age git tar rclone; do
+for tool in age git tar rclone python3 curl runuser flock timeout; do
   if command -v "$tool" >/dev/null 2>&1; then
     ok "$tool found"
   else
     fail "$tool not found in PATH"
   fi
 done
-if command -v pg_dump >/dev/null 2>&1; then
-  pgv=$(pg_dump --version | sed -n 's/^pg_dump (PostgreSQL) \([0-9]*\).*/\1/p')
-  if [ "${pgv:-0}" -ge 16 ]; then
-    ok "pg_dump major version $pgv (server is 16)"
+# pg_dump (backups) and pg_restore (recoveries and the drill) must be the same
+# major version as the server (16): a newer client writes a dump or a restore
+# script the 16 server rejects (found while rehearsing the restore drill with a
+# 18.x client). Not blocking (a deploy must not stop for it): the restore drill
+# fails loudly if it ever matters.
+for pgtool in pg_dump pg_restore; do
+  if command -v "$pgtool" >/dev/null 2>&1; then
+    pgv=$("$pgtool" --version | sed -n 's/^[a-z_]* (PostgreSQL) \([0-9]*\).*/\1/p')
+    if [ "${pgv:-0}" = 16 ]; then
+      ok "$pgtool major version 16 (same as the server)"
+    elif [ "${pgv:-0}" -gt 16 ] 2>/dev/null; then
+      note "$pgtool is version $pgv, the server is 16: backups and restores may be refused; install postgresql-client-16 and put it first in PATH"
+    else
+      fail "$pgtool is version '${pgv:-unknown}', need 16"
+    fi
   else
-    fail "pg_dump is version '${pgv:-unknown}', need 16 or newer"
+    fail "$pgtool not found in PATH (postgresql-client-16)"
   fi
-else
-  fail "pg_dump not found in PATH"
-fi
+done
 if command -v rclone >/dev/null 2>&1; then
   rconf=$(rclone config file 2>/dev/null | tail -1)
   if [ "$rconf" = /root/.config/rclone/rclone.conf ]; then
@@ -498,6 +544,37 @@ if command -v rclone >/dev/null 2>&1; then
   else
     todo "rclone remote gdrive: is not configured for root"
   fi
+fi
+
+# The alert channel (Hermes). A missing CLI does not block a deploy; it is
+# reported so it is not forgotten: alerts would then reach only the journal.
+if [ -x /root/.local/bin/hermes ] || command -v hermes >/dev/null 2>&1; then
+  ok "hermes found (alerts go to Discord)"
+else
+  note "hermes not found: alerts are written to the journal only (muster-cloud-alert needs 'hermes send')"
+fi
+
+# Anonymous pulls: the GHCR package must be public, because the host holds no
+# registry credential at all. Checked the way a Docker client does it: an
+# anonymous pull token, then the tag list. A network failure is only a note.
+printf '\n== anonymous image pull (ghcr.io/%s)\n' "$GHCR_PACKAGE"
+if command -v curl >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+  ghcr_tok=""
+  ghcr_rc=0
+  ghcr_tok=$(curl -sS --max-time 20 "https://ghcr.io/token?service=ghcr.io&scope=repository:$GHCR_PACKAGE:pull" 2>/dev/null \
+    | python3 -I -c 'import json,sys; print(json.load(sys.stdin).get("token",""))' 2>/dev/null) || ghcr_rc=$?
+  if [ "$ghcr_rc" -ne 0 ] || [ -z "$ghcr_tok" ]; then
+    note "could not get an anonymous token from ghcr.io (network?); the package visibility was not checked"
+  else
+    code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 -H "Authorization: Bearer $ghcr_tok" \
+      "https://ghcr.io/v2/$GHCR_PACKAGE/tags/list?n=1" 2>/dev/null) || code=000
+    case $code in
+      200) ok "ghcr.io/$GHCR_PACKAGE can be listed anonymously (the package is public)" ;;
+      000) note "ghcr.io did not answer; the package visibility was not checked" ;;
+      *) todo "ghcr.io/$GHCR_PACKAGE answers HTTP $code to an anonymous request: make the package public once (deploy/KAMAL.md, step 1) or publish the first image" ;;
+    esac
+  fi
+  unset ghcr_tok
 fi
 
 # ---- 8. Tailscale Funnel ---------------------------------------------------------

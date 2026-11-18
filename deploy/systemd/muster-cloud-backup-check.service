@@ -1,0 +1,30 @@
+# Installed by deploy/kamal/host-setup.sh (never by CI). Notices when backups
+# quietly stop (local, Google Drive, authority copy, failed units).
+[Unit]
+Description=Muster Cloud: check that backups are current and nothing failed
+Documentation=file:///opt/muster-cloud/deploy/KAMAL.md
+After=network-online.target
+Wants=network-online.target
+OnFailure=muster-cloud-alert@%n.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+Environment=RCLONE_CONFIG=/root/.config/rclone/rclone.conf
+ExecStart=/usr/local/sbin/muster-cloud-backup-check
+TimeoutStartSec=15min
+Nice=10
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+# rclone rewrites its config file when it refreshes the OAuth token.
+ReadWritePaths=/root/.config/rclone /var/lib/muster-cloud/alerts
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true

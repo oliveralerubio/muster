@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 # muster-cloud-install-ops — install the host-side `muster-cloud-ops` that
 # matches a deployed image. Installed by deploy/kamal/host-setup.sh as
-# /usr/local/sbin/muster-cloud-install-ops (root:root 0755) and run by the
-# deploy workflow through one sudoers rule:
+# /usr/local/sbin/muster-cloud-install-ops (root:root 0755) and run by root
+# from muster-cloud-autodeploy (and by hand for a manual rollback). There is no
+# sudoers rule: nothing unprivileged can reach it.
 #
-#   gha ALL=(root) NOPASSWD: /usr/local/sbin/muster-cloud-install-ops
+# It still trusts nothing it is given: it takes exactly ONE argument, an image
+# reference that must look like
 #
-# Because the caller is unprivileged, this script trusts nothing from it: it
-# takes exactly ONE argument, an image reference that must look like
-#
+#   localhost:5000/oliveralerubio/muster-cloud:<40 hex characters>
 #   ghcr.io/oliveralerubio/muster-cloud:<40 hex characters>
 #
-# and it never pulls (root has no registry login): the image must already be
-# on this host, which `kamal deploy` guarantees. Steps:
+# (the first is the name Kamal runs; autodeploy tags the CI image with it) and
+# it never pulls: the image must already be on this host. Steps:
 #
 #   1. create (not start) a container from that image, copy
 #      /usr/local/bin/muster-cloud-ops out of it, remove the container;
@@ -41,7 +41,7 @@ umask 022
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export LC_ALL=C
 
-readonly REF_RE='^ghcr\.io/oliveralerubio/muster-cloud:[0-9a-f]{40}$'
+readonly REF_RE='^(ghcr\.io|localhost:5000)/oliveralerubio/muster-cloud:[0-9a-f]{40}$'
 readonly LIB_DIR=/usr/local/lib/muster-cloud
 readonly LINK=/usr/local/bin/muster-cloud-ops
 readonly KEEP=3
@@ -51,9 +51,9 @@ fail() {
   exit "$2"
 }
 
-[ "$#" -eq 1 ] || fail "usage: muster-cloud-install-ops ghcr.io/oliveralerubio/muster-cloud:<40-hex-sha>" 64
+[ "$#" -eq 1 ] || fail "usage: muster-cloud-install-ops {localhost:5000|ghcr.io}/oliveralerubio/muster-cloud:<40-hex-sha>" 64
 ref=$1
-[[ $ref =~ $REF_RE ]] || fail "refused: the image must match ghcr.io/oliveralerubio/muster-cloud:<40 hex characters>" 64
+[[ $ref =~ $REF_RE ]] || fail "refused: the image must match {localhost:5000|ghcr.io}/oliveralerubio/muster-cloud:<40 hex characters>" 64
 sha=${ref##*:}
 [ "$(id -u)" -eq 0 ] || fail "must run as root (through sudo)" 64
 command -v docker >/dev/null 2>&1 || fail "docker not found" 69
@@ -70,7 +70,7 @@ if [ -e "$LINK" ] && [ ! -L "$LINK" ]; then
 fi
 
 docker image inspect "$ref" >/dev/null 2>&1 \
-  || fail "image $ref is not on this host (kamal deploy pulls it first)" 69
+  || fail "image $ref is not on this host (muster-cloud-autodeploy pulls it first)" 69
 
 work=$(mktemp -d "$LIB_DIR/.install.XXXXXX") || fail "mktemp failed" 74
 cid=""

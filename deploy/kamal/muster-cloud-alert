@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+# muster-cloud-alert — the one alert channel of the Cloud host. Installed by
+# deploy/kamal/host-setup.sh as /usr/local/sbin/muster-cloud-alert
+# (root:root 0755). Guide: deploy/KAMAL.md.
+#
+#   muster-cloud-alert fire KEY MESSAGE...     send MESSAGE unless this problem
+#                                              was already reported in the last
+#                                              6 hours (state file per KEY)
+#   muster-cloud-alert resolve [-q] KEY [MESSAGE...]
+#                                              the problem is gone: send
+#                                              "resolved" once and forget it
+#                                              (-q: forget it without a message)
+#   muster-cloud-alert notify MESSAGE...       send MESSAGE, no state, no limit
+#   muster-cloud-alert unit-failed UNIT        what muster-cloud-alert@.service
+#                                              runs when a unit fails
+#   muster-cloud-alert keys [PREFIX]           list the open problems
+#
+# Delivery: `hermes send -t <target> "<text>"` (root, no model involved; it
+# reuses the Discord bot token Hermes already has). The target is ALERT_TARGET
+# in /etc/muster-cloud/deploy.env (parsed, never sourced), default
+# discord:#contabo. Every message is also printed, so it is in the journal even
+# when delivery fails. A message that could not be delivered is NOT recorded as
+# sent, so the next run tries again.
+#
+# KEY is a stable name for one problem (letters, digits, . _ : @ -). The state
+# lives in /var/lib/muster-cloud/alerts, one small file per open problem.
+#
+# Exit codes: 0 sent, suppressed or nothing to do; 1 delivery failed;
+# 64 usage; 77 not root.
+
+set -euo pipefail
+umask 077
+export LC_ALL=C
+export PATH="${MUSTER_ALERT_PATH:+$MUSTER_ALERT_PATH:}/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.local/bin"
+
+readonly STATE_DIR=${MUSTER_ALERT_STATE_DIR:-/var/lib/muster-cloud/alerts}
+readonly DEPLOY_ENV=${MUSTER_CLOUD_DEPLOY_ENV:-/etc/muster-cloud/deploy.env}
+readonly REPEAT_SECONDS=${MUSTER_ALERT_REPEAT_SECONDS:-21600}
+readonly DEFAULT_TARGET='discord:#contabo'
+readonly MAX_TEXT=1500
+readonly KEY_RE='^[A-Za-z][A-Za-z0-9_.:@-]{0,119}$'
+
+usage() {
+  sed -n '2,/^# Exit codes/p' "$0" | sed 's/^# \{0,1\}//' >&2
+  exit 64
+}
+
+log() { printf 'muster-cloud-alert: %s\n' "$*" >&2; }
+
+if [ "${MUSTER_ALERT_ALLOW_NONROOT:-0}" != 1 ] && [ "$(id -u)" -ne 0 ]; then
+  log "must run as root"
+  exit 77
+fi
+
+# alert_target: ALERT_TARGET from deploy.env (last assignment wins), else the
+# default. Only a plain target spelling is accepted.
+alert_target() {
+  local target=""
+  if [ -f "$DEPLOY_ENV" ] && [ -r "$DEPLOY_ENV" ]; then
+    target=$(sed -n 's/^ALERT_TARGET=//p' "$DEPLOY_ENV" | tail -n 1 | tr -d "\"'\r")
+  fi
+  [ -n "$target" ] || target=$DEFAULT_TARGET
+  case $target in
+    *[!A-Za-z0-9_:#@./-]*) log "ALERT_TARGET has unexpected characters; using $DEFAULT_TARGET"; target=$DEFAULT_TARGET ;;
+  esac
+  printf '%s' "$target"
+}
+
+find_hermes() {
+  if [ -n "${MUSTER_HERMES:-}" ]; then
+    printf '%s' "$MUSTER_HERMES"
+    return 0
+  fi
+  command -v hermes 2>/dev/null
+}
+
+# send TEXT — print it, then deliver it.
+send() {
+  local text=$1 host hermes target
+  host=$(hostname -s 2>/dev/null || echo host)
+  text="[muster-cloud $host] $text"
+  if [ "${#text}" -gt "$MAX_TEXT" ]; then
+    text="${text:0:$((MAX_TEXT - 3))}..."
+  fi
+  printf '%s\n' "$text"
+  if ! hermes=$(find_hermes); then
+    log "hermes not found: the message above was NOT delivered"
+    return 1
+  fi
+  target=$(alert_target)
+  if ! timeout 60 "$hermes" send -t "$target" "$text" >/dev/null; then
+    log "hermes send to $target failed: the message above was NOT delivered"
+    return 1
+  fi
+  return 0
+}
+
+valid_key() {
+  [[ $1 =~ $KEY_RE ]] || {
+    log "invalid key: $1"
+    exit 64
+  }
+}
+
+state_file() { printf '%s/%s' "$STATE_DIR" "$1"; }
+
+state_get() { # file field
+  sed -n "s/^$2=//p" "$1" | head -n 1
+}
+
+locked() {
+  install -d -m 0700 -- "$STATE_DIR"
+  exec 9>"$STATE_DIR/.lock"
+  flock -w 60 9 || {
+    log "another alert is being written"
+    exit 1
+  }
+}
+
+write_state() { # file first last
+  local tmp
+  tmp=$(mktemp "$STATE_DIR/.new.XXXXXX")
+  printf 'first=%s\nlast=%s\n' "$2" "$3" >"$tmp"
+  mv -f -- "$tmp" "$1"
+}
+
+cmd_fire() {
+  [ "$#" -ge 2 ] || usage
+  local key=$1 file now first last
+  shift
+  valid_key "$key"
+  locked
+  file=$(state_file "$key")
+  now=$(date +%s)
+  first=$now
+  if [ -f "$file" ]; then
+    first=$(state_get "$file" first)
+    last=$(state_get "$file" last)
+    [[ $first =~ ^[0-9]+$ ]] || first=$now
+    if [[ $last =~ ^[0-9]+$ ]] && [ $((now - last)) -lt "$REPEAT_SECONDS" ]; then
+      log "suppressed (already reported $(((now - last) / 60)) min ago): $key"
+      return 0
+    fi
+  fi
+  send "ALERT: $*" || return 1
+  write_state "$file" "$first" "$now"
+}
+
+cmd_resolve() {
+  local quiet=0
+  if [ "${1:-}" = "-q" ]; then
+    quiet=1
+    shift
+  fi
+  [ "$#" -ge 1 ] || usage
+  local key=$1 file first since
+  shift
+  valid_key "$key"
+  locked
+  file=$(state_file "$key")
+  [ -f "$file" ] || return 0
+  if [ "$quiet" -eq 0 ]; then
+    first=$(state_get "$file" first)
+    since=""
+    if [[ $first =~ ^[0-9]+$ ]]; then
+      since=" (open since $(date -u -d "@$first" +%Y-%m-%dT%H:%MZ))"
+    fi
+    if [ "$#" -gt 0 ]; then
+      send "RESOLVED: $*$since" || return 1
+    else
+      send "RESOLVED: $key$since" || return 1
+    fi
+  fi
+  rm -f -- "$file"
+}
+
+cmd_notify() {
+  [ "$#" -ge 1 ] || usage
+  send "$*"
+}
+
+cmd_unit_failed() {
+  [ "$#" -eq 1 ] || usage
+  local unit=$1 result status
+  case $unit in
+    muster-cloud-alert@*) log "not alerting about a failed alert"; return 0 ;;
+  esac
+  [[ $unit =~ ^muster-cloud-[A-Za-z0-9@._-]+\.service$ ]] || {
+    log "refusing unit name: $unit"
+    exit 64
+  }
+  result=$(systemctl show -p Result --value -- "$unit" 2>/dev/null || echo unknown)
+  status=$(systemctl show -p ExecMainStatus --value -- "$unit" 2>/dev/null || echo unknown)
+  cmd_fire "unit:$unit" "$unit failed (result=$result, exit status $status). Details: journalctl -u $unit -n 50"
+}
+
+cmd_keys() {
+  local prefix=${1:-} f
+  [ -d "$STATE_DIR" ] || return 0
+  for f in "$STATE_DIR"/*; do
+    [ -f "$f" ] || continue
+    f=${f##*/}
+    case $f in
+      "$prefix"*) printf '%s\n' "$f" ;;
+    esac
+  done
+}
+
+[ "$#" -ge 1 ] || usage
+sub=$1
+shift
+case $sub in
+  fire) cmd_fire "$@" ;;
+  resolve) cmd_resolve "$@" ;;
+  notify) cmd_notify "$@" ;;
+  unit-failed) cmd_unit_failed "$@" ;;
+  keys) cmd_keys "$@" ;;
+  *) usage ;;
+esac

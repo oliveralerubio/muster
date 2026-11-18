@@ -1,0 +1,12 @@
+# Installed by deploy/kamal/host-setup.sh (never by CI).
+[Unit]
+Description=Muster Cloud: hourly encrypted offsite copy of the lifecycle authority
+
+[Timer]
+OnCalendar=*:23
+RandomizedDelaySec=5min
+Persistent=true
+Unit=muster-cloud-authority-offsite.service
+
+[Install]
+WantedBy=timers.target

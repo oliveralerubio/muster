@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# muster-cloud-authority-offsite — keep an encrypted offsite copy of the
+# lifecycle authority (control journal + witness). Installed by
+# deploy/kamal/host-setup.sh as /usr/local/sbin/muster-cloud-authority-offsite
+# (root:root 0755); run after every successful backup (OnSuccess= of
+# muster-cloud-backup.service) and hourly. Guide: deploy/KAMAL.md.
+#
+# Why: the backups deliberately do not contain the authority (cloud/src/
+# control.rs: a restore must be judged against a journal that outlives the
+# database). After the loss of the whole host the authority is gone too, and
+# `muster-cloud-ops init` would create a NEW one that rejects every restored
+# database. This copy is what a disaster recovery starts from.
+#
+# Read order (see the module docs of control.rs): a record is committed as
+# journal append + fsync, THEN witness replacement. Open accepts a journal that
+# is ahead of the witness and refuses a journal that is behind it. So the
+# witness is copied FIRST and the journal SECOND: the copied journal can only
+# be at or ahead of the copied witness, never behind. Nothing is locked; a
+# journal copied in the middle of an append ends in a torn line, which open
+# discards exactly as it does after a crash. The copy is then validated with
+# the real `muster-cloud-ops status` on a scratch copy of the files (never on
+# the live ones), which also gives the journal sequence.
+#
+# Upload: tar (journal, witness, META.json), `age -r $MUSTER_BACKUP_AGE_RECIPIENT`
+# (from /etc/muster-cloud/ops.env), `rclone copyto --immutable` to
+#   gdrive:muster-cloud-backups/authority/authority-<UTC>-<sequence>.tar.age
+# The files are tiny and append-only: nothing ever deletes them. A copy is made
+# only when the journal moved on since the last upload (and the remote really
+# has that sequence), so a quiet authority does not pile up files.
+#
+# Exit codes: 0 ok (uploaded or already current); 1 upload failed; 65 the copy
+# did not validate; 69 a required tool or file is missing; 77 not root.
+#
+# Test hooks (all optional): MUSTER_CONTROL_DIR, MUSTER_CONTROL_WITNESS,
+# MUSTER_OPS_ENV, MUSTER_OPS_BIN, MUSTER_OFFSITE_REMOTE,
+# MUSTER_AUTHORITY_STATE, MUSTER_RCLONE.
+
+set -euo pipefail
+umask 077
+export LC_ALL=C
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+readonly CONTROL_DIR=${MUSTER_CONTROL_DIR:-/srv/muster-cloud/control}
+readonly WITNESS=${MUSTER_CONTROL_WITNESS:-/var/lib/muster-witness/w/witness.json}
+readonly OPS_ENV=${MUSTER_OPS_ENV:-/etc/muster-cloud/ops.env}
+readonly OPS_BIN=${MUSTER_OPS_BIN:-/usr/local/bin/muster-cloud-ops}
+readonly REMOTE=${MUSTER_OFFSITE_REMOTE:-gdrive:muster-cloud-backups}
+readonly STATE_DIR=${MUSTER_AUTHORITY_STATE:-/var/lib/muster-cloud/authority}
+readonly RCLONE=${MUSTER_RCLONE:-rclone}
+readonly JOURNAL=journal.v1.jsonl
+
+log() { printf 'authority-offsite: %s\n' "$*"; }
+die() {
+  log "$1"
+  exit "$2"
+}
+
+[ "${MUSTER_AUTHORITY_ALLOW_NONROOT:-0}" = 1 ] || [ "$(id -u)" -eq 0 ] || die "must run as root" 77
+for tool in "$RCLONE" age tar python3 flock; do
+  command -v "$tool" >/dev/null 2>&1 || die "required tool not found: $tool" 69
+done
+[ -x "$OPS_BIN" ] || die "muster-cloud-ops not found at $OPS_BIN" 69
+[ -f "$CONTROL_DIR/$JOURNAL" ] || die "no control journal at $CONTROL_DIR/$JOURNAL" 69
+[ -f "$WITNESS" ] || die "no witness at $WITNESS" 69
+
+# The age recipient is the one key of ops.env this script needs (a public key).
+[ -f "$OPS_ENV" ] || die "cannot read $OPS_ENV" 69
+recipient=$(sed -n 's/^MUSTER_BACKUP_AGE_RECIPIENT=//p' "$OPS_ENV" | tail -n 1 | tr -d "\"'\r")
+[[ $recipient =~ ^age1[a-z0-9]+$ ]] || die "MUSTER_BACKUP_AGE_RECIPIENT in $OPS_ENV is not an age recipient" 69
+
+install -d -m 0700 -- "$STATE_DIR"
+exec 9>"$STATE_DIR/lock"
+flock -w 900 9 || die "another authority copy is running" 1
+
+work=$(mktemp -d "${TMPDIR:-/tmp}/muster-authority.XXXXXX")
+trap 'rm -rf --one-file-system -- "$work"' EXIT
+mkdir -m 0700 -- "$work/payload" "$work/check" "$work/check/control" "$work/check/witness" "$work/check/repos"
+
+# 1. witness first, journal second (never the other way round).
+cp -- "$WITNESS" "$work/payload/witness.json"
+cp -- "$CONTROL_DIR/$JOURNAL" "$work/payload/$JOURNAL"
+
+# 2. validate with the real tool, on throwaway copies (open may truncate a torn
+#    tail or advance the witness; the payload stays as it was copied).
+cp -- "$work/payload/$JOURNAL" "$work/check/control/$JOURNAL"
+cp -- "$work/payload/witness.json" "$work/check/witness/witness.json"
+if ! status_json=$(MUSTER_CONTROL_DIR="$work/check/control" \
+  MUSTER_CONTROL_WITNESS="$work/check/witness/witness.json" \
+  MUSTER_REPO_ROOT="$work/check/repos" "$OPS_BIN" status 2>"$work/status.err"); then
+  log "the copied authority did not validate: $(head -c 300 "$work/status.err" | tr '\n' ' ')"
+  exit 65
+fi
+if ! fields=$(printf '%s' "$status_json" | python3 -I -c '
+import json, re, sys
+d = json.load(sys.stdin)
+seq, h, dep, store = d["sequence"], d["journal_hash"], d["deployment_id"], d["control_store_id"]
+if not isinstance(seq, int) or seq < 1 or not re.fullmatch(r"[0-9a-f]{64}", h):
+    sys.exit("unexpected status output")
+print(seq, h, dep, store)
+'); then
+  die "cannot read the sequence from the status output" 65
+fi
+read -r seq jhash deployment store <<<"$fields"
+
+# 3. skip when this exact state is already offsite.
+state_file=$STATE_DIR/last-uploaded
+if [ -f "$state_file" ] && [ "$(cat -- "$state_file")" = "$seq:$jhash" ]; then
+  if remote_list=$("$RCLONE" lsf "$REMOTE/authority" --files-only --contimeout 30s --timeout 120s --retries 3 2>/dev/null) \
+    && printf '%s\n' "$remote_list" | grep -Eq "^authority-[0-9]{8}T[0-9]{6}Z-$seq\.tar\.age$"; then
+    log "journal sequence $seq is already offsite; nothing to do"
+    exit 0
+  fi
+fi
+
+# 4. archive, encrypt, upload.
+now_utc=$(date -u +%Y%m%dT%H%M%SZ)
+name=authority-$now_utc-$seq.tar.age
+printf '{"format":"muster-authority-copy","version":1,"copied_at":"%s","journal_sequence":%s,"journal_hash":"%s","deployment_id":"%s","control_store_id":"%s"}\n' \
+  "$now_utc" "$seq" "$jhash" "$deployment" "$store" >"$work/payload/META.json"
+tar --owner=0 --group=0 --numeric-owner -C "$work/payload" -cf - "$JOURNAL" witness.json META.json \
+  | age -r "$recipient" -o "$work/$name"
+[ -s "$work/$name" ] || die "the encrypted archive is empty" 1
+
+if ! "$RCLONE" copyto "$work/$name" "$REMOTE/authority/$name" --immutable \
+  --contimeout 30s --timeout 120s --retries 3 --low-level-retries 10 --stats 0 --log-level NOTICE; then
+  die "upload of $name FAILED" 1
+fi
+# The upload is only believed once the remote lists it.
+if ! "$RCLONE" lsf "$REMOTE/authority" --files-only --contimeout 30s --timeout 120s --retries 3 | grep -qxF -- "$name"; then
+  die "$name is not listed on the remote after the upload" 1
+fi
+printf '%s:%s\n' "$seq" "$jhash" >"$state_file"
+log "uploaded $name (journal sequence $seq)"

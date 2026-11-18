@@ -1,0 +1,38 @@
+# Installed by deploy/kamal/host-setup.sh (never by CI). Encrypted offsite copy
+# of the lifecycle authority (journal + witness). Also started by the
+# OnSuccess= drop-in of muster-cloud-backup.service.
+[Unit]
+Description=Muster Cloud: encrypted offsite copy of the lifecycle authority
+Documentation=file:///opt/muster-cloud/deploy/KAMAL.md
+After=network-online.target
+Wants=network-online.target
+ConditionPathIsDirectory=/srv/muster-cloud/control
+OnFailure=muster-cloud-alert@%n.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+Environment=RCLONE_CONFIG=/root/.config/rclone/rclone.conf
+Environment=RCLONE_CACHE_DIR=/var/cache/muster-cloud-offsite
+CacheDirectory=muster-cloud-offsite
+ExecStart=/usr/local/sbin/muster-cloud-authority-offsite
+TimeoutStartSec=30min
+Nice=10
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/root/.config/rclone /var/lib/muster-cloud/authority
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX

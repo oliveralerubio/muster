@@ -1,0 +1,380 @@
+#!/usr/bin/env bash
+# muster-cloud-restore-drill — a REAL disaster-recovery rehearsal, on this host,
+# into throwaway targets. Production is never touched: it reads only Google
+# Drive, and writes only into a scratch directory, a throwaway PostgreSQL
+# container with no network at all, and nothing else. Guide: deploy/KAMAL.md
+# ("Disaster recovery").
+#
+#   sudo deploy/kamal/muster-cloud-restore-drill --age-identity FILE
+#        [--shred-identity] [--workdir DIR]
+#
+#   --age-identity FILE   the age PRIVATE key (a path; the key is supplied by
+#                         you at run time and never stored on this host). Put
+#                         it on a RAM disk, e.g. /dev/shm/muster-backup.key.
+#   --shred-identity      shred -u FILE when the drill ends, success or not
+#   --workdir DIR         where the scratch directory is created (default
+#                         /var/tmp). Needs about 4 times the snapshot size.
+#
+# What it does, as the supported recovery procedure does it:
+#   1. downloads the newest COMPLETE snapshot (manifest.json present) and the
+#      newest authority copy from gdrive:muster-cloud-backups into the scratch
+#      directory (rclone copy);
+#   2. decrypts the authority copy with the identity and restores its journal
+#      and witness into scratch control and witness paths;
+#   3. starts a throwaway postgres (the image pinned in config/deploy.yml, no
+#      network, scratch data directory, random password);
+#   4. runs deploy/pg-restore.sh against those targets: it verifies the
+#      snapshot (structure and every hash), restores the database and the Git
+#      store, runs `muster-cloud-ops restore-finalize` (the restored database
+#      joins the authority as a candidate and everything the journal
+#      tombstoned is erased), checks heads and runs `git fsck`, and finally
+#      `muster-cloud-ops restore-check`;
+#   5. repeats restore-check and git fsck on every restored repository, and
+#      compares the restored tenants and heads with manifest.json;
+#   6. prints ONE JSON summary line on stdout: ok, snapshot id and time, the
+#      data-loss bound (seconds since the snapshot was taken), the authority
+#      copy used, repositories fscked, the tenant comparison and the elapsed
+#      seconds;
+#   7. removes everything it created (container, scratch directory), even on
+#      failure.
+#
+# Restored data is plaintext inside the scratch directory (mode 0700, root) for
+# the minutes the drill runs. Exit 0 only when every check passed.
+#
+# Exit codes: 0 ok; 1 a check or step failed (the JSON says which); 64 usage;
+# 69 a required tool or file is missing; 77 not root.
+#
+# Test hooks (all optional): MUSTER_OFFSITE_REMOTE, MUSTER_RCLONE, MUSTER_OPS_BIN,
+# MUSTER_DRILL_ALLOW_NONROOT=1 (then the PostgreSQL container runs as the
+# calling user).
+
+set -uo pipefail
+umask 077
+export LC_ALL=C
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+REPO=$(cd "$HERE/../.." && pwd -P)
+readonly HERE REPO
+readonly REMOTE=${MUSTER_OFFSITE_REMOTE:-gdrive:muster-cloud-backups}
+readonly RCLONE=${MUSTER_RCLONE:-rclone}
+readonly OPS_BIN=${MUSTER_OPS_BIN:-/usr/local/bin/muster-cloud-ops}
+readonly PG_RESTORE_SH=$REPO/deploy/pg-restore.sh
+readonly PG_UID=${MUSTER_DRILL_PG_UID:-10002}
+readonly ID_RE='^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$'
+readonly AUTH_RE='^authority-[0-9]{8}T[0-9]{6}Z-[0-9]+\.tar\.age$'
+readonly NEW_DB=muster_restore
+
+identity=""
+shred_identity=0
+workdir=/var/tmp
+
+usage() {
+  sed -n '2,/^# Exit codes/p' "$0" | sed 's/^# \{0,1\}//' >&2
+  exit 64
+}
+
+while [ "$#" -gt 0 ]; do
+  case $1 in
+    --age-identity)
+      [ "$#" -ge 2 ] || usage
+      identity=$2
+      shift 2
+      ;;
+    --shred-identity)
+      shred_identity=1
+      shift
+      ;;
+    --workdir)
+      [ "$#" -ge 2 ] || usage
+      workdir=$2
+      shift 2
+      ;;
+    *) usage ;;
+  esac
+done
+[ -n "$identity" ] || usage
+
+# ---- result and cleanup --------------------------------------------------------
+STAGE=preflight
+ERR_MSG=""
+DONE=0
+S=""
+container=""
+PW=""
+snapshot_id=""
+snapshot_at=""
+snapshot_age=""
+authority_name=""
+authority_seq=""
+tenant_json="null"
+repos_fscked=0
+restore_check_json="null"
+
+# json_out KEY=VALUE... (KEY:=JSON for a raw JSON value)
+json_out() {
+  python3 -I -c '
+import json, sys
+out = {}
+for arg in sys.argv[1:]:
+    key, _, value = arg.partition("=")
+    if key.endswith(":"):
+        out[key[:-1]] = json.loads(value)
+    else:
+        out[key] = value
+print(json.dumps(out, sort_keys=True))
+' "$@"
+}
+
+fail_json() {
+  json_out ok:=false "stage=$STAGE" "error=$ERR_MSG" "elapsed_seconds:=$SECONDS" \
+    "snapshot_id=$snapshot_id" "authority_copy=$authority_name"
+}
+
+# shellcheck disable=SC2329  # runs through the EXIT trap
+cleanup() {
+  local rc=$?
+  trap - EXIT INT TERM HUP
+  if [ "$DONE" -ne 1 ]; then
+    [ -n "$ERR_MSG" ] || ERR_MSG="interrupted or unexpected error (exit $rc)"
+    fail_json
+    rc=1
+  fi
+  if [ -n "$container" ]; then
+    docker rm -f "$container" >/dev/null 2>&1 || printf 'restore-drill: warning: could not remove container %s\n' "$container" >&2
+  fi
+  if [ -n "$S" ] && [ -d "$S" ]; then
+    rm -rf --one-file-system -- "$S" || printf 'restore-drill: warning: could not remove %s\n' "$S" >&2
+  fi
+  if [ "$shred_identity" -eq 1 ] && [ -f "$identity" ]; then
+    shred -u -- "$identity" 2>/dev/null || rm -f -- "$identity"
+  fi
+  unset PW PGPASSWORD POSTGRES_PASSWORD
+  exit "$rc"
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM HUP
+
+die() {
+  ERR_MSG=$1
+  printf 'restore-drill: %s\n' "$1" >&2
+  exit 1
+}
+say() { printf 'restore-drill: %s\n' "$*" >&2; }
+
+rc_run() { "$RCLONE" "$@" --contimeout 30s --timeout 300s --retries 3 --low-level-retries 10 --stats 0 --log-level NOTICE; }
+
+# ---- preflight --------------------------------------------------------------------
+if [ "${MUSTER_DRILL_ALLOW_NONROOT:-0}" != 1 ] && [ "$(id -u)" -ne 0 ]; then
+  ERR_MSG="must run as root"
+  printf 'restore-drill: must run as root\n' >&2
+  exit 77
+fi
+for tool in "$RCLONE" age docker tar git python3 psql pg_restore createdb dropdb flock; do
+  command -v "$tool" >/dev/null 2>&1 || {
+    ERR_MSG="required tool not found: $tool"
+    printf 'restore-drill: %s\n' "$ERR_MSG" >&2
+    exit 69
+  }
+done
+[ -x "$OPS_BIN" ] || { ERR_MSG="muster-cloud-ops not found at $OPS_BIN"; printf 'restore-drill: %s\n' "$ERR_MSG" >&2; exit 69; }
+[ -f "$PG_RESTORE_SH" ] || { ERR_MSG="missing $PG_RESTORE_SH"; printf 'restore-drill: %s\n' "$ERR_MSG" >&2; exit 69; }
+[ -f "$identity" ] && [ -r "$identity" ] || { ERR_MSG="the age identity file is not readable"; printf 'restore-drill: %s\n' "$ERR_MSG" >&2; exit 69; }
+grep -q '^AGE-SECRET-KEY-' "$identity" || die "the identity file holds no age secret key"
+case $(realpath -m -- "$workdir") in
+  /srv/muster-cloud | /srv/muster-cloud/* | /var/lib/muster-witness | /var/lib/muster-witness/*)
+    die "the scratch directory must not be under the production data ($workdir)"
+    ;;
+esac
+[ -d "$workdir" ] || die "workdir does not exist: $workdir"
+
+pg_image=$(sed -n 's/^[[:space:]]*image:[[:space:]]*\(postgres:[^[:space:]]*\)[[:space:]]*$/\1/p' "$REPO/config/deploy.yml" | head -n 1)
+[[ $pg_image =~ ^postgres:[0-9A-Za-z._-]+@sha256:[0-9a-f]{64}$ ]] || die "cannot read the pinned postgres image from config/deploy.yml"
+
+S=$(mktemp -d "$workdir/muster-restore-drill.XXXXXX") || die "cannot create a scratch directory in $workdir"
+mkdir -m 0700 -- "$S/snapshot" "$S/authority" "$S/control" "$S/witness" || die "cannot create the scratch layout"
+say "scratch directory $S"
+
+# ---- 1. newest complete snapshot and newest authority copy ---------------------------
+STAGE="listing Google Drive"
+remote_manifests=$(rc_run lsf "$REMOTE/snapshots" --recursive --files-only --include manifest.json) \
+  || die "cannot list $REMOTE/snapshots"
+snapshot_id=""
+while IFS= read -r path; do
+  id=${path%%/*}
+  [[ $id =~ $ID_RE ]] && snapshot_id=$id
+done < <(printf '%s\n' "$remote_manifests" | sort)
+[ -n "$snapshot_id" ] || die "no complete snapshot on Google Drive"
+
+remote_auth=$(rc_run lsf "$REMOTE/authority" --files-only) || die "cannot list $REMOTE/authority"
+authority_name=""
+while IFS= read -r name; do
+  [[ $name =~ $AUTH_RE ]] && authority_name=$name
+done < <(printf '%s\n' "$remote_auth" | sort)
+[ -n "$authority_name" ] || die "no authority copy on Google Drive: the backups cannot be restored without one"
+say "newest snapshot $snapshot_id; newest authority copy $authority_name"
+
+STAGE="checking free space"
+snap_bytes=$(rc_run size --json "$REMOTE/snapshots/$snapshot_id" | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["bytes"])') \
+  || die "cannot size the snapshot"
+avail=$(df --output=avail -B1 -- "$workdir" | tail -n 1 | tr -d ' ')
+if [ "$avail" -lt $((snap_bytes * 4 + 1073741824)) ]; then
+  die "not enough free space in $workdir: the drill needs about $((snap_bytes * 4 / 1048576 + 1024)) MiB, $((avail / 1048576)) MiB are free"
+fi
+
+STAGE="downloading"
+rc_run copy "$REMOTE/snapshots/$snapshot_id" "$S/snapshot/$snapshot_id" --checksum || die "download of the snapshot failed"
+rc_run copyto "$REMOTE/authority/$authority_name" "$S/authority/$authority_name" || die "download of the authority copy failed"
+
+# ---- 2. the authority, into scratch control and witness paths --------------------------
+STAGE="restoring the authority"
+age --decrypt -i "$identity" -o "$S/authority/authority.tar" "$S/authority/$authority_name" \
+  || die "cannot decrypt the authority copy with that identity"
+members=$(tar -tf "$S/authority/authority.tar" | sort | tr '\n' ' ')
+[ "$members" = "META.json journal.v1.jsonl witness.json " ] || die "the authority archive holds unexpected members: $members"
+mkdir -m 0700 -- "$S/authority/x"
+tar -xf "$S/authority/authority.tar" --no-same-owner --no-same-permissions -C "$S/authority/x" || die "cannot unpack the authority archive"
+install -m 0600 -- "$S/authority/x/journal.v1.jsonl" "$S/control/journal.v1.jsonl"
+install -m 0600 -- "$S/authority/x/witness.json" "$S/witness/witness.json"
+authority_seq=$(python3 -I -c 'import json,sys; print(int(json.load(open(sys.argv[1]))["journal_sequence"]))' "$S/authority/x/META.json") \
+  || die "cannot read META.json of the authority copy"
+rm -rf --one-file-system -- "$S/authority"
+
+# ---- 3. a throwaway postgres ----------------------------------------------------------------
+STAGE="starting the throwaway postgres"
+pg_user_arg="$PG_UID:$PG_UID"
+if [ "${MUSTER_DRILL_ALLOW_NONROOT:-0}" = 1 ]; then
+  pg_user_arg="$(id -u):$(id -g)"
+else
+  mkdir -m 0700 -- "$S/pgdata" "$S/pgsocket"
+  chown "$PG_UID:$PG_UID" "$S/pgdata" "$S/pgsocket"
+fi
+[ -d "$S/pgdata" ] || mkdir -m 0700 -- "$S/pgdata" "$S/pgsocket"
+PW=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
+container=muster-drill-pg-$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')
+POSTGRES_PASSWORD=$PW docker run --detach --name "$container" --network none \
+  --user "$pg_user_arg" --memory 1g --cpus 2 --shm-size 256m --pids-limit 512 \
+  --security-opt no-new-privileges --cap-drop ALL \
+  -e POSTGRES_USER=muster -e POSTGRES_DB=postgres -e POSTGRES_PASSWORD \
+  -e POSTGRES_INITDB_ARGS="--auth-local=scram-sha-256 --auth-host=scram-sha-256" \
+  -v "$S/pgdata:/var/lib/postgresql/data" -v "$S/pgsocket:/var/run/postgresql" \
+  "$pg_image" >/dev/null || die "cannot start the throwaway postgres"
+
+export PGHOST=$S/pgsocket PGUSER=muster PGPASSWORD=$PW PGDATABASE=postgres
+ready=0
+for _ in $(seq 1 90); do
+  if docker logs "$container" 2>&1 | grep -q 'PostgreSQL init process complete' \
+    && psql -Atc 'SELECT 1' >/dev/null 2>&1; then
+    ready=1
+    break
+  fi
+  sleep 1
+done
+[ "$ready" -eq 1 ] || die "the throwaway postgres did not become ready"
+say "throwaway postgres is ready (no network, scratch data directory)"
+
+# ---- 4. the supported restore procedure ---------------------------------------------------
+STAGE="deploy/pg-restore.sh"
+admin_url="postgres://muster:$PW@localhost/postgres?host=$S/pgsocket"
+if MUSTER_RESTORE_ADMIN_URL=$admin_url MUSTER_CLOUD_OPS=$OPS_BIN \
+  "$PG_RESTORE_SH" --backup "$S/snapshot/$snapshot_id" --new-db "$NEW_DB" --new-repo-root "$S/repos" \
+  --control-dir "$S/control" --control-witness "$S/witness/witness.json" \
+  --age-identity-file "$identity" >"$S/pg-restore.log" 2>&1; then
+  say "pg-restore.sh finished: $(grep -E '^pg-restore.sh: database=' "$S/pg-restore.log" | tail -n 1)"
+else
+  rc=$?
+  say "pg-restore.sh exited $rc; last lines:"
+  tail -n 15 "$S/pg-restore.log" >&2
+  die "deploy/pg-restore.sh failed (exit $rc)"
+fi
+
+# ---- 5. independent checks -------------------------------------------------------------------
+STAGE="restore-check"
+new_db_url="postgres://muster:$PW@localhost/$NEW_DB?host=$S/pgsocket"
+restore_check_json=$(MUSTER_CONTROL_DIR="$S/control" MUSTER_CONTROL_WITNESS="$S/witness/witness.json" \
+  MUSTER_REPO_ROOT="$S/repos" MUSTER_DATABASE_URL=$new_db_url "$OPS_BIN" restore-check 2>"$S/restore-check.err") \
+  || die "muster-cloud-ops restore-check refused the restored database: $(head -c 300 "$S/restore-check.err" | tr '\n' ' ')"
+unset new_db_url
+role=$(printf '%s' "$restore_check_json" | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["db"]["role"])') \
+  || die "cannot read the restore-check output"
+[ "$role" = candidate ] || die "the restored database is '$role', expected a candidate incarnation"
+
+STAGE="git fsck"
+repos_fscked=0
+for repo in "$S"/repos/*.git; do
+  [ -d "$repo" ] || continue
+  repos_fscked=$((repos_fscked + 1))
+  git -C "$repo" fsck --no-progress --no-dangling >/dev/null 2>&1 || die "git fsck failed for restored repository ${repo##*/}"
+done
+
+STAGE="comparing tenants and heads with manifest.json"
+PGDATABASE=$NEW_DB psql -At -F ' ' -c \
+  "SELECT w.id, COALESCE(h.head_revision, '') FROM workspaces w LEFT JOIN workspace_heads h ON h.workspace_id = w.id ORDER BY w.id" \
+  >"$S/restored-heads.txt" || die "cannot read the restored tenants"
+tenant_json=$(python3 -I -c '
+import json, os, sys
+manifest_path, heads_path, repos_dir, journal_path = sys.argv[1:5]
+manifest = json.load(open(manifest_path))
+want = {t["workspace_id"]: t for t in manifest["tenants"]}
+got = {}
+for line in open(heads_path):
+    parts = line.split()
+    if parts:
+        got[parts[0]] = parts[1] if len(parts) > 1 else None
+repos = {n[:-4] for n in os.listdir(repos_dir) if n.endswith(".git")} if os.path.isdir(repos_dir) else set()
+gone = set()
+for line in open(journal_path, encoding="utf-8"):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        record = json.loads(line)["record"]
+    except (ValueError, KeyError):
+        continue
+    if record.get("kind") in ("workspace_tombstoned", "workspace_purged"):
+        gone.add(record["workspace_id"])
+missing = sorted(set(want) - set(got))
+erased = [w for w in missing if w in gone]
+unexplained = [w for w in missing if w not in gone]
+extra = sorted(set(got) - set(want))
+head_mismatch = sorted(w for w in set(want) & set(got) if (want[w]["head"] or None) != (got[w] or None))
+repo_missing = sorted(w for w in set(want) & set(got) if want[w]["git"] and w not in repos)
+repo_extra = sorted(w for w in repos if w not in want or not want[w]["git"])
+repo_extra = [w for w in repo_extra if w in got or w not in gone]
+ok = not (unexplained or extra or head_mismatch or repo_missing or repo_extra)
+print(json.dumps({
+    "ok": ok,
+    "manifest_tenants": len(want),
+    "restored_tenants": len(got),
+    "erased_by_journal_after_snapshot": len(erased),
+    "missing_unexplained": unexplained,
+    "extra_in_restore": extra,
+    "head_mismatch": head_mismatch,
+    "repo_missing": repo_missing,
+    "repo_extra": repo_extra,
+}, sort_keys=True))
+' "$S/snapshot/$snapshot_id/manifest.json" "$S/restored-heads.txt" "$S/repos" "$S/control/journal.v1.jsonl") \
+  || die "cannot compare the restored tenants with manifest.json"
+tenants_ok=$(printf '%s' "$tenant_json" | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["ok"])')
+[ "$tenants_ok" = True ] || {
+  say "tenant comparison: $tenant_json"
+  die "the restored tenants or heads differ from manifest.json"
+}
+
+# ---- 6. summary -------------------------------------------------------------------------------
+snapshot_at=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["snapshot_at"])' "$S/snapshot/$snapshot_id/manifest.json") \
+  || die "cannot read snapshot_at from manifest.json"
+snapshot_age=$(python3 -I -c '
+import sys, time
+from datetime import datetime, timezone
+at = datetime.fromisoformat(sys.argv[1])
+print(int(time.time() - at.astimezone(timezone.utc).timestamp()))
+' "$snapshot_at") || die "cannot compute the snapshot age"
+
+DONE=1
+json_out ok:=true "snapshot_id=$snapshot_id" "snapshot_at=$snapshot_at" \
+  "snapshot_age_seconds:=$snapshot_age" "max_data_loss_seconds:=$snapshot_age" \
+  "authority_copy=$authority_name" "authority_journal_sequence:=$authority_seq" \
+  "restored_incarnation_role=$role" "repos_fscked:=$repos_fscked" \
+  "tenants:=$tenant_json" "restore_check:=$restore_check_json" \
+  "elapsed_seconds:=$SECONDS" cleanup=done

@@ -2,9 +2,14 @@
 # bin/kamal — run Kamal from its official, pinned container image. No Ruby on
 # the host: the only requirement is Docker.
 #
-#   bin/kamal config            render the resolved configuration (secrets redacted)
-#   bin/kamal deploy --skip-push --version <sha>
+#   bin/kamal config                      render the resolved configuration (secrets redacted)
+#   bin/kamal app boot --version <sha>    switch to an image already on the host
 #   bin/kamal rollback <sha>
+#   bin/kamal accessory boot db           first start of the database
+#
+# Do not use `kamal deploy`: it pulls the image through an SSH tunnel to the
+# local registry, which does not exist (config/deploy.yml). The host's
+# muster-cloud-autodeploy pulls the image and runs `app boot` instead.
 #
 # Guide: deploy/KAMAL.md.
 #
@@ -17,17 +22,18 @@
 #     .kamal/secrets through deploy/kamal/secret;
 #   - these variables, when set: MUSTER_CLOUD_PUBLIC_URL, MUSTER_PADDLE_ENVIRONMENT,
 #     MUSTER_PADDLE_PRICE_PERSONAL, MUSTER_PADDLE_PRICE_TEAM_SEAT,
-#     KAMAL_REGISTRY_PASSWORD, MUSTER_CLOUD_SECRETS_FILE.
+#     MUSTER_CLOUD_SECRETS_FILE. There is no registry credential anywhere.
 #
 # Non-secret settings come from /etc/muster-cloud/deploy.env when it exists
 # (override its path with MUSTER_CLOUD_DEPLOY_ENV). It is parsed, never
-# sourced: KEY=VALUE lines for the four non-secret variables above only, and a
-# variable already set in your environment wins.
+# sourced: KEY=VALUE lines for the four non-secret variables above (plus
+# ALERT_TARGET, which only the host's alert script reads and is ignored here),
+# and a variable already set in your environment wins.
 #
 # The container shares the host network so SSH to the host's own Tailscale
-# address works the same from CI (which runs on that host) and from a laptop.
-# The Docker socket is NOT mounted unless KAMAL_WRAPPER_DOCKER=1 (needed only
-# for a manual build+push: `bin/kamal deploy` without --skip-push).
+# address works the same from the autodeploy timer (which runs on that host)
+# and from a laptop. The Docker socket is NOT mounted unless
+# KAMAL_WRAPPER_DOCKER=1 (nothing in this deployment needs it).
 #
 # The image is pinned by digest (the multi-arch index of ghcr.io/basecamp/kamal
 # v2.12.0). To upgrade: pick the new tag, resolve its digest with
@@ -67,7 +73,8 @@ load_deploy_env() {
           export "$key=$value"
         fi
         ;;
-      *) die "$file: unexpected line (only the four non-secret variables are allowed there)" ;;
+      ALERT_TARGET) ;; # read by muster-cloud-alert, not by Kamal
+      *) die "$file: unexpected line (only the non-secret settings are allowed there)" ;;
     esac
   done <"$file"
 }
@@ -111,7 +118,7 @@ fi
 # Pass by name only: values never appear on the command line.
 for name in MUSTER_CLOUD_PUBLIC_URL MUSTER_PADDLE_ENVIRONMENT \
   MUSTER_PADDLE_PRICE_PERSONAL MUSTER_PADDLE_PRICE_TEAM_SEAT \
-  KAMAL_REGISTRY_PASSWORD MUSTER_CLOUD_SECRETS_FILE; do
+  MUSTER_CLOUD_SECRETS_FILE; do
   if [ -n "${!name:-}" ]; then
     args+=(--env "$name")
   fi
