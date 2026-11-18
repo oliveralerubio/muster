@@ -289,6 +289,8 @@ boot_version() { # version
   echo "muster-cloud-web-$v" >"$S/route"
   touch "$S/ready"
   [ ! -e "$S/hold-after-boot" ] || touch "$S/state/hold" # the operator sets the hold while Kamal boots
+  : >"$S/boot-started"
+  [ ! -e "$S/boot-wait" ] || sleep 2 # the boot is slow: a test acts while it runs
   if [ -n "$old" ] && [ "$old" != "$v" ] && [ -e "$S/c/muster-cloud-web-$old" ]; then
     stop_c "muster-cloud-web-$old"
   fi
@@ -334,7 +336,7 @@ case "$1 $2" in
   "prune all") locked ;;
 esac
 EOF
-  printf '#!/bin/sh\nexit 0\n' >"$T/work/deploy/kamal/host-setup.sh"
+  printf '#!/bin/sh\necho "caller=${MUSTER_HOST_SETUP_CALLER:-}" >>"$T/host-setup.log"\nexit 0\n' >"$T/work/deploy/kamal/host-setup.sh"
   chmod +x "$T/work/bin/kamal" "$T/work/deploy/kamal/host-setup.sh"
   git -C "$T/work" init -q -b main
   git -C "$T/work" add -A
@@ -1111,7 +1113,8 @@ mkdir -p "$T/state/attempts"
 printf '%s %s\n' 3 "$(date +%s)" >"$T/state/attempts/$REL"
 rm -f "$T/fail-app-boot"
 run_it
-check "redeploy past the retry limit: not retried, request kept" eval '[ -e "$T/state/redeploy" ] && [ "$(count_of kamal.log '\''kamal app boot'\'')" -eq 1 ]'
+check "redeploy past the retry limit: not retried, dropped with an alert, no second boot" eval '[ ! -e "$T/state/redeploy" ] && [ ! -e "$T/state/redeploy.inflight" ] && logged alert.log "failed 3 times; dropped" && [ "$(count_of kamal.log '\''kamal app boot'\'')" -eq 1 ]'
+check "redeploy past the retry limit: the run goes on with HEAD (already running: no-op)" has "no-op: main HEAD ${REL:0:12} is already running"
 
 setup_head_running redeploy-touched-during-deploy
 touch "$T/state/redeploy" "$T/retouch-redeploy"
@@ -1151,14 +1154,49 @@ rm -f "$T/state/hold" "$T/hold-on-pull"
 setup_deploy hold-during-kamal-boot
 touch "$T/hold-after-boot"
 run_it
-check "hold set while Kamal boots: stops after that call, exit 0" eval '[ "$rc" -eq 0 ] && has "decision: hold:" && logged kamal.log "kamal app boot --version $REL"'
-check "hold set while Kamal boots: no muster-cloud-ops install, no record" eval 'not_logged alert.log "install-ops" && recorded_is "$SHA"'
-check "hold set while Kamal boots: no stop by name, no prune" eval 'not_logged stop.log "by=docker" && not_logged kamal.log "prune"'
-check "hold set while Kamal boots: the cut-short marker stays" [ -e "$T/state/deploying" ]
+check "hold set once the switch began: the run finishes its own deploy (exit 0, no hold stop)" eval '[ "$rc" -eq 0 ] && lacks "decision: hold:" && has "decision: deployed ${REL:0:12}"'
+check "hold set once the switch began: verified, recorded, marker gone, old container stopped" eval 'logged alert.log "install-ops" && recorded_is "$REL" && routed_is "$REL" && [ ! -e "$T/state/deploying" ] && logged stop.log "muster-cloud-web-$SHA"'
+check "hold set once the switch began: the hold stays for the operator" [ -e "$T/state/hold" ]
 rm -f "$T/state/hold" "$T/hold-after-boot"
+
+# P1: the hold is set after the switch and readiness then fails: the run rolls
+# back and alerts (it never logs "rolling back" and walks away), and --hold
+# returns only after all of that.
+setup_deploy hold-after-switch-readiness-fails
+touch "$T/boot-wait" "$T/public-down"
+bg_run
+wait_for "$T/boot-started" # the proxy now routes to REL, Kamal is still booting
+run_it --hold              # blocks on the flock until the run has finished
+hold_out=$out
+hold_rc=$rc
+bg_done_wait() { for _ in $(seq 1 30); do [ -e "$T/bg.rc" ] && ! kill -0 "$bg_pid" 2>/dev/null && return 0; sleep 0.1; done; return 1; }
+check "hold after the switch: --hold prints held and exits 0" eval '[ "$hold_rc" -eq 0 ] && [ "$hold_out" = held ]'
+check "hold after the switch: the run was over when --hold returned (rollback and alert already done)" eval 'logged kamal.log "kamal rollback $SHA" && logged alert.log "fire autodeploy:${REL:0:12}"'
+bg_done_wait
+out=$(cat "$T/bg.out")
+check "hold after the switch, readiness fails: rolls back to the previous version and alerts (exit 75)" eval '[ "$(cat "$T/bg.rc")" -eq 75 ] && has "rolling back to ${SHA:0:12}" && has "FAILED while checking /readyz" && lacks "decision: hold:"'
+check "hold after the switch: the previous version is routed, running and recorded" eval 'routed_is "$SHA" && grep -qx running "$T/c/muster-cloud-web-$SHA" && recorded_is "$SHA" && [ ! -e "$T/state/deploying" ]'
+check "hold after the switch: the alert says the rollback worked" logged alert.log "rolled back to ${SHA:0:12}, which serves again"
+check "hold after the switch: the hold marker is there" [ -e "$T/state/hold" ]
+rm -f "$T/state/hold" "$T/boot-wait" "$T/public-down" "$T/boot-started" "$T/bg.rc"
+
+# The same with the hold already set when Kamal boots (deterministic variant).
+setup_deploy hold-after-boot-readiness-fails
+touch "$T/hold-after-boot" "$T/public-down"
 run_it
-check "hold set while Kamal boots: the stopped deploy is not counted as a failed attempt" eval '[ -z "$(ls "$T/state/attempts")" ]'
-check "after the release the next run finishes the deploy" eval 'has "decision: incomplete deploy: a previous deploy was cut short" && has "decision: deployed ${REL:0:12}" && recorded_is "$REL" && [ ! -e "$T/state/deploying" ]'
+check "hold set while Kamal boots, readiness fails: rolled back and alerted" eval '[ "$rc" -eq 75 ] && logged kamal.log "kamal rollback $SHA" && logged alert.log "fire autodeploy:${REL:0:12}" && routed_is "$SHA" && recorded_is "$SHA" && lacks "decision: hold:"'
+rm -f "$T/state/hold" "$T/hold-after-boot" "$T/public-down"
+
+# A hold set BEFORE the switch still stops the run, and the deploy stopped that
+# way is not counted as a failed attempt.
+setup_deploy hold-before-switch-not-counted
+touch "$T/hold-on-pull"
+run_it
+check "hold set before the switch: stops, no marker, no attempt counted" eval '[ "$rc" -eq 0 ] && has "decision: hold:" && [ ! -e "$T/state/deploying" ] && [ -z "$(ls "$T/state/attempts")" ]'
+rm -f "$T/state/hold" "$T/hold-on-pull"
+run_it
+check "after the release the next run deploys" eval 'has "decision: deployed ${REL:0:12}" && recorded_is "$REL"'
+check "autodeploy tells host-setup it is the caller (no guard-only marker on a first deploy)" logged host-setup.log "caller=autodeploy"
 
 setup_deploy hold-guard-stops-before-start
 echo exited >"$T/c/muster-cloud-web-$SHA"
@@ -1264,10 +1302,48 @@ run_it
 check "a killed run's inflight request is given back and served by the next run" eval 'has "decision: redeploy requested" && has "decision: deployed ${REL:0:12}" && [ ! -e "$T/state/redeploy" ] && [ ! -e "$T/state/redeploy.inflight" ]'
 
 setup_head_running redeploy-inflight-hold
-touch "$T/state/redeploy" "$T/hold-after-boot"
+touch "$T/state/redeploy" "$T/hold-on-pull" "$T/no-local-image" # the hold arrives while the image is pulled, before the switch
 run_it
-check "hold in the middle of a redeploy: the request is given back, not lost" eval 'has "decision: hold:" && [ -e "$T/state/redeploy" ] && [ ! -e "$T/state/redeploy.inflight" ]'
+check "hold in the middle of a redeploy (before the switch): the request is given back, not lost" eval 'has "decision: hold:" && [ -e "$T/state/redeploy" ] && [ ! -e "$T/state/redeploy.inflight" ]'
 rm -f "$T/state/hold"
+
+# P2: a process that did not consume the request never gives it back.
+setup_head_running inflight-not-mine
+touch "$T/state/redeploy.inflight" # another run consumed the request and is deploying right now
+hold_lock
+run_it --guard
+check "a guard that did not get the flock leaves another run's redeploy.inflight alone" eval '[ -e "$T/state/redeploy.inflight" ] && [ ! -e "$T/state/redeploy" ]'
+run_it
+check "a full run that did not get the flock leaves redeploy.inflight alone" eval 'has "skip: another autodeploy run is active" && [ -e "$T/state/redeploy.inflight" ] && [ ! -e "$T/state/redeploy" ]'
+run_it --hold &
+hold_pid=$!
+sleep 0.5
+release_lock
+wait "$hold_pid"
+check "--hold leaves redeploy.inflight alone" eval '[ -e "$T/state/redeploy.inflight" ] && [ ! -e "$T/state/redeploy" ]'
+rm -f "$T/state/hold"
+
+# P2: a redeploy that hit the retry limit is dropped (one alert) and the same run
+# goes on with main's HEAD: it must not pin every later run to that sha.
+newer_head() { # a second commit on main in the fake origin; its image is not here yet
+  git -C "$T/work" -c user.name=test -c user.email=test@example.invalid -c commit.gpgsign=false commit -q --allow-empty -m newer
+  git -C "$T/work" push -q "$T/origin.git" HEAD:main
+  NEW=$(git -C "$T/work" rev-parse HEAD)
+  printf '%s\n' "$NEW" >"$T/github-head"
+  printf '%s\n' "$NEW" >"$T/revision"
+  touch "$T/no-local-image"
+}
+setup_head_running redeploy-exhausted-newer-head
+mkdir -p "$T/state/attempts"
+printf '3 %s\n' "$(date +%s)" >"$T/state/attempts/$REL"
+touch "$T/state/redeploy"
+newer_head
+run_it
+check "an exhausted redeploy: dropped with one alert" eval 'has "redeploy of ${REL:0:12} failed 3 times; dropping the request" && [ "$(count_of alert.log "fire autodeploy-redeploy:${REL:0:12} muster-cloud: redeploy of ${REL:0:12} failed 3 times; dropped")" -eq 1 ] && [ ! -e "$T/state/redeploy" ] && [ ! -e "$T/state/redeploy.inflight" ]'
+check "an exhausted redeploy: the same run deploys the newer HEAD" eval '[ "$rc" -eq 0 ] && has "decision: deployed ${NEW:0:12}" && logged kamal.log "kamal app boot --version $NEW" && routed_is "$NEW" && recorded_is "$NEW"'
+check "an exhausted redeploy: the exhausted sha was not booted again" not_logged kamal.log "--version $REL"
+run_it
+check "an exhausted redeploy: the next run is a no-op and sends nothing more" eval 'has "no-op: main HEAD ${NEW:0:12} is already running" && [ "$(count_of alert.log "redeploy of")" -eq 1 ]'
 
 # ---- F3/F9: the candidate is probed itself; cleanup re-reads the route ------------------------------
 setup_deploy routes-unreadable-candidate-down

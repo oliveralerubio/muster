@@ -2,8 +2,10 @@
 # deploy/tests/host-setup-fresh.sh — tests that `host-setup.sh` makes a fresh
 # host safe BEFORE the timers are enabled: with no `deployed` record it creates
 # the `guard-only` marker (so nothing can deploy before `init`), it never adds
-# one to a host that has deployed, and never touches an existing guard-only or
-# hold. Also that the drill's boot-time cleanup rule is installed.
+# one to a host that has deployed or when autodeploy itself calls it
+# (MUSTER_HOST_SETUP_CALLER=autodeploy: its first deploy runs host-setup before
+# it writes `deployed`), and never touches an existing guard-only or hold. Also
+# that the drill's boot-time cleanup rule is installed.
 #
 #   deploy/tests/host-setup-fresh.sh
 #
@@ -32,6 +34,8 @@ mkdir -p /var/lib/muster-cloud
 S=/var/lib/muster-cloud/autodeploy
 run() { "$R/repo/deploy/kamal/host-setup.sh" --check 2>&1 | grep -E 'guard-only|tmpfiles' ; }
 echo "== fresh";    run
+echo "== autodeploy"; MUSTER_HOST_SETUP_CALLER=autodeploy run
+echo "== other-caller"; MUSTER_HOST_SETUP_CALLER=someone run
 mkdir -p $S; : >$S/deployed
 echo "== deployed"; run
 rm -f $S/deployed; : >$S/guard-only
@@ -73,6 +77,10 @@ check_not() { # description section pattern
 
 check "a fresh host gets the guard-only marker" fresh "fresh host: create /var/lib/muster-cloud/autodeploy/guard-only"
 check "the drill's boot-time cleanup rule is installed" fresh "muster-cloud-drill.conf"
+# autodeploy's first deploy runs host-setup before it writes `deployed`: no marker then.
+check_not "called by autodeploy with no deployed record: no guard-only is created" autodeploy "create /var/lib/muster-cloud/autodeploy/guard-only"
+check "...and says why" autodeploy "called by autodeploy"
+check "any other caller value still gets the marker on a fresh host" other-caller "fresh host: create /var/lib/muster-cloud/autodeploy/guard-only"
 check_not "a host that has deployed gets none" deployed "create /var/lib/muster-cloud/autodeploy/guard-only"
 check "...and says why" deployed "has deployed before"
 check_not "an existing guard-only is left alone" marker "create /var/lib/muster-cloud/autodeploy/guard-only"

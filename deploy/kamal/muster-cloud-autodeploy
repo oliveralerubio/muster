@@ -42,12 +42,14 @@
 #
 # One gate, `gate`, runs immediately before EVERY side effect (each Kamal call,
 # docker start/stop/pull, record, marker, checkout and host change): while
-# $STATE/hold exists the run stops cleanly (exit 0, nothing more is changed; a
-# deploy stopped half way keeps its `deploying` marker and is finished after the
-# release).
+# $STATE/hold exists the run stops cleanly (exit 0, nothing more is changed). The
+# hold only stops a run from STARTING new work: once the deploy has written its
+# `deploying` marker (the proxy switch has begun) the run finishes that deploy,
+# verifies it and, on failure, rolls back and alerts, ignoring the hold.
 #
 # Hold (maintenance mode): while $STATE/hold exists the guard and the full run
-# do nothing at all (no start, no stop, no deploy, no record change, no GitHub).
+# do nothing at all (no start, no stop, no deploy, no record change, no GitHub);
+# a deploy past its switch is the one thing that still completes (see above).
 # Use `muster-cloud-autodeploy --hold` BEFORE any manual Kamal command or a
 # cutover (it returns once nothing of autodeploy is running any more) and
 # `--release` afterwards. One journal line when the marker is new and then every
@@ -61,6 +63,8 @@
 # exact sha is pulled. The request is consumed atomically at the start
 # (redeploy -> redeploy.inflight): removed when the deploy succeeded, given back
 # when it did not (unless a new request arrived meanwhile), under the retry limit.
+# Only the run that consumed it ever gives it back. A request whose sha already
+# failed the limit is dropped with one alert, and the run goes on with main's HEAD.
 #
 # "What runs now" is the version kamal-proxy routes the muster-cloud-web service
 # to (`kamal-proxy list`), not a container that merely exists. A deploy cut short
@@ -173,6 +177,8 @@ work=""
 run_dir=""
 OLDER=0
 REDEPLOY_DONE=0 # 1 once the redeploy request this run consumed was satisfied
+INFLIGHT_MINE=0 # 1 once THIS run created redeploy.inflight (a run that did not is never to touch it)
+SWITCHED=0      # 1 from the moment the deploy writes its `deploying` marker: the hold no longer stops this run
 
 # redeploy_settle: the request a run consumed (redeploy -> redeploy.inflight) is
 # removed when it was satisfied, or when a new request arrived meanwhile;
@@ -191,7 +197,10 @@ on_exit() {
   if [ "$rc" -ne 0 ] && [ "$rc" -ne 75 ] && [ "$HANDLED" -eq 0 ]; then
     log "unexpected error (exit $rc)"
   fi
-  redeploy_settle
+  # Only the run that consumed the request settles it: a guard, a run that lost
+  # the flock or --hold exits through here too, and redeploy.inflight may be
+  # another process's.
+  [ "$INFLIGHT_MINE" -eq 0 ] || redeploy_settle
   [ -z "$run_dir" ] || rm -rf --one-file-system -- "$run_dir"
   [ -z "$work" ] || rm -rf --one-file-system -- "$work"
 }
@@ -204,6 +213,11 @@ trap 'log "unexpected error at line $LINENO"' ERR
 # the exit would only end the subshell.
 gate() {
   [ -e "$STATE/hold" ] || return 0
+  # The hold only stops a run from STARTING new work. Once the proxy switch has
+  # begun (the `deploying` marker is written) the run finishes its own deploy,
+  # verifies it and, on failure, rolls back and alerts, whatever the hold says:
+  # stopping half way would leave the old container stopped and nobody told.
+  [ "$SWITCHED" -eq 0 ] || return 0
   attempt_undo # a deploy the hold stopped is not a failed attempt
   decide "hold: $STATE/hold is set; stopping before the next change"
   exit 0
@@ -420,6 +434,16 @@ verify_ready() { # base-url
 
 # ---- failed attempts -----------------------------------------------------------------
 attempt_file() { printf '%s/attempts/%s' "$STATE" "$1"; }
+
+attempts_count() { # sha -> the number of failed attempts on record (0 when none)
+  local file count=0 last
+  file=$(attempt_file "$1")
+  if [ -f "$file" ]; then
+    read -r count last <"$file" || count=0
+    [[ $count =~ ^[0-9]+$ ]] || count=0
+  fi
+  printf '%s' "$count"
+}
 
 attempts_allow() { # sha -> 0 when a new attempt may start
   local file count last now
@@ -728,7 +752,6 @@ stop_other_webs() {
 
 # ---- the deploy proper ---------------------------------------------------------------------
 STAGE=""
-SWITCHED=0
 
 # local_image_ok SHA -> 0 when the local-registry-named image of that exact sha is
 # already here (its revision label is the sha): nothing needs pulling.
@@ -1166,11 +1189,12 @@ web_count=$(grep -c . <<<"$web_versions" || true)
 
 # A redeploy request is consumed here, atomically (redeploy -> redeploy.inflight);
 # redeploy_settle removes it after a successful deploy and gives it back otherwise.
-redeploy_settle # a killed run's leftover
+redeploy_settle # a killed run's leftover (this run holds the flock: nobody else owns it)
 redeploy=0
 if [ -e "$STATE/redeploy" ]; then
   gate
   if mv -- "$STATE/redeploy" "$STATE/redeploy.inflight" 2>/dev/null; then
+    INFLIGHT_MINE=1
     redeploy=1
   fi
 fi
@@ -1181,6 +1205,15 @@ if [ "$redeploy" -eq 1 ]; then
   if [ -z "$target" ]; then
     decide "redeploy requested, but no version runs or is recorded; deploying main HEAD as usual"
     REDEPLOY_DONE=1
+    redeploy=0
+  elif [ "$(attempts_count "$target")" -ge "$MAX_ATTEMPTS" ]; then
+    # A request that already failed the limit must not pin every later run to
+    # this sha (and so block every later release): drop it, say so once, and go
+    # on with main's HEAD in this same run.
+    gate
+    rm -f -- "$STATE/redeploy.inflight"
+    decide "redeploy of $(short "$target") failed $MAX_ATTEMPTS times; dropping the request and continuing with main HEAD"
+    alert_fire "autodeploy-redeploy:$(short "$target")" "muster-cloud: redeploy of $(short "$target") failed $MAX_ATTEMPTS times; dropped. Autodeploy goes on with main HEAD. Check: journalctl -u muster-cloud-autodeploy -n 100; ask again with: touch $STATE/redeploy"
     redeploy=0
   else
     decide "redeploy requested: booting the running version $(short "$target") again (no GitHub, no CI)"
@@ -1284,7 +1317,7 @@ decide "source checkout is at $s"
 
 gate
 hs_out="$work/host-setup.out"
-if "$SOURCE/deploy/kamal/host-setup.sh" >"$hs_out" 2>&1; then
+if MUSTER_HOST_SETUP_CALLER=autodeploy "$SOURCE/deploy/kamal/host-setup.sh" >"$hs_out" 2>&1; then
   hs_rc=0
 else
   hs_rc=$?
@@ -1344,8 +1377,8 @@ if [ "$SWITCHED" -eq 1 ]; then
   fi
 fi
 # The failure is handled (rolled back or alerted): the marker of a cut-short
-# deploy is for kills and crashes only. (Under a hold it stays: the alert below
-# must still go out, and the next run after the release boots again.)
-[ -e "$STATE/hold" ] || rm -f -- "$STATE/deploying"
+# deploy is for kills and crashes only. (Before the switch a hold may have been
+# set meanwhile: then the marker of an earlier cut-short run stays.)
+if [ "$SWITCHED" -eq 1 ] || [ ! -e "$STATE/hold" ]; then rm -f -- "$STATE/deploying"; fi
 decide "failed: $s while $STAGE; $outcome"
 fail_handled "autodeploy:$s" "deploy of $s FAILED while $STAGE; $outcome. Retries: at most $MAX_ATTEMPTS, 30 minutes apart. Details: journalctl -u muster-cloud-autodeploy -n 100"

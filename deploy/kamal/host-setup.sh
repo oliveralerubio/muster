@@ -33,7 +33,10 @@
 #   fresh host    when /var/lib/muster-cloud/autodeploy/deployed does not exist
 #                 yet, the marker .../autodeploy/guard-only is created BEFORE the
 #                 timers are enabled, so nothing can deploy before `init` (the
-#                 guide's bootstrap removes it in step 7)
+#                 guide's bootstrap removes it in step 7). Not when called by
+#                 autodeploy (MUSTER_HOST_SETUP_CALLER=autodeploy, below): its
+#                 first deploy runs this before it writes `deployed`, and the
+#                 marker would block every later run
 #   drill key     /etc/muster-cloud/drill-age.key (root 0400): a SECOND age
 #                 identity only the monthly restore drill uses, generated here
 #                 when missing. Its public half is added to ops.env as an extra
@@ -51,7 +54,10 @@
 #   funnel        `tailscale funnel --bg --https=10000 http://127.0.0.1:18110`
 #
 # muster-cloud-autodeploy runs this script in apply mode from the checkout it is
-# about to deploy, so everything listed above follows the release by itself.
+# about to deploy, so everything listed above follows the release by itself. It
+# sets the environment variable MUSTER_HOST_SETUP_CALLER=autodeploy for that call;
+# the only thing it changes is that the `guard-only` marker is never created
+# (autodeploy running means someone already removed it on purpose).
 #
 # It refuses to proceed unless /etc/muster-cloud/ops.env is a regular file
 # owned by root with mode 0600. It also CHECKS (never creates) the secret
@@ -672,9 +678,13 @@ fi
 # A fresh host has no `deployed` record: until `init` has run, nothing may
 # deploy (the timer would pull the HEAD of main onto an empty database).
 # guard-only keeps the guard but stops deploys; the bootstrap removes it. It is
-# created BEFORE the timers are enabled below, never on a host that deployed.
+# created BEFORE the timers are enabled below, never on a host that deployed and
+# never when autodeploy itself calls this script (its first deploy runs it before
+# it writes `deployed`; the marker would block every later run).
 if [ -e "$STATE_BASE/autodeploy/deployed" ]; then
   ok "this host has deployed before ($STATE_BASE/autodeploy/deployed): no guard-only marker is added"
+elif [ "${MUSTER_HOST_SETUP_CALLER:-}" = autodeploy ]; then
+  ok "called by autodeploy: no guard-only marker is added"
 elif [ -e "$STATE_BASE/autodeploy/guard-only" ] || [ -e "$STATE_BASE/autodeploy/hold" ]; then
   ok "fresh host: $STATE_BASE/autodeploy already has a guard-only or hold marker"
 else

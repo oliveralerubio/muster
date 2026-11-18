@@ -207,7 +207,10 @@ On a fresh host (no `/var/lib/muster-cloud/autodeploy/deployed` record yet)
 (`/var/lib/muster-cloud/autodeploy/guard-only`) **before it enables the timers**,
 so nothing can deploy before `init` (step 6) and you have nothing to remember. The
 marker stays until you remove it in step 7. On a host that has deployed before it
-adds nothing, and never touches an existing `guard-only` or `hold`.
+adds nothing, and never touches an existing `guard-only` or `hold`. When
+autodeploy itself runs `host-setup.sh` (it sets `MUSTER_HOST_SETUP_CALLER=autodeploy`)
+the marker is never created either: the first deploy runs it before it records
+`deployed`, and the marker would block every later run.
 
 It creates what is missing (accounts, directories with exact modes, the
 `kamal` Docker network with the fixed subnet `172.31.250.0/24`), installs the
@@ -377,7 +380,9 @@ workflow in the Actions tab (GitHub emails a warning first).
   The marker is removed only after a deploy succeeded: a failed or interrupted
   attempt keeps it, under the same limit of 3 attempts 30 minutes apart as any
   commit, and a marker touched again while that deploy ran stays for the next
-  run. While the `hold` below exists nothing runs, so the redeploy waits until it
+  run. When the redeploy has used up the 3 attempts it is dropped (one alert,
+  "redeploy of <sha> failed 3 times; dropped") and that same run goes on with
+  `main`'s HEAD, so a failed redeploy never blocks later releases. While the `hold` below exists nothing runs, so the redeploy waits until it
   is released. A new commit on `main` needs nothing: it deploys itself.
 - Containers stopped by hand: Docker's restart policy brings a crashed container
   back but not one that was stopped with `docker stop` / `docker kill`. The guard
@@ -423,9 +428,11 @@ workflow in the Actions tab (GitHub emails a warning first).
   - `hold` is **maintenance mode**. `sudo muster-cloud-autodeploy --hold` creates
     the marker (`/var/lib/muster-cloud/autodeploy/hold`) **and waits until any run
     that is already in flight, the guard included, has finished**; it prints
-    `held` when nothing of autodeploy is running any more (a run that is cut
-    short at its next step keeps its `deploying` marker and is finished after the
-    release). From then on both the guard and the full run do nothing at all (no
+    `held` when nothing of autodeploy is running any more. The hold only stops a
+    run from **starting** new work: a run stops at its next step and the deploy is
+    finished after the release (it keeps its `deploying` marker), but a deploy
+    whose switch has already begun finishes, verifies itself and, if that fails,
+    rolls back and alerts, hold or not, so `--hold` returns only after that. From then on both the guard and the full run do nothing at all (no
     container is started or stopped, no deploy, no change to the deployed record,
     no contact with GitHub) until `sudo muster-cloud-autodeploy --release`
     removes it and prints `released`. Both are safe to repeat. Use it for **every
