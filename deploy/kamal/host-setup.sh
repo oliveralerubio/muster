@@ -401,7 +401,7 @@ else
 fi
 
 if [ -f "$DEPLOY_ENV" ] && [ ! -L "$DEPLOY_ENV" ]; then
-  if grep -Evq '^(#.*|)$|^(MUSTER_CLOUD_PUBLIC_URL|MUSTER_PADDLE_ENVIRONMENT|MUSTER_PADDLE_PRICE_PERSONAL|MUSTER_PADDLE_PRICE_TEAM_SEAT|ALERT_TARGET)=' "$DEPLOY_ENV"; then
+  if grep -Evq '^(#.*|)$|^(MUSTER_CLOUD_PUBLIC_URL|MUSTER_PADDLE_ENVIRONMENT|MUSTER_PADDLE_PRICE_PERSONAL|MUSTER_PADDLE_PRICE_TEAM_SEAT|MUSTER_OIDC_EXTRA_AUDIENCES|ALERT_TARGET)=' "$DEPLOY_ENV"; then
     fail "$DEPLOY_ENV has lines other than the non-secret settings (bin/kamal refuses them)"
   fi
 elif [ -e "$DEPLOY_ENV" ] || [ -L "$DEPLOY_ENV" ]; then
