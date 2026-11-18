@@ -24,13 +24,21 @@
 #                 from deploy/kamal/. No sudoers rule exists or is created: user
 #                 `gha` has no privilege here, and the old drop-in
 #                 /etc/sudoers.d/muster-cloud-deploy is DELETED when found
-#   state dirs    /var/lib/muster-cloud/{alerts,offsite,authority} (root 0700)
+#   state dirs    /var/lib/muster-cloud/{alerts,offsite,authority,drill} (root 0700)
+#   drill key     /etc/muster-cloud/drill-age.key (root 0400): a SECOND age
+#                 identity only the monthly restore drill uses, generated here
+#                 when missing. Its public half is added to ops.env as an extra
+#                 backup recipient (MUSTER_BACKUP_AGE_RECIPIENTS); the main key
+#                 stays off the host
 #   timers        backup (every 6 h at :41), retention (hourly), offsite copy to
 #                 Google Drive (hourly), authority copy (hourly and after every
 #                 backup), backup check (every 30 min), autodeploy (every 5 min),
-#                 liveness guard (every 15 s: starts a container stopped by hand);
-#                 enabled with `enable --now`. Every muster-cloud oneshot alerts
-#                 through muster-cloud-alert@.service when it fails
+#                 liveness guard (every 15 s: starts a container stopped by hand),
+#                 restore drill (monthly); enabled with `enable --now`. Also the
+#                 path unit muster-cloud-authority-offsite.path, which starts the
+#                 authority copy a few seconds after every change of the control
+#                 journal. Every muster-cloud oneshot alerts through
+#                 muster-cloud-alert@.service when it fails
 #   funnel        `tailscale funnel --bg --https=10000 http://127.0.0.1:18110`
 #
 # muster-cloud-autodeploy runs this script in apply mode from the checkout it is
@@ -67,6 +75,7 @@ readonly ETC_DIR=/etc/muster-cloud
 readonly OPS_ENV=$ETC_DIR/ops.env
 readonly KAMAL_ENV=$ETC_DIR/kamal.env
 readonly DEPLOY_ENV=$ETC_DIR/deploy.env
+readonly DRILL_KEY=$ETC_DIR/drill-age.key
 readonly KAMAL_NET=kamal
 readonly KAMAL_SUBNET=172.31.250.0/24
 readonly DEPLOY_USER=gha
@@ -85,6 +94,8 @@ readonly OWN_UNITS=(muster-cloud-alert@.service
   muster-cloud-guard.service muster-cloud-guard.timer
   muster-cloud-backup-check.service muster-cloud-backup-check.timer
   muster-cloud-authority-offsite.service muster-cloud-authority-offsite.timer
+  muster-cloud-authority-offsite.path
+  muster-cloud-restore-drill.service muster-cloud-restore-drill.timer
   muster-cloud-offsite.service muster-cloud-offsite.timer)
 readonly FUNNEL_PORT=10000
 readonly PROXY_HTTP_PORT=18110
@@ -287,7 +298,7 @@ ensure_dir "$ROOT_DIR/pgsocket" "$PG_UID" "$SVC_UID" 0750
 # State of the root-run host scripts (alerts, offsite, authority copies). The
 # autodeploy state and checkout under the same base are created by the script.
 ensure_dir "$STATE_BASE" 0 0 0755
-for sub in alerts offsite authority; do
+for sub in alerts offsite authority drill; do
   ensure_dir "$STATE_BASE/$sub" 0 0 0700
 done
 
@@ -429,6 +440,92 @@ if [ "$ops_env_ok" -eq 1 ]; then
   done
 fi
 
+# ---- 3b. the drill-only age identity ------------------------------------------------
+# The monthly restore drill opens Drive snapshots without a person: it needs a
+# private key on this host. That key is a SECOND identity, used by nothing else;
+# the main backup key stays off the host. Backups and authority copies are
+# encrypted to both (MUSTER_BACKUP_AGE_RECIPIENTS in ops.env).
+printf '\n== restore drill identity (%s)\n' "$DRILL_KEY"
+drill_pub=""
+if ! command -v age-keygen >/dev/null 2>&1; then
+  fail "age-keygen not found in PATH (it comes with age)"
+elif [ -L "$DRILL_KEY" ] || { [ -e "$DRILL_KEY" ] && [ ! -f "$DRILL_KEY" ]; }; then
+  fail "$DRILL_KEY must be a regular file"
+else
+  if [ ! -e "$DRILL_KEY" ]; then
+    change "generate the drill-only age identity $DRILL_KEY (root 0400)" \
+      bash -c 'umask 077 && rm -f -- "$1.new" && age-keygen -o "$1.new" >/dev/null 2>&1 && chmod 0400 "$1.new" && mv -f -- "$1.new" "$1"' _ "$DRILL_KEY"
+  fi
+  if [ -f "$DRILL_KEY" ]; then
+    if [ "$(stat -c '%u:%g %a' -- "$DRILL_KEY")" = "0:0 400" ]; then
+      ok "$DRILL_KEY (root:root 0400)"
+    else
+      change "fix $DRILL_KEY -> root:root 0400" bash -c 'chown 0:0 "$1" && chmod 0400 "$1"' _ "$DRILL_KEY"
+    fi
+    drill_pub=$(age-keygen -y "$DRILL_KEY" 2>/dev/null | head -n 1) || drill_pub=""
+    if [[ $drill_pub =~ ^age1[a-z0-9]+$ ]]; then
+      ok "the drill identity has a valid public key"
+    else
+      drill_pub=""
+      fail "$DRILL_KEY is not an age identity (move it away and run this script again to make a new one)"
+    fi
+  fi
+fi
+
+# add_drill_recipient FILE PUBKEY — append the key to MUSTER_BACKUP_AGE_RECIPIENTS
+# (comma separated; the line is created when there is none), atomically, keeping
+# ops.env root:root 0600. Never prints the file.
+add_drill_recipient() {
+  python3 -I - "$1" "$2" <<'PY'
+import os, sys
+path, pub = sys.argv[1], sys.argv[2]
+key = "MUSTER_BACKUP_AGE_RECIPIENTS="
+with open(path) as handle:
+    lines = handle.read().splitlines()
+index = None
+for i, line in enumerate(lines):
+    if line.startswith(key):
+        index = i
+if index is None:
+    lines.append(key + pub)
+else:
+    value = lines[index][len(key):].strip().strip("\"'")
+    items = [item.strip() for item in value.split(",") if item.strip()]
+    if pub not in items:
+        items.append(pub)
+    lines[index] = key + ",".join(items)
+tmp = path + ".new"
+try:
+    os.unlink(tmp)
+except FileNotFoundError:
+    pass
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(fd, "w") as handle:
+    handle.write("\n".join(lines) + "\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+if os.geteuid() == 0:  # (this script only runs as root; the guard lets tests run it)
+    os.chown(tmp, 0, 0)
+os.replace(tmp, path)
+PY
+}
+
+if [ "$ops_env_ok" -eq 1 ]; then
+  if [ -n "$drill_pub" ]; then
+    have_recipients=$(sed -n 's/^MUSTER_BACKUP_AGE_RECIPIENTS=//p' "$OPS_ENV" | tail -n 1 | tr -d "\"' \r")
+    main_recipient=$(sed -n 's/^MUSTER_BACKUP_AGE_RECIPIENT=//p' "$OPS_ENV" | tail -n 1 | tr -d "\"' \r")
+    if [ "$drill_pub" = "$main_recipient" ]; then
+      fail "the drill key is the same as MUSTER_BACKUP_AGE_RECIPIENT: the drill key must be a separate identity"
+    elif [[ ",$have_recipients," == *",$drill_pub,"* ]]; then
+      ok "$OPS_ENV lists the drill key as an extra backup recipient"
+    else
+      change "add the drill public key to MUSTER_BACKUP_AGE_RECIPIENTS in $OPS_ENV" add_drill_recipient "$OPS_ENV" "$drill_pub"
+    fi
+  else
+    note "the drill key is added to $OPS_ENV once the drill identity exists"
+  fi
+fi
+
 # ---- 4. docker network ------------------------------------------------------------
 printf '\n== docker network %s\n' "$KAMAL_NET"
 if ! docker info >/dev/null 2>&1; then
@@ -469,9 +566,12 @@ fi
 
 # ---- 6. systemd units ------------------------------------------------------------
 printf '\n== systemd timers\n'
+# (named "timers" for history: it also holds the path unit that starts the
+# authority copy after a change of the journal)
 timers=(muster-cloud-backup.timer muster-cloud-retention.timer muster-cloud-offsite.timer
-  muster-cloud-authority-offsite.timer muster-cloud-backup-check.timer muster-cloud-autodeploy.timer
-  muster-cloud-guard.timer)
+  muster-cloud-authority-offsite.timer muster-cloud-authority-offsite.path
+  muster-cloud-backup-check.timer muster-cloud-autodeploy.timer
+  muster-cloud-guard.timer muster-cloud-restore-drill.timer)
 
 if [ "$ops_env_ok" -eq 1 ]; then
   stage=$WORK/units
@@ -505,7 +605,8 @@ verify_own_units() {
       fail "missing $REPO/deploy/systemd/$unit"
       return 1
     }
-    sed -E 's|^(ExecStart=)/usr/local/sbin/muster-cloud-[a-z-]+|\1/bin/true|' "$REPO/deploy/systemd/$unit" >"$vdir/$unit"
+    # (the drill runs the script of the source checkout, the others the installed one)
+    sed -E 's#^(ExecStart=)(/usr/local/sbin|/var/lib/muster-cloud/source/deploy/kamal)/muster-cloud-[a-z-]+#\1/bin/true#' "$REPO/deploy/systemd/$unit" >"$vdir/$unit"
   done
   verify=$(cd "$vdir" && systemd-analyze verify --man=no "${OWN_UNITS[@]/#/$vdir/}" 2>&1) || true
   if [ -n "$verify" ]; then
@@ -562,9 +663,16 @@ for timer in "${timers[@]}"; do
   fi
 done
 
+# The drill's "enabled since" mark: the check that watches the drill counts its
+# grace period from here until the first successful drill.
+if [ "$MODE" = apply ] && [ -d "$STATE_BASE/drill" ] && [ ! -e "$STATE_BASE/drill/enabled-since" ] \
+  && systemctl is-enabled --quiet muster-cloud-restore-drill.timer 2>/dev/null; then
+  change "record when the restore drill was enabled" touch "$STATE_BASE/drill/enabled-since"
+fi
+
 # ---- 7. host tools the timers need -------------------------------------------------
 printf '\n== host tools for backups\n'
-for tool in age git tar rclone python3 curl runuser flock timeout; do
+for tool in age age-keygen git tar rclone python3 curl runuser flock timeout; do
   if command -v "$tool" >/dev/null 2>&1; then
     ok "$tool found"
   else
@@ -576,7 +684,9 @@ done
 # script the 16 server rejects (found while rehearsing the restore drill with a
 # 18.x client). Not blocking (a deploy must not stop for it): the restore drill
 # fails loudly if it ever matters.
-for pgtool in pg_dump pg_restore; do
+# (the drill also needs psql, createdb and dropdb of the same version; the drill
+# itself refuses with a clear message when one is missing)
+for pgtool in pg_dump pg_restore psql; do
   if command -v "$pgtool" >/dev/null 2>&1; then
     pgv=$("$pgtool" --version | sed -n 's/^[a-z_]* (PostgreSQL) \([0-9]*\).*/\1/p')
     if [ "${pgv:-0}" = 16 ]; then

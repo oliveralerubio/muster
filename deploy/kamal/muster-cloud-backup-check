@@ -18,10 +18,20 @@
 #   unit:<name>            a muster-cloud-* unit is in the failed state
 #   autodeploy-silent      muster-cloud-autodeploy has not completed a check
 #                          for 6 hours
+#   restore-drill-stale    the monthly restore drill has not succeeded for 40
+#                          days (counted from its last success, or from the day
+#                          it was enabled)
+#
+# It also heals one thing by itself, without an alert: when
+# muster-cloud-authority-offsite.path is enabled but not running (systemd stops a
+# path unit whose trigger limit was exceeded), it resets and starts it again and
+# starts an authority copy (a change made while it was down is not lost). An
+# alert only fires when that restart fails.
 #
 # Test hooks (all optional): MUSTER_BACKUP_ROOT, MUSTER_CONTROL_DIR,
 # MUSTER_OFFSITE_REMOTE, MUSTER_RCLONE, MUSTER_ALERT_BIN, MUSTER_AUTODEPLOY_STATE,
-# MUSTER_BACKUP_CHECK_NOW (epoch seconds), MUSTER_BACKUP_CHECK_SKIP_UNITS=1.
+# MUSTER_BACKUP_CHECK_NOW (epoch seconds), MUSTER_BACKUP_CHECK_SKIP_UNITS=1,
+# MUSTER_SYSTEMCTL, MUSTER_DRILL_STATE.
 #
 # Exit codes: 0 all checks ran (problems were reported, not returned);
 # 1 an alert could not be delivered; 69 a required tool is missing; 77 not root.
@@ -38,6 +48,9 @@ readonly REMOTE=${MUSTER_OFFSITE_REMOTE:-gdrive:muster-cloud-backups}
 readonly RCLONE=${MUSTER_RCLONE:-rclone}
 readonly ALERT=${MUSTER_ALERT_BIN:-/usr/local/sbin/muster-cloud-alert}
 readonly AUTODEPLOY_STATE=${MUSTER_AUTODEPLOY_STATE:-/var/lib/muster-cloud/autodeploy}
+readonly SYSTEMCTL=${MUSTER_SYSTEMCTL:-systemctl}
+readonly DRILL_STATE=${MUSTER_DRILL_STATE:-/var/lib/muster-cloud/drill}
+readonly DRILL_MAX=$((40 * 86400))
 readonly LOCAL_MAX=$((7 * 3600))
 readonly REMOTE_MAX=$((8 * 3600))
 readonly AUTHORITY_GRACE=$((90 * 60))
@@ -161,7 +174,7 @@ fi
 
 # ---- 4. failed muster-cloud-* units ----------------------------------------------
 if [ "${MUSTER_BACKUP_CHECK_SKIP_UNITS:-0}" != 1 ]; then
-  failed_units=$(systemctl list-units --type=service --state=failed 'muster-cloud-*' --no-legend --plain 2>/dev/null \
+  failed_units=$("$SYSTEMCTL" list-units --type=service --state=failed 'muster-cloud-*' --no-legend --plain 2>/dev/null \
     | awk '{print $1}' | grep -v '^muster-cloud-alert@' || true)
   for unit in $failed_units; do
     problem "unit:$unit" "$unit is in the failed state. Details: journalctl -u $unit -n 50"
@@ -176,7 +189,7 @@ if [ "${MUSTER_BACKUP_CHECK_SKIP_UNITS:-0}" != 1 ]; then
 fi
 
 # ---- 5. the autodeploy timer is alive ----------------------------------------------
-if [ "${MUSTER_BACKUP_CHECK_SKIP_UNITS:-0}" != 1 ] && systemctl is-enabled --quiet muster-cloud-autodeploy.timer 2>/dev/null; then
+if [ "${MUSTER_BACKUP_CHECK_SKIP_UNITS:-0}" != 1 ] && "$SYSTEMCTL" is-enabled --quiet muster-cloud-autodeploy.timer 2>/dev/null; then
   stamp=$AUTODEPLOY_STATE/last-ok-check
   if [ ! -f "$stamp" ]; then
     problem autodeploy-silent "muster-cloud-autodeploy has never completed a check of GitHub"
@@ -186,6 +199,43 @@ if [ "${MUSTER_BACKUP_CHECK_SKIP_UNITS:-0}" != 1 ] && systemctl is-enabled --qui
       problem autodeploy-silent "muster-cloud-autodeploy has not completed a check of GitHub for $(human "$age") (new releases are not being deployed)"
     else
       fine autodeploy-silent "muster-cloud-autodeploy is checking GitHub again"
+    fi
+  fi
+fi
+
+# ---- 6. the path unit that starts the authority copy is running -----------------------
+path_unit=muster-cloud-authority-offsite.path
+if [ "${MUSTER_BACKUP_CHECK_SKIP_UNITS:-0}" != 1 ] && "$SYSTEMCTL" is-enabled --quiet "$path_unit" 2>/dev/null; then
+  if "$SYSTEMCTL" is-active --quiet "$path_unit" 2>/dev/null; then
+    fine authority-path-down "$path_unit is running again"
+  else
+    log "$path_unit is enabled but not running; restarting it"
+    "$SYSTEMCTL" reset-failed "$path_unit" 2>/dev/null || true
+    if "$SYSTEMCTL" start "$path_unit"; then
+      "$SYSTEMCTL" start --no-block muster-cloud-authority-offsite.service 2>/dev/null || true
+      fine authority-path-down "$path_unit is running again"
+    else
+      problem authority-path-down "$path_unit is not running and could not be started: the authority copy follows the journal only hourly. Details: systemctl status $path_unit"
+    fi
+  fi
+fi
+
+# ---- 7. the monthly restore drill keeps succeeding ---------------------------------------
+if [ "${MUSTER_BACKUP_CHECK_SKIP_UNITS:-0}" != 1 ] && "$SYSTEMCTL" is-enabled --quiet muster-cloud-restore-drill.timer 2>/dev/null; then
+  drill_ref=""
+  if [ -f "$DRILL_STATE/last-ok" ]; then
+    drill_ref=$DRILL_STATE/last-ok
+  elif [ -f "$DRILL_STATE/enabled-since" ]; then
+    drill_ref=$DRILL_STATE/enabled-since
+  fi
+  if [ -z "$drill_ref" ]; then
+    log "no restore drill mark in $DRILL_STATE yet; not checked"
+  else
+    age=$((now - $(stat -c %Y -- "$drill_ref")))
+    if [ "$age" -gt "$DRILL_MAX" ]; then
+      problem restore-drill-stale "the monthly restore drill has not succeeded for $((age / 86400)) days (limit 40). Details: journalctl -u muster-cloud-restore-drill -n 80"
+    else
+      fine restore-drill-stale "the restore drill succeeded recently"
     fi
   fi
 fi

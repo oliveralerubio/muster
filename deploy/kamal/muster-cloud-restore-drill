@@ -6,19 +6,31 @@
 # ("Disaster recovery").
 #
 #   sudo deploy/kamal/muster-cloud-restore-drill --age-identity FILE
-#        [--shred-identity] [--workdir DIR]
+#        [--shred-identity] [--workdir DIR] [--max-age-days N] [--select-only]
 #
-#   --age-identity FILE   the age PRIVATE key (a path; the key is supplied by
-#                         you at run time and never stored on this host). Put
-#                         it on a RAM disk, e.g. /dev/shm/muster-backup.key.
+#   --age-identity FILE   an age PRIVATE key (a path). Two kinds are used: the
+#                         main backup key, supplied by you at run time and
+#                         never stored on this host (put it on a RAM disk, e.g.
+#                         /dev/shm/muster-backup.key), and the drill-only key
+#                         /etc/muster-cloud/drill-age.key (root 0400, made by
+#                         host-setup.sh; its public half is an extra recipient
+#                         of every backup) that the monthly timer uses.
 #   --shred-identity      shred -u FILE when the drill ends, success or not
+#                         (never with the drill-only key)
 #   --workdir DIR         where the scratch directory is created (default
-#                         /var/tmp). Needs about 4 times the snapshot size.
+#                         /var/tmp). Needs about 4 times the snapshot size; the
+#                         drill refuses cleanly, before downloading anything,
+#                         when the free space is not enough.
+#   --max-age-days N      the snapshot must be younger than N days (default 8)
+#   --select-only         print which snapshot and authority copy would be used
+#                         and stop (nothing is downloaded or restored)
 #
 # What it does, as the supported recovery procedure does it:
-#   1. downloads the newest COMPLETE snapshot (manifest.json present) and the
-#      newest authority copy from gdrive:muster-cloud-backups into the scratch
-#      directory (rclone copy);
+#   1. picks the newest COMPLETE snapshot (manifest.json present) whose manifest
+#      lists the public key of the identity as a recipient (so it can really be
+#      opened with it) and that is younger than --max-age-days; with none, it
+#      fails saying so. It downloads that snapshot and the newest authority copy
+#      from gdrive:muster-cloud-backups into the scratch directory (rclone copy);
 #   2. decrypts the authority copy with the identity and restores its journal
 #      and witness into scratch control and witness paths;
 #   3. starts a throwaway postgres (the image pinned in config/deploy.yml, no
@@ -44,9 +56,10 @@
 # Exit codes: 0 ok; 1 a check or step failed (the JSON says which); 64 usage;
 # 69 a required tool or file is missing; 77 not root.
 #
-# Test hooks (all optional): MUSTER_OFFSITE_REMOTE, MUSTER_RCLONE, MUSTER_OPS_BIN,
-# MUSTER_DRILL_ALLOW_NONROOT=1 (then the PostgreSQL container runs as the
-# calling user).
+# Test hooks (all optional): MUSTER_OFFSITE_REMOTE, MUSTER_RCLONE, MUSTER_AGE,
+# MUSTER_AGE_KEYGEN,
+# MUSTER_OPS_BIN, MUSTER_DRILL_NOW (epoch seconds), MUSTER_DRILL_ALLOW_NONROOT=1
+# (then the PostgreSQL container runs as the calling user).
 
 set -uo pipefail
 umask 077
@@ -59,6 +72,8 @@ readonly HERE REPO
 readonly REMOTE=${MUSTER_OFFSITE_REMOTE:-gdrive:muster-cloud-backups}
 readonly RCLONE=${MUSTER_RCLONE:-rclone}
 readonly OPS_BIN=${MUSTER_OPS_BIN:-/usr/local/bin/muster-cloud-ops}
+readonly AGE=${MUSTER_AGE:-age}
+readonly AGE_KEYGEN=${MUSTER_AGE_KEYGEN:-age-keygen}
 readonly PG_RESTORE_SH=$REPO/deploy/pg-restore.sh
 readonly PG_UID=${MUSTER_DRILL_PG_UID:-10002}
 readonly ID_RE='^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$'
@@ -68,6 +83,8 @@ readonly NEW_DB=muster_restore
 identity=""
 shred_identity=0
 workdir=/var/tmp
+max_age_days=8
+select_only=0
 
 usage() {
   sed -n '2,/^# Exit codes/p' "$0" | sed 's/^# \{0,1\}//' >&2
@@ -90,10 +107,20 @@ while [ "$#" -gt 0 ]; do
       workdir=$2
       shift 2
       ;;
+    --max-age-days)
+      [ "$#" -ge 2 ] || usage
+      max_age_days=$2
+      shift 2
+      ;;
+    --select-only)
+      select_only=1
+      shift
+      ;;
     *) usage ;;
   esac
 done
 [ -n "$identity" ] || usage
+[[ $max_age_days =~ ^[0-9]+$ ]] && [ "$max_age_days" -ge 1 ] || usage
 
 # ---- result and cleanup --------------------------------------------------------
 STAGE=preflight
@@ -170,41 +197,58 @@ if [ "${MUSTER_DRILL_ALLOW_NONROOT:-0}" != 1 ] && [ "$(id -u)" -ne 0 ]; then
   printf 'restore-drill: must run as root\n' >&2
   exit 77
 fi
-for tool in "$RCLONE" age docker tar git python3 psql pg_restore createdb dropdb flock; do
+for tool in "$RCLONE" "$AGE" "$AGE_KEYGEN" python3 sha256sum; do
   command -v "$tool" >/dev/null 2>&1 || {
     ERR_MSG="required tool not found: $tool"
     printf 'restore-drill: %s\n' "$ERR_MSG" >&2
     exit 69
   }
 done
-[ -x "$OPS_BIN" ] || { ERR_MSG="muster-cloud-ops not found at $OPS_BIN"; printf 'restore-drill: %s\n' "$ERR_MSG" >&2; exit 69; }
-[ -f "$PG_RESTORE_SH" ] || { ERR_MSG="missing $PG_RESTORE_SH"; printf 'restore-drill: %s\n' "$ERR_MSG" >&2; exit 69; }
 [ -f "$identity" ] && [ -r "$identity" ] || { ERR_MSG="the age identity file is not readable"; printf 'restore-drill: %s\n' "$ERR_MSG" >&2; exit 69; }
 grep -q '^AGE-SECRET-KEY-' "$identity" || die "the identity file holds no age secret key"
-case $(realpath -m -- "$workdir") in
-  /srv/muster-cloud | /srv/muster-cloud/* | /var/lib/muster-witness | /var/lib/muster-witness/*)
-    die "the scratch directory must not be under the production data ($workdir)"
-    ;;
-esac
-[ -d "$workdir" ] || die "workdir does not exist: $workdir"
+identity_pub=$("$AGE_KEYGEN" -y "$identity" 2>/dev/null | head -n 1)
+[[ $identity_pub =~ ^age1[a-z0-9]+$ ]] || die "cannot derive the public key of the age identity"
+# A manifest names its recipients by the SHA-256 of their public key.
+identity_hash=$(printf '%s' "$identity_pub" | sha256sum | cut -d' ' -f1)
 
-pg_image=$(sed -n 's/^[[:space:]]*image:[[:space:]]*\(postgres:[^[:space:]]*\)[[:space:]]*$/\1/p' "$REPO/config/deploy.yml" | head -n 1)
-[[ $pg_image =~ ^postgres:[0-9A-Za-z._-]+@sha256:[0-9a-f]{64}$ ]] || die "cannot read the pinned postgres image from config/deploy.yml"
-
-S=$(mktemp -d "$workdir/muster-restore-drill.XXXXXX") || die "cannot create a scratch directory in $workdir"
-mkdir -m 0700 -- "$S/snapshot" "$S/authority" "$S/control" "$S/witness" || die "cannot create the scratch layout"
-say "scratch directory $S"
-
-# ---- 1. newest complete snapshot and newest authority copy ---------------------------
+# ---- 1. the snapshot: newest, complete, readable with this identity, young ----------
 STAGE="listing Google Drive"
+now=${MUSTER_DRILL_NOW:-$(date +%s)}
 remote_manifests=$(rc_run lsf "$REMOTE/snapshots" --recursive --files-only --include manifest.json) \
   || die "cannot list $REMOTE/snapshots"
 snapshot_id=""
+newest_complete=""
+checked=0
 while IFS= read -r path; do
   id=${path%%/*}
-  [[ $id =~ $ID_RE ]] && snapshot_id=$id
-done < <(printf '%s\n' "$remote_manifests" | sort)
-[ -n "$snapshot_id" ] || die "no complete snapshot on Google Drive"
+  [[ $id =~ $ID_RE ]] || continue
+  [ -n "$newest_complete" ] || newest_complete=$id
+  id_age=$((now - $(date -u -d "${id:0:4}-${id:4:2}-${id:6:2}T${id:9:2}:${id:11:2}:${id:13:2}Z" +%s)))
+  [ "$id_age" -le $((max_age_days * 86400)) ] || break # older ones are all too old
+  checked=$((checked + 1))
+  [ "$checked" -le 60 ] || break
+  manifest_json=$(rc_run cat "$REMOTE/snapshots/$id/manifest.json") || {
+    say "cannot read the manifest of $id; trying an older snapshot"
+    continue
+  }
+  # The identity can open the snapshot when its key is the primary recipient
+  # (recipient_sha256) or one of the extra ones (recipients_sha256).
+  if printf '%s' "$manifest_json" | python3 -I -c '
+import json, sys
+enc = json.load(sys.stdin)["encryption"]
+want = sys.argv[1]
+sys.exit(0 if want == enc.get("recipient_sha256") or want in (enc.get("recipients_sha256") or []) else 1)
+' "$identity_hash" 2>/dev/null; then
+    snapshot_id=$id
+    break
+  fi
+  say "snapshot $id is not encrypted to this identity's key; trying an older one"
+done < <(printf '%s\n' "$remote_manifests" | sort -r)
+[ -n "$newest_complete" ] || die "no complete snapshot on Google Drive"
+if [ -z "$snapshot_id" ]; then
+  die "no complete snapshot younger than $max_age_days days on Google Drive is encrypted to this identity's key (newest complete one: $newest_complete). Backups made before this key was added as a recipient (MUSTER_BACKUP_AGE_RECIPIENTS in ops.env) cannot be opened with it; a new backup runs every 6 hours"
+fi
+[ "$snapshot_id" = "$newest_complete" ] || say "note: the newest complete snapshot is $newest_complete; the drill uses $snapshot_id, the newest one this identity can open"
 
 remote_auth=$(rc_run lsf "$REMOTE/authority" --files-only) || die "cannot list $REMOTE/authority"
 authority_name=""
@@ -212,7 +256,22 @@ while IFS= read -r name; do
   [[ $name =~ $AUTH_RE ]] && authority_name=$name
 done < <(printf '%s\n' "$remote_auth" | sort)
 [ -n "$authority_name" ] || die "no authority copy on Google Drive: the backups cannot be restored without one"
-say "newest snapshot $snapshot_id; newest authority copy $authority_name"
+say "snapshot $snapshot_id; newest authority copy $authority_name"
+
+if [ "$select_only" -eq 1 ]; then
+  DONE=1
+  json_out ok:=true select_only:=true "snapshot_id=$snapshot_id" "newest_complete_snapshot=$newest_complete" \
+    "authority_copy=$authority_name" "identity_recipient_sha256=$identity_hash"
+  exit 0
+fi
+
+# ---- the scratch space: refuse cleanly, before anything is downloaded -------------------
+case $(realpath -m -- "$workdir") in
+  /srv/muster-cloud | /srv/muster-cloud/* | /var/lib/muster-witness | /var/lib/muster-witness/*)
+    die "the scratch directory must not be under the production data ($workdir)"
+    ;;
+esac
+[ -d "$workdir" ] || die "workdir does not exist: $workdir"
 
 STAGE="checking free space"
 snap_bytes=$(rc_run size --json "$REMOTE/snapshots/$snapshot_id" | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["bytes"])') \
@@ -222,14 +281,31 @@ if [ "$avail" -lt $((snap_bytes * 4 + 1073741824)) ]; then
   die "not enough free space in $workdir: the drill needs about $((snap_bytes * 4 / 1048576 + 1024)) MiB, $((avail / 1048576)) MiB are free"
 fi
 
+# ---- the rest needs the full toolset and a scratch directory ---------------------------
+for tool in docker tar git psql pg_restore createdb dropdb flock; do
+  command -v "$tool" >/dev/null 2>&1 || {
+    ERR_MSG="required tool not found: $tool"
+    printf 'restore-drill: %s\n' "$ERR_MSG" >&2
+    exit 69
+  }
+done
+[ -x "$OPS_BIN" ] || { ERR_MSG="muster-cloud-ops not found at $OPS_BIN"; printf 'restore-drill: %s\n' "$ERR_MSG" >&2; exit 69; }
+[ -f "$PG_RESTORE_SH" ] || { ERR_MSG="missing $PG_RESTORE_SH"; printf 'restore-drill: %s\n' "$ERR_MSG" >&2; exit 69; }
+pg_image=$(sed -n 's/^[[:space:]]*image:[[:space:]]*\(postgres:[^[:space:]]*\)[[:space:]]*$/\1/p' "$REPO/config/deploy.yml" | head -n 1)
+[[ $pg_image =~ ^postgres:[0-9A-Za-z._-]+@sha256:[0-9a-f]{64}$ ]] || die "cannot read the pinned postgres image from config/deploy.yml"
+
+S=$(mktemp -d "$workdir/muster-restore-drill.XXXXXX") || die "cannot create a scratch directory in $workdir"
+mkdir -m 0700 -- "$S/snapshot" "$S/authority" "$S/control" "$S/witness" || die "cannot create the scratch layout"
+say "scratch directory $S"
+
 STAGE="downloading"
 rc_run copy "$REMOTE/snapshots/$snapshot_id" "$S/snapshot/$snapshot_id" --checksum || die "download of the snapshot failed"
 rc_run copyto "$REMOTE/authority/$authority_name" "$S/authority/$authority_name" || die "download of the authority copy failed"
 
 # ---- 2. the authority, into scratch control and witness paths --------------------------
 STAGE="restoring the authority"
-age --decrypt -i "$identity" -o "$S/authority/authority.tar" "$S/authority/$authority_name" \
-  || die "cannot decrypt the authority copy with that identity"
+"$AGE" --decrypt -i "$identity" -o "$S/authority/authority.tar" "$S/authority/$authority_name" \
+  || die "cannot decrypt the authority copy $authority_name with that identity (a copy made before this identity's key became a recipient is not readable by it; the hourly run uploads a new one)"
 members=$(tar -tf "$S/authority/authority.tar" | sort | tr '\n' ' ')
 [ "$members" = "META.json journal.v1.jsonl witness.json " ] || die "the authority archive holds unexpected members: $members"
 mkdir -m 0700 -- "$S/authority/x"

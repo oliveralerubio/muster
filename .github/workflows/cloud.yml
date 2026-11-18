@@ -252,7 +252,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install tools (git, python3, flock)
+      - name: Install tools (git, python3, flock, age)
         run: |
           set -eu
           apt="apt-get"
@@ -261,6 +261,8 @@ jobs:
           command -v git >/dev/null 2>&1 || install="$install git"
           command -v python3 >/dev/null 2>&1 || install="$install python3"
           command -v flock >/dev/null 2>&1 || install="$install util-linux"
+          # The offsite, authority-copy and drill tests encrypt with real keys.
+          command -v age-keygen >/dev/null 2>&1 || install="$install age"
           if [ -n "$install" ]; then
             $apt update
             $apt install -y --no-install-recommends $install
@@ -270,12 +272,32 @@ jobs:
         run: |
           set -eu
           for f in bin/kamal deploy/kamal/muster-cloud-autodeploy deploy/kamal/host-setup.sh \
-                   deploy/tests/autodeploy-guard.sh; do
+                   deploy/kamal/muster-cloud-offsite deploy/kamal/muster-cloud-authority-offsite \
+                   deploy/kamal/muster-cloud-backup-check deploy/kamal/muster-cloud-restore-drill \
+                   deploy/pg-restore.sh deploy/pg-control-owner.sh \
+                   deploy/tests/autodeploy-guard.sh deploy/tests/offsite.sh \
+                   deploy/tests/authority-offsite.sh deploy/tests/control-owner.sh \
+                   deploy/tests/restore-drill.sh deploy/tests/backup-check-units.sh; do
             bash -n "$f"
           done
 
       - name: Autodeploy tests (guard, proxy and database bootstrap, incomplete deploys)
         run: deploy/tests/autodeploy-guard.sh
+
+      - name: Offsite tests (never purge the last complete snapshot)
+        run: deploy/tests/offsite.sh
+
+      - name: Authority copy tests (every recipient decrypts, copies again when the journal grows)
+        run: deploy/tests/authority-offsite.sh
+
+      - name: Authority ownership after a restore
+        run: deploy/tests/control-owner.sh
+
+      - name: Restore drill selection and backup-check tests
+        run: |
+          set -eu
+          deploy/tests/restore-drill.sh
+          deploy/tests/backup-check-units.sh
 
   backup-drill:
     name: backup-drill

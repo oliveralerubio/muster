@@ -1,0 +1,40 @@
+# Installed by deploy/kamal/host-setup.sh (never by CI). The monthly restore
+# drill: a real recovery of the newest Google Drive snapshot and authority copy
+# into throwaway targets on this host (production is never touched), opened with
+# the drill-only age key /etc/muster-cloud/drill-age.key (root 0400). Started by
+# muster-cloud-restore-drill.timer. It runs the script of the source checkout
+# that muster-cloud-autodeploy keeps current, so the drill always matches the
+# release. A failure (no snapshot younger than 8 days that lists the drill key,
+# not enough disk space, a check that failed) alerts through OnFailure=.
+# Guide: deploy/KAMAL.md ("The monthly restore drill").
+[Unit]
+Description=Muster Cloud: monthly restore drill (recover the newest backup into a throwaway copy)
+Documentation=file:///opt/muster-cloud/deploy/KAMAL.md
+After=network-online.target docker.service
+Wants=network-online.target
+ConditionPathIsDirectory=/var/lib/muster-cloud/source/deploy
+OnFailure=muster-cloud-alert@%n.service
+
+[Service]
+Type=oneshot
+# Root, and deliberately not sandboxed, like muster-cloud-autodeploy.service:
+# it runs docker (a throwaway postgres) and pg-restore.sh.
+User=root
+Group=root
+Environment=RCLONE_CONFIG=/root/.config/rclone/rclone.conf
+# The scratch directory lives on the root disk but never under the production
+# data; the script checks the free space (about 4x the snapshot) and refuses
+# cleanly, before it downloads anything, when it is not enough.
+ExecStart=/var/lib/muster-cloud/source/deploy/kamal/muster-cloud-restore-drill --age-identity /etc/muster-cloud/drill-age.key --workdir /var/lib/muster-cloud/drill
+# Only after a successful drill: the check that watches the drill reads this.
+ExecStartPost=/usr/bin/touch /var/lib/muster-cloud/drill/last-ok
+TimeoutStartSec=2h
+Nice=15
+IOSchedulingClass=idle
+UMask=0077
+NoNewPrivileges=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+RestrictSUIDSGID=true
+LockPersonality=true
