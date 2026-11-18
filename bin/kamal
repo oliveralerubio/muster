@@ -34,6 +34,13 @@
 # guard does nothing while a container with it (or any ghcr.io/basecamp/kamal
 # image) runs. Keep the label if you edit the `docker run` below.
 #
+# It also carries muster.kamal.owner=<who>: MUSTER_KAMAL_OWNER, or "manual"
+# when that is not set (muster-cloud-autodeploy sets it to "autodeploy" for its
+# own calls). A full autodeploy run does nothing while a Kamal container that is
+# not its own runs, so a manual Kamal run (a rollback by hand, a cutover) is
+# never undone by the next deploy. The owner is a plain word, not a secret: it
+# is passed on the command line.
+#
 # The container shares the host network so SSH to the host's own Tailscale
 # address works the same from the autodeploy timer (which runs on that host)
 # and from a laptop. The Docker socket is NOT mounted unless
@@ -91,10 +98,16 @@ case $secrets_file in
   *) die "MUSTER_CLOUD_SECRETS_FILE must be an absolute path" ;;
 esac
 
-# The label is how the host's liveness guard (muster-cloud-autodeploy) knows a
-# Kamal run is going on, whatever Kamal version or image reference it uses.
+# The labels are how the host's liveness guard (muster-cloud-autodeploy) knows a
+# Kamal run is going on, and whose, whatever Kamal version or image reference
+# it uses.
+owner=${MUSTER_KAMAL_OWNER:-manual}
+case $owner in
+  '' | *[!A-Za-z0-9._-]*) die "MUSTER_KAMAL_OWNER may only contain letters, digits, '.', '_' and '-'" ;;
+esac
 args=(run --rm --network host
   --label muster.kamal=1
+  --label "muster.kamal.owner=$owner"
   --user "$(id -u):$(id -g)"
   --env HOME=/home/kamal
   --volume "$repo:/workdir")
