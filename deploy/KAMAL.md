@@ -24,7 +24,9 @@ Internet --HTTPS--> Tailscale Funnel (port 10000, certificate by Tailscale)
 
 host: systemd timers -> muster-cloud-ops (backup every 6 h, retention hourly)
                      -> muster-cloud-offsite (copy to Google Drive, hourly)
-                     -> muster-cloud-authority-offsite (encrypted authority copy)
+                     -> muster-cloud-authority-offsite (encrypted authority copy: seconds
+                        after every journal change, via a .path unit, plus hourly)
+                     -> muster-cloud-restore-drill (monthly, unattended, throwaway targets)
                      -> muster-cloud-backup-check (every 30 min) -> Discord alerts
 ```
 
@@ -70,8 +72,9 @@ host: systemd timers -> muster-cloud-ops (backup every 6 h, retention hourly)
 | `muster-cloud-backup.timer` | Every 6 hours (about 00:41, 06:41, 12:41, 18:41, up to 15 minutes late): one encrypted, snapshot-bound backup. |
 | `muster-cloud-retention.timer` | Hourly: removes expired snapshots and enforces the deletion caps. Writes an audit record of what it removed. |
 | `muster-cloud-offsite.timer` | Hourly: copies new snapshots to Google Drive (never `sync`), and deletes from Drive only what retention recorded as removed (see below). |
-| `muster-cloud-authority-offsite.timer` | Hourly and right after every successful backup: an age-encrypted copy of the lifecycle authority (journal and witness) to Google Drive. |
-| `muster-cloud-backup-check.timer` | Every 30 minutes: alerts when backups quietly stop (see Alerts). |
+| `muster-cloud-authority-offsite.path` + `.timer` | An age-encrypted copy of the lifecycle authority (journal and witness) to Google Drive: started a few seconds after every change of the control journal (the path unit), right after every successful backup, and hourly (the timer, the backstop). See "How soon a change reaches Drive" below. |
+| `muster-cloud-restore-drill.timer` | Monthly (the 3rd, about 03:30, up to 3 hours late): a real recovery of the newest Drive snapshot into throwaway targets, opened with the drill-only key. See "The monthly restore drill". |
+| `muster-cloud-backup-check.timer` | Every 30 minutes: alerts when backups quietly stop (see Alerts). Also restarts the authority-copy path unit if systemd stopped it, and watches that the restore drill keeps succeeding. |
 | Docker | Restarts the containers after a reboot or crash (`unless-stopped`). |
 
 The root scripts under `/usr/local/sbin` are copied by `host-setup.sh` from the
@@ -165,11 +168,15 @@ by the one-off `init` below. `host-setup.sh` refuses to run without it.
 | `MUSTER_CONTROL_WITNESS` | `/var/lib/muster-witness/w/witness.json` |
 | `MUSTER_BACKUP_ROOT` | `/srv/muster-cloud/backups` |
 | `MUSTER_BACKUP_AGE_RECIPIENT` | The age **public** key (`age1...`) backups and authority copies are encrypted to. |
+| `MUSTER_BACKUP_AGE_RECIPIENTS` | Optional, comma-separated: further age public keys every backup and authority copy is also encrypted to. `host-setup.sh` adds the public half of the drill-only key here by itself (step 4); you do not write it. |
 
 Generate the age key pair on your own computer (`age-keygen -o muster-backup.key`),
 put only the public key here, and keep the private key in your password manager.
-It never touches the VPS (except for the minutes of a restore drill, below);
-without it no backup can be restored.
+It never touches the VPS (except for the minutes of a manual restore drill or a
+recovery, below); without it no backup can be restored. The only private age key
+that lives on the host is the separate drill-only key of step 4, which cannot be
+used to restore anything but the monthly drill's throwaway copy (what that costs
+you in security is under "The monthly restore drill").
 
 **`deploy.env`** (`root:root`, mode `0644`, no secrets): read by `bin/kamal` and
 `muster-cloud-alert`. Only these keys are accepted.
@@ -196,7 +203,10 @@ sudo touch /var/lib/muster-cloud/autodeploy/guard-only   # until step 7: no depl
 It creates what is missing (accounts, directories with exact modes, the
 `kamal` Docker network with the fixed subnet `172.31.250.0/24`), installs the
 host scripts and all units, deletes the old `gha` sudoers rule if one exists,
-enables the timers, and sets up Funnel
+enables the timers and the authority-copy path unit, generates the drill-only
+age key `/etc/muster-cloud/drill-age.key` (root `0400`) when it does not exist
+and adds its public half to `MUSTER_BACKUP_AGE_RECIPIENTS` in `ops.env`
+(see "The monthly restore drill"), and sets up Funnel
 (`tailscale funnel --bg --https=10000 http://127.0.0.1:18110`). It refuses to
 touch a `kamal` network with another subnet, and refuses to create anything
 under `/var/lib/muster-witness` unless that is its own mounted filesystem. It
@@ -205,33 +215,48 @@ other Tailscale serve entries. Anything left for you appears as `TODO` or
 `FAIL`; fix it and run it again until it is quiet (it is safe to repeat).
 After this first run autodeploy runs it by itself on every release.
 
-### 5. Start the database (optional: autodeploy does it)
+### 5. Start the database (required, before `init`)
 
-Autodeploy starts what is missing by itself. `kamal app boot` assumes
-kamal-proxy exists and nothing else creates it, so before booting the app a
-deploy runs `kamal proxy boot` when no `kamal-proxy` container exists at all,
-and `kamal accessory boot db` when no `muster-cloud-db` container exists (it logs
-one decision line for each; a failure takes the usual failure and alert path).
-A stopped container is not "missing": the liveness guard starts it. Both
-commands are safe to repeat and read `config/deploy.yml`: `proxy boot` is
-start-or-run with `proxy.run` (kamal-proxy v0.10.3, published only on
-`127.0.0.1:18110` and `127.0.0.1:18111`; checked in the Kamal 2.12.0 source and
-by rendering the command), and `accessory boot db` skips an existing container.
-PostgreSQL's entrypoint runs `initdb` only when the data directory has no
-`PG_VERSION`, so an existing `/srv/muster-cloud/pg/data` is used as it is.
-
-To start the database yourself before the first deploy (for example to restore
-into it first), as `gha`, from the checkout:
+On a fresh host this step is not optional, and the order matters. `init`
+(step 6) needs the database to exist, and nothing else would create it in time:
+autodeploy is what normally boots the database, but it refuses to deploy before
+`init` (the `guard-only` marker from step 4), and the guard cannot boot anything
+yet because there is no source checkout on a new host (it leaves that to the
+first deploy). So the database is started by hand, once, as `gha`, from a
+checkout of this repository that `gha` can read:
 
 ```
 sudo -iu gha
-cd <checkout>
-bin/kamal accessory boot db
+git clone https://github.com/oliveralerubio/muster.git ~/muster   # skip when you already have a checkout gha can read
+cd ~/muster
+./bin/kamal accessory boot db
+exit
 ```
 
+Check it: `docker ps` shows `muster-cloud-db` running and
+`sudo docker exec muster-cloud-db pg_isready -U muster` answers "accepting
+connections". The command is safe to repeat: it skips a container that already
+exists, and PostgreSQL's entrypoint runs `initdb` only when
+`/srv/muster-cloud/pg/data` has no `PG_VERSION`, so an existing data directory
+(a restore, or a host that lost only its containers) is used as it is.
 PostgreSQL 16 starts as user 10002 with scram-sha-256 everywhere, no published
-port, data in `/srv/muster-cloud/pg/data`. No registry login happens (the
-registry is `localhost:5000`).
+port, data in `/srv/muster-cloud/pg/data`. It reads `POSTGRES_PASSWORD` from
+`kamal.env` (step 3), and no registry login happens (the registry is
+`localhost:5000`). `bin/kamal` labels its container as a manual run, so the
+guard (which runs every 15 seconds) waits until it finishes.
+
+You do not need `./bin/kamal proxy boot` here: `init` does not use the proxy,
+and the first deploy boots `kamal-proxy` itself when no such container exists
+(it logs one decision line). If you want the proxy up earlier, `./bin/kamal
+proxy boot` is safe to repeat; it is start-or-run with `proxy.run`
+(kamal-proxy v0.10.3, published only on `127.0.0.1:18110` and
+`127.0.0.1:18111`; checked in the Kamal 2.12.0 source and by rendering the
+command).
+
+After the first deploy, autodeploy starts what is missing by itself: before
+booting the app it runs `kamal proxy boot` when no `kamal-proxy` container
+exists at all, and `kamal accessory boot db` when no `muster-cloud-db` container
+exists. A stopped container is not "missing": the liveness guard starts it.
 
 ### 6. Publish the first image and create the lifecycle authority, once
 
@@ -239,8 +264,8 @@ Merge to `main` (or run the workflow **Publish muster Cloud image** from
 `main`). Then make the package public (step 1) and run `host-setup.sh --check`
 again: the anonymous pull check must be quiet.
 
-Create the authority on pristine targets only (empty database, empty repository
-root). `init` refuses anything else, so a mistaken repeat is harmless, but never
+Create the authority on pristine targets only (empty database from step 5, empty
+repository root). `init` refuses anything else, so a mistaken repeat is harmless, but never
 run it against a restored or unknown store. `<sha>` is the commit that was
 published.
 
@@ -265,7 +290,8 @@ Afterwards:
 
 ```
 docker ps                                   # kamal-proxy, muster-cloud-web-<sha>, muster-cloud-db
-systemctl list-timers 'muster-cloud-*'     # six timers
+systemctl list-timers 'muster-cloud-*'     # eight timers
+systemctl status muster-cloud-authority-offsite.path   # active (waiting)
 curl -fsS https://personal.tailbb30e7.ts.net:10000/readyz
 ```
 
@@ -282,7 +308,14 @@ sudo systemctl start muster-cloud-offsite.service
 sudo rclone lsf gdrive:muster-cloud-backups/snapshots
 sudo rclone lsf gdrive:muster-cloud-backups/authority
 sudo muster-cloud-alert notify "muster Cloud: alert test"   # arrives in Discord
+sudo systemctl start muster-cloud-restore-drill.service    # a few minutes; see "The monthly restore drill"
+sudo journalctl -u muster-cloud-restore-drill -n 5 --no-pager   # one JSON line with "ok":true
 ```
+
+The drill needs a backup made after the drill key was added (step 4 did that
+before the first backup, so the one above is enough), uploaded by the offsite
+service, and an authority copy. If you run it earlier it stops with a clear
+message and nothing is changed.
 
 From then on everything is automatic: a merge to `main` with green Cloud CI
 deploys itself within minutes.
@@ -299,6 +332,8 @@ One channel: `hermes send -t <target> "<text>"` as root (Discord, default
 | `local-snapshot-stale` | The newest snapshot on the host is older than 7 hours (backups run every 6). |
 | `gdrive-snapshot-stale` / `gdrive-unreachable` | The newest complete snapshot on Google Drive is older than 8 hours or missing, or Drive cannot be listed. |
 | `authority-stale` | The newest authority copy on Drive is behind this host's journal for more than 90 minutes. |
+| `authority-path-down` | `muster-cloud-authority-offsite.path` is enabled but not running and could not be restarted. (When the restart works, nothing is sent: the check restarts it by itself, and starts an authority copy at once so no change is missed.) |
+| `restore-drill-stale` | The monthly restore drill has not succeeded for 40 days, counted from its last success or from the day it was enabled. A drill that fails also raises `unit:muster-cloud-restore-drill.service` at once. |
 | `autodeploy-silent` | Autodeploy has not completed a check of GitHub for 6 hours. |
 
 The same problem is reported at most once every 6 hours, and one
@@ -321,10 +356,17 @@ workflow in the Actions tab (GitHub emails a warning first).
 - Logs: `journalctl -u muster-cloud-autodeploy`, `docker logs muster-cloud-web-<sha>`,
   `journalctl -u muster-cloud-backup -u muster-cloud-retention -u muster-cloud-offsite`.
 - Boot the running commit again (for example after editing a file in
-  `/etc/muster-cloud`): `sudo touch /var/lib/muster-cloud/autodeploy/redeploy`
-  and `sudo systemctl start muster-cloud-autodeploy.service`. The marker is
-  consumed by that one deploy. A new commit on `main` needs nothing: it deploys
-  itself.
+  `/etc/muster-cloud`, or after a disaster-recovery cutover):
+  `sudo touch /var/lib/muster-cloud/autodeploy/redeploy` and
+  `sudo systemctl start muster-cloud-autodeploy.service` (or wait up to 5
+  minutes). Kamal renames the old container, boots a new one that reads its
+  settings afresh, and stops the old one once the new one is routed and ready
+  (no downtime, and no need to stop anything by hand). The marker is removed
+  only after a deploy succeeded: a failed or interrupted attempt keeps it, under
+  the same limit of 3 attempts 30 minutes apart as any commit, and a marker
+  touched again while that deploy ran stays for the next run. While the `hold`
+  marker below exists nothing runs, so the redeploy waits until it is removed.
+  A new commit on `main` needs nothing: it deploys itself.
 - Containers stopped by hand: Docker's restart policy brings a crashed container
   back but not one that was stopped with `docker stop` / `docker kill`. The guard
   starts `muster-cloud-db`, `kamal-proxy` and the web container of the version
@@ -354,19 +396,51 @@ workflow in the Actions tab (GitHub emails a warning first).
   the proxy routes to one that is not the recorded version or does not answer
   `/readyz`. The journal says `decision: incomplete deploy: ...`.
 - Stop the guard on purpose (for example to stop a container by hand for
-  maintenance): `sudo systemctl stop muster-cloud-guard.timer`, and
-  `sudo systemctl start muster-cloud-guard.timer` afterwards. Stopping it is not
-  enough: the 5-minute autodeploy run still starts the container, so stop
-  `muster-cloud-autodeploy.timer` too. Host-setup enables the guard timer again
-  at the next deploy. The `guard-only` marker below does not stop it: guard-only
-  still guards.
-- Hold deploys but keep the guard (for example before the first merge to `main`,
-  or while investigating): `sudo touch /var/lib/muster-cloud/autodeploy/guard-only`.
-  While the file exists every run does only the guard and exits 0 without
-  contacting GitHub; `sudo rm -f /var/lib/muster-cloud/autodeploy/guard-only`
-  resumes deploys. Unlike stopping the timer, this keeps the containers up. A run
-  that does not check GitHub does not refresh the `autodeploy-silent` stamp, so
-  after 6 hours of holding that alert fires as a reminder that deploys are held.
+  maintenance): touch the `hold` marker (below). It stops the guard and the
+  deploys together. Stopping the timers by hand is not needed and is not
+  enough: host-setup enables them again at the next deploy.
+- Two markers pause autodeploy, and they are not the same:
+  - `guard-only` holds **deploys** but keeps the **guard** (use it before the
+    first merge to `main`, or while investigating):
+    `sudo touch /var/lib/muster-cloud/autodeploy/guard-only`. While the file
+    exists every run does only the guard and exits 0 without contacting GitHub;
+    `sudo rm -f /var/lib/muster-cloud/autodeploy/guard-only` resumes deploys.
+    Unlike stopping the timer, this keeps the containers up. A run that does not
+    check GitHub does not refresh the `autodeploy-silent` stamp, so after 6 hours
+    of holding that alert fires as a reminder that deploys are held.
+  - `hold` is **maintenance mode**: `sudo touch /var/lib/muster-cloud/autodeploy/hold`
+    makes both the guard and the full run do nothing at all (no container is
+    started or stopped, no deploy, no change to the deployed record, no contact
+    with GitHub) until `sudo rm -f /var/lib/muster-cloud/autodeploy/hold`. Use it
+    for a manual rollback or a disaster-recovery cutover, where the guard or a
+    deploy would undo what you are doing. It logs one journal line when it
+    appears and then every 10 minutes, and alerts once when it is older than 24
+    hours (then at most once per 24 hours), so a forgotten hold does not stay
+    quiet. While it exists the containers are **not** kept up: if one stops, no
+    one starts it. Remove the marker as soon as you are done; the next run
+    (within 5 minutes) resumes from the state you left, and runs the `redeploy`
+    marker if you touched one.
+- Manual Kamal runs: `bin/kamal` labels the container it starts with
+  `muster.kamal.owner=<owner>`, where the owner is `MUSTER_KAMAL_OWNER` or
+  `manual` when that is not set; autodeploy's own calls use `autodeploy`. A full
+  autodeploy run does nothing (it exits 0 and writes one decision line) while
+  any Kamal container that is not its own runs, checked at the start and before
+  every Kamal step, and the guard also waits. So a `bin/kamal` you started by
+  hand is never undone halfway by a deploy. That protects one command, not a
+  whole procedure with pauses between commands: for a procedure (a rollback, a
+  cutover) touch `hold` first and remove it at the end. The owner may only
+  contain letters, digits, `.`, `_` and `-`, and is not a secret.
+- A stale Kamal lock: Kamal keeps a deploy lock (a directory on the host) while a
+  command runs, and a power loss or a kill leaves it behind, which makes every
+  later Kamal command refuse with "Deploy lock found". Before its Kamal commands
+  autodeploy looks at `kamal lock status`: when there is a lock, no Kamal
+  container runs, and the lock is older than 15 minutes or was taken before this
+  host's last boot, it releases it (one decision line and one alert). A younger
+  lock is waited for: that run is skipped and the next one looks again. The age
+  counts from when the lock was taken, and a lock left by a command you started by
+  hand is treated the same way, so do not leave a half-finished manual Kamal
+  command around; if you must clear one at once (nothing running), run
+  `./bin/kamal lock release` as `gha`.
 - A commit that failed 3 times is skipped until a newer one arrives; to retry it
   now: `sudo rm -f /var/lib/muster-cloud/autodeploy/attempts/*` and start the
   service.
@@ -403,19 +477,36 @@ after the URL changes.
 ## Rolling back
 
 Autodeploy only ever moves forward: it refuses a commit older than what runs.
-To go back by hand and stay there, stop it first:
+To go back by hand and stay there, put it in maintenance mode first. `hold`
+stops the guard and the deploys together (stopping the timers is no longer
+needed, and not enough: the guard timer would start the container you drained):
 
 ```
-sudo systemctl stop muster-cloud-autodeploy.timer
+sudo touch /var/lib/muster-cloud/autodeploy/hold
 sudo -iu gha                              # then, from /var/lib/muster-cloud/run or any checkout of that commit:
 bin/kamal app containers                  # versions still on the host
-bin/kamal rollback <sha> --version <sha>  # boots that version, drains the current one
+bin/kamal rollback <sha> --version <sha>  # boots that version, drains the current one (owner "manual")
+exit
 sudo /usr/local/sbin/muster-cloud-install-ops localhost:5000/oliveralerubio/muster-cloud:<sha>
+curl -fsS http://127.0.0.1:18110/readyz   # and check docker ps: nothing keeps the containers up while the hold lasts
 ```
 
-The last command makes the timers use the matching `muster-cloud-ops`. Start the
-timer again (`sudo systemctl start muster-cloud-autodeploy.timer`) once a fixed
-commit is on `main`; it will deploy it.
+The `install-ops` command makes the timers use the matching `muster-cloud-ops`.
+Leave the hold in place until a fixed commit is on `main`: removing it while the
+bad commit is still HEAD makes the next run deploy that commit again, undoing
+the rollback. When the fix is on `main`, `sudo rm -f
+/var/lib/muster-cloud/autodeploy/hold`; it deploys it within 5 minutes. (The
+hold alerts after 24 hours as a reminder.)
+
+**Backups made with the drill key and an older release.** Once a backup is made
+to two recipients (the drill key and the main key) its `manifest.json` carries
+an extra field, `recipients_sha256`. An older `muster-cloud-ops` does not know
+that field and refuses to read such a manifest (`restore-check` and the
+restore verification say so). Rolling back across the release that added the
+drill key is therefore safe for running the service, but until you roll
+forward again you cannot use the older binary to verify or restore the
+snapshots made in between; use the current `deploy/pg-restore.sh` and
+`muster-cloud-ops` of the fixed release for recoveries, not the old ones.
 
 **Migrations run forward at startup and are never undone.** A rollback runs
 older code against a newer database. It is only safe for releases that did not
@@ -440,8 +531,35 @@ schema, the way back is to fix forward, or to restore a backup (below).
   hashes, sizes and timestamps.
 - `authority/authority-<UTC>-<sequence>.tar.age`: the lifecycle authority
   (control journal, witness, a small `META.json`), encrypted to the same age
-  recipient. Written after every backup and hourly when the journal moved on.
-  Append-only: nothing deletes these (they are a few kilobytes).
+  recipients as the backups. Written within seconds of a journal change, after
+  every backup and hourly when the journal moved on. Append-only: nothing deletes
+  these (they are a few kilobytes).
+
+### How soon a change reaches Drive
+
+The authority copy is what lets a recovery know which tenants were deleted, so
+it matters that it follows the journal closely. It is **not** instantaneous, and
+this guide does not claim it is:
+
+- `muster-cloud-authority-offsite.path` watches the journal file
+  (`PathChanged`). A change starts the copy service, which waits 5 seconds (so a
+  burst of records becomes one or two uploads), archives, encrypts and uploads,
+  and, if the journal grew while it ran, copies again by itself (up to 5 rounds
+  per start; a start while a copy runs is a no-op for systemd, which is why the
+  script does this itself). The path unit is rate-limited (60 triggers per 30
+  seconds); the copy service has no start limit, so a burst can never stop the
+  unit that triggers it. The hourly timer is the backstop for anything this
+  missed, and the 30-minute check restarts the path unit if systemd ever stopped
+  it.
+- So the window between a journal change and its copy on Drive is **seconds to
+  about a minute** when Drive answers (the settle time plus the upload), and up
+  to an hour when an upload fails and the timer has to retry; the
+  `authority-stale` alert fires when a copy has been behind for more than 90
+  minutes, and a failed copy raises `unit:muster-cloud-authority-offsite.service`
+  at once. A host lost inside that window recovers with an authority copy that
+  misses the last change: a deletion made in those seconds is not in the copy,
+  and a restore from it would not erase that tenant again until the deletion is
+  repeated. The window is small, not zero.
 
 `muster-cloud-offsite` uploads with `rclone copy` only. An upload can never
 delete anything, so an emptied or wiped local snapshot directory deletes
@@ -484,9 +602,68 @@ tenants and heads with `manifest.json`, prints one JSON line and removes
 everything it created. The JSON has `ok`, the snapshot id and time,
 `max_data_loss_seconds` (the age of that snapshot: the data you would lose),
 the authority copy used and `elapsed_seconds`. Exit code 0 only when every check
-passed. Run it after setting up, and again every few months or after changing
-the backup code; it needs about four times the snapshot size in `/var/tmp`
-(`--workdir` changes that).
+passed. Run it by hand with the main key when you want to prove that the key in your
+password manager still opens the backups (the monthly drill below uses the
+drill-only key, so it proves everything except that one key); it needs about
+four times the snapshot size in `/var/tmp` (`--workdir` changes that). The
+drill refuses cleanly, before it downloads anything, when there is not enough
+space, and with `--select-only` it only says which snapshot it would use.
+
+### The monthly restore drill
+
+A recovery nobody practised is a guess, and a person will not run the drill every
+month, so it runs by itself: `muster-cloud-restore-drill.timer` (the 3rd of each
+month at about 03:30, up to 3 hours late, `Persistent=true` so a month missed
+because the host was off runs at the next boot). It is the same command as
+above, run as root from the source checkout autodeploy keeps current:
+
+```
+muster-cloud-restore-drill --age-identity /etc/muster-cloud/drill-age.key --workdir /var/lib/muster-cloud/drill
+```
+
+- **A second, drill-only age key.** The main key stays in your password manager.
+  `host-setup.sh` generates `/etc/muster-cloud/drill-age.key` (root, `0400`; it
+  never overwrites an existing one) and adds its public half to
+  `MUSTER_BACKUP_AGE_RECIPIENTS` in `ops.env`, so every backup and every
+  authority copy made from then on can be opened by either key. The drill uses
+  only the drill key and never shreds it (`--shred-identity` is for the main key).
+- **Which snapshot.** The newest complete snapshot whose manifest lists the drill
+  key's public key as a recipient, so it can really be opened. If the newest
+  snapshots were made before the drill key existed, it skips them and says so;
+  if no such snapshot is younger than 8 days it fails with a message saying so
+  (a long gap here means backups stopped, or the offsite copy did). The same
+  goes for the authority copy: it must be encrypted to the drill key, so the
+  first drill after the key was added needs one backup and one authority copy
+  made after it (a drill started earlier fails loudly and changes nothing).
+- **Space.** The scratch directory is `/var/lib/muster-cloud/drill` (never under
+  `/srv/muster-cloud`), and the drill checks about four times the snapshot size is
+  free before it downloads anything; if not, it fails with the needed and the free
+  space. Free space or move the directory (`--workdir` in the unit) and run
+  `sudo systemctl start muster-cloud-restore-drill.service`.
+- **What counts as success.** Exit 0 and one JSON line with `"ok":true` in the
+  journal (`journalctl -u muster-cloud-restore-drill`). Only then is
+  `/var/lib/muster-cloud/drill/last-ok` touched. A failed drill raises
+  `unit:muster-cloud-restore-drill.service` at once, and the 30-minute check
+  raises `restore-drill-stale` when there has been no success for 40 days.
+- **The cost, honestly.** Until now the age private key never lived on this host.
+  The drill key does, readable by root. Whoever has root on this host (or its disk)
+  can now decrypt the Drive snapshots and authority copies made after the key
+  was added: that includes data of tenants deleted since, until their snapshot
+  expires (30 days by default, `MUSTER_BACKUP_RETENTION_DAYS`). That is the price of
+  an unattended drill. It does not give more than root already had on live data
+  (root can read the database and the repositories), and it does not open anything
+  made before the key was added. This is deliberately not a one-line switch:
+  `host-setup.sh` puts the key, its recipient entry and the timer back at every
+  deploy, so removing the drill means removing it from `host-setup.sh` (and
+  `deploy/systemd/`) in a commit, then deleting `drill-age.key` and its public
+  key from `MUSTER_BACKUP_AGE_RECIPIENTS` on the host.
+- **Changing the key.** Move `drill-age.key` aside and run
+  `sudo deploy/kamal/host-setup.sh`: it generates a new one and adds the new public
+  key (remove the old public key from `MUSTER_BACKUP_AGE_RECIPIENTS` by hand if you
+  do not want backups to keep including it). A new key is used for backups made
+  after it; the drill fails until one exists, as described above. On a new host
+  after a total loss the same thing happens: the old public key stays listed (it
+  is harmless) and a new key joins it.
 
 ### Recover for real
 
@@ -496,8 +673,11 @@ the backup code; it needs about four times the snapshot size in `/var/tmp`
 
 1. Do the bootstrap, steps 0 to 5, on the new host (including `host-setup.sh`;
    the same `ops.env`, `kamal.env` and `deploy.env`; `MUSTER_BACKUP_AGE_RECIPIENT`
-   must stay the same key). Keep the autodeploy timer stopped. Do **not** run
-   `init`.
+   must stay the same key; step 5 starts the empty database). In step 4 put the
+   **`hold`** marker instead of `guard-only`
+   (`sudo touch /var/lib/muster-cloud/autodeploy/hold`) and keep it until the
+   cutover below is done: `hold` also stops the guard, which would otherwise
+   start containers you are about to replace. Do **not** run `init`.
 2. Put the age private key in `/dev/shm/muster-backup.key` (mode 0600).
 3. Restore the authority from the newest copy on Drive:
    ```
@@ -531,19 +711,55 @@ the backup code; it needs about four times the snapshot size in `/var/tmp`
    `--age-identity-file /dev/shm/muster-backup.key`, and `--control-dir`,
    `--control-witness` pointing at the restored authority. It refuses anything
    unsafe, joins the restore as a new candidate incarnation and erases tenants
-   deleted after the backup. Then `chown -R 10001:10001` the repository root.
-6. Cut over, deliberately:
-   1. `muster-cloud-ops activate --incarnation <id printed by the restore> --database-url <new db>`
-      (this fences the running service, if any: it starts refusing requests).
-   2. `docker stop` the service container if there is one, move
-      `/srv/muster-cloud/repos` aside and put the restored repository root in its
-      place (owner `10001:10001`, mode `0700`).
+   deleted after the backup. It runs as root, so what it wrote must go back to
+   the service (user 10001), or the service cannot read the witness and refuses
+   to start. `pg-restore.sh` hands the journal, the witness and the lock back
+   itself and fails (exit 73) if it cannot; do the same for the repository root
+   and confirm the rest:
+   ```
+   sudo chown -R 10001:10001 /srv/muster-cloud/repos-restored
+   sudo find /srv/muster-cloud/control /var/lib/muster-witness/w -type f \
+     -exec chown 10001:10001 {} + -exec chmod 0600 {} +        # journal, lock, witness (a no-op when already right)
+   sudo ls -ln /srv/muster-cloud/control /var/lib/muster-witness/w   # everything 10001 10001, -rw-------
+   ```
+6. Cut over, deliberately, with the `hold` marker still in place (nothing
+   starts, stops or deploys while you work):
+   1. Activate the restored database. `activate` reads the database URL from the
+      environment, like `restore-check`, so the password never appears in the
+      process list; put the URL of the **new** database in a root-only file
+      without echoing it, and add the file after `ops.env` (a later
+      `EnvironmentFile` wins):
+      ```
+      sudo bash -c 'umask 077; read -rsp "new database URL: " u; echo; printf "MUSTER_DATABASE_URL=%s\n" "$u" >/dev/shm/new-db.env'
+      sudo systemd-run --pipe --wait --collect -p User=muster-cloud -p Group=muster-cloud -p UMask=0077 \
+        -p EnvironmentFile=/etc/muster-cloud/ops.env -p EnvironmentFile=/dev/shm/new-db.env \
+        /usr/local/bin/muster-cloud-ops activate --incarnation <id printed by the restore>
+      sudo rm -f /dev/shm/new-db.env
+      ```
+      (The URL has the form `postgres://muster:<password>@localhost/<new db>?host=/srv/muster-cloud/pgsocket`.
+      This fences the running service, if any: it starts refusing requests. The
+      old `--database-url` flag still works but prints a warning, because it puts
+      the password in the process list.)
+   2. Move `/srv/muster-cloud/repos` aside and put the restored repository root in
+      its place (owner `10001:10001`, mode `0700`). You do not need to stop the
+      service container: it is fenced, and the redeploy below replaces it.
    3. Update the database name in `MUSTER_DATABASE_URL` in both `kamal.env` and
-      `ops.env`, then start autodeploy again
-      (`sudo systemctl start muster-cloud-autodeploy.timer`; it deploys the HEAD of
-      `main`).
+      `ops.env`.
+   4. Redeploy and release the hold, in this order:
+      ```
+      sudo touch /var/lib/muster-cloud/autodeploy/redeploy
+      sudo rm -f /var/lib/muster-cloud/autodeploy/hold
+      sudo systemctl start muster-cloud-autodeploy.service      # do not wait 5 minutes
+      journalctl -u muster-cloud-autodeploy -n 40 --no-pager
+      ```
+      The run boots the running commit again with the new settings (on a new host
+      it deploys the HEAD of `main` anyway) and stops the fenced container once
+      the new one is routed and ready. Check
+      `curl -fsS https://personal.tailbb30e7.ts.net:10000/readyz`.
 7. Delete the age key from the RAM disk (`shred -u /dev/shm/muster-backup.key`),
-   run the backup once, and check `muster-cloud-backup-check` is quiet.
+   run the backup once, and check `muster-cloud-backup-check` is quiet. The
+   next monthly drill (or `sudo systemctl start muster-cloud-restore-drill.service`
+   once a backup made after the restore exists) proves the new host can recover too.
 
 What you lose: everything after the snapshot (up to 6 hours of data), plus
 everything the journal says was deleted stays deleted.
@@ -555,9 +771,17 @@ everything the journal says was deleted stays deleted.
   has both write access to the Drive folder and the age private key can upload an
   older authority copy together with an older snapshot, and a recovery would
   roll the whole deployment back to that point without anything detecting it.
-  The age key is not on the host, and Drive is not writable from anything but
-  root's `rclone` remote; but both are single points of trust, and the system
-  does not defend against someone who holds both.
+  The main age key is not on the host, and Drive is not writable from anything
+  but root's `rclone` remote; but both are single points of trust, and the system
+  does not defend against someone who holds both. Since the monthly drill, the
+  drill-only age key also lives on the host (root `0400`), and a backup made
+  after it was added is encrypted to it too, so **root on this host now holds both
+  halves** for everything made since then: Drive access and a key that opens it.
+  That means a compromised root can read recent Drive backups (including
+  tenants deleted within the retention window) and can rewrite what Drive holds,
+  not only damage the live data. Root could already do all of that to the live
+  data; the drill key extends it to the retained history. The main key, the one
+  that restores a new host, is still off the host.
 - **Shared machine.** The VPS also runs other projects and CI. Kamal and the
   helper rely on `gha` being in the `docker` group, which is root-equivalent.
   Autodeploy starts Kamal as `gha` only from an export of a commit of `main` with

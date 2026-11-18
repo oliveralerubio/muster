@@ -425,6 +425,11 @@ passed to `pg_dump` through `PG*` environment variables, never argv.) Needs
 `MUSTER_BACKUP_AGE_RECIPIENT` (a recipient PUBLIC key). Prints one JSON line
 (`backup_id`, `path`, `snapshot_at`, `tenants`, `encryption`).
 
+- Optional `MUSTER_BACKUP_AGE_RECIPIENTS`: more recipient public keys,
+  comma-separated (a second identity that may open the backup, such as the
+  restore drill's). A backup to several recipients records all of them in the
+  manifest (`recipients_sha256`; an older `muster-cloud-ops` cannot read such a
+  manifest). A malformed entry refuses the backup (78) before anything is read.
 - **Encryption is the default and required**: no recipient → refused (65).
   `--plaintext` (`--plaintext-synthetic`) is for synthetic data in
   development (`MUSTER_ENV=development`) only, and refused in production (65).
