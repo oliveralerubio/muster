@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# bin/kamal — run Kamal from its official, pinned container image. No Ruby on
+# the host: the only requirement is Docker.
+#
+#   bin/kamal config            render the resolved configuration (secrets redacted)
+#   bin/kamal deploy --skip-push --version <sha>
+#   bin/kamal rollback <sha>
+#
+# Guide: deploy/KAMAL.md.
+#
+# What the container gets:
+#   - the repository, mounted at /workdir (the image's working directory);
+#   - your ~/.ssh, read-only (Kamal reaches the host over SSH with your keys;
+#     the host key must already be in ~/.ssh/known_hosts);
+#   - the secrets file, read-only, at the SAME path
+#     (${MUSTER_CLOUD_SECRETS_FILE:-/etc/muster-cloud/kamal.env}), read by
+#     .kamal/secrets through deploy/kamal/secret;
+#   - these variables, when set: MUSTER_CLOUD_PUBLIC_URL, MUSTER_PADDLE_ENVIRONMENT,
+#     MUSTER_PADDLE_PRICE_PERSONAL, MUSTER_PADDLE_PRICE_TEAM_SEAT,
+#     KAMAL_REGISTRY_PASSWORD, MUSTER_CLOUD_SECRETS_FILE.
+#
+# Non-secret settings come from /etc/muster-cloud/deploy.env when it exists
+# (override its path with MUSTER_CLOUD_DEPLOY_ENV). It is parsed, never
+# sourced: KEY=VALUE lines for the four non-secret variables above only, and a
+# variable already set in your environment wins.
+#
+# The container shares the host network so SSH to the host's own Tailscale
+# address works the same from CI (which runs on that host) and from a laptop.
+# The Docker socket is NOT mounted unless KAMAL_WRAPPER_DOCKER=1 (needed only
+# for a manual build+push: `bin/kamal deploy` without --skip-push).
+#
+# The image is pinned by digest (the multi-arch index of ghcr.io/basecamp/kamal
+# v2.12.0). To upgrade: pick the new tag, resolve its digest with
+#   docker buildx imagetools inspect ghcr.io/basecamp/kamal:<tag>
+# and change KAMAL_IMAGE below.
+
+set -euo pipefail
+
+KAMAL_IMAGE='ghcr.io/basecamp/kamal:v2.12.0@sha256:7b5be276aa17bbe122887f6a1ff12865f4848111989699b9786083be95d98415'
+
+die() {
+  printf 'bin/kamal: %s\n' "$1" >&2
+  exit 1
+}
+
+command -v docker >/dev/null 2>&1 || die "docker is required"
+
+repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+
+load_deploy_env() {
+  local file=$1 line key value
+  [ -f "$file" ] || return 0
+  [ -r "$file" ] || die "cannot read $file"
+  while IFS= read -r line || [ -n "$line" ]; do
+    case $line in
+      '' | '#'*) continue ;;
+    esac
+    key=${line%%=*}
+    value=${line#*=}
+    case $value in
+      \"*\") value=${value#\"}; value=${value%\"} ;;
+      \'*\') value=${value#\'}; value=${value%\'} ;;
+    esac
+    case $key in
+      MUSTER_CLOUD_PUBLIC_URL | MUSTER_PADDLE_ENVIRONMENT | MUSTER_PADDLE_PRICE_PERSONAL | MUSTER_PADDLE_PRICE_TEAM_SEAT)
+        if [ -z "${!key:-}" ]; then
+          export "$key=$value"
+        fi
+        ;;
+      *) die "$file: unexpected line (only the four non-secret variables are allowed there)" ;;
+    esac
+  done <"$file"
+}
+load_deploy_env "${MUSTER_CLOUD_DEPLOY_ENV:-/etc/muster-cloud/deploy.env}"
+
+secrets_file=${MUSTER_CLOUD_SECRETS_FILE:-/etc/muster-cloud/kamal.env}
+export MUSTER_CLOUD_SECRETS_FILE=$secrets_file
+case $secrets_file in
+  /*) ;;
+  *) die "MUSTER_CLOUD_SECRETS_FILE must be an absolute path" ;;
+esac
+
+args=(run --rm --network host
+  --user "$(id -u):$(id -g)"
+  --env HOME=/home/kamal
+  --volume "$repo:/workdir")
+for group in $(id -G); do
+  args+=(--group-add "$group")
+done
+
+if [ -t 0 ] && [ -t 1 ]; then
+  args+=(--interactive --tty)
+fi
+
+if [ -d "${HOME:-/nonexistent}/.ssh" ]; then
+  args+=(--volume "$HOME/.ssh:/home/kamal/.ssh:ro")
+fi
+
+if [ -f "$secrets_file" ]; then
+  args+=(--volume "$secrets_file:$secrets_file:ro")
+else
+  printf 'bin/kamal: note: secrets file %s not found; commands that read secrets will fail\n' "$secrets_file" >&2
+fi
+
+if [ "${KAMAL_WRAPPER_DOCKER:-0}" = 1 ]; then
+  [ -S /var/run/docker.sock ] || die "KAMAL_WRAPPER_DOCKER=1 but /var/run/docker.sock is missing"
+  args+=(--volume /var/run/docker.sock:/var/run/docker.sock
+    --group-add "$(stat -c %g /var/run/docker.sock)")
+fi
+
+# Pass by name only: values never appear on the command line.
+for name in MUSTER_CLOUD_PUBLIC_URL MUSTER_PADDLE_ENVIRONMENT \
+  MUSTER_PADDLE_PRICE_PERSONAL MUSTER_PADDLE_PRICE_TEAM_SEAT \
+  KAMAL_REGISTRY_PASSWORD MUSTER_CLOUD_SECRETS_FILE; do
+  if [ -n "${!name:-}" ]; then
+    args+=(--env "$name")
+  fi
+done
+
+exec docker "${args[@]}" "$KAMAL_IMAGE" "$@"

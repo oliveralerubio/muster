@@ -1,0 +1,50 @@
+# Installed by deploy/kamal/host-setup.sh (never by CI). @RCLONE@ is replaced
+# with the path of the host's rclone.
+[Unit]
+Description=Muster Cloud: offsite copy of published backup snapshots (Google Drive)
+Documentation=file:///opt/muster-cloud/deploy/KAMAL.md
+After=network-online.target
+Wants=network-online.target
+ConditionPathIsDirectory=/srv/muster-cloud/backups/snapshots
+
+[Service]
+Type=oneshot
+# rclone's own config (the Drive remote and its refreshed OAuth token) is root's.
+User=root
+Group=root
+Environment=RCLONE_CONFIG=/root/.config/rclone/rclone.conf
+Environment=RCLONE_CACHE_DIR=/var/cache/muster-cloud-offsite
+CacheDirectory=muster-cloud-offsite
+# `sync`, not `copy`: when local retention (or a deletion cap) removes a
+# snapshot, its offsite copy goes too. No Drive trash: a deleted tenant's data
+# must really expire. ONLY the published snapshots/ directory is sent, never
+# staging/, ops/, trash/ or audit/. Everything in it is age-encrypted except
+# each manifest.json. --max-delete caps one run at 30 files (10 snapshots):
+# normal retention removes far fewer per hour, so a wiped or emptied local
+# root fails this unit instead of erasing the offsite copies too.
+ExecStart=@RCLONE@ sync /srv/muster-cloud/backups/snapshots gdrive:muster-cloud-backups/snapshots \
+    --drive-use-trash=false --checksum --transfers 2 --checkers 4 \
+    --max-delete 30 \
+    --retries 3 --low-level-retries 10 --stats 0 --log-level NOTICE
+TimeoutStartSec=2h
+Nice=10
+IOSchedulingClass=idle
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+# /root stays readable for rclone.conf; only its rclone directory is writable
+# (OAuth token refresh rewrites the config file).
+ProtectHome=read-only
+ReadWritePaths=/root/.config/rclone
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX

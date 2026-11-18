@@ -1,0 +1,616 @@
+#!/usr/bin/env bash
+# deploy/kamal/host-setup.sh — one-time (and safely repeatable) preparation of
+# the `personal` VPS for the Kamal deployment of muster Cloud. Guide:
+# deploy/KAMAL.md.
+#
+#   sudo deploy/kamal/host-setup.sh            apply: create/fix what is missing
+#   sudo deploy/kamal/host-setup.sh --check    change NOTHING; report what is
+#                                              missing or different
+#
+# Run as root from a checkout of this repository. Idempotent: a second run
+# changes nothing. It manages only what is listed here and never touches any
+# other container, network, service, UFW rule, /etc/docker or Tailscale serve
+# entry:
+#
+#   accounts      users/groups muster-cloud (10001) and muster-pg (10002)
+#   directories   /srv/muster-cloud/{repos,repos/locks,control,backups,pg/data,
+#                 pgsocket}, /var/lib/muster-witness/w, /etc/muster-cloud
+#   witness       refuses to create anything under /var/lib/muster-witness
+#                 unless that is a mounted filesystem of its own
+#   network       Docker network `kamal` with the fixed subnet 172.31.250.0/24
+#                 (refuses if a `kamal` network exists with another subnet)
+#   deploy hook   /usr/local/sbin/muster-cloud-install-ops (root:root 0755) and
+#                 the sudoers drop-in /etc/sudoers.d/muster-cloud-deploy that
+#                 lets user `gha` run exactly that one script
+#   timers        backup (every 6 h at :41), retention (hourly) and offsite copy
+#                 to Google Drive (hourly), enabled with `enable --now`
+#   funnel        `tailscale funnel --bg --https=10000 http://127.0.0.1:18110`
+#
+# It refuses to proceed unless /etc/muster-cloud/ops.env is a regular file
+# owned by root with mode 0600. It also CHECKS (never creates) the secret
+# files /etc/muster-cloud/kamal.env and deploy.env, the gha account, rclone's
+# `gdrive:` remote and the loopback ports of kamal-proxy.
+#
+# Exit codes: 0 everything in place (apply: and done); 1 something is missing,
+# different or failed (see the FAIL/TODO/WOULD lines); 64 usage; 77 not root or
+# ops.env refused.
+
+# The `bash -c '...'` bodies passed to change() are single-quoted on purpose:
+# their $1..$4 are positional arguments of that inner shell.
+# shellcheck disable=SC2016
+set -uo pipefail
+umask 022
+export LC_ALL=C
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+REPO=$(cd "$HERE/../.." && pwd -P)
+readonly HERE REPO
+
+# ---- fixed facts of this deployment ------------------------------------------
+readonly SVC_UID=10001 SVC_NAME=muster-cloud
+readonly PG_UID=10002 PG_NAME=muster-pg
+readonly ROOT_DIR=/srv/muster-cloud
+readonly WITNESS_MOUNT=/var/lib/muster-witness
+readonly ETC_DIR=/etc/muster-cloud
+readonly OPS_ENV=$ETC_DIR/ops.env
+readonly KAMAL_ENV=$ETC_DIR/kamal.env
+readonly DEPLOY_ENV=$ETC_DIR/deploy.env
+readonly KAMAL_NET=kamal
+readonly KAMAL_SUBNET=172.31.250.0/24
+readonly DEPLOY_USER=gha
+readonly INSTALL_OPS=/usr/local/sbin/muster-cloud-install-ops
+readonly SUDOERS_FILE=/etc/sudoers.d/muster-cloud-deploy
+readonly UNIT_DIR=/etc/systemd/system
+readonly FUNNEL_PORT=10000
+readonly PROXY_HTTP_PORT=18110
+readonly PROXY_HTTPS_PORT=18111
+readonly TS_HOST_IP=100.92.84.56
+
+MODE=apply
+case "${1:-}" in
+  '') ;;
+  --check) MODE=check ;;
+  -h | --help)
+    sed -n '2,/ops.env refused\./p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+    ;;
+  *)
+    printf 'usage: %s [--check]\n' "$0" >&2
+    exit 64
+    ;;
+esac
+[ "$#" -le 1 ] || {
+  printf 'usage: %s [--check]\n' "$0" >&2
+  exit 64
+}
+
+# ---- reporting -----------------------------------------------------------------
+n_change=0 # check: would change; apply: changed
+n_fail=0   # blocked or failed
+n_todo=0   # needs a human (secrets, SSH keys, rclone remote)
+
+ok() { printf 'ok     %s\n' "$1"; }
+note() { printf 'note   %s\n' "$1"; }
+fail() {
+  printf 'FAIL   %s\n' "$1"
+  n_fail=$((n_fail + 1))
+}
+todo() {
+  printf 'TODO   %s\n' "$1"
+  n_todo=$((n_todo + 1))
+}
+
+# change "description" cmd args...  — run it (apply) or only report it (check).
+change() {
+  local desc=$1
+  shift
+  if [ "$MODE" = check ]; then
+    printf 'WOULD  %s\n' "$desc"
+    n_change=$((n_change + 1))
+    return 0
+  fi
+  if "$@"; then
+    printf 'done   %s\n' "$desc"
+    n_change=$((n_change + 1))
+    return 0
+  fi
+  fail "$desc (command failed)"
+  return 1
+}
+
+WORK=""
+# shellcheck disable=SC2329  # runs through the EXIT trap
+cleanup() {
+  [ -z "$WORK" ] || rm -rf --one-file-system -- "$WORK"
+}
+trap cleanup EXIT
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/muster-host-setup.XXXXXX") || {
+  printf 'host-setup.sh: mktemp failed\n' >&2
+  exit 74
+}
+
+# ---- preflight ---------------------------------------------------------------
+[ "$(id -u)" -eq 0 ] || {
+  printf 'host-setup.sh: must run as root (sudo)\n' >&2
+  exit 77
+}
+for tool in docker systemctl visudo install cmp stat getent flock mountpoint findmnt ss; do
+  command -v "$tool" >/dev/null 2>&1 || {
+    printf 'host-setup.sh: required tool not found: %s\n' "$tool" >&2
+    exit 77
+  }
+done
+printf 'host-setup.sh: mode=%s repo=%s\n' "$MODE" "$REPO"
+
+# The unit files run with this file as their environment (it holds the
+# database URL): refuse anything but a root-owned 0600 regular file.
+ops_env_ok=1
+if [ ! -f "$OPS_ENV" ] || [ -L "$OPS_ENV" ]; then
+  ops_env_ok=0
+  why="is not a regular file"
+elif [ "$(stat -c '%u:%g %a' -- "$OPS_ENV")" != "0:0 600" ]; then
+  ops_env_ok=0
+  why="must be owned by root:root with mode 0600 (has $(stat -c '%U:%G %a' -- "$OPS_ENV"))"
+fi
+if [ "$ops_env_ok" -eq 0 ]; then
+  if [ "$MODE" = apply ]; then
+    printf 'host-setup.sh: refusing to proceed: %s %s\n' "$OPS_ENV" "$why" >&2
+    printf 'host-setup.sh: create it as root first (see deploy/KAMAL.md, step 2)\n' >&2
+    exit 77
+  fi
+  fail "$OPS_ENV $why (apply mode refuses to proceed)"
+fi
+
+# ---- helpers: accounts and directories --------------------------------------
+ensure_account() { # name id
+  local name=$1 id=$2 gid uid pgid
+  if gid=$(getent group "$name" | cut -d: -f3) && [ -n "$gid" ]; then
+    if [ "$gid" = "$id" ]; then
+      ok "group $name ($id)"
+    else
+      fail "group $name exists with gid $gid, expected $id"
+    fi
+  else
+    change "create group $name ($id)" groupadd --system --gid "$id" "$name"
+  fi
+  if uid=$(getent passwd "$name" | cut -d: -f3) && [ -n "$uid" ]; then
+    pgid=$(getent passwd "$name" | cut -d: -f4)
+    if [ "$uid" = "$id" ] && [ "$pgid" = "$id" ]; then
+      ok "user $name ($id:$id)"
+    else
+      fail "user $name exists as $uid:$pgid, expected $id:$id"
+    fi
+  else
+    change "create user $name ($id)" useradd --system --uid "$id" --gid "$id" \
+      --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$name"
+  fi
+}
+
+# ensure_dir path uid gid mode
+ensure_dir() {
+  local path=$1 uid=$2 gid=$3 mode=$4 have
+  if [ -L "$path" ]; then
+    fail "$path is a symbolic link; refusing"
+    return
+  fi
+  if [ ! -d "$path" ]; then
+    change "create $path ($uid:$gid $mode)" install -d -m "$mode" -o "$uid" -g "$gid" "$path"
+    return
+  fi
+  have=$(stat -c '%u:%g %a' -- "$path")
+  if [ "$have" = "$uid:$gid ${mode#0}" ] || [ "$have" = "$uid:$gid $mode" ]; then
+    ok "$path ($uid:$gid $mode)"
+  else
+    change "fix $path: $have -> $uid:$gid $mode" bash -c 'chown "$1:$2" "$4" && chmod "$3" "$4"' _ "$uid" "$gid" "$mode" "$path"
+  fi
+}
+
+# ensure_traversable path — must exist; "other" needs x so uid 10001/10002 can
+# walk down to their directories.
+ensure_traversable() {
+  local path=$1 mode
+  if [ ! -d "$path" ]; then
+    change "create $path (root 0755)" install -d -m 0755 -o 0 -g 0 "$path"
+    return
+  fi
+  mode=$(stat -c %a -- "$path")
+  if [ $((0$mode & 1)) -ne 0 ]; then
+    ok "$path is traversable ($mode)"
+  else
+    change "make $path traversable ($mode -> o+x)" chmod o+x "$path"
+  fi
+}
+
+# put_file src dest mode — install root:root, atomically; skip when identical.
+put_file() {
+  local src=$1 dest=$2 mode=$3
+  if [ -f "$dest" ] && [ ! -L "$dest" ] && cmp -s -- "$src" "$dest" \
+    && [ "$(stat -c '%u:%g %a' -- "$dest")" = "0:0 ${mode#0}" ]; then
+    ok "$dest up to date"
+    return 1
+  fi
+  change "install $dest" bash -c 'install -m "$3" -o 0 -g 0 "$1" "$2.new" && mv -f "$2.new" "$2"' _ "$src" "$dest" "$mode"
+  return 0
+}
+
+# ---- 1. accounts ---------------------------------------------------------------
+printf '\n== accounts\n'
+ensure_account "$SVC_NAME" "$SVC_UID"
+ensure_account "$PG_NAME" "$PG_UID"
+
+# ---- 2. directories --------------------------------------------------------------
+printf '\n== directories\n'
+# 0711: gha must be able to walk to kamal.env; the files inside carry the secrecy.
+ensure_dir "$ETC_DIR" 0 0 0711
+ensure_traversable "$ROOT_DIR"
+ensure_dir "$ROOT_DIR/repos" "$SVC_UID" "$SVC_UID" 0700
+ensure_dir "$ROOT_DIR/repos/locks" "$SVC_UID" "$SVC_UID" 0700
+ensure_dir "$ROOT_DIR/control" "$SVC_UID" "$SVC_UID" 0700
+ensure_dir "$ROOT_DIR/backups" "$SVC_UID" "$SVC_UID" 0700
+if [ -d "$ROOT_DIR/pg" ] && [ ! -L "$ROOT_DIR/pg" ]; then
+  ensure_traversable "$ROOT_DIR/pg"
+elif [ ! -e "$ROOT_DIR/pg" ]; then
+  change "create $ROOT_DIR/pg (root 0711)" install -d -m 0711 -o 0 -g 0 "$ROOT_DIR/pg"
+else
+  fail "$ROOT_DIR/pg is not a directory"
+fi
+ensure_dir "$ROOT_DIR/pg/data" "$PG_UID" "$PG_UID" 0700
+# The unix socket directory: postgres (10002) writes, the service group
+# (10001) may enter it to connect.
+ensure_dir "$ROOT_DIR/pgsocket" "$PG_UID" "$SVC_UID" 0750
+
+printf '\n== witness (own filesystem, never the root disk)\n'
+if mountpoint -q "$WITNESS_MOUNT"; then
+  src=$(findmnt -n -o SOURCE,FSTYPE "$WITNESS_MOUNT" | head -1)
+  ok "$WITNESS_MOUNT is a mount point ($src)"
+  if [ "$(stat -c %d -- "$WITNESS_MOUNT")" = "$(stat -c %d -- "$ROOT_DIR")" ]; then
+    fail "$WITNESS_MOUNT is on the same filesystem as $ROOT_DIR"
+  else
+    ensure_dir "$WITNESS_MOUNT/w" "$SVC_UID" "$SVC_UID" 0700
+  fi
+else
+  fail "$WITNESS_MOUNT is not mounted: refusing to create the witness directory on the root disk (mount the witness partition first)"
+fi
+
+# ---- 3. secret and settings files (checked, never created) --------------------
+printf '\n== files under %s (values are never printed)\n' "$ETC_DIR"
+
+# has_key file KEY — a non-empty KEY=VALUE line exists.
+has_key() { grep -Eq "^$2=.+" "$1"; }
+
+check_keys() { # file label key...
+  local file=$1 label=$2 key missing=""
+  shift 2
+  for key in "$@"; do
+    has_key "$file" "$key" || missing="$missing $key"
+  done
+  if [ -z "$missing" ]; then
+    ok "$label has all required keys"
+  else
+    todo "$label is missing:$missing"
+  fi
+}
+
+if getent passwd "$DEPLOY_USER" >/dev/null; then
+  ok "account $DEPLOY_USER exists"
+  if id -nG "$DEPLOY_USER" | tr ' ' '\n' | grep -qx docker; then
+    ok "$DEPLOY_USER is in the docker group"
+  else
+    todo "add $DEPLOY_USER to the docker group (usermod -aG docker $DEPLOY_USER)"
+  fi
+else
+  todo "account $DEPLOY_USER does not exist"
+fi
+
+if [ -f "$KAMAL_ENV" ] && [ ! -L "$KAMAL_ENV" ]; then
+  if getent passwd "$DEPLOY_USER" >/dev/null; then
+    # Owned by gha (it reads it through bin/kamal), nobody else.
+    if [ "$(stat -c '%U:%G %a' -- "$KAMAL_ENV")" = "$DEPLOY_USER:$DEPLOY_USER 600" ]; then
+      ok "$KAMAL_ENV ($DEPLOY_USER:$DEPLOY_USER 0600)"
+    else
+      change "fix $KAMAL_ENV -> $DEPLOY_USER:$DEPLOY_USER 0600" bash -c 'chown "$2:$2" "$1" && chmod 0600 "$1"' _ "$KAMAL_ENV" "$DEPLOY_USER"
+    fi
+  fi
+  check_keys "$KAMAL_ENV" "$KAMAL_ENV" MUSTER_DATABASE_URL MUSTER_OIDC_ISSUER \
+    MUSTER_OIDC_CLIENT_ID MUSTER_OIDC_CLIENT_SECRET MUSTER_PADDLE_API_KEY \
+    MUSTER_PADDLE_WEBHOOK_SECRET POSTGRES_PASSWORD
+else
+  todo "$KAMAL_ENV does not exist ($DEPLOY_USER:$DEPLOY_USER 0600; keys in deploy/KAMAL.md, step 2)"
+fi
+
+if [ -f "$DEPLOY_ENV" ] && [ ! -L "$DEPLOY_ENV" ]; then
+  check_keys "$DEPLOY_ENV" "$DEPLOY_ENV" MUSTER_PADDLE_PRICE_PERSONAL MUSTER_PADDLE_PRICE_TEAM_SEAT
+  if grep -Evq '^(#.*|)$|^(MUSTER_CLOUD_PUBLIC_URL|MUSTER_PADDLE_ENVIRONMENT|MUSTER_PADDLE_PRICE_PERSONAL|MUSTER_PADDLE_PRICE_TEAM_SEAT)=' "$DEPLOY_ENV"; then
+    fail "$DEPLOY_ENV has lines other than the four non-secret settings (bin/kamal refuses them)"
+  fi
+else
+  todo "$DEPLOY_ENV does not exist (deploy/KAMAL.md, step 2)"
+fi
+
+if [ "$ops_env_ok" -eq 1 ]; then
+  check_keys "$OPS_ENV" "$OPS_ENV" MUSTER_DATABASE_URL MUSTER_REPO_ROOT MUSTER_CONTROL_DIR \
+    MUSTER_CONTROL_WITNESS MUSTER_BACKUP_ROOT MUSTER_BACKUP_AGE_RECIPIENT
+  # The host-side tool and the service share these paths; a typo here would
+  # make them look at different stores.
+  for pair in "MUSTER_REPO_ROOT=$ROOT_DIR/repos" "MUSTER_CONTROL_DIR=$ROOT_DIR/control" \
+    "MUSTER_CONTROL_WITNESS=$WITNESS_MOUNT/w/witness.json" "MUSTER_BACKUP_ROOT=$ROOT_DIR/backups"; do
+    if grep -qxF "$pair" "$OPS_ENV"; then
+      ok "$OPS_ENV: $pair"
+    else
+      fail "$OPS_ENV must contain exactly the line $pair (same path as the container)"
+    fi
+  done
+fi
+
+# ---- 4. docker network ------------------------------------------------------------
+printf '\n== docker network %s\n' "$KAMAL_NET"
+if ! docker info >/dev/null 2>&1; then
+  fail "docker daemon is not reachable"
+elif docker network inspect "$KAMAL_NET" >/dev/null 2>&1; then
+  subnets=$(docker network inspect "$KAMAL_NET" --format '{{range .IPAM.Config}}{{.Subnet}} {{end}}')
+  subnets=${subnets% }
+  if [ "$subnets" = "$KAMAL_SUBNET" ]; then
+    ok "network $KAMAL_NET exists with subnet $KAMAL_SUBNET"
+  else
+    fail "network $KAMAL_NET exists with subnet '$subnets', not $KAMAL_SUBNET; refusing to touch it (every container on it would have to be recreated)"
+  fi
+else
+  change "create docker network $KAMAL_NET ($KAMAL_SUBNET)" \
+    docker network create --driver bridge --subnet "$KAMAL_SUBNET" "$KAMAL_NET"
+fi
+
+# ---- 5. deploy hook: install-ops + sudoers ---------------------------------------
+printf '\n== deploy hook\n'
+src_ops=$HERE/muster-cloud-install-ops
+[ -f "$src_ops" ] || fail "missing $src_ops"
+put_file "$src_ops" "$INSTALL_OPS" 0755 || true
+[ -x "$INSTALL_OPS" ] || [ "$MODE" = check ] || fail "$INSTALL_OPS is not executable"
+
+sudoers_tmp=$WORK/sudoers
+printf '%s\n' \
+  '# Managed by deploy/kamal/host-setup.sh. The deploy workflow (user gha, on this' \
+  '# host) may run exactly this one root-owned script; it validates its argument.' \
+  "$DEPLOY_USER ALL=(root) NOPASSWD: $INSTALL_OPS" >"$sudoers_tmp"
+if visudo -cf "$sudoers_tmp" >/dev/null 2>&1; then
+  if [ -f "$SUDOERS_FILE" ] && cmp -s -- "$sudoers_tmp" "$SUDOERS_FILE" \
+    && [ "$(stat -c '%u:%g %a' -- "$SUDOERS_FILE")" = "0:0 440" ]; then
+    ok "$SUDOERS_FILE up to date"
+  else
+    change "install $SUDOERS_FILE (validated with visudo -cf)" \
+      bash -c 'install -m 0440 -o 0 -g 0 "$1" "$2.new" && visudo -cf "$2.new" >/dev/null && mv -f "$2.new" "$2" || { rm -f "$2.new"; exit 1; }' _ "$sudoers_tmp" "$SUDOERS_FILE"
+  fi
+else
+  fail "the generated sudoers rule did not pass visudo -cf"
+fi
+
+# ---- 6. systemd units ------------------------------------------------------------
+printf '\n== systemd timers\n'
+timers=(muster-cloud-backup.timer muster-cloud-retention.timer muster-cloud-offsite.timer)
+
+if [ "$ops_env_ok" -eq 1 ]; then
+  stage=$WORK/units
+  mkdir -p -- "$stage"
+  if out=$("$REPO/deploy/install-systemd.sh" --root "$stage" --env-file "$OPS_ENV" 2>&1); then
+    ok "backup and retention units rendered and verified by install-systemd.sh"
+    for unit in muster-cloud-backup.service muster-cloud-backup.timer \
+      muster-cloud-retention.service muster-cloud-retention.timer; do
+      put_file "$stage/etc/systemd/system/$unit" "$UNIT_DIR/$unit" 0644 || true
+    done
+  else
+    printf '%s\n' "$out" | sed 's/^/       /'
+    fail "install-systemd.sh rejected $OPS_ENV or the units"
+  fi
+else
+  note "skipping backup/retention units until $OPS_ENV is valid"
+fi
+
+render_offsite() {
+  local rclone_bin
+  rclone_bin=$(command -v rclone) || {
+    fail "rclone not found in PATH (needed by muster-cloud-offsite.service)"
+    return 1
+  }
+  local off_stage=$WORK/offsite
+  mkdir -p -- "$off_stage"
+  sed "s|@RCLONE@|$rclone_bin|g" "$REPO/deploy/systemd/muster-cloud-offsite.service" >"$off_stage/muster-cloud-offsite.service"
+  cp -- "$REPO/deploy/systemd/muster-cloud-offsite.timer" "$off_stage/muster-cloud-offsite.timer"
+  if command -v systemd-analyze >/dev/null 2>&1; then
+    local verify
+    verify=$(cd "$off_stage" && systemd-analyze verify --man=no "$off_stage/muster-cloud-offsite.service" "$off_stage/muster-cloud-offsite.timer" 2>&1)
+    if [ -n "$verify" ]; then
+      printf '%s\n' "$verify" | sed 's/^/       /'
+      fail "systemd-analyze rejected the offsite units"
+      return 1
+    fi
+  fi
+  OFFSITE_STAGE=$off_stage
+}
+
+OFFSITE_STAGE=""
+if render_offsite; then
+  put_file "$OFFSITE_STAGE/muster-cloud-offsite.service" "$UNIT_DIR/muster-cloud-offsite.service" 0644 || true
+  put_file "$OFFSITE_STAGE/muster-cloud-offsite.timer" "$UNIT_DIR/muster-cloud-offsite.timer" 0644 || true
+fi
+
+# Drop-ins: a 6-hourly backup at :41 (this host has another backup at 03:17)
+# and ordering after Docker (the database is a container).
+dropin_tmp=$WORK/dropins
+mkdir -p -- "$dropin_tmp"
+printf '%s\n' '[Timer]' 'OnCalendar=' 'OnCalendar=*-*-* 00/6:41:00' >"$dropin_tmp/schedule.conf"
+printf '%s\n' '[Unit]' 'After=docker.service' >"$dropin_tmp/docker.conf"
+ensure_dropin() { # dir name srcfile
+  local dir=$UNIT_DIR/$1 file=$2 src=$3
+  if [ -f "$dir/$file" ] && cmp -s -- "$src" "$dir/$file"; then
+    ok "$dir/$file up to date"
+    return
+  fi
+  change "install $dir/$file" bash -c 'install -d -m 0755 -o 0 -g 0 "$1" && install -m 0644 -o 0 -g 0 "$2" "$1/$3"' _ "$dir" "$src" "$file"
+}
+ensure_dropin muster-cloud-backup.timer.d 10-schedule.conf "$dropin_tmp/schedule.conf"
+ensure_dropin muster-cloud-backup.service.d 10-docker.conf "$dropin_tmp/docker.conf"
+ensure_dropin muster-cloud-retention.service.d 10-docker.conf "$dropin_tmp/docker.conf"
+
+if [ "$MODE" = apply ] && [ "$n_change" -gt 0 ]; then
+  # Cheap and idempotent: pick up any unit or drop-in written above.
+  systemctl daemon-reload || fail "systemctl daemon-reload failed"
+fi
+for timer in "${timers[@]}"; do
+  if [ ! -f "$UNIT_DIR/$timer" ] && [ "$MODE" = apply ]; then
+    fail "$timer is not installed; cannot enable it"
+    continue
+  fi
+  if systemctl is-enabled --quiet "$timer" 2>/dev/null && systemctl is-active --quiet "$timer" 2>/dev/null; then
+    ok "$timer is enabled and active"
+  else
+    change "enable and start $timer" systemctl enable --now "$timer"
+  fi
+done
+
+# ---- 7. host tools the timers need -------------------------------------------------
+printf '\n== host tools for backups\n'
+for tool in age git tar rclone; do
+  if command -v "$tool" >/dev/null 2>&1; then
+    ok "$tool found"
+  else
+    fail "$tool not found in PATH"
+  fi
+done
+if command -v pg_dump >/dev/null 2>&1; then
+  pgv=$(pg_dump --version | sed -n 's/^pg_dump (PostgreSQL) \([0-9]*\).*/\1/p')
+  if [ "${pgv:-0}" -ge 16 ]; then
+    ok "pg_dump major version $pgv (server is 16)"
+  else
+    fail "pg_dump is version '${pgv:-unknown}', need 16 or newer"
+  fi
+else
+  fail "pg_dump not found in PATH"
+fi
+if command -v rclone >/dev/null 2>&1; then
+  rconf=$(rclone config file 2>/dev/null | tail -1)
+  if [ "$rconf" = /root/.config/rclone/rclone.conf ]; then
+    ok "rclone config is $rconf"
+  else
+    fail "rclone config is '$rconf'; the offsite unit expects /root/.config/rclone/rclone.conf"
+  fi
+  if rclone listremotes 2>/dev/null | grep -qx 'gdrive:'; then
+    ok "rclone remote gdrive: is configured for root"
+  else
+    todo "rclone remote gdrive: is not configured for root"
+  fi
+fi
+
+# ---- 8. Tailscale Funnel ---------------------------------------------------------
+printf '\n== tailscale funnel (public HTTPS on port %s)\n' "$FUNNEL_PORT"
+
+# funnel_state: prints "match" when :10000 is a funnel to the proxy, else
+# "absent" or "other"; "others" prints a canonical dump of every serve entry
+# except :10000, so we can prove we did not touch them.
+serve_py() { python3 -I -c '
+import json, sys
+mode, port, target = sys.argv[1], sys.argv[2], sys.argv[3]
+cfg = json.load(sys.stdin) or {}
+def on_port(key):
+    return str(key).rsplit(":", 1)[-1] == port
+if mode == "others":
+    out = {}
+    for section in ("TCP", "Web", "Services", "AllowFunnel", "Foreground"):
+        value = cfg.get(section)
+        if isinstance(value, dict):
+            kept = {k: v for k, v in value.items() if not on_port(k)}
+            if kept:
+                out[section] = kept
+        elif value:
+            out[section] = value
+    print(json.dumps(out, sort_keys=True))
+else:
+    funnel = [k for k, v in (cfg.get("AllowFunnel") or {}).items() if on_port(k) and v]
+    if not funnel:
+        print("absent")
+    else:
+        handlers = [h for k in funnel for h in ((cfg.get("Web") or {}).get(k, {}).get("Handlers") or {}).items()]
+        print("match" if handlers == [("/", {"Proxy": target})] else "other")
+' "$@"; }
+
+if ! command -v tailscale >/dev/null 2>&1; then
+  fail "tailscale not found"
+elif ! command -v python3 >/dev/null 2>&1; then
+  fail "python3 not found (needed to read tailscale serve status --json)"
+else
+  target="http://127.0.0.1:$PROXY_HTTP_PORT"
+  before=$(tailscale serve status --json 2>&1)
+  if ! state=$(printf '%s' "$before" | serve_py state "$FUNNEL_PORT" "$target" 2>&1); then
+    fail "cannot read tailscale serve status: $(printf '%s' "$before" | head -2)"
+  elif [ "$state" = match ]; then
+    ok "funnel :$FUNNEL_PORT -> $target is configured"
+  else
+    [ "$state" = other ] && note "funnel :$FUNNEL_PORT exists with a different target; it will be replaced"
+    others_before=$(printf '%s' "$before" | serve_py others "$FUNNEL_PORT" "$target")
+    if change "tailscale funnel --bg --https=$FUNNEL_PORT $target" \
+      tailscale funnel --bg "--https=$FUNNEL_PORT" "$target"; then
+      if [ "$MODE" = apply ]; then
+        after=$(tailscale serve status --json 2>&1)
+        others_after=$(printf '%s' "$after" | serve_py others "$FUNNEL_PORT" "$target")
+        [ "$(printf '%s' "$after" | serve_py state "$FUNNEL_PORT" "$target")" = match ] \
+          || fail "funnel :$FUNNEL_PORT is not active after configuring it (is Funnel allowed for this node?)"
+        [ "$others_before" = "$others_after" ] \
+          || fail "OTHER tailscale serve entries changed; inspect 'tailscale serve status' now"
+      fi
+    fi
+  fi
+fi
+
+# ---- 9. kamal-proxy loopback ports ---------------------------------------------
+printf '\n== kamal-proxy ports (loopback only)\n'
+if docker inspect kamal-proxy >/dev/null 2>&1; then
+  pub=$(docker port kamal-proxy 2>/dev/null | tr '\n' ' ')
+  want80="80/tcp -> 127.0.0.1:$PROXY_HTTP_PORT"
+  want443="443/tcp -> 127.0.0.1:$PROXY_HTTPS_PORT"
+  if [[ $pub == *"$want80"* && $pub == *"$want443"* ]] && ! [[ $pub == *"0.0.0.0"* || $pub == *"[::]"* ]]; then
+    ok "kamal-proxy publishes only on 127.0.0.1 ($pub)"
+  else
+    fail "kamal-proxy exists and publishes '$pub' (expected only 127.0.0.1:$PROXY_HTTP_PORT and :$PROXY_HTTPS_PORT); Kamal would reuse it: remove it by hand (docker rm -f kamal-proxy) so the first deploy recreates it"
+  fi
+else
+  for port in "$PROXY_HTTP_PORT" "$PROXY_HTTPS_PORT"; do
+    if ss -Hltn "sport = :$port" 2>/dev/null | grep -q .; then
+      fail "something already listens on port $port; kamal-proxy could not bind it"
+    else
+      ok "port $port is free for kamal-proxy"
+    fi
+  done
+fi
+
+# ---- 10. SSH reachability that Kamal needs (never changed here) ----------------
+printf '\n== ssh for Kamal (gha connects to %s)\n' "$TS_HOST_IP"
+if ss -Hltn 'sport = :22' 2>/dev/null | awk '{print $4}' | grep -Eq "^(0\.0\.0\.0|\*|\[::\]|$TS_HOST_IP):22$"; then
+  ok "sshd listens on $TS_HOST_IP:22 (or on all addresses)"
+else
+  todo "sshd does not listen on $TS_HOST_IP:22 or on all addresses"
+fi
+gha_home=$(getent passwd "$DEPLOY_USER" | cut -d: -f6 || true)
+if [ -n "$gha_home" ] && [ -d "$gha_home/.ssh" ]; then
+  if [ -s "$gha_home/.ssh/authorized_keys" ]; then
+    ok "$DEPLOY_USER has authorized_keys"
+  else
+    todo "$gha_home/.ssh/authorized_keys is missing or empty (gha must be able to ssh to itself)"
+  fi
+  if ssh-keygen -F "$TS_HOST_IP" -f "$gha_home/.ssh/known_hosts" >/dev/null 2>&1; then
+    ok "$DEPLOY_USER knows the host key of $TS_HOST_IP"
+  else
+    todo "$gha_home/.ssh/known_hosts has no entry for $TS_HOST_IP (run once: sudo -u $DEPLOY_USER ssh $DEPLOY_USER@$TS_HOST_IP true)"
+  fi
+else
+  todo "no ~/.ssh for $DEPLOY_USER; it needs a key it can use to ssh to $TS_HOST_IP"
+fi
+
+# ---- summary --------------------------------------------------------------------
+printf '\n== summary (%s)\n' "$MODE"
+if [ "$MODE" = check ]; then
+  printf 'would change: %s   failed/blocked: %s   to do by hand: %s\n' "$n_change" "$n_fail" "$n_todo"
+  [ "$n_change" -eq 0 ] && [ "$n_fail" -eq 0 ] && [ "$n_todo" -eq 0 ] && exit 0
+  exit 1
+fi
+printf 'changed: %s   failed/blocked: %s   to do by hand: %s\n' "$n_change" "$n_fail" "$n_todo"
+[ "$n_fail" -eq 0 ] && [ "$n_todo" -eq 0 ] && exit 0
+exit 1

@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# muster-cloud-install-ops — install the host-side `muster-cloud-ops` that
+# matches a deployed image. Installed by deploy/kamal/host-setup.sh as
+# /usr/local/sbin/muster-cloud-install-ops (root:root 0755) and run by the
+# deploy workflow through one sudoers rule:
+#
+#   gha ALL=(root) NOPASSWD: /usr/local/sbin/muster-cloud-install-ops
+#
+# Because the caller is unprivileged, this script trusts nothing from it: it
+# takes exactly ONE argument, an image reference that must look like
+#
+#   ghcr.io/oliveralerubio/muster-cloud:<40 hex characters>
+#
+# and it never pulls (root has no registry login): the image must already be
+# on this host, which `kamal deploy` guarantees. Steps:
+#
+#   1. create (not start) a container from that image, copy
+#      /usr/local/bin/muster-cloud-ops out of it, remove the container;
+#   2. verify the copy: a regular file, no unresolved shared libraries, and it
+#      runs as an unprivileged user (no arguments: exit 64, "expected a
+#      command");
+#   3. store it as /usr/local/lib/muster-cloud/<sha>/muster-cloud-ops (root,
+#      0755) and atomically repoint the symlink /usr/local/bin/muster-cloud-ops;
+#   4. keep the three newest versions (the one in use is always kept).
+#
+# The timers' units (muster-cloud-backup/retention) call the symlink, so they
+# always run the operator tool built from the code that is deployed.
+#
+# Compatibility: the binary is built in the bookworm-based image (glibc 2.36)
+# and runs on the Ubuntu 24.04 host (glibc 2.39). glibc is backward
+# compatible: a binary needs only symbol versions at or below those it was
+# linked against. The service uses rustls (no OpenSSL), so its only shared
+# libraries are libc, libm and libgcc_s, all present on Ubuntu. Step 2 re-checks
+# this on every install with `ldd`, and it was checked on ubuntu:24.04.
+#
+# Exit codes: 0 installed; 64 usage; 65 refused (image, binary, or symlink);
+# 69 docker unavailable or image missing; 74 I/O.
+
+set -euo pipefail
+umask 022
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export LC_ALL=C
+
+readonly REF_RE='^ghcr\.io/oliveralerubio/muster-cloud:[0-9a-f]{40}$'
+readonly LIB_DIR=/usr/local/lib/muster-cloud
+readonly LINK=/usr/local/bin/muster-cloud-ops
+readonly KEEP=3
+
+fail() {
+  printf 'muster-cloud-install-ops: %s\n' "$1" >&2
+  exit "$2"
+}
+
+[ "$#" -eq 1 ] || fail "usage: muster-cloud-install-ops ghcr.io/oliveralerubio/muster-cloud:<40-hex-sha>" 64
+ref=$1
+[[ $ref =~ $REF_RE ]] || fail "refused: the image must match ghcr.io/oliveralerubio/muster-cloud:<40 hex characters>" 64
+sha=${ref##*:}
+[ "$(id -u)" -eq 0 ] || fail "must run as root (through sudo)" 64
+command -v docker >/dev/null 2>&1 || fail "docker not found" 69
+
+mkdir -p -- "$LIB_DIR" || fail "cannot create $LIB_DIR" 74
+chmod 0755 -- "$LIB_DIR"
+
+exec 9>"$LIB_DIR/.lock"
+flock -w 120 9 || fail "another install is running" 74
+
+# The symlink is ours: never overwrite something else.
+if [ -e "$LINK" ] && [ ! -L "$LINK" ]; then
+  fail "$LINK exists and is not a symlink; remove it by hand first" 65
+fi
+
+docker image inspect "$ref" >/dev/null 2>&1 \
+  || fail "image $ref is not on this host (kamal deploy pulls it first)" 69
+
+work=$(mktemp -d "$LIB_DIR/.install.XXXXXX") || fail "mktemp failed" 74
+cid=""
+cleanup() {
+  if [ -n "$cid" ]; then
+    docker rm -f "$cid" >/dev/null 2>&1 || true
+  fi
+  rm -rf --one-file-system -- "$work"
+}
+trap cleanup EXIT
+
+cid=$(docker create --pull=never --network none "$ref") \
+  || fail "docker create failed for $ref" 69
+docker cp "$cid:/usr/local/bin/muster-cloud-ops" "$work/muster-cloud-ops" \
+  || fail "cannot copy /usr/local/bin/muster-cloud-ops out of $ref" 69
+docker rm -f "$cid" >/dev/null
+cid=""
+
+bin=$work/muster-cloud-ops
+[ -f "$bin" ] && [ ! -L "$bin" ] || fail "the copied binary is not a regular file" 65
+chown root:root -- "$bin"
+chmod 0755 -- "$bin"
+chmod 0755 -- "$work"
+
+# Run the checks as an unprivileged user with an empty environment.
+unpriv=(setpriv --reuid=65534 --regid=65534 --clear-groups --no-new-privs env -i PATH=/usr/bin:/bin)
+if ldd_out=$("${unpriv[@]}" ldd "$bin" 2>&1); then
+  case $ldd_out in
+    *"not found"*) fail "the binary has unresolved shared libraries on this host: $ldd_out" 65 ;;
+  esac
+else
+  fail "ldd failed on the binary: $ldd_out" 65
+fi
+set +e
+run_out=$("${unpriv[@]}" "$bin" 2>&1)
+run_rc=$?
+set -e
+if [ "$run_rc" -ne 64 ] || [[ $run_out != *"expected a command"* ]]; then
+  fail "the binary did not behave as muster-cloud-ops (exit $run_rc)" 65
+fi
+
+dest=$LIB_DIR/$sha
+mkdir -p -- "$dest"
+chmod 0755 -- "$dest"
+mv -f -- "$bin" "$dest/muster-cloud-ops.new"
+mv -f -- "$dest/muster-cloud-ops.new" "$dest/muster-cloud-ops"
+touch -- "$dest"
+
+# Atomic switch: rename(2) replaces the old symlink in one step.
+tmp_link=$LIB_DIR/.link.$$
+ln -sfn -- "$dest/muster-cloud-ops" "$tmp_link"
+mv -T -- "$tmp_link" "$LINK"
+
+# Retention: newest KEEP versions by modification time, plus the one linked.
+current=$(readlink -- "$LINK")
+keep_n=0
+while IFS= read -r dir; do
+  keep_n=$((keep_n + 1))
+  [ "$keep_n" -gt "$KEEP" ] || continue
+  [ "$dir/muster-cloud-ops" != "$current" ] || continue
+  rm -rf --one-file-system -- "$dir"
+done < <(find "$LIB_DIR" -mindepth 1 -maxdepth 1 -type d -regextype posix-extended \
+  -regex '.*/[0-9a-f]{40}' -printf '%T@ %p\n' | sort -rn | cut -d' ' -f2-)
+
+printf 'muster-cloud-install-ops: %s -> %s\n' "$LINK" "$dest/muster-cloud-ops"

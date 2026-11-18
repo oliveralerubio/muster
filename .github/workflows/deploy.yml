@@ -1,0 +1,162 @@
+name: Deploy muster Cloud
+
+# Every green push to main (Cloud CI) builds one image tagged with the commit
+# SHA on a GitHub-hosted runner, then deploys it with Kamal from the
+# `deploy-personal` runner, which runs ON the target VPS as user `gha`.
+# Guide: deploy/KAMAL.md. No repository secrets beyond GITHUB_TOKEN: the app's
+# secrets live in /etc/muster-cloud/kamal.env on the host and never reach
+# GitHub.
+#
+# `workflow_dispatch` redeploys the tip of main (re-run a failed deploy, or
+# redeploy after editing the files under /etc/muster-cloud). It only runs from
+# main: a branch cannot use this workflow to reach the host.
+
+on:
+  workflow_run:
+    workflows: ["Cloud CI"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-muster-cloud
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/oliveralerubio/muster-cloud
+
+jobs:
+  image:
+    name: build image
+    if: >-
+      github.repository == 'oliveralerubio/muster' && (
+        (github.event_name == 'workflow_run'
+          && github.event.workflow_run.conclusion == 'success'
+          && github.event.workflow_run.event == 'push'
+          && github.event.workflow_run.head_branch == 'main')
+        || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      sha: ${{ steps.sha.outputs.sha }}
+    env:
+      SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+    steps:
+      - name: Resolve the commit to deploy
+        id: sha
+        run: |
+          set -eu
+          case "$SHA" in
+            *[!0-9a-f]* | '') echo "not a commit SHA: $SHA" >&2; exit 1 ;;
+          esac
+          [ "${#SHA}" -eq 40 ] || { echo "not a 40-character SHA" >&2; exit 1; }
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ steps.sha.outputs.sha }}
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: deploy/Dockerfile
+          push: true
+          tags: ${{ env.IMAGE }}:${{ steps.sha.outputs.sha }}
+          # Kamal refuses an image without the `service` label. The source
+          # label links the GHCR package to this repository, which is what
+          # lets GITHUB_TOKEN (packages: read) pull it on the VPS.
+          labels: |
+            service=muster-cloud
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.sha.outputs.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+  deploy:
+    name: deploy to personal
+    needs: image
+    runs-on: deploy-personal
+    permissions:
+      contents: read
+      packages: read
+    env:
+      SHA: ${{ needs.image.outputs.sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.image.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Runs are serialized, but a queued older run must never replace a newer
+      # deploy. Automatic runs skip a commit that is already contained in the
+      # version now running; a manual dispatch always deploys.
+      - name: Skip if a newer version is already deployed
+        id: guard
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -eu
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          [ "$EVENT" = workflow_run ] || exit 0
+          current=$(docker ps --filter label=service=muster-cloud --filter label=role=web \
+            --format '{{.Image}}' | head -n1)
+          current=${current##*:}
+          case "$current" in
+            *[!0-9a-f]* | '') exit 0 ;;
+          esac
+          [ "${#current}" -eq 40 ] || exit 0
+          if [ "$current" != "$SHA" ] && git cat-file -e "$current^{commit}" 2>/dev/null \
+            && git merge-base --is-ancestor "$SHA" "$current"; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$SHA is older than the running $current; not deploying it"
+          fi
+
+      - name: Deploy with Kamal
+        if: steps.guard.outputs.skip != 'true'
+        env:
+          KAMAL_REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        run: bin/kamal deploy --skip-push --version "$SHA"
+
+      # Root step, through one sudoers rule for one script that validates its
+      # argument (installed by deploy/kamal/host-setup.sh).
+      - name: Install the matching muster-cloud-ops for the timers
+        if: steps.guard.outputs.skip != 'true'
+        run: sudo -n /usr/local/sbin/muster-cloud-install-ops "$IMAGE:$SHA"
+
+      - name: Verify
+        if: steps.guard.outputs.skip != 'true'
+        run: |
+          set -eu
+          url=$(sed -n 's/^MUSTER_CLOUD_PUBLIC_URL=//p' /etc/muster-cloud/deploy.env 2>/dev/null | head -n1 | tr -d "\"'")
+          url=${url:-https://personal.tailbb30e7.ts.net:10000}
+          curl_ready() {
+            curl -fsS --retry 10 --retry-delay 3 --retry-all-errors --max-time 20 "$1/readyz"
+          }
+          echo "local, through kamal-proxy:"
+          curl_ready http://127.0.0.1:18110
+          echo
+          echo "public, through Tailscale Funnel:"
+          curl_ready "$url"
+          echo
+          # The privileged helper is copied by hand (host-setup.sh); say so
+          # when the repository's version has moved on.
+          if ! cmp -s deploy/kamal/muster-cloud-install-ops /usr/local/sbin/muster-cloud-install-ops; then
+            echo "::warning::/usr/local/sbin/muster-cloud-install-ops differs from the repository; rerun deploy/kamal/host-setup.sh as root"
+          fi

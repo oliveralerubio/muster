@@ -100,6 +100,8 @@ run still exits with the caller command's status; stop it manually with
 dir by hand. The launcher never affects other clusters (including any
 pre-existing host instance).
 
+Production deployment on the `personal` VPS (Kamal, CI-built image, timers, offsite backups): see [`KAMAL.md`](KAMAL.md).
+
 ## Cloud CI workflow (`.github/workflows/cloud.yml`)
 
 CI for the `muster-cloud` backend, separate from `.github/workflows/ci.yml`
