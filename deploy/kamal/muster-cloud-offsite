@@ -24,12 +24,25 @@
 # tenant's data must really expire. An emptied or wiped local snapshots
 # directory therefore deletes NOTHING remotely.
 #
+# NEVER THE LAST COPY: before anything is purged on Drive, the script checks
+# that, with the ids about to go (and everything it already purged in this
+# run) gone, Drive still holds a COMPLETE snapshot at least as new as the
+# newest complete local one. "Complete" is verified, not assumed: its
+# manifest.json is read back, every artifact it lists exists on Drive with the
+# listed size and, when Drive reports a SHA-256 for it, the listed hash. When
+# the check fails (Drive full so the newest upload failed, a truncated file, an
+# unreadable Drive, or nothing left but the snapshots about to be purged) the
+# purge is skipped, the audit stays unprocessed so the next run retries it, and
+# the run exits 3 so the failure alert fires.
+#
 # Guard: at most 100 ids are deleted per run. An audit file that lists more
 # than 100 ids, or that is not a valid retention record, is refused (exit 3,
 # so the failure alert fires); audit files that would only push this run past
 # 100 ids wait for the next run.
 #
-# Exit codes: 0 ok; 1 upload failed; 3 an audit record was refused or a remote
+# Exit codes: 0 ok; 1 upload failed (the run fails and alerts: a failed copy of
+# any artifact is never silent); 3 an audit record was refused, a purge was
+# skipped because Drive would keep no complete newer snapshot, or a remote
 # deletion failed; 64 usage; 69 a required tool is missing; 77 not root.
 #
 # Test hooks (all optional): MUSTER_BACKUP_ROOT, MUSTER_OFFSITE_REMOTE,
@@ -75,6 +88,7 @@ flock -n 9 || {
 work=$(mktemp -d "${TMPDIR:-/tmp}/muster-offsite.XXXXXX")
 trap 'rm -rf --one-file-system -- "$work"' EXIT
 
+newest_local="" # newest complete local snapshot id (set by the upload step)
 rc_common=(--contimeout 30s --timeout 120s --retries 3 --low-level-retries 10 --stats 0 --log-level NOTICE)
 rc_copy=(--ignore-existing --transfers 2 --checkers 4 --drive-use-trash=false)
 
@@ -106,6 +120,7 @@ else
     done
   done
   log "upload: $n_snap local snapshot(s) considered"
+  newest_local=$(sed 's|/.*||' "$work/manifests.lst" | sort | tail -n 1)
   up_ok=1
   # An empty list file must never reach rclone: skip the call instead.
   for list in artifacts manifests; do
@@ -124,6 +139,109 @@ else
 fi
 
 # ---- 2. deletions recorded by retention ---------------------------------------
+# What Drive really holds, read once and only when a purge is pending.
+remote_ready=0
+purged_now=()
+declare -A verdict=()
+
+load_remote() {
+  [ "$remote_ready" -eq 0 ] || return 0
+  local rc=0
+  "$RCLONE" lsjson "$REMOTE/snapshots" --recursive --files-only --hash "${rc_common[@]}" \
+    >"$work/remote.json" 2>"$work/remote.err" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    log "audit: cannot list $REMOTE/snapshots (rclone exit $rc): $(head -c 200 "$work/remote.err" | tr '\n' ' ')"
+    return 1
+  fi
+  # Snapshot ids that have a manifest.json on Drive, newest first.
+  python3 -I -c '
+import json, re, sys
+ids = set()
+for entry in json.load(open(sys.argv[1])):
+    path = entry.get("Path", "")
+    head, _, tail = path.partition("/")
+    if tail == "manifest.json" and re.fullmatch(r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}", head):
+        ids.add(head)
+print("\n".join(sorted(ids, reverse=True)))
+' "$work/remote.json" >"$work/remote-ids.lst" || return 1
+  remote_ready=1
+}
+
+# verify_remote_snapshot id — the snapshot on Drive is complete: its manifest
+# is readable and every artifact it lists is there with the listed size (and
+# the listed SHA-256, when Drive reports one).
+verify_remote_snapshot() {
+  local id=$1
+  if [ -n "${verdict[$id]:-}" ]; then
+    [ "${verdict[$id]}" = ok ]
+    return
+  fi
+  verdict[$id]=bad
+  "$RCLONE" cat "$REMOTE/snapshots/$id/manifest.json" "${rc_common[@]}" >"$work/manifest-$id.json" 2>/dev/null || return 1
+  python3 -I -c '
+import json, re, sys
+listing = json.load(open(sys.argv[1]))
+sid = sys.argv[2]
+manifest = json.load(open(sys.argv[3]))
+if not isinstance(manifest, dict) or manifest.get("backup_id") != sid:
+    sys.exit("the manifest names another snapshot")
+artifacts = manifest.get("artifacts")
+if not isinstance(artifacts, list) or not artifacts:
+    sys.exit("the manifest lists no artifacts")
+if {a.get("kind") for a in artifacts if isinstance(a, dict)} < {"db", "git"}:
+    sys.exit("the manifest lacks the db or the git artifact")
+files = {}
+for entry in listing:
+    head, _, tail = entry.get("Path", "").partition("/")
+    if head == sid and tail and "/" not in tail:
+        files[tail] = entry
+for art in artifacts:
+    name, size, sha = art.get("name"), art.get("bytes"), art.get("sha256")
+    if not isinstance(name, str) or not re.fullmatch(r"(db\.dump|git\.tar)(\.age)?", name):
+        sys.exit("an artifact name is not valid")
+    if not isinstance(size, int) or isinstance(size, bool):
+        sys.exit(name + ": no size in the manifest")
+    entry = files.get(name)
+    if entry is None:
+        sys.exit(name + " is missing on the remote")
+    if entry.get("Size") != size:
+        sys.exit("%s: %s bytes on the remote, %s in the manifest" % (name, entry.get("Size"), size))
+    remote_sha = (entry.get("Hashes") or {}).get("sha256")
+    if remote_sha and sha and remote_sha.lower() != str(sha).lower():
+        sys.exit(name + ": the remote SHA-256 differs from the manifest")
+' "$work/remote.json" "$id" "$work/manifest-$id.json" 2>"$work/verify.err" || {
+    log "audit: remote snapshot $id is not complete: $(head -c 200 "$work/verify.err" | tr '\n' ' ')"
+    return 1
+  }
+  verdict[$id]=ok
+}
+
+# purge_is_safe id... — with these ids (and everything purged earlier in this
+# run) gone, Drive still holds a verified complete snapshot at least as new as
+# the newest complete local one.
+purge_is_safe() {
+  load_remote || return 1
+  local -A excluded=()
+  local candidate
+  for candidate in "$@" ${purged_now[@]+"${purged_now[@]}"}; do
+    excluded[$candidate]=1
+  done
+  while IFS= read -r candidate; do
+    [ -n "$candidate" ] || continue
+    [ -z "${excluded[$candidate]:-}" ] || continue
+    if [ -n "$newest_local" ] && [[ ${candidate:0:16} < ${newest_local:0:16} ]]; then
+      log "audit: the newest complete snapshot Drive would keep ($candidate) is older than the newest local one ($newest_local)"
+      return 1
+    fi
+    if verify_remote_snapshot "$candidate"; then
+      log "audit: Drive keeps the complete snapshot $candidate (newest local: ${newest_local:-none})"
+      return 0
+    fi
+  done <"$work/remote-ids.lst"
+  log "audit: Drive would keep no complete snapshot as new as the newest local one (${newest_local:-none})"
+  return 1
+}
+
 processed=$STATE_DIR/processed-audits.txt
 touch -- "$processed"
 if [ ! -d "$AUDIT" ]; then
@@ -185,17 +303,32 @@ print("\n".join(seen))
       break
     fi
     planned=$((planned + count))
-    failed=0
+    to_purge=()
     for id in "${id_list[@]}"; do
       if [ -e "$SNAPS/$id" ] || [ -L "$SNAPS/$id" ]; then
         log "audit: $name: $id is still present locally; NOT deleting it remotely"
-        continue
+      else
+        to_purge+=("$id")
       fi
+    done
+    if [ "${#to_purge[@]}" -gt 0 ] && ! purge_is_safe "${to_purge[@]}"; then
+      log "audit: $name: NOT purging anything on Drive and leaving the record unprocessed (retried next run): the last complete offsite copy must not be deleted"
+      status=3
+      continue
+    fi
+    failed=0
+    for id in ${to_purge[@]+"${to_purge[@]}"}; do
       rc=0
       "$RCLONE" purge "$REMOTE/snapshots/$id" --drive-use-trash=false "${rc_common[@]}" || rc=$?
       case $rc in
-        0) log "audit: $name: deleted $id from the remote (no trash)" ;;
-        3) log "audit: $name: $id was already absent from the remote" ;;
+        0)
+          purged_now+=("$id")
+          log "audit: $name: deleted $id from the remote (no trash)"
+          ;;
+        3)
+          purged_now+=("$id")
+          log "audit: $name: $id was already absent from the remote"
+          ;;
         *)
           log "audit: $name: deleting $id FAILED (rclone exit $rc); will retry next run"
           failed=1
