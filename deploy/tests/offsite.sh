@@ -10,6 +10,11 @@
 # purge would succeed, and that must never delete the last recoverable offsite
 # snapshot (the audit stays unprocessed and the run fails, so it alerts).
 #
+# The manifest check is `muster-cloud-ops backup verify-manifest`; here a fake
+# ops (below) mimics its exit codes (0 valid, 65 invalid). The real parser is
+# tested in cloud/tests/ops_verify_manifest.rs, and the last case runs the real
+# binary when target/debug/muster-cloud-ops exists.
+#
 # Exit 0 when every case passes, 1 otherwise.
 
 set -uo pipefail
@@ -60,6 +65,31 @@ fake_rclone() { # path
   chmod +x "$1"
 }
 
+# The fake muster-cloud-ops: `backup verify-manifest FILE --backup-id ID`, exit
+# 0 when valid, 65 when invalid (a stand-in for the Rust parser, which this
+# test does not exercise). It logs every call to $FAKE_OPS_LOG.
+fake_ops() { # path
+  cat >"$1" <<'FAKE'
+#!/usr/bin/env python3
+import json, os, sys, uuid
+with open(os.environ["FAKE_OPS_LOG"], "a") as log:
+    log.write(" ".join(sys.argv[1:]) + "\n")
+if sys.argv[1:3] != ["backup", "verify-manifest"] or sys.argv[4:5] != ["--backup-id"]:
+    sys.exit(64)
+try:
+    m = json.load(open(sys.argv[3]))
+    uuid.UUID(m["op_id"])
+    names = {"age-x25519": ("db.dump.age", "git.tar.age"), "none": ("db.dump", "git.tar")}[m["encryption"]["scheme"]]
+    ok = (m["format"] == "muster-backup" and m["version"] == 2 and m["backup_id"] == sys.argv[5]
+          and sorted((a["name"], a["kind"]) for a in m["artifacts"]) == sorted(zip(names, ("db", "git"))))
+except Exception:
+    ok = False
+print("fake-ops: refused", file=sys.stderr) if not ok else None
+sys.exit(0 if ok else 65)
+FAKE
+  chmod +x "$1"
+}
+
 # mk_snap dir id [artifact-bytes] — a complete snapshot with a real manifest.
 mk_snap() {
   local dir=$1 id=$2 n=${3:-64}
@@ -106,13 +136,16 @@ setup() { # name
   T=$ROOT/$1
   mkdir -p "$T/bin" "$T/backups/snapshots" "$T/remote/snapshots" "$T/state"
   fake_rclone "$T/bin/rclone"
+  fake_ops "$T/bin/muster-cloud-ops"
   : >"$T/rclone.log"
+  : >"$T/ops.log"
 }
 
 run_offsite() {
   rc=0
   out=$(MUSTER_OFFSITE_ALLOW_NONROOT=1 MUSTER_BACKUP_ROOT="$T/backups" MUSTER_OFFSITE_REMOTE="$T/remote" \
     MUSTER_OFFSITE_STATE="$T/state" MUSTER_RCLONE="$T/bin/rclone" FAKE_RCLONE_LOG="$T/rclone.log" \
+    MUSTER_OPS_BIN="${OPS_BIN_UNDER_TEST:-$T/bin/muster-cloud-ops}" FAKE_OPS_LOG="$T/ops.log" \
     "$SCRIPT" 2>&1) || rc=$?
 }
 
@@ -229,6 +262,34 @@ for variant in 'm["version"] = 3' 'm["artifacts"][1]["kind"] = "extra"' 'm["form
   check "invalid manifest ($variant): the audit is not consumed" not_processed
 done
 
+# ---- 9b. the bug: a NEWER remote manifest with an invalid op_id is not a survivor -------------------
+# (the old shell check accepted it, the older snapshot was purged, and the
+# restore's parser then rejected what was left: nothing recoverable)
+setup bad-op-id
+mk_snap "$T/backups/snapshots" "$NEW"
+mk_snap "$T/remote/snapshots" "$OLD"
+mk_snap "$T/remote/snapshots" "$NEW"
+patch_manifest "$T/remote/snapshots" "$NEW" 'm["op_id"] = "not-a-uuid"'
+audit_removing "$OLD"
+FAKE_RCLONE_FULL=1 run_offsite
+check "invalid op_id: the older complete snapshot is NOT purged" on_remote "$OLD"
+check "invalid op_id: the audit is not consumed" not_processed
+check "invalid op_id: exits 3 (the alert fires)" rc_is 3
+check "invalid op_id: no purge was even attempted" bash -c "! grep -q '^purge' '$T/rclone.log'"
+check "invalid op_id: the ops parser was asked, about that snapshot" \
+  grep -qF -- "--backup-id $NEW" "$T/ops.log"
+check "invalid op_id: the log says the manifest was refused" has "its manifest was refused (exit 65)"
+
+# ... and a host without the ops binary purges nothing either.
+setup no-ops
+mk_snap "$T/backups/snapshots" "$NEW"
+mk_snap "$T/remote/snapshots" "$OLD"
+audit_removing "$OLD"
+OPS_BIN_UNDER_TEST=$T/bin/absent run_offsite
+unset OPS_BIN_UNDER_TEST
+check "no ops binary: nothing is purged" on_remote "$OLD"
+check "no ops binary: exits 3" rc_is 3
+
 # ---- 10. a failed purge stops every deletion of the run ---------------------------------------------
 SECOND_AUDIT=retention-20261118T020000Z-66666666-2222-3333-4444-555555555555.json
 setup purge-fails
@@ -262,6 +323,29 @@ AUDIT_FILE=$SECOND_AUDIT audit_removing "$MID"
 run_offsite
 check "relist: both audits are purged" bash -c "[ ! -e '$T/remote/snapshots/$OLD' ] && [ ! -e '$T/remote/snapshots/$MID' ]"
 check "relist: two purge decisions, two listings" test "$(grep -c '^lsjson' "$T/rclone.log")" -eq 2
+
+# ---- 12. the real parser, when the binary is built ---------------------------------------------------
+REAL_OPS=$REPO/target/debug/muster-cloud-ops
+if [ -x "$REAL_OPS" ]; then
+  setup real-ops
+  mk_snap "$T/backups/snapshots" "$NEW"
+  mk_snap "$T/remote/snapshots" "$OLD"
+  mk_snap "$T/remote/snapshots" "$NEW"
+  audit_removing "$OLD"
+  OPS_BIN_UNDER_TEST=$REAL_OPS run_offsite
+  check "real ops: a valid newer snapshot lets the older one go" not_on_remote "$OLD"
+  setup real-ops-bad
+  mk_snap "$T/backups/snapshots" "$NEW"
+  mk_snap "$T/remote/snapshots" "$OLD"
+  mk_snap "$T/remote/snapshots" "$NEW"
+  patch_manifest "$T/remote/snapshots" "$NEW" 'm["op_id"] = "not-a-uuid"'
+  audit_removing "$OLD"
+  OPS_BIN_UNDER_TEST=$REAL_OPS FAKE_RCLONE_FULL=1 run_offsite
+  unset OPS_BIN_UNDER_TEST
+  check "real ops: an invalid op_id keeps the older snapshot" on_remote "$OLD"
+else
+  printf 'skip real ops (build target/debug/muster-cloud-ops to run them)\n'
+fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

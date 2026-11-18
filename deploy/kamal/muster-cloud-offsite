@@ -30,10 +30,10 @@
 # newest complete local one. "Complete" is verified, not assumed: its
 # manifest.json is read back, every artifact it lists exists on Drive with the
 # listed size and, when Drive reports a SHA-256 for it, the listed hash, and
-# the manifest passes the same structure rules `muster-cloud-ops backup verify`
-# and the restore apply (format muster-backup version 2, exactly the db and the
-# git artifact under the names of its encryption scheme, nothing else in the
-# directory). Drive is listed afresh before every purge decision, never reused.
+# the manifest passes `muster-cloud-ops backup verify-manifest`, which is the
+# restore's own manifest parser (exit 0 valid, 65 invalid; a missing or failing
+# ops binary also blocks the purge), and nothing else is in the directory.
+# Drive is listed afresh before every purge decision, never reused.
 # When the check fails (Drive full so the newest upload failed, a truncated file, an
 # unreadable Drive, or nothing left but the snapshots about to be purged) the
 # purge is skipped, the audit stays unprocessed so the next run retries it, and
@@ -54,7 +54,7 @@
 # deletion failed; 64 usage; 69 a required tool is missing; 77 not root.
 #
 # Test hooks (all optional): MUSTER_BACKUP_ROOT, MUSTER_OFFSITE_REMOTE,
-# MUSTER_OFFSITE_STATE, MUSTER_RCLONE.
+# MUSTER_OFFSITE_STATE, MUSTER_RCLONE, MUSTER_OPS_BIN.
 
 set -euo pipefail
 umask 077
@@ -71,6 +71,7 @@ readonly MAX_DELETE_IDS=100
 readonly MAX_AUDIT_BYTES=1048576
 readonly ID_RE='^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$'
 readonly AUDIT_RE='^retention-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$'
+readonly OPS_BIN=${MUSTER_OPS_BIN:-/usr/local/bin/muster-cloud-ops}
 readonly ARTIFACT_RE='^(db\.dump|git\.tar)(\.age)?$'
 
 log() { printf 'offsite: %s\n' "$*"; }
@@ -173,42 +174,31 @@ print("\n".join(sorted(ids, reverse=True)))
 }
 
 # verify_remote_snapshot id — the snapshot on Drive is complete: its manifest
-# passes the rules of cloud/src/backup.rs read_snapshot (the restore's own) and
-# every artifact it lists is there with the listed size (and the listed
-# SHA-256, when Drive reports one). The manifest is the only thing downloaded,
-# so the hashes of the artifacts themselves are not recomputed here.
+# is valid by `muster-cloud-ops backup verify-manifest` (the restore's own
+# parser: the only definition of a valid manifest, never re-implemented here)
+# and every artifact it lists is there with the listed size (and the listed
+# SHA-256, when Drive reports one), with nothing else in the directory. The
+# manifest is the only thing downloaded, so the hashes of the artifacts
+# themselves are not recomputed here.
 verify_remote_snapshot() {
-  local id=$1
+  local id=$1 rc=0
+  [ -x "$OPS_BIN" ] || {
+    log "audit: remote snapshot $id cannot be verified: muster-cloud-ops not found at $OPS_BIN"
+    return 1
+  }
   "$RCLONE" cat "$REMOTE/snapshots/$id/manifest.json" "${rc_common[@]}" >"$work/manifest-$id.json" 2>/dev/null || return 1
+  "$OPS_BIN" backup verify-manifest "$work/manifest-$id.json" --backup-id "$id" \
+    >/dev/null 2>"$work/verify.err" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    log "audit: remote snapshot $id is not complete: its manifest was refused (exit $rc): $(head -c 200 "$work/verify.err" | tr '\n' ' ')"
+    return 1
+  fi
+  # The manifest is valid, so its fields have the shapes the parser enforces.
   python3 -I -c '
-import json, re, sys
+import json, sys
 listing = json.load(open(sys.argv[1]))
 sid = sys.argv[2]
 manifest = json.load(open(sys.argv[3]))
-if not isinstance(manifest, dict):
-    sys.exit("the manifest is not an object")
-keys = {"format", "version", "backup_id", "op_id", "snapshot_at", "created_at", "encryption",
-        "normal_expires_at", "tenants", "artifacts"}
-if set(manifest) != keys:
-    sys.exit("the manifest has missing or unknown fields")
-version = manifest["version"]
-if manifest["format"] != "muster-backup" or version != 2 or isinstance(version, bool):
-    sys.exit("unsupported manifest format or version")
-if manifest["backup_id"] != sid:
-    sys.exit("the manifest names another snapshot")
-for field in ("snapshot_at", "created_at", "normal_expires_at"):
-    value = manifest[field]
-    if not isinstance(value, str) or not re.fullmatch(
-            r"[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?([Zz]|[+-][0-9]{2}:[0-9]{2})", value):
-        sys.exit(field + " is not a timestamp")
-scheme = (manifest["encryption"] or {}).get("scheme") if isinstance(manifest["encryption"], dict) else None
-names = {"age-x25519": ("db.dump.age", "git.tar.age"), "none": ("db.dump", "git.tar")}.get(scheme)
-if names is None:
-    sys.exit("unknown encryption scheme")
-want = {names[0]: "db", names[1]: "git"}
-artifacts = manifest["artifacts"]
-if not isinstance(artifacts, list) or len(artifacts) != 2:
-    sys.exit("the manifest must list exactly two artifacts")
 files, under = {}, 0
 for entry in listing:
     head, _, tail = entry.get("Path", "").partition("/")
@@ -216,14 +206,8 @@ for entry in listing:
         under += 1
         if "/" not in tail:
             files[tail] = entry
-for art in artifacts:
-    if not isinstance(art, dict):
-        sys.exit("an artifact entry is not an object")
-    name, kind, size, sha = art.get("name"), art.get("kind"), art.get("bytes"), art.get("sha256")
-    if want.pop(name, None) != kind or not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha):
-        sys.exit("unexpected artifact %s" % (name,))
-    if not isinstance(size, int) or isinstance(size, bool):
-        sys.exit(name + ": no size in the manifest")
+for art in manifest["artifacts"]:
+    name, size, sha = art["name"], art["bytes"], art["sha256"]
     entry = files.get(name)
     if entry is None:
         sys.exit(name + " is missing on the remote")

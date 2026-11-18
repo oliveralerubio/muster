@@ -290,6 +290,34 @@ fn artifact_names(scheme: &str) -> Option<(&'static str, &'static str)> {
     }
 }
 
+/// The manifest alone, checked strictly: the exact fields and types, format
+/// and version, timestamps, the encryption scheme and the two artifacts under
+/// the names of that scheme. The one definition of a valid manifest: the
+/// restore, `backup verify` and `backup verify-manifest` all go through it.
+fn parse_manifest(raw: &[u8]) -> Result<Manifest, String> {
+    let m: Manifest = serde_json::from_slice(raw).map_err(|e| format!("manifest: {e}"))?;
+    if m.format != FORMAT || m.version != VERSION {
+        return Err("unsupported format".into());
+    }
+    if !is_backup_id(&m.backup_id) {
+        return Err("manifest: not a backup id".into());
+    }
+    for t in [&m.snapshot_at, &m.created_at, &m.normal_expires_at] {
+        parse_rfc(t).ok_or("invalid timestamp")?;
+    }
+    let (db, git) = artifact_names(&m.encryption.scheme).ok_or("unknown scheme")?;
+    let mut want = BTreeMap::from([(db, "db"), (git, "git")]);
+    if m.artifacts.len() != 2 {
+        return Err("expected two artifacts".into());
+    }
+    for a in &m.artifacts {
+        if want.remove(a.name.as_str()) != Some(a.kind.as_str()) || !is_sha256(&a.sha256) {
+            return Err(format!("unexpected artifact {}", a.name));
+        }
+    }
+    Ok(m)
+}
+
 /// A published snapshot directory, checked strictly (structure, names,
 /// sizes; hashes only with `hashes`). `Err`: not catalogued.
 fn read_snapshot(dir: &Path, hashes: bool) -> Result<Manifest, String> {
@@ -305,26 +333,11 @@ fn read_snapshot(dir: &Path, hashes: bool) -> Result<Manifest, String> {
         _ => return Err(format!("{name}: not a real directory")),
     }
     let raw = read_regular(&dir.join(MANIFEST)).map_err(|e| format!("{name}: manifest: {e}"))?;
-    let m: Manifest = serde_json::from_slice(&raw).map_err(|e| format!("{name}: manifest: {e}"))?;
-    if m.format != FORMAT || m.version != VERSION {
-        return Err(format!("{name}: unsupported format"));
-    }
+    let m = parse_manifest(&raw).map_err(|e| format!("{name}: {e}"))?;
     if m.backup_id != name {
         return Err(format!("{name}: manifest names another backup"));
     }
-    for t in [&m.snapshot_at, &m.created_at, &m.normal_expires_at] {
-        parse_rfc(t).ok_or_else(|| format!("{name}: invalid timestamp"))?;
-    }
-    let (db, git) =
-        artifact_names(&m.encryption.scheme).ok_or_else(|| format!("{name}: unknown scheme"))?;
-    let mut want = BTreeMap::from([(db, "db"), (git, "git")]);
-    if m.artifacts.len() != 2 {
-        return Err(format!("{name}: expected two artifacts"));
-    }
     for a in &m.artifacts {
-        if want.remove(a.name.as_str()) != Some(a.kind.as_str()) || !is_sha256(&a.sha256) {
-            return Err(format!("{name}: unexpected artifact {}", a.name));
-        }
         let path = dir.join(&a.name);
         let meta = fs::symlink_metadata(&path).map_err(|e| format!("{name}/{}: {e}", a.name))?;
         if !meta.file_type().is_file() || meta.len() != a.bytes {
@@ -1119,6 +1132,26 @@ pub fn verify(dir: &Path) -> Result<serde_json::Value, BackupError> {
     }))
 }
 
+/// `backup verify-manifest <file> [--backup-id ID]`: only the manifest, by
+/// exactly the rules of the restore (`read_snapshot`), for a copy of it kept
+/// elsewhere (the offsite copy) whose artifacts are not at hand. With
+/// `backup_id` the manifest must also name that snapshot.
+pub fn verify_manifest(
+    file: &Path,
+    backup_id: Option<&str>,
+) -> Result<serde_json::Value, BackupError> {
+    let raw = read_regular(file).map_err(io("manifest"))?;
+    let m = parse_manifest(&raw).map_err(BackupError::Refused)?;
+    if backup_id.is_some_and(|id| id != m.backup_id) {
+        return Err(BackupError::Refused("manifest names another backup".into()));
+    }
+    Ok(serde_json::json!({
+        "backup_id": m.backup_id,
+        "scheme": m.encryption.scheme,
+        "artifacts": m.artifacts.iter().map(|a| &a.name).collect::<Vec<_>>(),
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // Inventory, projection and retention
 // ---------------------------------------------------------------------------
@@ -1389,7 +1422,100 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::age_recipients;
+    use super::{age_recipients, read_snapshot, verify_manifest};
+    use serde_json::{json, Value};
+    use std::path::Path;
+
+    const ID: &str = "20261118T000000Z-bbbbbbbb";
+
+    fn manifest() -> Value {
+        json!({
+            "format": "muster-backup", "version": 2, "backup_id": ID,
+            "op_id": "11111111-2222-3333-4444-555555555555",
+            "snapshot_at": "2026-11-18T00:00:00Z", "created_at": "2026-11-18T00:00:05Z",
+            "encryption": {"scheme": "age-x25519", "recipient_sha256": "0".repeat(64)},
+            "normal_expires_at": "2026-12-18T00:00:00Z", "tenants": [],
+            "artifacts": [
+                {"name": "db.dump.age", "kind": "db", "bytes": 3, "sha256": "a".repeat(64)},
+                {"name": "git.tar.age", "kind": "git", "bytes": 3, "sha256": "b".repeat(64)},
+            ],
+        })
+    }
+
+    /// A snapshot directory `<root>/<ID>` holding `m` and its two artifacts.
+    fn snapshot(root: &Path, m: &Value) -> std::path::PathBuf {
+        let dir = root.join(ID);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("manifest.json"), m.to_string()).unwrap();
+        for name in ["db.dump.age", "git.tar.age"] {
+            std::fs::write(dir.join(name), b"xyz").unwrap();
+        }
+        dir
+    }
+
+    fn check(m: &Value, id: Option<&str>) -> Result<Value, String> {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("m.json");
+        std::fs::write(&file, m.to_string()).unwrap();
+        verify_manifest(&file, id).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn verify_manifest_accepts_a_valid_manifest() {
+        let out = check(&manifest(), Some(ID)).unwrap();
+        assert_eq!(out["backup_id"], ID);
+        check(&manifest(), None).unwrap();
+    }
+
+    #[test]
+    fn verify_manifest_refuses_what_the_restore_refuses() {
+        let mut cases: Vec<(&str, Value)> = Vec::new();
+        for (what, edit) in [
+            ("op_id", json!("not-a-uuid")),
+            ("version", json!(3)),
+            ("format", json!("other")),
+            ("snapshot_at", json!("yesterday")),
+            ("backup_id", json!("nope")),
+        ] {
+            let mut m = manifest();
+            m[what] = edit;
+            cases.push((what, m));
+        }
+        let mut m = manifest();
+        m["artifacts"][1]["kind"] = json!("extra");
+        cases.push(("unknown artifact kind", m));
+        let mut m = manifest();
+        m["encryption"]["scheme"] = json!("rot13");
+        cases.push(("scheme", m));
+        let mut m = manifest();
+        m["artifacts"][0]["sha256"] = json!("short");
+        cases.push(("sha256", m));
+        let mut m = manifest();
+        m["surprise"] = json!(1);
+        cases.push(("unknown field", m));
+        for (what, m) in cases {
+            let err = check(&m, None).expect_err(what);
+            assert!(err.starts_with("refused:"), "{what}: {err}");
+            // The restore's own reader agrees on every one of them.
+            let root = tempfile::tempdir().unwrap();
+            let dir = snapshot(root.path(), &m);
+            assert!(read_snapshot(&dir, false).is_err(), "{what}");
+        }
+    }
+
+    #[test]
+    fn verify_manifest_refuses_another_backup_id() {
+        let err = check(&manifest(), Some("20261101T000000Z-aaaaaaaa")).unwrap_err();
+        assert!(err.contains("another backup"), "{err}");
+    }
+
+    #[test]
+    fn verify_manifest_accepts_what_the_restore_accepts() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = snapshot(root.path(), &manifest());
+        read_snapshot(&dir, false).unwrap();
+        check(&manifest(), Some(ID)).unwrap();
+    }
 
     const A: &str = "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p";
     const B: &str = "age1lggyhqrw2nlhcxprm67z43rta597azn8gknawjehu9d9dl0jq3yqqvfafg";

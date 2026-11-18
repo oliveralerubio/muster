@@ -21,6 +21,9 @@
 //! muster-cloud-ops backup run [--plaintext-synthetic]
 //!                     one snapshot-bound, age-encrypted, catalogued snapshot
 //! muster-cloud-ops backup verify --snapshot DIR   structure + every hash
+//! muster-cloud-ops backup verify-manifest FILE [--backup-id ID]
+//!                     only a manifest.json, by the restore's own rules
+//!                     (no configuration needed; 0 valid, 65 invalid)
 //! muster-cloud-ops retention run                  remove expired snapshots
 //! ```
 //!
@@ -120,6 +123,11 @@ async fn main() -> ExitCode {
             .position(|a| a == name)
             .and_then(|i| args.get(i + 1).cloned())
     };
+
+    // Reads one file and needs no configuration, so it runs before any is read.
+    if args.len() >= 2 && args[0] == "backup" && args[1] == "verify-manifest" {
+        return verify_manifest_command(&args[2..]);
+    }
 
     let production = !matches!(env("MUSTER_ENV").as_deref(), Some("development"));
     let crash = match env("MUSTER_DEV_CONTROL_CRASH") {
@@ -315,6 +323,25 @@ async fn lifecycle_command(
     };
     println!("{json}");
     ExitCode::SUCCESS
+}
+
+/// `backup verify-manifest <file> [--backup-id ID]`: 0 valid, 65 invalid.
+fn verify_manifest_command(args: &[String]) -> ExitCode {
+    let (file, id) = match args {
+        [file] => (file, None),
+        [file, flag, id] if flag == "--backup-id" => (file, Some(id.as_str())),
+        _ => return usage("backup verify-manifest <manifest.json> [--backup-id ID]"),
+    };
+    match muster_cloud::backup::verify_manifest(std::path::Path::new(file), id) {
+        Ok(v) => {
+            println!("{v}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("muster-cloud-ops: {e}");
+            ExitCode::from(e.exit_code())
+        }
+    }
 }
 
 /// `backup run|verify` and `retention run`.
