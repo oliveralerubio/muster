@@ -42,6 +42,7 @@ fn web_panel_javascript_passes_its_node_suite() {
             && stdout.contains("ok testUsageWithoutSessionsExplainsNoCoverage")
             && stdout.contains("ok testEffectiveViewShowsStatesAndEscapesNames")
             && stdout.contains("ok testDashboardSyncOperationsRedesign")
+      && stdout.contains("ok testFleetTableColumnWidthsDeclaredOnce")
             && stdout.contains("ok testSkillsViewRendersUnmanagedSectionAndEscapesNames"),
         "the suite must actually run its tests:\n{stdout}{stderr}"
     );
