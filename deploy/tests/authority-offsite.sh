@@ -65,7 +65,7 @@ write_fake_ops() { # path
 [ "${1:-}" = status ] || exit 64
 seq=$(wc -l <"$MUSTER_CONTROL_DIR/journal.v1.jsonl" | tr -d ' ')
 hash=$(printf '%064d' "$seq")
-if [ -n "${FAKE_OPS_GROW:-}" ] && [ ! -e "$FAKE_OPS_GROW.done" ]; then
+if [ -n "${FAKE_OPS_GROW:-}" ] && { [ -n "${FAKE_OPS_GROW_ALWAYS:-}" ] || [ ! -e "$FAKE_OPS_GROW.done" ]; }; then
   : >"$FAKE_OPS_GROW.done"
   printf '{"n":%s}\n' "$((seq + 1))" >>"$FAKE_OPS_GROW"
 fi
@@ -90,7 +90,7 @@ run_copy() {
   out=$(MUSTER_AUTHORITY_ALLOW_NONROOT=1 MUSTER_CONTROL_DIR="$T/control" MUSTER_CONTROL_WITNESS="$T/witness/witness.json" \
     MUSTER_OPS_ENV="$T/ops.env" MUSTER_OPS_BIN="$T/ops" MUSTER_OFFSITE_REMOTE="$T/remote" \
     MUSTER_AUTHORITY_STATE="$T/state" MUSTER_RCLONE="$T/rclone" MUSTER_AGE="$(command -v age)" FAKE_RCLONE_LOG="$T/rclone.log" \
-    FAKE_OPS_GROW="${FAKE_OPS_GROW:-}" "$SCRIPT" 2>&1) || rc=$?
+    FAKE_OPS_GROW="${FAKE_OPS_GROW:-}" FAKE_OPS_GROW_ALWAYS="${FAKE_OPS_GROW_ALWAYS:-}" "$SCRIPT" 2>&1) || rc=$?
 }
 
 # opens_with identity archive — the identity decrypts it and it holds the three members.
@@ -153,6 +153,20 @@ check "growing journal: succeeds" rc_is 0
 check "growing journal: copied again in the same run" has "copying again"
 check "growing journal: both states were uploaded" uploaded_count_is 2
 check "growing journal: the second copy has sequence 2" bash -c 'ls "$1/remote/authority" | grep -q -- "-2.tar.age"' _ "$T"
+
+# ---- 7. a journal that never stops growing: not "ok" while the upload is behind ----------------------------
+setup busy
+FAKE_OPS_GROW="$T/control/journal.v1.jsonl" FAKE_OPS_GROW_ALWAYS=1 run_copy
+check "busy journal: exits 75, not 0" rc_is 75
+check "busy journal: five rounds were tried" uploaded_count_is 5
+check "busy journal: the log says the copy is behind" has "still changing after 5 rounds"
+# The unit starts it again by itself, and the alert is not sent per restart.
+UNIT=$REPO/deploy/systemd/muster-cloud-authority-offsite.service
+check "unit: Restart=on-failure" grep -qx 'Restart=on-failure' "$UNIT"
+check "unit: RestartSec=30s" grep -qx 'RestartSec=30s' "$UNIT"
+check "unit: a sane start limit (not unlimited)" bash -c 'grep -qx "StartLimitBurst=40" "$1" && grep -qx "StartLimitIntervalSec=30min" "$1"' _ "$UNIT"
+check "unit: configuration errors are not retried" grep -qx 'RestartPreventExitStatus=65 69 77' "$UNIT"
+check "unit: still alerts through OnFailure" grep -qx 'OnFailure=muster-cloud-alert@%n.service' "$UNIT"
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

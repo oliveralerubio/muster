@@ -37,10 +37,18 @@
 # the script looks at the journal again and, when it grew meanwhile, copies
 # once more (at most 5 rounds, MUSTER_AUTHORITY_SETTLE seconds apart); a burst
 # of records therefore becomes one or two uploads, and no change is left for
-# the hourly run.
+# the hourly run. When the journal is STILL moving after the fifth round the
+# upload is behind the local journal: the script then exits 75 instead of
+# claiming success, and the unit (Restart=on-failure, RestartSec=30s) runs it
+# again half a minute later, so a busy period catches up without waiting for the
+# hourly timer. Restarts do not alert one by one: OnFailure= fires only when the
+# unit finally fails (its start limit is hit, about 20 minutes of failing in a
+# row), and muster-cloud-alert sends one message per 6 hours for that unit.
 #
 # Exit codes: 0 ok (uploaded or already current); 1 upload failed; 65 the copy
-# did not validate; 69 a required tool or file is missing; 77 not root.
+# did not validate; 69 a required tool or file is missing; 75 the journal was
+# still changing after 5 rounds (the upload is behind; retried by the unit); 77
+# not root.
 #
 # Test hooks (all optional): MUSTER_CONTROL_DIR, MUSTER_CONTROL_WITNESS,
 # MUSTER_OPS_ENV, MUSTER_OPS_BIN, MUSTER_OFFSITE_REMOTE,
@@ -171,11 +179,17 @@ print(seq, h, dep, store)
 
 settle=${MUSTER_AUTHORITY_SETTLE:-0}
 [ "$settle" -eq 0 ] 2>/dev/null || sleep "$settle"
+caught_up=0
 for round in 1 2 3 4 5; do
   copy_once
   # Did the journal grow while this copy ran? A start request that arrived
   # meanwhile was a no-op, so look for ourselves.
-  [ "$(stat -c %s -- "$CONTROL_DIR/$JOURNAL")" != "$copied_size" ] || break
+  if [ "$(stat -c %s -- "$CONTROL_DIR/$JOURNAL")" = "$copied_size" ]; then
+    caught_up=1
+    break
+  fi
+  [ "$round" -lt 5 ] || break
   log "the journal changed during the copy; copying again (round $((round + 1)))"
   [ "$settle" -eq 0 ] 2>/dev/null || sleep "$settle"
 done
+[ "$caught_up" -eq 1 ] || die "the journal was still changing after 5 rounds: the offsite copy is behind the local journal; exiting 75 so the unit runs it again shortly" 75
