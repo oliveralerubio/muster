@@ -72,9 +72,10 @@ env:
     # network is created with this fixed subnet by deploy/kamal/host-setup.sh.
     MUSTER_TRUSTED_PROXIES: 172.31.250.0/24
     MUSTER_PADDLE_ENVIRONMENT: <%= ENV.fetch("MUSTER_PADDLE_ENVIRONMENT", "sandbox") %>
-    # Paddle price ids are not secret.
-    MUSTER_PADDLE_PRICE_PERSONAL: <%= ENV.fetch("MUSTER_PADDLE_PRICE_PERSONAL") %>
-    MUSTER_PADDLE_PRICE_TEAM_SEAT: <%= ENV.fetch("MUSTER_PADDLE_PRICE_TEAM_SEAT") %>
+    # Paddle price ids are not secret. Empty = billing disabled (the service
+    # ignores empty values; see deploy/KAMAL.md).
+    MUSTER_PADDLE_PRICE_PERSONAL: "<%= ENV.fetch("MUSTER_PADDLE_PRICE_PERSONAL", "") %>"
+    MUSTER_PADDLE_PRICE_TEAM_SEAT: "<%= ENV.fetch("MUSTER_PADDLE_PRICE_TEAM_SEAT", "") %>"
   secret:
     - MUSTER_DATABASE_URL
     - MUSTER_OIDC_ISSUER

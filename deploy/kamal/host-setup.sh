@@ -308,16 +308,68 @@ printf '\n== files under %s (values are never printed)\n' "$ETC_DIR"
 # has_key file KEY — a non-empty KEY=VALUE line exists.
 has_key() { grep -Eq "^$2=.+" "$1"; }
 
-check_keys() { # file label key...
-  local file=$1 label=$2 key missing=""
+# has_line file KEY — a KEY= line exists (its value may be empty).
+has_line() { grep -Eq "^$2=" "$1"; }
+
+# key_filled file KEY — the (last) value of KEY is not empty after the same
+# one-pair-of-quotes removal deploy/kamal/secret does. Nothing is printed.
+key_filled() {
+  local v
+  v=$(grep -E "^$2=" "$1" | tail -n 1) || true
+  v=${v#*=}
+  case $v in
+    \"*\") v=${v#\"}; v=${v%\"} ;;
+    \'*\') v=${v#\'}; v=${v%\'} ;;
+  esac
+  [ -n "$v" ]
+}
+
+# check_keys file label key... — every key has a non-empty value. Keys listed
+# after a literal "--" must only be present: the Paddle ones, which may be
+# empty (billing off; see check_billing below).
+check_keys() {
+  local file=$1 label=$2 key missing="" optional=0
   shift 2
   for key in "$@"; do
-    has_key "$file" "$key" || missing="$missing $key"
+    if [ "$key" = "--" ]; then
+      optional=1
+    elif [ "$optional" -eq 1 ]; then
+      has_line "$file" "$key" || missing="$missing $key"
+    else
+      has_key "$file" "$key" || missing="$missing $key"
+    fi
   done
   if [ -z "$missing" ]; then
     ok "$label has all required keys"
   else
     todo "$label is missing:$missing"
+  fi
+}
+
+# Billing is optional: an empty MUSTER_PADDLE_API_KEY means "billing off" and
+# the webhook secret and price ids may stay empty. With an API key, all four
+# must be filled in. Runs after both files were looked at.
+check_billing() {
+  local missing="" key
+  if [ ! -f "$KAMAL_ENV" ] || [ -L "$KAMAL_ENV" ] || ! has_line "$KAMAL_ENV" MUSTER_PADDLE_API_KEY; then
+    return 0 # already reported above
+  fi
+  if ! key_filled "$KAMAL_ENV" MUSTER_PADDLE_API_KEY; then
+    note "billing is off: MUSTER_PADDLE_API_KEY is empty (fill the four Paddle values and redeploy to enable it; deploy/KAMAL.md)"
+    return 0
+  fi
+  key_filled "$KAMAL_ENV" MUSTER_PADDLE_WEBHOOK_SECRET || missing="$missing MUSTER_PADDLE_WEBHOOK_SECRET($KAMAL_ENV)"
+  for key in MUSTER_PADDLE_PRICE_PERSONAL MUSTER_PADDLE_PRICE_TEAM_SEAT; do
+    if [ -f "$DEPLOY_ENV" ] && [ ! -L "$DEPLOY_ENV" ] && key_filled "$DEPLOY_ENV" "$key"; then
+      :
+    else
+      missing="$missing $key($DEPLOY_ENV)"
+    fi
+  done
+  if [ -z "$missing" ]; then
+    ok "billing is on: the Paddle API key, webhook secret and both price ids are set"
+  else
+    todo "MUSTER_PADDLE_API_KEY is set, so billing needs these non-empty:$missing"
   fi
 }
 
@@ -342,20 +394,23 @@ if [ -f "$KAMAL_ENV" ] && [ ! -L "$KAMAL_ENV" ]; then
     fi
   fi
   check_keys "$KAMAL_ENV" "$KAMAL_ENV" MUSTER_DATABASE_URL MUSTER_OIDC_ISSUER \
-    MUSTER_OIDC_CLIENT_ID MUSTER_OIDC_CLIENT_SECRET MUSTER_PADDLE_API_KEY \
-    MUSTER_PADDLE_WEBHOOK_SECRET POSTGRES_PASSWORD
+    MUSTER_OIDC_CLIENT_ID MUSTER_OIDC_CLIENT_SECRET POSTGRES_PASSWORD \
+    -- MUSTER_PADDLE_API_KEY MUSTER_PADDLE_WEBHOOK_SECRET
 else
   todo "$KAMAL_ENV does not exist ($DEPLOY_USER:$DEPLOY_USER 0600; keys in deploy/KAMAL.md, step 2)"
 fi
 
 if [ -f "$DEPLOY_ENV" ] && [ ! -L "$DEPLOY_ENV" ]; then
-  check_keys "$DEPLOY_ENV" "$DEPLOY_ENV" MUSTER_PADDLE_PRICE_PERSONAL MUSTER_PADDLE_PRICE_TEAM_SEAT
   if grep -Evq '^(#.*|)$|^(MUSTER_CLOUD_PUBLIC_URL|MUSTER_PADDLE_ENVIRONMENT|MUSTER_PADDLE_PRICE_PERSONAL|MUSTER_PADDLE_PRICE_TEAM_SEAT|ALERT_TARGET)=' "$DEPLOY_ENV"; then
     fail "$DEPLOY_ENV has lines other than the non-secret settings (bin/kamal refuses them)"
   fi
+elif [ -e "$DEPLOY_ENV" ] || [ -L "$DEPLOY_ENV" ]; then
+  fail "$DEPLOY_ENV must be a regular file, not a symlink"
 else
-  todo "$DEPLOY_ENV does not exist (deploy/KAMAL.md, step 2)"
+  note "$DEPLOY_ENV does not exist: defaults apply and billing price ids stay empty (deploy/KAMAL.md, step 3)"
 fi
+
+check_billing
 
 if [ "$ops_env_ok" -eq 1 ]; then
   check_keys "$OPS_ENV" "$OPS_ENV" MUSTER_DATABASE_URL MUSTER_REPO_ROOT MUSTER_CONTROL_DIR \

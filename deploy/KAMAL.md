@@ -144,6 +144,15 @@ needed, no multi-line values. Read only by `deploy/kamal/secret`.
 
 There is no registry token anywhere: neither here nor in GitHub.
 
+Billing can start disabled: write `MUSTER_PADDLE_API_KEY=` and
+`MUSTER_PADDLE_WEBHOOK_SECRET=` with empty values in `kamal.env` (the keys must
+be present) and leave the two price ids empty or absent in `deploy.env`;
+`host-setup.sh` then reports "billing is off" as a note. To enable it later,
+fill all four values (`host-setup.sh` asks for the rest once the API key is
+set) and boot the running commit again:
+`sudo touch /var/lib/muster-cloud/autodeploy/redeploy` plus
+`sudo systemctl start muster-cloud-autodeploy.service` (or wait for the timer).
+
 **`ops.env`** (`root:root`, mode `0600`): read by the timers' units and
 by the one-off `init` below. `host-setup.sh` refuses to run without it.
 
