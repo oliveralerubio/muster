@@ -1,6 +1,8 @@
 # Installed by deploy/kamal/host-setup.sh (never by CI). Encrypted offsite copy
-# of the lifecycle authority (journal + witness). Also started by the
-# OnSuccess= drop-in of muster-cloud-backup.service.
+# of the lifecycle authority (journal + witness). Started by
+# muster-cloud-authority-offsite.path shortly after every change of the control
+# journal, by the OnSuccess= drop-in of muster-cloud-backup.service, and hourly
+# by the timer (the backstop).
 [Unit]
 Description=Muster Cloud: encrypted offsite copy of the lifecycle authority
 Documentation=file:///opt/muster-cloud/deploy/KAMAL.md
@@ -8,6 +10,10 @@ After=network-online.target
 Wants=network-online.target
 ConditionPathIsDirectory=/srv/muster-cloud/control
 OnFailure=muster-cloud-alert@%n.service
+# The path unit may ask for a start often; a start while a run is active is a
+# no-op, and the script copies again by itself when the journal grew meanwhile.
+# No start limit: a limit hit would also fail the path unit that triggers this.
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot
@@ -15,6 +21,9 @@ User=root
 Group=root
 Environment=RCLONE_CONFIG=/root/.config/rclone/rclone.conf
 Environment=RCLONE_CACHE_DIR=/var/cache/muster-cloud-offsite
+# Wait a few seconds before a copy and between rounds, so a burst of journal
+# records becomes one or two uploads.
+Environment=MUSTER_AUTHORITY_SETTLE=5
 CacheDirectory=muster-cloud-offsite
 ExecStart=/usr/local/sbin/muster-cloud-authority-offsite
 TimeoutStartSec=30min

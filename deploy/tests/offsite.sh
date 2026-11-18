@@ -54,76 +54,9 @@ processed() { grep -qxF -- "$AUDIT_NAME" "$T/state/processed-audits.txt"; }
 not_processed() { ! processed; }
 rc_is() { [ "$rc" -eq "$1" ]; }
 
-# ---- a fake rclone: the "remote" is a plain directory ------------------------------
+# The fake rclone (deploy/tests/fake-rclone): the "remote" is a plain directory.
 fake_rclone() { # path
-  cat >"$1" <<'PY'
-#!/usr/bin/env python3
-import hashlib, json, os, shutil, sys
-
-args = sys.argv[1:]
-log = os.environ.get("FAKE_RCLONE_LOG")
-if log:
-    with open(log, "a") as handle:
-        handle.write(" ".join(args) + "\n")
-WITH_VALUE = {"--files-from-raw", "--contimeout", "--timeout", "--retries",
-              "--low-level-retries", "--stats", "--log-level", "--transfers", "--checkers"}
-flags, pos, i = {}, [], 1
-while i < len(args):
-    a = args[i]
-    if a in WITH_VALUE:
-        flags[a] = args[i + 1]
-        i += 2
-    elif a.startswith("--"):
-        flags[a] = True
-        i += 1
-    else:
-        pos.append(a)
-        i += 1
-cmd = args[0]
-if cmd == "copy":
-    if os.environ.get("FAKE_RCLONE_FULL"):
-        print("fake rclone: googleapi: Error 403: The user's Drive storage quota has been exceeded.", file=sys.stderr)
-        sys.exit(1)
-    src, dst = pos
-    with open(flags["--files-from-raw"]) as handle:
-        names = [line.rstrip("\n") for line in handle if line.strip()]
-    for name in names:
-        target = os.path.join(dst, name)
-        if "--ignore-existing" in flags and os.path.exists(target):
-            continue
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        shutil.copyfile(os.path.join(src, name), target)
-elif cmd == "purge":
-    if not os.path.isdir(pos[0]):
-        sys.exit(3)
-    shutil.rmtree(pos[0])
-elif cmd == "lsjson":
-    root = pos[0]
-    if os.environ.get("FAKE_RCLONE_LS_FAIL"):
-        print("fake rclone: couldn't list the remote: connection refused", file=sys.stderr)
-        sys.exit(1)
-    if not os.path.isdir(root):
-        sys.exit(3)
-    out = []
-    for base, _dirs, files in os.walk(root):
-        for name in files:
-            path = os.path.join(base, name)
-            entry = {"Path": os.path.relpath(path, root), "Name": name,
-                     "Size": os.path.getsize(path), "IsDir": False}
-            if "--hash" in flags and not os.environ.get("FAKE_RCLONE_NO_HASH"):
-                with open(path, "rb") as handle:
-                    entry["Hashes"] = {"sha256": hashlib.sha256(handle.read()).hexdigest()}
-            out.append(entry)
-    print(json.dumps(out))
-elif cmd == "cat":
-    if not os.path.isfile(pos[0]):
-        sys.exit(3)
-    with open(pos[0], "rb") as handle:
-        sys.stdout.buffer.write(handle.read())
-else:
-    print("fake rclone: unsupported command " + cmd, file=sys.stderr)
-    sys.exit(2)
-PY
+  cp -- "$REPO/deploy/tests/fake-rclone" "$1"
   chmod +x "$1"
 }
 
