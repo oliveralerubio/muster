@@ -1,0 +1,13 @@
+# Installed by deploy/kamal/host-setup.sh (never by CI).
+[Unit]
+Description=Muster Cloud: liveness guard every 15 seconds
+
+[Timer]
+OnBootSec=1min
+# Counted from the end of the previous run, so runs never overlap.
+OnUnitInactiveSec=15s
+AccuracySec=1s
+Unit=muster-cloud-guard.service
+
+[Install]
+WantedBy=timers.target

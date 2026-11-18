@@ -27,7 +27,8 @@
 #   state dirs    /var/lib/muster-cloud/{alerts,offsite,authority} (root 0700)
 #   timers        backup (every 6 h at :41), retention (hourly), offsite copy to
 #                 Google Drive (hourly), authority copy (hourly and after every
-#                 backup), backup check (every 30 min), autodeploy (every 5 min);
+#                 backup), backup check (every 30 min), autodeploy (every 5 min),
+#                 liveness guard (every 15 s: starts a container stopped by hand);
 #                 enabled with `enable --now`. Every muster-cloud oneshot alerts
 #                 through muster-cloud-alert@.service when it fails
 #   funnel        `tailscale funnel --bg --https=10000 http://127.0.0.1:18110`
@@ -81,6 +82,7 @@ readonly HOST_SCRIPTS=(muster-cloud-install-ops muster-cloud-alert muster-cloud-
 # retention come from install-systemd.sh).
 readonly OWN_UNITS=(muster-cloud-alert@.service
   muster-cloud-autodeploy.service muster-cloud-autodeploy.timer
+  muster-cloud-guard.service muster-cloud-guard.timer
   muster-cloud-backup-check.service muster-cloud-backup-check.timer
   muster-cloud-authority-offsite.service muster-cloud-authority-offsite.timer
   muster-cloud-offsite.service muster-cloud-offsite.timer)
@@ -468,7 +470,8 @@ fi
 # ---- 6. systemd units ------------------------------------------------------------
 printf '\n== systemd timers\n'
 timers=(muster-cloud-backup.timer muster-cloud-retention.timer muster-cloud-offsite.timer
-  muster-cloud-authority-offsite.timer muster-cloud-backup-check.timer muster-cloud-autodeploy.timer)
+  muster-cloud-authority-offsite.timer muster-cloud-backup-check.timer muster-cloud-autodeploy.timer
+  muster-cloud-guard.timer)
 
 if [ "$ops_env_ok" -eq 1 ]; then
   stage=$WORK/units

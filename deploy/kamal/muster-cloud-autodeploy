@@ -4,6 +4,12 @@
 # (root:root 0755) and run every 5 minutes by muster-cloud-autodeploy.timer.
 # Guide: deploy/KAMAL.md.
 #
+#   muster-cloud-autodeploy            the full run below (every 5 minutes)
+#   muster-cloud-autodeploy --guard    ONLY the liveness guard (every 15 seconds,
+#                                      muster-cloud-guard.timer); never contacts
+#                                      GitHub, never deploys; exits 0
+#   anything else                      exit 64
+#
 # Nothing outside this host can start a deploy: no GitHub runner is involved.
 # GitHub only builds and publishes the image (ghcr.io/oliveralerubio/
 # muster-cloud:<sha>, a public package) after Cloud CI is green on main. This
@@ -45,6 +51,19 @@
 # run do only the guard (deploys held, containers still kept up); remove it to
 # deploy again.
 #
+# The guard also runs alone, as `--guard`, every 15 s from
+# muster-cloud-guard.timer, so a stopped container is back in well under a
+# minute (the 5-minute timer above also polls GitHub and must not run faster).
+# A guard run does nothing, and says so in one journal line, while a deploy,
+# rollback or redeploy could be under way, because it could start the old web
+# container that Kamal just stopped or fight the proxy switch:
+#   - the flock below is held (the full run holds it from before the guard
+#     until it exits, so across the whole deploy and any rollback), or
+#   - a Kamal container (the image pinned in bin/kamal) runs on the host, for
+#     example someone running ./bin/kamal by hand outside the lock.
+# The second check also guards the first step of the full run. When everything
+# is up the guard writes nothing to the journal.
+#
 # One journal line per decision ("autodeploy: ..."). Alerts (Hermes) only on a
 # failure or on a successful deploy, one short line. Overlapping runs are
 # prevented with flock.
@@ -56,6 +75,7 @@
 # Test hooks (all optional): MUSTER_AUTODEPLOY_PATH (prepended to PATH),
 # MUSTER_AUTODEPLOY_{SOURCE,STATE,RUN,ALLOW_NONROOT,LOCAL_URL,GUARD_WAIT},
 # MUSTER_GITHUB_API, MUSTER_GITHUB_URL, MUSTER_SBIN, MUSTER_CLOUD_DEPLOY_ENV.
+# Tests: deploy/tests/autodeploy-guard.sh.
 
 set -Eeuo pipefail
 umask 022
@@ -102,6 +122,20 @@ on_exit() {
 trap on_exit EXIT
 trap 'log "unexpected error at line $LINENO"' ERR
 
+RUN_MODE=full
+case "${1:-}" in
+  '') ;;
+  --guard) RUN_MODE=guard ;;
+  *)
+    printf 'usage: muster-cloud-autodeploy [--guard]\n' >&2
+    exit 64
+    ;;
+esac
+if [ "$#" -gt 1 ]; then
+  printf 'usage: muster-cloud-autodeploy [--guard]\n' >&2
+  exit 64
+fi
+
 if [ "${MUSTER_AUTODEPLOY_ALLOW_NONROOT:-0}" != 1 ] && [ "$(id -u)" -ne 0 ]; then
   log "must run as root"
   exit 77
@@ -109,11 +143,17 @@ fi
 
 install -d -m 0755 -- "$STATE" "$STATE/attempts"
 exec 9>"$STATE/lock"
+# fd 9 is never closed: the lock lasts until this process exits, so a full run
+# holds it across the guard, the whole deploy and any rollback.
 if ! flock -n 9; then
-  decide "skip: another autodeploy run is active"
+  if [ "$RUN_MODE" = guard ]; then
+    decide "guard: skipped, a deploy or another autodeploy run holds the lock"
+  else
+    decide "skip: another autodeploy run is active"
+  fi
   exit 0
 fi
-work=$(mktemp -d "${TMPDIR:-/tmp}/muster-autodeploy.XXXXXX")
+[ "$RUN_MODE" = guard ] || work=$(mktemp -d "${TMPDIR:-/tmp}/muster-autodeploy.XXXXXX")
 
 alert_fire() { "$SBIN/muster-cloud-alert" fire "$@" || log "the alert could not be delivered"; }
 alert_notify() { "$SBIN/muster-cloud-alert" notify "$@" || log "the alert could not be delivered"; }
@@ -483,11 +523,42 @@ guard() {
   fi
 }
 
+# kamal_running -> 0 when a Kamal container runs on this host. Kamal runs from
+# the image pinned as KAMAL_IMAGE in bin/kamal (read from the checkout, so the
+# pin exists in one place only); without a readable pin, any ghcr.io/basecamp/
+# kamal image counts.
+readonly KAMAL_IMAGE_REPO=ghcr.io/basecamp/kamal
+kamal_running() {
+  local ref ids
+  ref=$(sed -n "s/^KAMAL_IMAGE='\\([^'@]*\\).*/\\1/p" "$SOURCE/bin/kamal" 2>/dev/null | head -n 1) || ref=""
+  case $ref in "$KAMAL_IMAGE_REPO":*) ;; *) ref="" ;; esac
+  if [ -n "$ref" ]; then
+    ids=$(docker ps -q --filter "ancestor=$ref" 2>/dev/null) || return 1
+    [ -n "$ids" ]
+  else
+    ids=$(docker ps --format '{{.Image}}' 2>/dev/null) || return 1
+    grep -q "^$KAMAL_IMAGE_REPO[:@]" <<<"$ids"
+  fi
+}
+
+# The guard, unless a Kamal run (a deploy by hand, outside the lock) is going on.
+guard_when_idle() {
+  if kamal_running; then
+    decide "guard: skipped, a Kamal container is running"
+    return 0
+  fi
+  guard
+}
+
 # ================================ main ====================================================
 # The liveness guard runs first, before anything is asked of GitHub. With the
 # marker `touch /var/lib/muster-cloud/autodeploy/guard-only` it is all that runs:
 # deploys are held, the containers are still kept up.
-guard || log "guard: unexpected error; continuing"
+if [ "$RUN_MODE" = guard ]; then
+  guard_when_idle || log "guard: unexpected error"
+  exit 0
+fi
+guard_when_idle || log "guard: unexpected error; continuing"
 if [ -e "$STATE/guard-only" ]; then
   decide "guard-only: $STATE/guard-only exists; not checking GitHub, no deploy"
   exit 0

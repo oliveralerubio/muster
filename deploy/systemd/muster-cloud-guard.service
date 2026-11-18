@@ -1,0 +1,24 @@
+# Installed by deploy/kamal/host-setup.sh (never by CI). The liveness guard
+# alone, every 15 s from muster-cloud-guard.timer: starts muster-cloud-db,
+# kamal-proxy or the web container when someone stopped it by hand. It skips
+# while a deploy runs. Guide: deploy/KAMAL.md.
+[Unit]
+Description=Muster Cloud: start a container that was stopped by hand
+Documentation=file:///opt/muster-cloud/deploy/KAMAL.md
+After=network-online.target docker.service
+OnFailure=muster-cloud-alert@%n.service
+
+[Service]
+Type=oneshot
+# Root, and deliberately not sandboxed, like muster-cloud-autodeploy.service:
+# it runs docker and the same script.
+User=root
+Group=root
+ExecStart=/usr/local/sbin/muster-cloud-autodeploy --guard
+TimeoutStartSec=5min
+UMask=0022
+Nice=5
+# Quiet journal: runs every 15 s. Systemd's own "Starting"/"Finished" lines are
+# info level and dropped; the script's lines (notice) and any failure stay.
+LogLevelMax=notice
+SyslogLevel=notice

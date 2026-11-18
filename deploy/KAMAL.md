@@ -66,6 +66,7 @@ host: systemd timers -> muster-cloud-ops (backup every 6 h, retention hourly)
 | --- | --- |
 | `Publish muster Cloud image` workflow | GitHub-hosted. Builds the image and pushes it to GHCR. Nothing else. |
 | `muster-cloud-autodeploy.timer` | Every 5 minutes, as root. Applies the decision above, then: updates its own checkout (`/var/lib/muster-cloud/source`), runs that checkout's `host-setup.sh` in apply mode (so scripts, units, drop-ins and permissions follow the release), pulls the image, boots it with Kamal, installs the matching `muster-cloud-ops` (`muster-cloud-install-ops`), checks `/readyz` locally and through Funnel. If a step after the switch fails it rolls back to the previous version and alerts. A commit whose deploy failed is retried 3 times, 30 minutes apart, then it waits for a newer commit. |
+| `muster-cloud-guard.timer` | Every 15 seconds, as root: `muster-cloud-autodeploy --guard`, the liveness guard alone (see Day to day). It never contacts GitHub and never deploys. |
 | `muster-cloud-backup.timer` | Every 6 hours (about 00:41, 06:41, 12:41, 18:41, up to 15 minutes late): one encrypted, snapshot-bound backup. |
 | `muster-cloud-retention.timer` | Hourly: removes expired snapshots and enforces the deletion caps. Writes an audit record of what it removed. |
 | `muster-cloud-offsite.timer` | Hourly: copies new snapshots to Google Drive (never `sync`), and deletes from Drive only what retention recorded as removed (see below). |
@@ -307,12 +308,24 @@ re-enable the workflow in the Actions tab.
   consumed by that one deploy. A new commit on `main` needs nothing: it deploys
   itself.
 - Containers stopped by hand: Docker's restart policy brings a crashed container
-  back but not one that was stopped with `docker stop` / `docker kill`. At the
-  start of every run (before GitHub is asked) autodeploy starts `muster-cloud-db`,
-  `kamal-proxy` and the web container of the version it recorded as deployed
-  (`/var/lib/muster-cloud/autodeploy/deployed`) if they exist and are stopped,
-  in that order, waits up to 60 s for `/readyz`, and alerts once. It never starts
-  any other container or an older web version.
+  back but not one that was stopped with `docker stop` / `docker kill`. The guard
+  starts `muster-cloud-db`, `kamal-proxy` and the web container of the version
+  autodeploy recorded as deployed (`/var/lib/muster-cloud/autodeploy/deployed`)
+  if they exist and are stopped, in that order, waits up to 60 s for `/readyz`,
+  and alerts once. It never starts any other container or an older web version.
+  It runs every 15 seconds from its own timer, `muster-cloud-guard.timer`
+  (`muster-cloud-autodeploy --guard`), so a stopped container is back in well
+  under a minute, and also at the start of every 5-minute autodeploy run. It
+  writes nothing to the journal while everything is up. It does nothing (one
+  journal line) while a deploy, rollback or redeploy holds the autodeploy lock
+  or while any Kamal container runs on the host, so it cannot undo a switch.
+- Stop the guard on purpose (for example to stop a container by hand for
+  maintenance): `sudo systemctl stop muster-cloud-guard.timer`, and
+  `sudo systemctl start muster-cloud-guard.timer` afterwards. Stopping it is not
+  enough: the 5-minute autodeploy run still starts the container, so stop
+  `muster-cloud-autodeploy.timer` too. Host-setup enables the guard timer again
+  at the next deploy. The `guard-only` marker below does not stop it: guard-only
+  still guards.
 - Hold deploys but keep the guard (for example before the first merge to `main`,
   or while investigating): `sudo touch /var/lib/muster-cloud/autodeploy/guard-only`.
   While the file exists every run does only the guard and exits 0 without
