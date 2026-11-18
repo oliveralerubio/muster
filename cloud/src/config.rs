@@ -30,6 +30,10 @@ pub struct Config {
     pub oidc_issuer: Url,
     pub oidc_client_id: String,
     oidc_client_secret: String,
+    /// `MUSTER_OIDC_EXTRA_AUDIENCES`: additional `aud` values an ID token may
+    /// carry next to the client id (Zitadel adds its project id). Empty means
+    /// strict: only the client id is accepted.
+    pub oidc_extra_audiences: Vec<String>,
     /// Absolute directory holding one bare Git repository per workspace.
     pub repo_root: std::path::PathBuf,
     pub paddle: Option<PaddleConfig>,
@@ -163,6 +167,11 @@ impl Config {
             get("MUSTER_OIDC_CLIENT_ID").ok_or(ConfigError::Missing("MUSTER_OIDC_CLIENT_ID"))?;
         let oidc_client_secret = get("MUSTER_OIDC_CLIENT_SECRET")
             .ok_or(ConfigError::Missing("MUSTER_OIDC_CLIENT_SECRET"))?;
+
+        let oidc_extra_audiences = match get("MUSTER_OIDC_EXTRA_AUDIENCES") {
+            None => Vec::new(),
+            Some(list) => parse_audiences(&list)?,
+        };
 
         let repo_root = std::path::PathBuf::from(
             get("MUSTER_REPO_ROOT").ok_or(ConfigError::Missing("MUSTER_REPO_ROOT"))?,
@@ -417,6 +426,7 @@ impl Config {
             oidc_issuer,
             oidc_client_id,
             oidc_client_secret,
+            oidc_extra_audiences,
             repo_root,
             paddle,
             dev_storage_limit,
@@ -602,6 +612,24 @@ fn redact_url(raw: &str) -> String {
     }
 }
 
+/// Comma-separated audience list: entries are trimmed, empty ones ignored,
+/// duplicates dropped; an entry containing whitespace is refused.
+fn parse_audiences(list: &str) -> Result<Vec<String>, ConfigError> {
+    let mut audiences: Vec<String> = Vec::new();
+    for entry in list.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        if entry.chars().any(char::is_whitespace) {
+            return Err(ConfigError::Invalid {
+                name: "MUSTER_OIDC_EXTRA_AUDIENCES",
+                reason: "entries must not contain whitespace".into(),
+            });
+        }
+        if !audiences.iter().any(|a| a == entry) {
+            audiences.push(entry.to_string());
+        }
+    }
+    Ok(audiences)
+}
+
 impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Config")
@@ -612,6 +640,7 @@ impl fmt::Debug for Config {
             .field("oidc_issuer", &self.oidc_issuer.as_str())
             .field("oidc_client_id", &self.oidc_client_id)
             .field("oidc_client_secret", &"[REDACTED]")
+            .field("oidc_extra_audiences", &self.oidc_extra_audiences)
             .field("repo_root", &self.repo_root)
             .field("paddle", &self.paddle)
             .field("control", &self.control)

@@ -1,0 +1,22 @@
+# Installed by deploy/kamal/host-setup.sh (never by CI). The pull-based deploy:
+# nothing outside this host can start it. Guide: deploy/KAMAL.md.
+[Unit]
+Description=Muster Cloud: deploy the newest green commit of main
+Documentation=file:///opt/muster-cloud/deploy/KAMAL.md
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+OnFailure=muster-cloud-alert@%n.service
+
+[Service]
+Type=oneshot
+# Root, and deliberately not sandboxed: it runs docker, git, systemctl and
+# host-setup.sh, and starts Kamal as user gha. Exit 75 means "failed and
+# already alerted"; it is not a unit failure (no second alert).
+User=root
+Group=root
+ExecStart=/usr/local/sbin/muster-cloud-autodeploy
+SuccessExitStatus=75
+TimeoutStartSec=45min
+UMask=0022
+Nice=5

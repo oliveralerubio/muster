@@ -1,0 +1,358 @@
+#!/usr/bin/env bash
+# muster-cloud-offsite — copy published backup snapshots to Google Drive and
+# apply the deletions that retention explicitly recorded. Installed by
+# deploy/kamal/host-setup.sh as /usr/local/sbin/muster-cloud-offsite
+# (root:root 0755) and run hourly by muster-cloud-offsite.service. Guide:
+# deploy/KAMAL.md.
+#
+# UPLOAD: `rclone copy` only, never `sync`. A published snapshot directory
+# (snapshots/<backup_id>/, immutable once published) is copied when the remote
+# does not have it yet (--ignore-existing); the artifacts go first and
+# manifest.json last, so a manifest on Drive means the snapshot is complete.
+# Nothing is ever deleted by an upload.
+#
+# DELETION: the only way anything leaves Drive. Retention (muster-cloud-ops
+# retention run) writes one audit record per run,
+#   <backup root>/audit/retention-<time>-<op uuid>.json
+#   {"format":"muster-retention","version":1,...,"removed":["<backup_id>",...]}
+# and `removed` lists the snapshots it deleted locally. For every audit file
+# not processed yet, each listed id is deleted from Drive only if
+#   - it matches the snapshot id format (YYYYMMDDTHHMMSSZ-xxxxxxxx), and
+#   - it is absent from the local snapshots directory.
+# Each audit file is processed once (its name is then appended to a state
+# file). Drive's trash is bypassed (--drive-use-trash=false): a deleted
+# tenant's data must really expire. An emptied or wiped local snapshots
+# directory therefore deletes NOTHING remotely.
+#
+# NEVER THE LAST COPY: before anything is purged on Drive, the script checks
+# that, with the ids about to go (and everything it already purged in this
+# run) gone, Drive still holds a COMPLETE snapshot at least as new as the
+# newest complete local one. "Complete" is verified, not assumed: its
+# manifest.json is read back, every artifact it lists exists on Drive with the
+# listed size and, when Drive reports a SHA-256 for it, the listed hash, and
+# the manifest passes `muster-cloud-ops backup verify-manifest`, which is the
+# restore's own manifest parser (exit 0 valid, 65 invalid; a missing or failing
+# ops binary also blocks the purge), and nothing else is in the directory.
+# Drive is listed afresh before every purge decision, never reused.
+# When the check fails (Drive full so the newest upload failed, a truncated file, an
+# unreadable Drive, or nothing left but the snapshots about to be purged) the
+# purge is skipped, the audit stays unprocessed so the next run retries it, and
+# the run exits 3 so the failure alert fires.
+#
+# The first failed deletion stops all deletions for the rest of the run (a
+# half-purged snapshot must not be mistaken for a complete one, and the next run
+# lists Drive afresh): the remaining audits stay unprocessed and the run exits 3.
+#
+# Guard: at most 100 ids are deleted per run. An audit file that lists more
+# than 100 ids, or that is not a valid retention record, is refused (exit 3,
+# so the failure alert fires); audit files that would only push this run past
+# 100 ids wait for the next run.
+#
+# Exit codes: 0 ok; 1 upload failed (the run fails and alerts: a failed copy of
+# any artifact is never silent); 3 an audit record was refused, a purge was
+# skipped because Drive would keep no complete newer snapshot, or a remote
+# deletion failed; 64 usage; 69 a required tool is missing; 77 not root.
+#
+# Test hooks (all optional): MUSTER_BACKUP_ROOT, MUSTER_OFFSITE_REMOTE,
+# MUSTER_OFFSITE_STATE, MUSTER_RCLONE, MUSTER_OPS_BIN.
+
+set -euo pipefail
+umask 077
+export LC_ALL=C
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+readonly BACKUP_ROOT=${MUSTER_BACKUP_ROOT:-/srv/muster-cloud/backups}
+readonly SNAPS=$BACKUP_ROOT/snapshots
+readonly AUDIT=$BACKUP_ROOT/audit
+readonly REMOTE=${MUSTER_OFFSITE_REMOTE:-gdrive:muster-cloud-backups}
+readonly STATE_DIR=${MUSTER_OFFSITE_STATE:-/var/lib/muster-cloud/offsite}
+readonly RCLONE=${MUSTER_RCLONE:-rclone}
+readonly MAX_DELETE_IDS=100
+readonly MAX_AUDIT_BYTES=1048576
+readonly ID_RE='^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$'
+readonly AUDIT_RE='^retention-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.json$'
+readonly OPS_BIN=${MUSTER_OPS_BIN:-/usr/local/bin/muster-cloud-ops}
+readonly ARTIFACT_RE='^(db\.dump|git\.tar)(\.age)?$'
+
+log() { printf 'offsite: %s\n' "$*"; }
+
+if [ "${MUSTER_OFFSITE_ALLOW_NONROOT:-0}" != 1 ] && [ "$(id -u)" -ne 0 ]; then
+  log "must run as root"
+  exit 77
+fi
+for tool in "$RCLONE" python3 flock; do
+  command -v "$tool" >/dev/null 2>&1 || {
+    log "required tool not found: $tool"
+    exit 69
+  }
+done
+
+install -d -m 0700 -- "$STATE_DIR"
+exec 9>"$STATE_DIR/lock"
+flock -n 9 || {
+  log "another offsite run is active; nothing to do"
+  exit 0
+}
+
+work=$(mktemp -d "${TMPDIR:-/tmp}/muster-offsite.XXXXXX")
+trap 'rm -rf --one-file-system -- "$work"' EXIT
+
+newest_local="" # newest complete local snapshot id (set by the upload step)
+rc_common=(--contimeout 30s --timeout 120s --retries 3 --low-level-retries 10 --stats 0 --log-level NOTICE)
+rc_copy=(--ignore-existing --transfers 2 --checkers 4 --drive-use-trash=false)
+
+status=0
+
+# ---- 1. upload (copy only) ------------------------------------------------------
+if [ ! -d "$SNAPS" ]; then
+  log "no snapshots directory yet ($SNAPS); nothing to upload"
+else
+  : >"$work/artifacts.lst"
+  : >"$work/manifests.lst"
+  n_snap=0
+  for dir in "$SNAPS"/*/; do
+    [ -d "$dir" ] || continue
+    dir=${dir%/}
+    id=${dir##*/}
+    [[ $id =~ $ID_RE ]] || continue
+    [ ! -L "$dir" ] || continue
+    [ -f "$dir/manifest.json" ] && [ ! -L "$dir/manifest.json" ] || continue
+    n_snap=$((n_snap + 1))
+    for f in "$dir"/*; do
+      name=${f##*/}
+      [ -f "$f" ] && [ ! -L "$f" ] || continue
+      if [ "$name" = manifest.json ]; then
+        printf '%s/%s\n' "$id" "$name" >>"$work/manifests.lst"
+      elif [[ $name =~ $ARTIFACT_RE ]]; then
+        printf '%s/%s\n' "$id" "$name" >>"$work/artifacts.lst"
+      fi
+    done
+  done
+  log "upload: $n_snap local snapshot(s) considered"
+  newest_local=$(sed 's|/.*||' "$work/manifests.lst" | sort | tail -n 1)
+  up_ok=1
+  # An empty list file must never reach rclone: skip the call instead.
+  for list in artifacts manifests; do
+    if [ -s "$work/$list.lst" ]; then
+      if "$RCLONE" copy "$SNAPS" "$REMOTE/snapshots" --files-from-raw "$work/$list.lst" \
+        "${rc_copy[@]}" "${rc_common[@]}"; then
+        log "upload: $list copied ($(wc -l <"$work/$list.lst") file(s) checked)"
+      else
+        log "upload: rclone copy of $list FAILED"
+        up_ok=0
+        break # never send a manifest when its artifacts did not all arrive
+      fi
+    fi
+  done
+  [ "$up_ok" -eq 1 ] || status=1
+fi
+
+# ---- 2. deletions recorded by retention ---------------------------------------
+purged_now=()
+
+# list_remote — what Drive holds right now. Called before EVERY purge decision:
+# a listing that predates a (possibly partial) purge must never be reused.
+list_remote() {
+  local rc=0
+  "$RCLONE" lsjson "$REMOTE/snapshots" --recursive --files-only --hash "${rc_common[@]}" \
+    >"$work/remote.json" 2>"$work/remote.err" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    log "audit: cannot list $REMOTE/snapshots (rclone exit $rc): $(head -c 200 "$work/remote.err" | tr '\n' ' ')"
+    return 1
+  fi
+  # Snapshot ids that have a manifest.json on Drive, newest first.
+  python3 -I -c '
+import json, re, sys
+ids = set()
+for entry in json.load(open(sys.argv[1])):
+    path = entry.get("Path", "")
+    head, _, tail = path.partition("/")
+    if tail == "manifest.json" and re.fullmatch(r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}", head):
+        ids.add(head)
+print("\n".join(sorted(ids, reverse=True)))
+' "$work/remote.json" >"$work/remote-ids.lst"
+}
+
+# verify_remote_snapshot id — the snapshot on Drive is complete: its manifest
+# is valid by `muster-cloud-ops backup verify-manifest` (the restore's own
+# parser: the only definition of a valid manifest, never re-implemented here)
+# and every artifact it lists is there with the listed size (and the listed
+# SHA-256, when Drive reports one), with nothing else in the directory. The
+# manifest is the only thing downloaded, so the hashes of the artifacts
+# themselves are not recomputed here.
+verify_remote_snapshot() {
+  local id=$1 rc=0
+  [ -x "$OPS_BIN" ] || {
+    log "audit: remote snapshot $id cannot be verified: muster-cloud-ops not found at $OPS_BIN"
+    return 1
+  }
+  "$RCLONE" cat "$REMOTE/snapshots/$id/manifest.json" "${rc_common[@]}" >"$work/manifest-$id.json" 2>/dev/null || return 1
+  "$OPS_BIN" backup verify-manifest "$work/manifest-$id.json" --backup-id "$id" \
+    >/dev/null 2>"$work/verify.err" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    log "audit: remote snapshot $id is not complete: its manifest was refused (exit $rc): $(head -c 200 "$work/verify.err" | tr '\n' ' ')"
+    return 1
+  fi
+  # The manifest is valid, so its fields have the shapes the parser enforces.
+  python3 -I -c '
+import json, sys
+listing = json.load(open(sys.argv[1]))
+sid = sys.argv[2]
+manifest = json.load(open(sys.argv[3]))
+files, under = {}, 0
+for entry in listing:
+    head, _, tail = entry.get("Path", "").partition("/")
+    if head == sid and tail:
+        under += 1
+        if "/" not in tail:
+            files[tail] = entry
+for art in manifest["artifacts"]:
+    name, size, sha = art["name"], art["bytes"], art["sha256"]
+    entry = files.get(name)
+    if entry is None:
+        sys.exit(name + " is missing on the remote")
+    if entry.get("Size") != size:
+        sys.exit("%s: %s bytes on the remote, %s in the manifest" % (name, entry.get("Size"), size))
+    remote_sha = (entry.get("Hashes") or {}).get("sha256")
+    if remote_sha and remote_sha.lower() != sha:
+        sys.exit(name + ": the remote SHA-256 differs from the manifest")
+if under != 3:
+    sys.exit("unexpected files in the remote snapshot directory")
+' "$work/remote.json" "$id" "$work/manifest-$id.json" 2>"$work/verify.err" || {
+    log "audit: remote snapshot $id is not complete: $(head -c 200 "$work/verify.err" | tr '\n' ' ')"
+    return 1
+  }
+}
+
+# purge_is_safe id... — with these ids (and everything purged earlier in this
+# run) gone, Drive still holds a verified complete snapshot at least as new as
+# the newest complete local one.
+purge_is_safe() {
+  list_remote || return 1
+  local -A excluded=()
+  local candidate
+  for candidate in "$@" ${purged_now[@]+"${purged_now[@]}"}; do
+    excluded[$candidate]=1
+  done
+  while IFS= read -r candidate; do
+    [ -n "$candidate" ] || continue
+    [ -z "${excluded[$candidate]:-}" ] || continue
+    if [ -n "$newest_local" ] && [[ ${candidate:0:16} < ${newest_local:0:16} ]]; then
+      log "audit: the newest complete snapshot Drive would keep ($candidate) is older than the newest local one ($newest_local)"
+      return 1
+    fi
+    if verify_remote_snapshot "$candidate"; then
+      log "audit: Drive keeps the complete snapshot $candidate (newest local: ${newest_local:-none})"
+      return 0
+    fi
+  done <"$work/remote-ids.lst"
+  log "audit: Drive would keep no complete snapshot as new as the newest local one (${newest_local:-none})"
+  return 1
+}
+
+processed=$STATE_DIR/processed-audits.txt
+touch -- "$processed"
+if [ ! -d "$AUDIT" ]; then
+  log "no audit directory yet ($AUDIT); no remote deletions"
+else
+  planned=0
+  mapfile -t audits < <(find "$AUDIT" -maxdepth 1 -name 'retention-*.json' -printf '%f\n' | sort)
+  for name in "${audits[@]}"; do
+    [[ $name =~ $AUDIT_RE ]] || {
+      log "audit: ignoring unexpected file name $name"
+      continue
+    }
+    if grep -qxF -- "$name" "$processed"; then
+      continue
+    fi
+    file=$AUDIT/$name
+    if [ -L "$file" ] || [ ! -f "$file" ]; then
+      log "audit: REFUSED $name (not a regular file)"
+      status=3
+      continue
+    fi
+    size=$(stat -c %s -- "$file")
+    if [ "$size" -gt "$MAX_AUDIT_BYTES" ]; then
+      log "audit: REFUSED $name (larger than $MAX_AUDIT_BYTES bytes)"
+      status=3
+      continue
+    fi
+    if ! ids=$(python3 -I -c '
+import json, re, sys
+with open(sys.argv[1], "rb") as handle:
+    doc = json.loads(handle.read())
+if not isinstance(doc, dict) or doc.get("format") != "muster-retention" or doc.get("version") != 1:
+    sys.exit("not a muster-retention version 1 record")
+removed = doc.get("removed")
+if not isinstance(removed, list):
+    sys.exit("removed is not a list")
+pattern = re.compile(r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}")
+seen = []
+for item in removed:
+    if not isinstance(item, str) or not pattern.fullmatch(item):
+        sys.exit("removed holds an entry that is not a snapshot id")
+    if item not in seen:
+        seen.append(item)
+print("\n".join(seen))
+' "$file" 2>"$work/parse.err"); then
+      log "audit: REFUSED $name ($(head -c 200 "$work/parse.err" | tr '\n' ' '))"
+      status=3
+      continue
+    fi
+    mapfile -t id_list < <(printf '%s' "$ids" | grep -v '^$' || true)
+    count=${#id_list[@]}
+    if [ "$count" -gt "$MAX_DELETE_IDS" ]; then
+      log "audit: REFUSED $name (lists $count ids; the limit is $MAX_DELETE_IDS per run)"
+      status=3
+      continue
+    fi
+    if [ $((planned + count)) -gt "$MAX_DELETE_IDS" ]; then
+      log "audit: deferring $name to the next run ($planned ids already handled in this run)"
+      break
+    fi
+    planned=$((planned + count))
+    to_purge=()
+    for id in "${id_list[@]}"; do
+      if [ -e "$SNAPS/$id" ] || [ -L "$SNAPS/$id" ]; then
+        log "audit: $name: $id is still present locally; NOT deleting it remotely"
+      else
+        to_purge+=("$id")
+      fi
+    done
+    if [ "${#to_purge[@]}" -gt 0 ] && ! purge_is_safe "${to_purge[@]}"; then
+      log "audit: $name: NOT purging anything on Drive and leaving the record unprocessed (retried next run): the last complete offsite copy must not be deleted"
+      status=3
+      continue
+    fi
+    failed=0
+    for id in ${to_purge[@]+"${to_purge[@]}"}; do
+      rc=0
+      "$RCLONE" purge "$REMOTE/snapshots/$id" --drive-use-trash=false "${rc_common[@]}" || rc=$?
+      case $rc in
+        0)
+          purged_now+=("$id")
+          log "audit: $name: deleted $id from the remote (no trash)"
+          ;;
+        3)
+          purged_now+=("$id")
+          log "audit: $name: $id was already absent from the remote"
+          ;;
+        *)
+          log "audit: $name: deleting $id FAILED (rclone exit $rc); it may be half deleted. STOPPING all deletions for this run; the next run lists Drive afresh"
+          failed=1
+          break
+          ;;
+      esac
+    done
+    if [ "$failed" -eq 0 ]; then
+      printf '%s\n' "$name" >>"$processed"
+      log "audit: $name processed ($count id(s))"
+    else
+      status=3
+      break # the remaining audits stay unprocessed
+    fi
+  done
+fi
+
+log "done (exit $status)"
+exit "$status"

@@ -1,0 +1,62 @@
+# Installed by deploy/kamal/host-setup.sh (never by CI). Encrypted offsite copy
+# of the lifecycle authority (journal + witness). Started by
+# muster-cloud-authority-offsite.path shortly after every change of the control
+# journal, by the OnSuccess= drop-in of muster-cloud-backup.service, and hourly
+# by the timer (the backstop).
+[Unit]
+Description=Muster Cloud: encrypted offsite copy of the lifecycle authority
+Documentation=file:///opt/muster-cloud/deploy/KAMAL.md
+After=network-online.target
+Wants=network-online.target
+ConditionPathIsDirectory=/srv/muster-cloud/control
+OnFailure=muster-cloud-alert@%n.service
+# The path unit may ask for a start often; a start while a run is active is a
+# no-op, and the script copies again by itself when the journal grew meanwhile.
+# A failed run (Drive down, or the journal still moving after 5 rounds: exit 75)
+# is started again by Restart= every 30 s.
+# No start limit (StartLimitIntervalSec=0): systemd counts every start, also the
+# successful ones the path unit makes, against it, so a busy period could make
+# systemd REFUSE a start and a journal change would wait for the hourly timer.
+# The script coalesces, so unlimited starts are harmless. The price: Restart=
+# never ends in a "failed" unit, so OnFailure= fires only for what is not
+# retried (exit 65, 69 or 77, below); a copy that keeps failing is reported by
+# muster-cloud-backup-check instead (authority-stale after 90 minutes behind,
+# gdrive-unreachable). muster-cloud-alert sends one message per key per 6 hours
+# (REPEAT_SECONDS=21600, key unit:<unit>), so neither path can spam.
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+Environment=RCLONE_CONFIG=/root/.config/rclone/rclone.conf
+Environment=RCLONE_CACHE_DIR=/var/cache/muster-cloud-offsite
+# Wait a few seconds before a copy and between rounds, so a burst of journal
+# records becomes one or two uploads.
+Environment=MUSTER_AUTHORITY_SETTLE=5
+CacheDirectory=muster-cloud-offsite
+ExecStart=/usr/local/sbin/muster-cloud-authority-offsite
+Restart=on-failure
+RestartSec=30s
+# A configuration or validation problem (65, 69, 77) is not helped by retrying:
+# it fails the unit, and so alerts, at once.
+RestartPreventExitStatus=65 69 77
+TimeoutStartSec=30min
+Nice=10
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/root/.config/rclone /var/lib/muster-cloud/authority
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX

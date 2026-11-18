@@ -241,6 +241,72 @@ jobs:
           fi
           exit "$status"
 
+      # Uses the muster-cloud-ops just built; skips itself without a user namespace.
+      - name: Host ops binary never goes back to an older release
+        run: deploy/tests/install-ops.sh
+
+  # The host deploy scripts (deploy/kamal) tested against a fake docker, curl,
+  # Kamal and alert command: no Docker daemon, root or network needed.
+  deploy-scripts:
+    name: deploy scripts
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ci-docker
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools (git, python3, flock, age)
+        run: |
+          set -eu
+          apt="apt-get"
+          [ "$(id -u)" -eq 0 ] || apt="sudo apt-get"
+          install=""
+          command -v git >/dev/null 2>&1 || install="$install git"
+          command -v python3 >/dev/null 2>&1 || install="$install python3"
+          command -v flock >/dev/null 2>&1 || install="$install util-linux"
+          # The offsite, authority-copy and drill tests encrypt with real keys.
+          command -v age-keygen >/dev/null 2>&1 || install="$install age"
+          if [ -n "$install" ]; then
+            $apt update
+            $apt install -y --no-install-recommends $install
+          fi
+
+      - name: Syntax of the deploy scripts
+        run: |
+          set -eu
+          for f in bin/kamal deploy/kamal/muster-cloud-autodeploy deploy/kamal/host-setup.sh \
+                   deploy/kamal/muster-cloud-offsite deploy/kamal/muster-cloud-authority-offsite \
+                   deploy/kamal/muster-cloud-backup-check deploy/kamal/muster-cloud-restore-drill \
+                   deploy/kamal/muster-cloud-install-ops deploy/tests/install-ops.sh \
+                   deploy/pg-restore.sh deploy/tests/restore-owner.sh \
+                   deploy/tests/autodeploy-guard.sh deploy/tests/offsite.sh \
+                   deploy/tests/authority-offsite.sh deploy/tests/host-setup-fresh.sh \
+                   deploy/tests/restore-drill.sh deploy/tests/backup-check-units.sh; do
+            bash -n "$f"
+          done
+
+      - name: Autodeploy tests (guard, proxy and database bootstrap, incomplete deploys)
+        run: deploy/tests/autodeploy-guard.sh
+
+      - name: Offsite tests (never purge the last complete snapshot)
+        run: deploy/tests/offsite.sh
+
+      - name: Authority copy tests (every recipient decrypts, copies again when the journal grows)
+        run: deploy/tests/authority-offsite.sh
+
+      - name: Restore runs ops as the owner of the authority (user namespace; skipped when unavailable)
+        run: deploy/tests/restore-owner.sh
+
+      - name: A fresh host starts guard-only before any timer is enabled (user namespace; skipped when unavailable)
+        run: deploy/tests/host-setup-fresh.sh
+
+      - name: Restore drill selection and backup-check tests
+        run: |
+          set -eu
+          deploy/tests/restore-drill.sh
+          deploy/tests/backup-check-units.sh
+
   backup-drill:
     name: backup-drill
     if: >-

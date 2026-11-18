@@ -5,8 +5,10 @@
 //! ```text
 //! muster-cloud-ops init                               pristine targets only
 //! muster-cloud-ops status [--database-url URL]        reconcile (+ replay)
-//! muster-cloud-ops register --database-url URL        new candidate incarnation
-//! muster-cloud-ops activate --incarnation ID --database-url URL
+//! muster-cloud-ops register [--database-url URL]       new candidate incarnation
+//! muster-cloud-ops activate --incarnation ID [--database-url URL]
+//!                     (URL from MUSTER_DATABASE_URL when the flag is absent;
+//!                     the flag works but warns: it shows in the process list)
 //! muster-cloud-ops restore-check [--database-url URL] read-only restore gate
 //! muster-cloud-ops restore-finalize [--database-url URL]
 //!                     a restored database joins as a NEW candidate incarnation,
@@ -19,12 +21,17 @@
 //! muster-cloud-ops backup run [--plaintext-synthetic]
 //!                     one snapshot-bound, age-encrypted, catalogued snapshot
 //! muster-cloud-ops backup verify --snapshot DIR   structure + every hash
+//! muster-cloud-ops backup verify-manifest FILE [--backup-id ID]
+//!                     only a manifest.json, by the restore's own rules
+//!                     (no configuration needed; 0 valid, 65 invalid)
 //! muster-cloud-ops retention run                  remove expired snapshots
 //! ```
 //!
 //! Backups (`cloud/src/backup.rs`): `MUSTER_BACKUP_ROOT` (managed root),
 //! `MUSTER_BACKUP_AGE_RECIPIENT` (required unless `--plaintext-synthetic`,
-//! itself development only), `MUSTER_BACKUP_RETENTION_DAYS` (default 30);
+//! itself development only), `MUSTER_BACKUP_AGE_RECIPIENTS` (optional,
+//! comma-separated age public keys the backup is encrypted to as well),
+//! `MUSTER_BACKUP_RETENTION_DAYS` (default 30);
 //! development only: `MUSTER_DEV_BACKUP_RETENTION_SECS`,
 //! `MUSTER_DEV_BACKUP_CRASH=after_snapshot|after_db|after_git|before_publish`,
 //! `MUSTER_DEV_BACKUP_PAUSE_FILE`. Backup exits: 65 refused, 75 busy.
@@ -89,6 +96,22 @@ async fn connect(url: &str, access: DbAccess) -> Result<sqlx::PgPool, ControlErr
     Ok(db)
 }
 
+/// The database URL of `register` and `activate`: `MUSTER_DATABASE_URL`, so a
+/// password never has to be in the process list. `--database-url` still works
+/// (and wins) but warns.
+fn url_from_flag_or_env(flag: Option<String>) -> Result<String, ControlError> {
+    if let Some(url) = flag {
+        eprintln!(
+            "muster-cloud-ops: warning: --database-url puts the database password in the \
+             process list; set MUSTER_DATABASE_URL instead"
+        );
+        return Ok(url);
+    }
+    env("MUSTER_DATABASE_URL").ok_or_else(|| {
+        ControlError::Usage("--database-url (or MUSTER_DATABASE_URL) is required".into())
+    })
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -100,6 +123,11 @@ async fn main() -> ExitCode {
             .position(|a| a == name)
             .and_then(|i| args.get(i + 1).cloned())
     };
+
+    // Reads one file and needs no configuration, so it runs before any is read.
+    if args.len() >= 2 && args[0] == "backup" && args[1] == "verify-manifest" {
+        return verify_manifest_command(&args[2..]);
+    }
 
     let production = !matches!(env("MUSTER_ENV").as_deref(), Some("development"));
     let crash = match env("MUSTER_DEV_CONTROL_CRASH") {
@@ -185,8 +213,7 @@ async fn main() -> ExitCode {
                 }
             }
             "register" => {
-                let url = db_url
-                    .ok_or_else(|| ControlError::Usage("--database-url is required".into()))?;
+                let url = url_from_flag_or_env(db_url)?;
                 let db = connect(&url, DbAccess::Migrate).await?;
                 let mut authority = Authority::open(&paths)?;
                 let db_status = authority.register(&db, crash).await?;
@@ -196,8 +223,7 @@ async fn main() -> ExitCode {
                 }
             }
             "activate" => {
-                let url = db_url
-                    .ok_or_else(|| ControlError::Usage("--database-url is required".into()))?;
+                let url = url_from_flag_or_env(db_url)?;
                 let id = flag("--incarnation")
                     .and_then(|s| uuid::Uuid::parse_str(&s).ok())
                     .ok_or_else(|| {
@@ -297,6 +323,25 @@ async fn lifecycle_command(
     };
     println!("{json}");
     ExitCode::SUCCESS
+}
+
+/// `backup verify-manifest <file> [--backup-id ID]`: 0 valid, 65 invalid.
+fn verify_manifest_command(args: &[String]) -> ExitCode {
+    let (file, id) = match args {
+        [file] => (file, None),
+        [file, flag, id] if flag == "--backup-id" => (file, Some(id.as_str())),
+        _ => return usage("backup verify-manifest <manifest.json> [--backup-id ID]"),
+    };
+    match muster_cloud::backup::verify_manifest(std::path::Path::new(file), id) {
+        Ok(v) => {
+            println!("{v}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("muster-cloud-ops: {e}");
+            ExitCode::from(e.exit_code())
+        }
+    }
 }
 
 /// `backup run|verify` and `retention run`.
@@ -409,7 +454,15 @@ async fn backup_command(
             Some(Encryption::PlaintextSynthetic)
         } else {
             match env("MUSTER_BACKUP_AGE_RECIPIENT") {
-                Some(recipient) => Some(Encryption::Age { recipient }),
+                Some(primary) => {
+                    match backup::age_recipients(
+                        &primary,
+                        env("MUSTER_BACKUP_AGE_RECIPIENTS").as_deref(),
+                    ) {
+                        Ok(recipients) => Some(Encryption::Age { recipients }),
+                        Err(e) => return config_error(e),
+                    }
+                }
                 None => {
                     return fail(BackupError::Refused(
                         "MUSTER_BACKUP_AGE_RECIPIENT is required: backups are encrypted".into(),

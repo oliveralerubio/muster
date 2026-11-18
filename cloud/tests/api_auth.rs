@@ -1,6 +1,6 @@
 mod support;
 
-use support::{http, oidc_fixture, set_cookie, stack};
+use support::{http, oidc_fixture, set_cookie, stack, stack_with_env, Stack};
 
 #[tokio::test]
 async fn login_redirects_to_the_identity_provider_with_pkce() {
@@ -178,4 +178,75 @@ async fn unverified_or_missing_email_verification_is_refused_at_login() {
         let err: muster_cloud::protocol::ApiError = cb_resp.json().await.unwrap();
         assert_eq!(err.error.code, "bad_request");
     }
+}
+
+/// Runs a login whose ID token carries `idp_params` (extra query parameters
+/// for the fixture IdP) and returns the callback response.
+async fn login_with_token_params(s: &Stack, idp_params: &str) -> reqwest::Response {
+    let client = http();
+    let login_resp = client.get(s.url("/auth/login")).send().await.unwrap();
+    let (login_cookie, _) = set_cookie(&login_resp, "__Host-mc_login").unwrap();
+    let auth_url = format!(
+        "{}&login_as=zita&email=zita@example.com{idp_params}",
+        login_resp.headers()["location"].to_str().unwrap()
+    );
+    let idp_resp = client.get(&auth_url).send().await.unwrap();
+    let cb_url = idp_resp.headers()["location"].to_str().unwrap();
+    client
+        .get(cb_url)
+        .header("Cookie", format!("__Host-mc_login={login_cookie}"))
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn assert_login_refused(resp: reqwest::Response) {
+    assert_eq!(resp.status(), 400);
+    assert!(set_cookie(&resp, "__Host-mc_session").is_none());
+    let err: muster_cloud::protocol::ApiError = resp.json().await.unwrap();
+    assert_eq!(
+        err.error.message,
+        "identity provider returned an invalid ID token"
+    );
+}
+
+#[tokio::test]
+async fn configured_extra_audience_is_accepted_with_our_client_as_azp() {
+    let s = stack_with_env(&[(
+        "MUSTER_OIDC_EXTRA_AUDIENCES",
+        " proj-1 , ,proj-2,proj-1".into(),
+    )])
+    .await;
+    let resp = login_with_token_params(&s, "&extra_aud=proj-1&azp=client").await;
+    assert_eq!(resp.status(), 303);
+    assert!(set_cookie(&resp, "__Host-mc_session").is_some());
+}
+
+#[tokio::test]
+async fn extra_audience_is_refused_when_not_configured() {
+    let s = stack().await;
+    assert_login_refused(login_with_token_params(&s, "&extra_aud=proj-1&azp=client").await).await;
+}
+
+#[tokio::test]
+async fn unlisted_extra_audience_is_refused() {
+    let s = stack_with_env(&[("MUSTER_OIDC_EXTRA_AUDIENCES", "proj-1".into())]).await;
+    assert_login_refused(login_with_token_params(&s, "&extra_aud=proj-1,other&azp=client").await)
+        .await;
+    assert_login_refused(login_with_token_params(&s, "&extra_aud=other&azp=client").await).await;
+}
+
+#[tokio::test]
+async fn multiple_audiences_need_our_client_as_authorized_party() {
+    let s = stack_with_env(&[("MUSTER_OIDC_EXTRA_AUDIENCES", "proj-1".into())]).await;
+    assert_login_refused(login_with_token_params(&s, "&extra_aud=proj-1").await).await;
+    assert_login_refused(login_with_token_params(&s, "&extra_aud=proj-1&azp=proj-1").await).await;
+    assert_login_refused(login_with_token_params(&s, "&extra_aud=proj-1&azp=someone-else").await)
+        .await;
+}
+
+#[tokio::test]
+async fn single_audience_token_with_foreign_azp_is_refused() {
+    let s = stack().await;
+    assert_login_refused(login_with_token_params(&s, "&azp=someone-else").await).await;
 }

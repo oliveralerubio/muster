@@ -1,0 +1,19 @@
+# Installed by deploy/kamal/host-setup.sh (never by CI). Started by the
+# OnFailure= of every muster-cloud-* oneshot unit; %i is the failed unit.
+[Unit]
+Description=Muster Cloud: alert that %i failed
+Documentation=file:///opt/muster-cloud/deploy/KAMAL.md
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Root: the Hermes CLI and its Discord credentials are root's.
+User=root
+Group=root
+ExecStart=/usr/local/sbin/muster-cloud-alert unit-failed %i
+TimeoutStartSec=3min
+UMask=0077
+# Not sandboxed on purpose: the alert path must keep working whatever Hermes
+# decides to write under root's home.
+NoNewPrivileges=true
+PrivateTmp=true

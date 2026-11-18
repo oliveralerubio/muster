@@ -100,6 +100,8 @@ run still exits with the caller command's status; stop it manually with
 dir by hand. The launcher never affects other clusters (including any
 pre-existing host instance).
 
+Production deployment on the `personal` VPS (Kamal, CI-built image, timers, offsite backups): see [`KAMAL.md`](KAMAL.md).
+
 ## Cloud CI workflow (`.github/workflows/cloud.yml`)
 
 CI for the `muster-cloud` backend, separate from `.github/workflows/ci.yml`
@@ -187,6 +189,7 @@ secret store; never bake them into the image or commit them.
 | `MUSTER_OIDC_ISSUER` | **yes** | OIDC issuer URL of the identity provider (https, non-loopback in production). |
 | `MUSTER_OIDC_CLIENT_ID` | **yes** | OIDC client id. |
 | `MUSTER_OIDC_CLIENT_SECRET` | **yes** | OIDC client secret. Secret — inject via secret store. |
+| `MUSTER_OIDC_EXTRA_AUDIENCES` | no | Comma-separated extra `aud` values the ID token may carry next to the client id (default none = strict). Zitadel needs its project id here. Not secret. |
 | `MUSTER_REPO_ROOT` | **yes** | Absolute path of the per-workspace bare Git object store (one `<workspace-id>.git` repo per workspace). There is no default: the service refuses to start without it. Back up this directory together with the database — see `muster-cloud-ops backup run` below. |
 | `MUSTER_CONTROL_DIR` | **yes** | Absolute directory of the lifecycle authority's control store (hash-chained journal + lock). Must be disjoint from `MUSTER_REPO_ROOT` (neither inside the other). Not secret. |
 | `MUSTER_CONTROL_WITNESS` | **yes** | Absolute path of the authority's independent witness file; not inside the control dir or the repo root. Put it on a DIFFERENT volume/device than the control dir. Not secret. |
@@ -422,6 +425,11 @@ passed to `pg_dump` through `PG*` environment variables, never argv.) Needs
 `MUSTER_BACKUP_AGE_RECIPIENT` (a recipient PUBLIC key). Prints one JSON line
 (`backup_id`, `path`, `snapshot_at`, `tenants`, `encryption`).
 
+- Optional `MUSTER_BACKUP_AGE_RECIPIENTS`: more recipient public keys,
+  comma-separated (a second identity that may open the backup, such as the
+  restore drill's). A backup to several recipients records all of them in the
+  manifest (`recipients_sha256`; an older `muster-cloud-ops` cannot read such a
+  manifest). A malformed entry refuses the backup (78) before anything is read.
 - **Encryption is the default and required**: no recipient → refused (65).
   `--plaintext` (`--plaintext-synthetic`) is for synthetic data in
   development (`MUSTER_ENV=development`) only, and refused in production (65).
@@ -517,9 +525,13 @@ deploy/pg-restore.sh --backup <backup-dir> \
   `workspace_heads` must exist in the restored Git store AND be reachable
   from `refs/muster/uploads/*`; every restored repo must pass `git fsck`.
   Any failure tears down the targets created in that run.
-- Cutover is a separate MANUAL step: `muster-cloud-ops activate
-  --incarnation <id printed by the restore> --database-url <new db>`, which
-  fences the source incarnation (its running service starts refusing every
+- The authority (journal, lock, witness) is written as the owner of the control
+  directory (`setpriv`, the service's uid), never chowned; a control directory
+  owned by root, or a witness in a directory with another owner, is refused (73).
+- Cutover is a separate MANUAL step: `MUSTER_DATABASE_URL=<new db>
+  muster-cloud-ops activate --incarnation <id printed by the restore>` (the URL
+  in the environment, not `--database-url`: a flag puts the password in the
+  process list), which fences the source incarnation (its running service starts refusing every
   request), then start a NEW service instance pointed at the restored
   database and repo root (`MUSTER_DATABASE_URL`, `MUSTER_REPO_ROOT`). The
   script never restarts or reconfigures a service, and never overwrites the

@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# bin/kamal — run Kamal from its official, pinned container image. No Ruby on
+# the host: the only requirement is Docker.
+#
+#   bin/kamal config                      render the resolved configuration (secrets redacted)
+#   bin/kamal app boot --version <sha>    switch to an image already on the host
+#   bin/kamal rollback <sha>
+#   bin/kamal accessory boot db           first start of the database
+#
+# Do not use `kamal deploy`: it pulls the image through an SSH tunnel to the
+# local registry, which does not exist (config/deploy.yml). The host's
+# muster-cloud-autodeploy pulls the image and runs `app boot` instead.
+#
+# Guide: deploy/KAMAL.md.
+#
+# What the container gets:
+#   - the repository, mounted at /workdir (the image's working directory);
+#   - your ~/.ssh, read-only (Kamal reaches the host over SSH with your keys;
+#     the host key must already be in ~/.ssh/known_hosts);
+#   - the secrets file, read-only, at the SAME path
+#     (${MUSTER_CLOUD_SECRETS_FILE:-/etc/muster-cloud/kamal.env}), read by
+#     .kamal/secrets through deploy/kamal/secret;
+#   - these variables, when set: MUSTER_CLOUD_PUBLIC_URL, MUSTER_PADDLE_ENVIRONMENT,
+#     MUSTER_PADDLE_PRICE_PERSONAL, MUSTER_PADDLE_PRICE_TEAM_SEAT,
+#     MUSTER_OIDC_EXTRA_AUDIENCES, MUSTER_CLOUD_SECRETS_FILE. There is no registry credential anywhere.
+#
+# Non-secret settings come from /etc/muster-cloud/deploy.env when it exists
+# (override its path with MUSTER_CLOUD_DEPLOY_ENV). It is parsed, never
+# sourced: KEY=VALUE lines for the non-secret variables above (plus
+# ALERT_TARGET, which only the host's alert script reads and is ignored here),
+# and a variable already set in your environment wins.
+#
+# The container carries the label muster.kamal=1: muster-cloud-autodeploy's
+# guard does nothing while a container with it (or any ghcr.io/basecamp/kamal
+# image) runs. Keep the label if you edit the `docker run` below.
+#
+# It also carries muster.kamal.owner=<who>: MUSTER_KAMAL_OWNER, or "manual"
+# when that is not set (muster-cloud-autodeploy sets it to "autodeploy" for its
+# own calls). A full autodeploy run does nothing while a Kamal container that is
+# not its own runs, so a manual Kamal run (a rollback by hand, a cutover) is
+# never undone by the next deploy. The owner is a plain word, not a secret: it
+# is passed on the command line.
+#
+# The container shares the host network so SSH to the host's own Tailscale
+# address works the same from the autodeploy timer (which runs on that host)
+# and from a laptop. The Docker socket is NOT mounted unless
+# KAMAL_WRAPPER_DOCKER=1 (nothing in this deployment needs it).
+#
+# The image is pinned by digest (the multi-arch index of ghcr.io/basecamp/kamal
+# v2.12.0). To upgrade: pick the new tag, resolve its digest with
+#   docker buildx imagetools inspect ghcr.io/basecamp/kamal:<tag>
+# and change KAMAL_IMAGE below.
+
+set -euo pipefail
+
+KAMAL_IMAGE='ghcr.io/basecamp/kamal:v2.12.0@sha256:7b5be276aa17bbe122887f6a1ff12865f4848111989699b9786083be95d98415'
+
+die() {
+  printf 'bin/kamal: %s\n' "$1" >&2
+  exit 1
+}
+
+command -v docker >/dev/null 2>&1 || die "docker is required"
+
+repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+
+load_deploy_env() {
+  local file=$1 line key value
+  [ -f "$file" ] || return 0
+  [ -r "$file" ] || die "cannot read $file"
+  while IFS= read -r line || [ -n "$line" ]; do
+    case $line in
+      '' | '#'*) continue ;;
+    esac
+    key=${line%%=*}
+    value=${line#*=}
+    case $value in
+      \"*\") value=${value#\"}; value=${value%\"} ;;
+      \'*\') value=${value#\'}; value=${value%\'} ;;
+    esac
+    case $key in
+      MUSTER_CLOUD_PUBLIC_URL | MUSTER_PADDLE_ENVIRONMENT | MUSTER_PADDLE_PRICE_PERSONAL | MUSTER_PADDLE_PRICE_TEAM_SEAT | MUSTER_OIDC_EXTRA_AUDIENCES)
+        if [ -z "${!key:-}" ]; then
+          export "$key=$value"
+        fi
+        ;;
+      ALERT_TARGET) ;; # read by muster-cloud-alert, not by Kamal
+      *) die "$file: unexpected line (only the non-secret settings are allowed there)" ;;
+    esac
+  done <"$file"
+}
+load_deploy_env "${MUSTER_CLOUD_DEPLOY_ENV:-/etc/muster-cloud/deploy.env}"
+
+secrets_file=${MUSTER_CLOUD_SECRETS_FILE:-/etc/muster-cloud/kamal.env}
+export MUSTER_CLOUD_SECRETS_FILE=$secrets_file
+case $secrets_file in
+  /*) ;;
+  *) die "MUSTER_CLOUD_SECRETS_FILE must be an absolute path" ;;
+esac
+
+# The labels are how the host's liveness guard (muster-cloud-autodeploy) knows a
+# Kamal run is going on, and whose, whatever Kamal version or image reference
+# it uses.
+owner=${MUSTER_KAMAL_OWNER:-manual}
+case $owner in
+  '' | *[!A-Za-z0-9._-]*) die "MUSTER_KAMAL_OWNER may only contain letters, digits, '.', '_' and '-'" ;;
+esac
+args=(run --rm --network host
+  --label muster.kamal=1
+  --label "muster.kamal.owner=$owner"
+  --user "$(id -u):$(id -g)"
+  --env HOME=/home/kamal
+  --volume "$repo:/workdir")
+for group in $(id -G); do
+  args+=(--group-add "$group")
+done
+
+if [ -t 0 ] && [ -t 1 ]; then
+  args+=(--interactive --tty)
+fi
+
+if [ -d "${HOME:-/nonexistent}/.ssh" ]; then
+  args+=(--volume "$HOME/.ssh:/home/kamal/.ssh:ro")
+fi
+
+if [ -f "$secrets_file" ]; then
+  args+=(--volume "$secrets_file:$secrets_file:ro")
+else
+  printf 'bin/kamal: note: secrets file %s not found; commands that read secrets will fail\n' "$secrets_file" >&2
+fi
+
+if [ "${KAMAL_WRAPPER_DOCKER:-0}" = 1 ]; then
+  [ -S /var/run/docker.sock ] || die "KAMAL_WRAPPER_DOCKER=1 but /var/run/docker.sock is missing"
+  args+=(--volume /var/run/docker.sock:/var/run/docker.sock
+    --group-add "$(stat -c %g /var/run/docker.sock)")
+fi
+
+# Pass by name only: values never appear on the command line.
+for name in MUSTER_CLOUD_PUBLIC_URL MUSTER_PADDLE_ENVIRONMENT \
+  MUSTER_PADDLE_PRICE_PERSONAL MUSTER_PADDLE_PRICE_TEAM_SEAT \
+  MUSTER_OIDC_EXTRA_AUDIENCES MUSTER_CLOUD_SECRETS_FILE; do
+  if [ -n "${!name:-}" ]; then
+    args+=(--env "$name")
+  fi
+done
+
+exec docker "${args[@]}" "$KAMAL_IMAGE" "$@"

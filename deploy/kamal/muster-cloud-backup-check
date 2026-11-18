@@ -1,0 +1,243 @@
+#!/usr/bin/env bash
+# muster-cloud-backup-check — notice when backups quietly stop. Installed by
+# deploy/kamal/host-setup.sh as /usr/local/sbin/muster-cloud-backup-check
+# (root:root 0755) and run every 30 minutes by muster-cloud-backup-check.timer.
+# Guide: deploy/KAMAL.md.
+#
+# Problems it reports through muster-cloud-alert (Hermes -> Discord), each at
+# most once per 6 hours, plus one "resolved" message when it clears:
+#
+#   local-snapshot-stale   the newest published snapshot on this host is older
+#                          than 7 hours (backups run every 6 hours), or none
+#   gdrive-snapshot-stale  the newest COMPLETE snapshot (its manifest.json is
+#                          there) on gdrive: is older than 8 hours, or missing
+#   gdrive-unreachable     gdrive: cannot be listed at all
+#   authority-stale        the newest authority copy on gdrive: has a lower
+#                          journal sequence than the local journal, and the
+#                          journal has been that way for over 90 minutes
+#   unit:<name>            a muster-cloud-* unit is in the failed state
+#   autodeploy-silent      muster-cloud-autodeploy has not completed a check
+#                          for 6 hours
+#   restore-drill-stale    the monthly restore drill has not succeeded for 40
+#                          days (counted from its last success, or from the day
+#                          it was enabled)
+#
+# It also heals one thing by itself, without an alert: when
+# muster-cloud-authority-offsite.path is enabled but not running (systemd stops a
+# path unit whose trigger limit was exceeded), it resets and starts it again and
+# starts an authority copy (a change made while it was down is not lost). An
+# alert only fires when that restart fails.
+#
+# Test hooks (all optional): MUSTER_BACKUP_ROOT, MUSTER_CONTROL_DIR,
+# MUSTER_OFFSITE_REMOTE, MUSTER_RCLONE, MUSTER_ALERT_BIN, MUSTER_AUTODEPLOY_STATE,
+# MUSTER_BACKUP_CHECK_NOW (epoch seconds), MUSTER_BACKUP_CHECK_SKIP_UNITS=1,
+# MUSTER_SYSTEMCTL, MUSTER_DRILL_STATE.
+#
+# Exit codes: 0 all checks ran (problems were reported, not returned);
+# 1 an alert could not be delivered; 69 a required tool is missing; 77 not root.
+
+set -uo pipefail
+umask 077
+export LC_ALL=C
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+readonly BACKUP_ROOT=${MUSTER_BACKUP_ROOT:-/srv/muster-cloud/backups}
+readonly SNAPS=$BACKUP_ROOT/snapshots
+readonly CONTROL_DIR=${MUSTER_CONTROL_DIR:-/srv/muster-cloud/control}
+readonly REMOTE=${MUSTER_OFFSITE_REMOTE:-gdrive:muster-cloud-backups}
+readonly RCLONE=${MUSTER_RCLONE:-rclone}
+readonly ALERT=${MUSTER_ALERT_BIN:-/usr/local/sbin/muster-cloud-alert}
+readonly AUTODEPLOY_STATE=${MUSTER_AUTODEPLOY_STATE:-/var/lib/muster-cloud/autodeploy}
+readonly SYSTEMCTL=${MUSTER_SYSTEMCTL:-systemctl}
+readonly DRILL_STATE=${MUSTER_DRILL_STATE:-/var/lib/muster-cloud/drill}
+readonly DRILL_MAX=$((40 * 86400))
+readonly LOCAL_MAX=$((7 * 3600))
+readonly REMOTE_MAX=$((8 * 3600))
+readonly AUTHORITY_GRACE=$((90 * 60))
+readonly AUTODEPLOY_MAX=$((6 * 3600))
+readonly ID_RE='^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$'
+readonly AUTH_RE='^authority-([0-9]{8}T[0-9]{6}Z)-([0-9]+)\.tar\.age$'
+
+now=${MUSTER_BACKUP_CHECK_NOW:-$(date +%s)}
+rc=0
+
+log() { printf 'backup-check: %s\n' "$*"; }
+
+if [ "${MUSTER_BACKUP_CHECK_ALLOW_NONROOT:-0}" != 1 ] && [ "$(id -u)" -ne 0 ]; then
+  log "must run as root"
+  exit 77
+fi
+for tool in "$RCLONE" "$ALERT" flock; do
+  command -v "$tool" >/dev/null 2>&1 || [ -x "$tool" ] || {
+    log "required tool not found: $tool"
+    exit 69
+  }
+done
+
+problem() { # key message
+  log "PROBLEM $1: $2"
+  "$ALERT" fire "$1" "$2" || rc=1
+}
+fine() { # key message
+  "$ALERT" resolve "$1" "$2" || rc=1
+}
+
+# id_epoch YYYYMMDDTHHMMSSZ-xxxxxxxx -> epoch seconds
+id_epoch() {
+  local id=$1
+  date -u -d "${id:0:4}-${id:4:2}-${id:6:2}T${id:9:2}:${id:11:2}:${id:13:2}Z" +%s
+}
+
+human() { # seconds -> "5h12m"
+  local s=$1
+  printf '%sh%02dm' $((s / 3600)) $(((s % 3600) / 60))
+}
+
+rclone_run() {
+  timeout 300 "$RCLONE" "$@" --contimeout 30s --timeout 90s --retries 2 --low-level-retries 5
+}
+
+# ---- 1. newest local published snapshot ----------------------------------------
+newest_local=""
+if [ -d "$SNAPS" ]; then
+  while IFS= read -r id; do
+    [[ $id =~ $ID_RE ]] || continue
+    [ -f "$SNAPS/$id/manifest.json" ] || continue
+    newest_local=$id
+  done < <(find "$SNAPS" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null | sort)
+fi
+if [ -z "$newest_local" ]; then
+  problem local-snapshot-stale "no published backup snapshot exists on this host"
+else
+  age=$((now - $(id_epoch "$newest_local")))
+  if [ "$age" -gt "$LOCAL_MAX" ]; then
+    problem local-snapshot-stale "the newest local backup snapshot is $(human "$age") old (limit 7h): $newest_local"
+  else
+    fine local-snapshot-stale "local backups are current again (newest is $(human "$age") old)"
+  fi
+fi
+
+# ---- 2. newest complete snapshot on Drive --------------------------------------
+list_rc=0
+remote_manifests=$(rclone_run lsf "$REMOTE/snapshots" --recursive --files-only --include manifest.json 2>/dev/null) || list_rc=$?
+if [ "$list_rc" -ne 0 ] && [ "$list_rc" -ne 3 ]; then
+  problem gdrive-unreachable "cannot list Google Drive ($REMOTE/snapshots), rclone exit $list_rc: backups cannot be checked offsite"
+else
+  fine gdrive-unreachable "Google Drive is reachable again"
+  if [ "$list_rc" -eq 3 ]; then
+    remote_manifests=""
+  fi
+  newest_remote=""
+  while IFS= read -r path; do
+    id=${path%%/*}
+    [[ $id =~ $ID_RE ]] || continue
+    newest_remote=$id
+  done < <(printf '%s\n' "$remote_manifests" | sort)
+  if [ -z "$newest_remote" ]; then
+    problem gdrive-snapshot-stale "no complete backup snapshot exists on Google Drive"
+  else
+    age=$((now - $(id_epoch "$newest_remote")))
+    if [ "$age" -gt "$REMOTE_MAX" ]; then
+      problem gdrive-snapshot-stale "the newest backup snapshot on Google Drive is $(human "$age") old (limit 8h): $newest_remote"
+    else
+      fine gdrive-snapshot-stale "Google Drive backups are current again (newest is $(human "$age") old)"
+    fi
+  fi
+
+  # ---- 3. authority copy vs the local journal ----------------------------------
+  journal=$CONTROL_DIR/journal.v1.jsonl
+  if [ -f "$journal" ]; then
+    local_seq=$(wc -l <"$journal" | tr -d ' ')
+    journal_age=$((now - $(stat -c %Y -- "$journal")))
+    auth_rc=0
+    remote_auth=$(rclone_run lsf "$REMOTE/authority" --files-only 2>/dev/null) || auth_rc=$?
+    if [ "$auth_rc" -ne 0 ] && [ "$auth_rc" -ne 3 ]; then
+      problem gdrive-unreachable "cannot list the authority copies on Google Drive, rclone exit $auth_rc"
+    else
+      [ "$auth_rc" -ne 3 ] || remote_auth=""
+      remote_seq=0
+      while IFS= read -r name; do
+        if [[ $name =~ $AUTH_RE ]]; then
+          [ "${BASH_REMATCH[2]}" -le "$remote_seq" ] || remote_seq=${BASH_REMATCH[2]}
+        fi
+      done < <(printf '%s\n' "$remote_auth")
+      if [ "$remote_seq" -ge "$local_seq" ]; then
+        fine authority-stale "the authority copy on Google Drive is current again (journal sequence $remote_seq)"
+      elif [ "$journal_age" -gt "$AUTHORITY_GRACE" ]; then
+        problem authority-stale "the newest authority copy on Google Drive has journal sequence $remote_seq but this host's journal is at $local_seq (changed $(human "$journal_age") ago)"
+      fi
+    fi
+  else
+    log "no control journal at $journal; authority copy not checked"
+  fi
+fi
+
+# ---- 4. failed muster-cloud-* units ----------------------------------------------
+if [ "${MUSTER_BACKUP_CHECK_SKIP_UNITS:-0}" != 1 ]; then
+  failed_units=$("$SYSTEMCTL" list-units --type=service --state=failed 'muster-cloud-*' --no-legend --plain 2>/dev/null \
+    | awk '{print $1}' | grep -v '^muster-cloud-alert@' || true)
+  for unit in $failed_units; do
+    problem "unit:$unit" "$unit is in the failed state. Details: journalctl -u $unit -n 50"
+  done
+  # Close the problems of units that recovered.
+  for key in $("$ALERT" keys unit:); do
+    unit=${key#unit:}
+    if ! printf '%s\n' "$failed_units" | grep -qxF -- "$unit"; then
+      fine "$key" "$unit is no longer failed"
+    fi
+  done
+fi
+
+# ---- 5. the autodeploy timer is alive ----------------------------------------------
+if [ "${MUSTER_BACKUP_CHECK_SKIP_UNITS:-0}" != 1 ] && "$SYSTEMCTL" is-enabled --quiet muster-cloud-autodeploy.timer 2>/dev/null; then
+  stamp=$AUTODEPLOY_STATE/last-ok-check
+  if [ ! -f "$stamp" ]; then
+    problem autodeploy-silent "muster-cloud-autodeploy has never completed a check of GitHub"
+  else
+    age=$((now - $(stat -c %Y -- "$stamp")))
+    if [ "$age" -gt "$AUTODEPLOY_MAX" ]; then
+      problem autodeploy-silent "muster-cloud-autodeploy has not completed a check of GitHub for $(human "$age") (new releases are not being deployed)"
+    else
+      fine autodeploy-silent "muster-cloud-autodeploy is checking GitHub again"
+    fi
+  fi
+fi
+
+# ---- 6. the path unit that starts the authority copy is running -----------------------
+path_unit=muster-cloud-authority-offsite.path
+if [ "${MUSTER_BACKUP_CHECK_SKIP_UNITS:-0}" != 1 ] && "$SYSTEMCTL" is-enabled --quiet "$path_unit" 2>/dev/null; then
+  if "$SYSTEMCTL" is-active --quiet "$path_unit" 2>/dev/null; then
+    fine authority-path-down "$path_unit is running again"
+  else
+    log "$path_unit is enabled but not running; restarting it"
+    "$SYSTEMCTL" reset-failed "$path_unit" 2>/dev/null || true
+    if "$SYSTEMCTL" start "$path_unit"; then
+      "$SYSTEMCTL" start --no-block muster-cloud-authority-offsite.service 2>/dev/null || true
+      fine authority-path-down "$path_unit is running again"
+    else
+      problem authority-path-down "$path_unit is not running and could not be started: the authority copy follows the journal only hourly. Details: systemctl status $path_unit"
+    fi
+  fi
+fi
+
+# ---- 7. the monthly restore drill keeps succeeding ---------------------------------------
+if [ "${MUSTER_BACKUP_CHECK_SKIP_UNITS:-0}" != 1 ] && "$SYSTEMCTL" is-enabled --quiet muster-cloud-restore-drill.timer 2>/dev/null; then
+  drill_ref=""
+  if [ -f "$DRILL_STATE/last-ok" ]; then
+    drill_ref=$DRILL_STATE/last-ok
+  elif [ -f "$DRILL_STATE/enabled-since" ]; then
+    drill_ref=$DRILL_STATE/enabled-since
+  fi
+  if [ -z "$drill_ref" ]; then
+    log "no restore drill mark in $DRILL_STATE yet; not checked"
+  else
+    age=$((now - $(stat -c %Y -- "$drill_ref")))
+    if [ "$age" -gt "$DRILL_MAX" ]; then
+      problem restore-drill-stale "the monthly restore drill has not succeeded for $((age / 86400)) days (limit 40). Details: journalctl -u muster-cloud-restore-drill -n 80"
+    else
+      fine restore-drill-stale "the restore drill succeeded recently"
+    fi
+  fi
+fi
+
+exit "$rc"

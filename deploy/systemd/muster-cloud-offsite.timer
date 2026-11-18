@@ -1,0 +1,12 @@
+# Installed by deploy/kamal/host-setup.sh (never by CI).
+[Unit]
+Description=Muster Cloud: hourly offsite copy of backup snapshots
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=10m
+Persistent=true
+Unit=muster-cloud-offsite.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,1384 @@
+#!/usr/bin/env bash
+# muster-cloud-autodeploy — pull-based deploy of muster Cloud. Installed by
+# deploy/kamal/host-setup.sh as /usr/local/sbin/muster-cloud-autodeploy
+# (root:root 0755) and run every 5 minutes by muster-cloud-autodeploy.timer.
+# Guide: deploy/KAMAL.md.
+#
+#   muster-cloud-autodeploy            the full run below (every 5 minutes)
+#   muster-cloud-autodeploy --guard    ONLY the liveness guard (every 15 seconds,
+#                                      muster-cloud-guard.timer); never asks the
+#                                      GitHub API, never deploys; exits 0
+#   muster-cloud-autodeploy --hold     create the hold marker, wait until any run
+#                                      in flight (full or guard) has finished,
+#                                      print "held"; exit 0, idempotent
+#   muster-cloud-autodeploy --release  remove the hold marker, print "released";
+#                                      exit 0, idempotent
+#   anything else                      exit 64
+#
+# Nothing outside this host can start a deploy: no GitHub runner is involved.
+# GitHub only builds and publishes the image (ghcr.io/oliveralerubio/
+# muster-cloud:<sha>, a public package) after Cloud CI is green on main. This
+# script runs as root and, on each run:
+#
+#   a. asks the public GitHub API (no token) for the HEAD of main, and
+#      confirms that the "Cloud CI" run for that exact commit finished with
+#      success on a push, and that the image for it can be pulled anonymously;
+#   b. if that commit is not what runs now, updates the root-owned checkout
+#      /var/lib/muster-cloud/source: git fetch, the commit must be an ancestor
+#      of (or equal to) origin/main, `git checkout --detach`; a dirty tree is
+#      refused. A commit that is an ANCESTOR of the running one is never
+#      deployed;
+#   c. runs that checkout's deploy/kamal/host-setup.sh in apply mode;
+#   d. pulls the image anonymously (an empty Docker config) unless it is already
+#      local, tags it for Kamal's local-registry naming and runs Kamal as user
+#      gha from a gha-readable export of that commit: `kamal app boot --version
+#      <sha>` (Kamal never pulls or logs in). With no kamal-proxy container at
+#      all it first runs `kamal proxy boot`, with no muster-cloud-db container
+#      `kamal accessory boot db`;
+#   e. installs the matching muster-cloud-ops (muster-cloud-install-ops);
+#   f. verifies /readyz through kamal-proxy and through the public URL.
+#   Steps e and f (finish_deploy) are the same for a normal deploy and for the
+#   recovery of a cut-short one (below); a version is recorded only after them.
+#
+# One gate, `gate`, runs immediately before EVERY side effect (each Kamal call,
+# docker start/stop/pull, record, marker, checkout and host change): while
+# $STATE/hold exists the run stops cleanly (exit 0, nothing more is changed). The
+# hold only stops a run from STARTING new work: once the deploy has written its
+# `deploying` marker (the proxy switch has begun) the run finishes that deploy,
+# verifies it and, on failure, rolls back and alerts, ignoring the hold.
+#
+# Hold (maintenance mode): while $STATE/hold exists the guard and the full run
+# do nothing at all (no start, no stop, no deploy, no record change, no GitHub);
+# a deploy past its switch is the one thing that still completes (see above).
+# Use `muster-cloud-autodeploy --hold` BEFORE any manual Kamal command or a
+# cutover (it returns once nothing of autodeploy is running any more) and
+# `--release` afterwards. One journal line when the marker is new and then every
+# 10 minutes; one alert when it is older than 24 h, then at most once per 24 h.
+#
+# `touch /var/lib/muster-cloud/autodeploy/redeploy` means: boot the version that
+# runs NOW (the one kamal-proxy routes to, or the recorded one when the routes
+# cannot be read) again, with the settings read afresh (after editing a file in
+# /etc/muster-cloud, or a disaster-recovery cutover). It asks GitHub nothing,
+# needs no CI and never switches to a newer commit; the image is local, or that
+# exact sha is pulled. The request is consumed atomically at the start
+# (redeploy -> redeploy.inflight): removed when the deploy succeeded, given back
+# when it did not (unless a new request arrived meanwhile), under the retry limit.
+# Only the run that consumed it ever gives it back. A request whose sha already
+# failed the limit is dropped with one alert, and the run goes on with main's HEAD.
+#
+# "What runs now" is the version kamal-proxy routes the muster-cloud-web service
+# to (`kamal-proxy list`), not a container that merely exists. A deploy cut short
+# is never a silent no-op: the run boots main's HEAD again, through the normal
+# path, when a `deploying` marker is left in the state directory, or when two web
+# containers run and the proxy routes to one that is not the recorded deployed
+# version or does not answer /readyz.
+#
+# Any failure after the switch starts (d to f) runs `kamal rollback
+# <previous sha>` (only when the previous version no longer serves) and
+# alerts. A commit whose deploy failed is retried at most 3 times, 30 minutes
+# apart; a newer commit starts afresh. When the limit is reached with a
+# `deploying` marker left by cut-short attempts, an alert fires; if one web
+# container runs, is routed and ready, and finish_deploy passes for it, the marker
+# is cleared and that version recorded, otherwise the marker stays and the alert
+# repeats until it is clean.
+#
+# Liveness guard (the start of every run, before GitHub is asked): a container
+# that Docker's restart policy does not bring back because it was stopped by hand
+# is started again. Only three containers are ever started: muster-cloud-db,
+# kamal-proxy and the web container of the version recorded as deployed (the guard
+# records the version kamal-proxy routes to, only when at most one web container
+# runs and no deploy was cut short; never one the proxy does not route to; never
+# an older one). It waits up to 60 s for /readyz, logs one line and alerts once.
+# `touch /var/lib/muster-cloud/autodeploy/guard-only` makes a run do only the
+# guard (deploys held, containers still kept up). `--guard` runs alone every 15 s
+# and does nothing, saying so in one journal line, while the flock is held (the
+# full run holds it from before the guard until it exits) or Kamal may be running.
+#
+# Kamal ownership: bin/kamal labels its container muster.kamal=1 and
+# muster.kamal.owner=<owner> ($MUSTER_KAMAL_OWNER, default "manual"; this
+# script's own calls use "autodeploy"). Kamal may be running when a container
+# with that label or a ghcr.io/basecamp/kamal image runs, OR WHEN `docker ps`
+# FAILS (never treated as idle). Then the guard and a full run do nothing
+# (checked at the start and before every Kamal step).
+#
+# Kamal's deploy lock is the directory ~gha/.kamal/lock-muster-cloud on this host
+# (Kamal 2.12: `mkdir` then write `details`; `lock release` is `rm details && rm
+# -r dir`, so it cannot remove a lock whose `details` was never written, and
+# `lock status` then says there is no lock). It is therefore read and removed
+# directly, by the directory's mtime, and only when it is certainly dead: it was
+# taken before this host's last boot, or it is older than 60 minutes and no Kamal
+# container runs here (a Kamal client on another machine is invisible). A
+# younger lock is waited for (the run is skipped).
+#
+# Missing infrastructure: before Kamal is run for it the source checkout must
+# exist; if it does not it is created at the routed (else recorded) sha with the
+# same update_source the deploy uses. The guard then boots a kamal-proxy or
+# muster-cloud-db container that does not exist at all (`proxy boot`, `accessory
+# boot db`, a wait for pg_isready), at most every 5 minutes.
+#
+# Kamal's `app stale_containers --stop` is never used. After a verified deploy the
+# other web containers are stopped by name; the routed container is re-read right
+# before each stop and nothing is stopped when the route or its target cannot be
+# read. If the routes cannot be read a deploy is accepted only when the candidate
+# runs, is not unhealthy and answers 200 on /readyz when probed DIRECTLY at its
+# own address on the `kamal` network (with a warning), and a rollback never goes
+# to the commit that was just booted.
+#
+# One journal line per decision ("autodeploy: ..."). Alerts (Hermes) only on a
+# failure or on a successful deploy, one short line. Overlapping runs are
+# prevented with flock.
+#
+# Exit codes: 0 deployed, nothing to do, held or waiting; 75 a failure that was
+# already alerted; 1 unexpected error (the OnFailure alert fires); 64 usage; 77
+# not root.
+#
+# Test hooks (all optional): MUSTER_AUTODEPLOY_PATH (prepended to PATH),
+# MUSTER_AUTODEPLOY_{SOURCE,STATE,RUN,ALLOW_NONROOT,LOCAL_URL,GUARD_WAIT,DB_WAIT,
+# INFRA_GAP,BOOT_TIME,LOCK_DIR}, MUSTER_GITHUB_API, MUSTER_GITHUB_URL,
+# MUSTER_SBIN, MUSTER_CLOUD_DEPLOY_ENV. Tests: deploy/tests/autodeploy-guard.sh.
+
+set -Eeuo pipefail
+umask 022
+export LC_ALL=C
+export PATH="${MUSTER_AUTODEPLOY_PATH:+$MUSTER_AUTODEPLOY_PATH:}/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export GIT_TERMINAL_PROMPT=0
+
+readonly REPO_SLUG=oliveralerubio/muster
+readonly GITHUB_API=${MUSTER_GITHUB_API:-https://api.github.com}
+readonly GITHUB_URL=${MUSTER_GITHUB_URL:-https://github.com/$REPO_SLUG.git}
+readonly IMAGE_REPO=ghcr.io/oliveralerubio/muster-cloud
+# Kamal's name for the same image (config/deploy.yml: registry.server
+# localhost:5000 + image oliveralerubio/muster-cloud).
+readonly LOCAL_REPO=localhost:5000/oliveralerubio/muster-cloud
+readonly SOURCE=${MUSTER_AUTODEPLOY_SOURCE:-/var/lib/muster-cloud/source}
+readonly STATE=${MUSTER_AUTODEPLOY_STATE:-/var/lib/muster-cloud/autodeploy}
+readonly RUN_BASE=${MUSTER_AUTODEPLOY_RUN:-/var/lib/muster-cloud/run}
+readonly SBIN=${MUSTER_SBIN:-/usr/local/sbin}
+readonly DEPLOY_USER=gha
+readonly DEPLOY_ENV=${MUSTER_CLOUD_DEPLOY_ENV:-/etc/muster-cloud/deploy.env}
+readonly DEFAULT_PUBLIC_URL=https://personal.tailbb30e7.ts.net:10000
+readonly LOCAL_URL=${MUSTER_AUTODEPLOY_LOCAL_URL:-http://127.0.0.1:18110}
+readonly MAX_ATTEMPTS=3
+readonly ATTEMPT_GAP=1800
+readonly IMAGE_GRACE=3600
+readonly SHA_RE='^[0-9a-f]{40}$'
+readonly KAMAL_OWNER=autodeploy # the muster.kamal.owner label of this script's own Kamal calls
+readonly LOCK_MAX_AGE=3600      # a Kamal deploy lock older than this, with no local Kamal running, is stale
+readonly HOLD_LOG_EVERY=600     # the hold marker is logged when new, then at most this often
+readonly HOLD_ALERT_AFTER=86400 # ...and alerted when it is older than this, then at most this often
+readonly INFRA_GAP=${MUSTER_AUTODEPLOY_INFRA_GAP:-300} # seconds between the guard's attempts to boot missing infrastructure
+
+log() { printf 'autodeploy: %s\n' "$*"; }
+decide() { printf 'autodeploy: decision: %s\n' "$*"; }
+short() { printf '%s' "${1:0:12}"; }
+
+HANDLED=0
+work=""
+run_dir=""
+OLDER=0
+REDEPLOY_DONE=0 # 1 once the redeploy request this run consumed was satisfied
+INFLIGHT_MINE=0 # 1 once THIS run created redeploy.inflight (a run that did not is never to touch it)
+SWITCHED=0      # 1 from the moment the deploy writes its `deploying` marker: the hold no longer stops this run
+
+# redeploy_settle: the request a run consumed (redeploy -> redeploy.inflight) is
+# removed when it was satisfied, or when a new request arrived meanwhile;
+# otherwise it is given back. Runs at every exit, and at the start (a killed run).
+redeploy_settle() {
+  [ -e "$STATE/redeploy.inflight" ] || return 0
+  if [ "$REDEPLOY_DONE" -eq 1 ] || [ -e "$STATE/redeploy" ]; then
+    rm -f -- "$STATE/redeploy.inflight"
+  else
+    mv -f -- "$STATE/redeploy.inflight" "$STATE/redeploy" || true
+  fi
+}
+# shellcheck disable=SC2329  # runs through the EXIT trap
+on_exit() {
+  local rc=$?
+  if [ "$rc" -ne 0 ] && [ "$rc" -ne 75 ] && [ "$HANDLED" -eq 0 ]; then
+    log "unexpected error (exit $rc)"
+  fi
+  # Only the run that consumed the request settles it: a guard, a run that lost
+  # the flock or --hold exits through here too, and redeploy.inflight may be
+  # another process's.
+  [ "$INFLIGHT_MINE" -eq 0 ] || redeploy_settle
+  [ -z "$run_dir" ] || rm -rf --one-file-system -- "$run_dir"
+  [ -z "$work" ] || rm -rf --one-file-system -- "$work"
+}
+trap on_exit EXIT
+trap 'log "unexpected error at line $LINENO"' ERR
+
+# gate: THE check before every side effect (each Kamal call, docker start/stop/
+# pull, record, marker, checkout, host change): while the hold marker exists the
+# run stops cleanly. Always called in the main shell, never inside $(...), where
+# the exit would only end the subshell.
+gate() {
+  [ -e "$STATE/hold" ] || return 0
+  # The hold only stops a run from STARTING new work. Once the proxy switch has
+  # begun (the `deploying` marker is written) the run finishes its own deploy,
+  # verifies it and, on failure, rolls back and alerts, whatever the hold says:
+  # stopping half way would leave the old container stopped and nobody told.
+  [ "$SWITCHED" -eq 0 ] || return 0
+  attempt_undo # a deploy the hold stopped is not a failed attempt
+  decide "hold: $STATE/hold is set; stopping before the next change"
+  exit 0
+}
+
+RUN_MODE=full
+case "${1:-}" in
+  '') ;;
+  --guard) RUN_MODE=guard ;;
+  --hold) RUN_MODE=hold ;;
+  --release) RUN_MODE=release ;;
+  *)
+    printf 'usage: muster-cloud-autodeploy [--guard|--hold|--release]\n' >&2
+    exit 64
+    ;;
+esac
+if [ "$#" -gt 1 ]; then
+  printf 'usage: muster-cloud-autodeploy [--guard|--hold|--release]\n' >&2
+  exit 64
+fi
+
+if [ "${MUSTER_AUTODEPLOY_ALLOW_NONROOT:-0}" != 1 ] && [ "$(id -u)" -ne 0 ]; then
+  log "must run as root"
+  exit 77
+fi
+
+install -d -m 0755 -- "$STATE" "$STATE/attempts"
+if [ "$RUN_MODE" = release ]; then
+  rm -f -- "$STATE/hold" "$STATE/hold.seen" "$STATE/hold.alerted"
+  printf 'released\n'
+  exit 0
+fi
+exec 9>"$STATE/lock"
+# fd 9 is never closed: the lock lasts until this process exits, so a full run
+# holds it across the guard, the whole deploy and any rollback.
+if [ "$RUN_MODE" = hold ]; then
+  # The marker first, so a run that starts now stops at once and one in flight
+  # stops at its next gate; then wait on the same flock until it has finished.
+  [ -e "$STATE/hold" ] || : >"$STATE/hold"
+  flock 9
+  printf 'held\n'
+  exit 0
+fi
+if ! flock -n 9; then
+  if [ "$RUN_MODE" = guard ]; then
+    decide "guard: skipped, a deploy or another autodeploy run holds the lock"
+  else
+    decide "skip: another autodeploy run is active"
+  fi
+  exit 0
+fi
+[ "$RUN_MODE" = guard ] || work=$(mktemp -d "${TMPDIR:-/tmp}/muster-autodeploy.XXXXXX")
+
+alert_fire() { "$SBIN/muster-cloud-alert" fire "$@" || log "the alert could not be delivered"; }
+alert_notify() { "$SBIN/muster-cloud-alert" notify "$@" || log "the alert could not be delivered"; }
+
+# A failure that was alerted: stop with the handled exit code.
+fail_handled() { # key message
+  alert_fire "$1" "$2"
+  HANDLED=1
+  exit 75
+}
+
+# ---- GitHub, anonymously -----------------------------------------------------
+gh_get() { # path [accept]
+  curl -fsS --max-time 20 --retry 3 --retry-delay 2 --retry-all-errors \
+    -H "Accept: ${2:-application/vnd.github+json}" -H 'X-GitHub-Api-Version: 2022-11-28' \
+    -A muster-cloud-autodeploy -- "$GITHUB_API$1"
+}
+
+head_sha() {
+  local sha
+  sha=$(gh_get "/repos/$REPO_SLUG/commits/main" application/vnd.github.sha) || return 1
+  [[ $sha =~ $SHA_RE ]] || return 1
+  printf '%s' "$sha"
+}
+
+# ci_state SHA -> "success <epoch>", "pending", "none" or "failed <conclusion>"
+ci_state() {
+  gh_get "/repos/$REPO_SLUG/actions/runs?head_sha=$1&event=push&per_page=50" | python3 -I -c '
+import calendar, json, sys, time
+sha, slug = sys.argv[1], sys.argv[2]
+runs = json.load(sys.stdin).get("workflow_runs", [])
+mine = [r for r in runs
+        if r.get("name") == "Cloud CI" and r.get("event") == "push"
+        and r.get("head_branch") == "main" and r.get("head_sha") == sha
+        and (r.get("head_repository") or {}).get("full_name") == slug]
+if not mine:
+    print("none")
+    sys.exit(0)
+mine.sort(key=lambda r: r.get("created_at", ""))
+run = mine[-1]
+if run.get("status") != "completed":
+    print("pending")
+elif run.get("conclusion") != "success":
+    print("failed", run.get("conclusion"))
+else:
+    print("success", calendar.timegm(time.strptime(run["updated_at"], "%Y-%m-%dT%H:%M:%SZ")))
+' "$1" "$REPO_SLUG"
+}
+
+# The image must be readable with NO credential: an empty Docker config.
+anon_config() {
+  [ -d "$work/anon-docker" ] || mkdir -m 0700 -- "$work/anon-docker"
+  printf '%s' "$work/anon-docker"
+}
+image_available() {
+  DOCKER_CONFIG=$(anon_config) timeout 90 docker manifest inspect "$IMAGE_REPO:$1" >/dev/null 2>&1
+}
+
+# ---- what runs now ---------------------------------------------------------------
+# running_web_versions -> one sha per line, for every RUNNING muster-cloud web
+# container (there are two while a deploy is between the boot and the stop of
+# the old one, or after one was interrupted there). Returns 1 when Docker does
+# not answer.
+running_web_versions() {
+  local names name
+  names=$(docker ps --filter label=service=muster-cloud --filter label=role=web --format '{{.Names}}') || return 1
+  while IFS= read -r name; do
+    if [[ $name =~ ^muster-cloud-web-([0-9a-f]{40})$ ]]; then
+      printf '%s\n' "${BASH_REMATCH[1]}"
+    fi
+  done <<<"$names"
+  return 0
+}
+
+# routed_container -> the NAME of the container kamal-proxy sends the
+# muster-cloud-web service to (whatever it is called). Prints nothing (and
+# returns 0) when there is no kamal-proxy container, nothing is routed, or the
+# target container is gone. Returns 1 when kamal-proxy exists but does not
+# answer (the routes cannot be read).
+# (`kamal-proxy list --json`: {"muster-cloud-web": {"targets": ["<id>:8080"]}}.)
+routed_container() {
+  local json target cname
+  [ "$(container_status "$PROXY_CONTAINER")" != missing ] || return 0
+  json=$(timeout 20 docker exec "$PROXY_CONTAINER" kamal-proxy list --json 2>/dev/null) || return 1
+  target=$(python3 -I -c '
+import json, sys
+svc = json.load(sys.stdin).get("muster-cloud-web") or {}
+targets = svc.get("targets") or []
+print(targets[0].rsplit(":", 1)[0] if targets else "")
+' <<<"$json" 2>/dev/null) || return 1
+  [ -n "$target" ] || return 0
+  cname=$(docker inspect --type container --format '{{.Name}}' "$target" 2>/dev/null) || return 0
+  printf '%s' "${cname#/}"
+  return 0
+}
+
+# routed_version -> the sha of the web container kamal-proxy sends the
+# muster-cloud-web service to: the version that actually serves, whatever other
+# containers exist. Prints nothing (and returns 0) when nothing is routed or the
+# target is not a muster-cloud-web-<sha> container. Returns 1 when the routes
+# cannot be read (see routed_container).
+routed_version() {
+  local cname
+  cname=$(routed_container) || return 1
+  if [[ $cname =~ ^muster-cloud-web-([0-9a-f]{40})$ ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+  fi
+  return 0
+}
+
+local_ready() { curl -fsS --max-time 5 -- "$LOCAL_URL/readyz" >/dev/null 2>&1; }
+
+# web_health SHA -> the container's own health: healthy, unhealthy, starting,
+# none (the image defines no healthcheck) or missing.
+web_health() {
+  docker inspect --type container --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "muster-cloud-web-$1" 2>/dev/null || echo missing
+}
+
+# candidate_ready SHA -> 0 when the container of that version itself answers 200
+# on /readyz: probed at its own address on the `kamal` network (the host reaches
+# the bridge), never through the proxy, whose old route could be the one answering.
+candidate_ready() {
+  local ip code
+  ip=$(docker inspect --type container --format '{{with index .NetworkSettings.Networks "kamal"}}{{.IPAddress}}{{end}}' "muster-cloud-web-$1" 2>/dev/null) || return 1
+  [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 --retry 10 --retry-delay 3 --retry-all-errors -- "http://$ip:8080/readyz" 2>/dev/null) || return 1
+  [ "$code" = 200 ]
+}
+
+# serves_now SHA [warn] -> 0 when that version serves: kamal-proxy routes to it;
+# or, when the routes cannot be read, its container runs, is not unhealthy and
+# ITSELF answers 200 on /readyz (candidate_ready; a warning alert says so with
+# `warn`).
+serves_now() {
+  local routed
+  if routed=$(routed_version); then
+    if [ "$routed" = "$1" ]; then return 0; fi
+    return 1
+  fi
+  [ "$(web_status "$1" || true)" = running ] || return 1
+  case $(web_health "$1") in healthy | none) ;; *) return 1 ;; esac
+  candidate_ready "$1" || return 1
+  log "the proxy routes cannot be read; $(short "$1") runs, is not unhealthy and answers /readyz itself: accepting it"
+  if [ "${2:-}" = warn ]; then
+    alert_notify "WARNING: muster-cloud: cannot read proxy routes; accepted $(short "$1") because it runs, is not unhealthy and answers /readyz itself. Check: docker exec kamal-proxy kamal-proxy list"
+  fi
+  return 0
+}
+
+public_url() {
+  local url=""
+  if [ -f "$DEPLOY_ENV" ] && [ -r "$DEPLOY_ENV" ]; then
+    url=$(sed -n 's/^MUSTER_CLOUD_PUBLIC_URL=//p' "$DEPLOY_ENV" | tail -n 1 | tr -d "\"'\r")
+  fi
+  [ -n "$url" ] || url=$DEFAULT_PUBLIC_URL
+  printf '%s' "${url%/}"
+}
+
+verify_ready() { # base-url
+  curl -fsS --retry 10 --retry-delay 3 --retry-all-errors --max-time 20 -- "$1/readyz" >/dev/null
+}
+
+# ---- failed attempts -----------------------------------------------------------------
+attempt_file() { printf '%s/attempts/%s' "$STATE" "$1"; }
+
+attempts_count() { # sha -> the number of failed attempts on record (0 when none)
+  local file count=0 last
+  file=$(attempt_file "$1")
+  if [ -f "$file" ]; then
+    read -r count last <"$file" || count=0
+    [[ $count =~ ^[0-9]+$ ]] || count=0
+  fi
+  printf '%s' "$count"
+}
+
+attempts_allow() { # sha -> 0 when a new attempt may start
+  local file count last now
+  file=$(attempt_file "$1")
+  [ -f "$file" ] || return 0
+  read -r count last <"$file" || return 0
+  [[ $count =~ ^[0-9]+$ && $last =~ ^[0-9]+$ ]] || return 0
+  now=$(date +%s)
+  if [ "$count" -ge "$MAX_ATTEMPTS" ]; then
+    attempts_exhausted "$1" "$count"
+    return 1
+  fi
+  if [ $((now - last)) -lt "$ATTEMPT_GAP" ]; then
+    decide "skip: backing off $(((ATTEMPT_GAP - (now - last)) / 60)) more minutes after a failed deploy of $(short "$1")"
+    return 1
+  fi
+  return 0
+}
+
+# The attempt this run is counting (ATTEMPT_SHA) and what the record said before
+# it, so that a stop by the hold can put it back (attempt_undo, from gate).
+ATTEMPT_SHA=""
+ATTEMPT_BEFORE=""
+attempt_undo() {
+  [ -n "$ATTEMPT_SHA" ] || return 0
+  if [ -n "$ATTEMPT_BEFORE" ]; then
+    printf '%s\n' "$ATTEMPT_BEFORE" >"$(attempt_file "$ATTEMPT_SHA")"
+  else
+    rm -f -- "$(attempt_file "$ATTEMPT_SHA")"
+  fi
+  ATTEMPT_SHA=""
+}
+
+attempt_record() { # sha
+  local file count=0 last
+  gate
+  file=$(attempt_file "$1")
+  ATTEMPT_SHA=$1
+  ATTEMPT_BEFORE=""
+  [ ! -f "$file" ] || read -r ATTEMPT_BEFORE <"$file" || true
+  if [ -f "$file" ]; then
+    read -r count last <"$file" || count=0
+    [[ $count =~ ^[0-9]+$ ]] || count=0
+  fi
+  printf '%s %s\n' "$((count + 1))" "$(date +%s)" >"$file"
+}
+
+# Old attempt records of other commits are of no use any more.
+attempts_prune() { # keep-sha
+  local f
+  gate
+  for f in "$STATE"/attempts/*; do
+    [ -f "$f" ] || continue
+    [ "${f##*/}" = "$1" ] || rm -f -- "$f"
+  done
+}
+
+# ---- the source checkout ---------------------------------------------------------------
+git_src() { git -C "$SOURCE" "$@"; }
+
+# update_source SHA RUNNING — leaves $SOURCE checked out at SHA, or returns 1.
+update_source() {
+  local sha=$1 running=$2
+  gate
+  if [ ! -d "$SOURCE/.git" ]; then
+    if [ -e "$SOURCE" ] && [ -n "$(ls -A -- "$SOURCE" 2>/dev/null)" ]; then
+      log "$SOURCE exists but is not a git checkout"
+      return 1
+    fi
+    install -d -m 0755 -- "$SOURCE"
+    log "cloning $GITHUB_URL into $SOURCE"
+    timeout 600 git clone --quiet --branch main -- "$GITHUB_URL" "$SOURCE" || return 1
+  fi
+  if [ "$(git_src remote get-url origin 2>/dev/null)" != "$GITHUB_URL" ]; then
+    log "the origin of $SOURCE is not $GITHUB_URL; refusing"
+    return 1
+  fi
+  if [ -n "$(git_src status --porcelain 2>/dev/null)" ]; then
+    log "$SOURCE has local changes; refusing to use a dirty tree"
+    return 1
+  fi
+  # A failed fetch is not fatal: a commit the checkout already has (a redeploy of
+  # the running one) is still checked against the origin/main it last fetched.
+  timeout 300 git -C "$SOURCE" fetch --quiet --no-tags origin '+refs/heads/main:refs/remotes/origin/main' ||
+    log "git fetch failed; using the history the checkout has"
+  git_src cat-file -e "$sha^{commit}" 2>/dev/null || {
+    log "commit $(short "$sha") is not in the fetched history"
+    return 1
+  }
+  git_src merge-base --is-ancestor "$sha" origin/main || {
+    log "commit $(short "$sha") is not an ancestor of origin/main; refusing"
+    return 1
+  }
+  if [ -n "$running" ] && [ "$running" != "$sha" ]; then
+    if ! git_src cat-file -e "$running^{commit}" 2>/dev/null; then
+      timeout 120 git -C "$SOURCE" fetch --quiet --no-tags origin "$running" 2>/dev/null || true
+    fi
+    if git_src cat-file -e "$running^{commit}" 2>/dev/null; then
+      if git_src merge-base --is-ancestor "$sha" "$running"; then
+        OLDER=1
+        return 1
+      fi
+    else
+      log "the running commit $(short "$running") is unknown to the checkout; it cannot be older than main's HEAD by ancestry"
+    fi
+  fi
+  gate
+  git_src -c advice.detachedHead=false checkout --quiet --detach "$sha" || return 1
+  [ "$(git_src rev-parse HEAD)" = "$sha" ] || return 1
+  [ -z "$(git_src status --porcelain)" ] || return 1
+  return 0
+}
+
+# ---- Kamal, as gha, from an export of the commit ----------------------------------------
+# The export has no .git, and Kamal derives its version from git unless told
+# one: every command gets an explicit --version (KAMAL_VERSION).
+KAMAL_VERSION=""
+# kamal_exec: Kamal itself, with no check. MUSTER_KAMAL_OWNER=autodeploy puts the
+# label muster.kamal.owner=autodeploy on its container (bin/kamal).
+kamal_exec() {
+  local home
+  gate
+  home=$(getent passwd "$DEPLOY_USER" | cut -d: -f6) || return 1
+  timeout 1500 runuser -u "$DEPLOY_USER" -- env -i HOME="$home" PATH=/usr/local/bin:/usr/bin:/bin \
+    MUSTER_KAMAL_OWNER="$KAMAL_OWNER" \
+    "$run_dir/bin/kamal" "$@" --version "$KAMAL_VERSION"
+}
+
+# run_kamal: a Kamal step, after kamal_gate (nobody else runs Kamal, no stale lock).
+run_kamal() {
+  kamal_gate || return 1
+  kamal_exec "$@"
+}
+
+export_source() { # sha
+  gate
+  install -d -m 0755 -- "$RUN_BASE" || return 1
+  [ -z "$run_dir" ] || rm -rf --one-file-system -- "$run_dir"
+  run_dir=""
+  run_dir=$(mktemp -d "$RUN_BASE/deploy.XXXXXX") || return 1
+  git_src archive --format=tar "$1" | tar -x --no-same-owner -C "$run_dir" || return 1
+  chown -R "$DEPLOY_USER:$DEPLOY_USER" "$run_dir" || return 1
+  chmod 0755 "$run_dir" || return 1
+  [ -x "$run_dir/bin/kamal" ] || return 1
+}
+
+# kamal_owners -> one line per running Kamal container: its muster.kamal.owner
+# label ("autodeploy", "manual", ...), or "unknown" when it has none. A Kamal
+# container is one with the label muster.kamal=1 that bin/kamal puts on its
+# `docker run`, or any running container whose image reference starts with
+# ghcr.io/basecamp/kamal (Kamal run by hand, an older bin/kamal, another
+# version). The image is NOT looked up by `ancestor=`: bin/kamal pulls by
+# digest, which never creates the tag that filter needs. Returns 1 when Docker
+# does not answer.
+readonly KAMAL_IMAGE_REPO=ghcr.io/basecamp/kamal
+kamal_owners() {
+  local out image label owner
+  out=$(docker ps --format '{{.Image}}|{{.Label "muster.kamal"}}|{{.Label "muster.kamal.owner"}}' 2>/dev/null) || return 1
+  while IFS='|' read -r image label owner; do
+    [ -n "$image" ] || continue
+    if [ "$label" = 1 ]; then
+      printf '%s\n' "${owner:-unknown}"
+    elif [[ $image =~ ^$KAMAL_IMAGE_REPO([:@]|$) ]]; then
+      printf 'unknown\n'
+    fi
+  done <<<"$out"
+  return 0
+}
+
+owners_desc() { sort -u <<<"$1" | paste -sd, -; }
+
+# kamal_busy: may Kamal be running? 0 (and BUSY_WHY says why) when a Kamal
+# container runs or Docker did not answer (a failed `docker ps` is never idle).
+BUSY_WHY=""
+kamal_busy() {
+  local owners
+  if ! owners=$(kamal_owners); then
+    BUSY_WHY="Docker did not answer, so a Kamal run cannot be ruled out"
+    return 0
+  fi
+  [ -n "$owners" ] || return 1
+  BUSY_WHY="a Kamal container is running (owner: $(owners_desc "$owners"))"
+  return 0
+}
+
+boot_time() { # epoch of the last boot of this host, or nothing
+  if [ -n "${MUSTER_AUTODEPLOY_BOOT_TIME:-}" ]; then
+    printf '%s' "$MUSTER_AUTODEPLOY_BOOT_TIME"
+    return 0
+  fi
+  awk '/^btime /{print $2; exit}' /proc/stat 2>/dev/null || true
+}
+
+# Kamal 2.12's deploy lock is the directory <gha home>/.kamal/lock-muster-cloud on
+# this host (lib/kamal/commands/lock.rb: `mkdir`, then write `details`). Its
+# `release` is `rm details && rm -r dir`, which cannot remove a lock whose
+# `details` was never written (a crash between the two), and `lock status` then
+# reports "no deploy lock" while every `kamal app boot` fails. So the directory
+# is read and removed directly, by its mtime.
+kamal_lock_dir() {
+  local home
+  if [ -n "${MUSTER_AUTODEPLOY_LOCK_DIR:-}" ]; then
+    printf '%s' "$MUSTER_AUTODEPLOY_LOCK_DIR"
+    return 0
+  fi
+  home=$(getent passwd "$DEPLOY_USER" | cut -d: -f6) || return 1
+  [ -n "$home" ] || return 1
+  printf '%s/.kamal/lock-muster-cloud' "$home"
+}
+
+# lock_recover: the caller checked that no local Kamal container runs. Removes the
+# lock only when it is certainly dead: taken before this host's last boot, or older
+# than LOCK_MAX_AGE (a Kamal client on another machine is invisible here, hence the
+# long wait). A younger lock is waited for. Returns 0 (no lock, or removed), 1
+# (wait: skip this run) or 2 (could not remove it; alerted).
+lock_recover() {
+  local dir mtime now age btime reason
+  dir=$(kamal_lock_dir) || {
+    log "kamal: cannot tell where the deploy lock lives; not touching it"
+    return 0
+  }
+  [ -d "$dir" ] || return 0
+  mtime=$(stat -c %Y -- "$dir" 2>/dev/null) || {
+    log "kamal: cannot read the deploy lock; not touching it"
+    return 0
+  }
+  now=$(date +%s)
+  age=$((now - mtime))
+  [ "$age" -ge 0 ] || age=0
+  btime=$(boot_time)
+  if [[ $btime =~ ^[0-9]+$ ]] && [ "$mtime" -lt "$btime" ]; then
+    reason="it was taken before the last boot of this host"
+  elif [ "$age" -gt "$LOCK_MAX_AGE" ]; then
+    reason="it is $((age / 60)) minutes old (more than $((LOCK_MAX_AGE / 60)))"
+  else
+    decide "skip: a Kamal deploy lock is held (${age}s old) and may be in use; waiting"
+    return 1
+  fi
+  decide "releasing the Kamal deploy lock: no Kamal container is running and $reason"
+  gate
+  if rm -f -- "$dir/details" && rmdir -- "$dir"; then
+    decide "released the stale Kamal deploy lock"
+    alert_notify "muster-cloud: released a stale Kamal deploy lock ($reason; a deploy was cut short, for example by a power loss)"
+    return 0
+  fi
+  decide "could not release the Kamal deploy lock"
+  alert_fire autodeploy-lock "muster-cloud: a stale Kamal deploy lock ($reason) could not be released; deploys are blocked. Check: ls -la $dir"
+  return 2
+}
+
+# kamal_gate: may a Kamal command run now? Not while Kamal may be running (a run
+# by hand, or one a killed run left behind: it is not this run's), and not while a
+# live deploy lock is held; a stale lock is removed first (once per run). Prints a
+# decision line when it says no. Returns 0, 1 (skip) or 2 (failed and alerted).
+LOCK_CHECKED=0
+kamal_gate() {
+  local rc=0
+  gate
+  if kamal_busy; then
+    decide "skip: $BUSY_WHY; not running Kamal"
+    return 1
+  fi
+  if [ "$LOCK_CHECKED" -eq 0 ]; then
+    lock_recover || rc=$?
+    [ "$rc" -eq 0 ] || return "$rc"
+    LOCK_CHECKED=1
+  fi
+  return 0
+}
+
+# gate_or_exit: kamal_gate, and when it says no end the run before anything was
+# changed: exit 0 to wait, exit 75 when it alerted.
+gate_or_exit() {
+  local rc=0
+  kamal_gate || rc=$?
+  [ "$rc" -ne 0 ] || return 0
+  if [ "$rc" -eq 2 ]; then
+    HANDLED=1
+    exit 75
+  fi
+  exit 0
+}
+
+# stop_other_webs SHA: stop, by NAME, the running web containers that are
+# neither SHA's nor the one kamal-proxy routes to. Only called once SHA is routed
+# and verified. The routed container is read again right before EACH stop; when
+# the route or its target cannot be read (or is empty) nothing more is stopped.
+stop_other_webs() {
+  local routed names name
+  names=$(docker ps --filter label=service=muster-cloud --filter label=role=web --format '{{.Names}}') || return 0
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    [ "$name" != "muster-cloud-web-$1" ] || continue
+    routed=$(routed_container) || routed=""
+    if [ -z "$routed" ]; then
+      log "the proxy routes (or their target) cannot be read; leaving the other web containers running"
+      return 0
+    fi
+    [ "$name" != "$routed" ] || continue
+    gate
+    log "stopping the superseded web container $(join_names "$name")"
+    timeout 120 docker stop --time 30 "$name" >/dev/null 2>&1 || log "could not stop $(join_names "$name") (ignored)"
+  done <<<"$names"
+  return 0
+}
+
+# ---- the deploy proper ---------------------------------------------------------------------
+STAGE=""
+
+# local_image_ok SHA -> 0 when the local-registry-named image of that exact sha is
+# already here (its revision label is the sha): nothing needs pulling.
+local_image_ok() {
+  [ "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$LOCAL_REPO:$1" 2>/dev/null || true)" = "$1" ]
+}
+
+# finish_deploy SHA: what follows the switch, for a normal deploy and for the
+# recovery of a cut-short one: the matching muster-cloud-ops, then /readyz through
+# the proxy and through the public URL. Returns 1 with STAGE set when one fails.
+finish_deploy() {
+  STAGE="installing the matching muster-cloud-ops"
+  gate
+  "$SBIN/muster-cloud-install-ops" "$LOCAL_REPO:$1" || return 1
+  STAGE="checking /readyz"
+  verify_ready "$LOCAL_URL" || return 1
+  verify_ready "$(public_url)" || return 1
+}
+
+# commit_deploy SHA: SHA serves and was verified; record it, then clear its failed
+# attempts and the marker (in that order: a stop in between leaves the marker,
+# which only costs a re-boot).
+commit_deploy() {
+  record_deployed "$1"
+  gate
+  rm -f -- "$(attempt_file "$1")"
+  rm -f -- "$STATE/deploying"
+}
+
+# deploy_steps SHA -> 0 when the new version serves and verified
+deploy_steps() {
+  local sha=$1 ref_ghcr="$IMAGE_REPO:$1" ref_local="$LOCAL_REPO:$1" revision
+  STAGE="pulling the image"
+  if ! local_image_ok "$sha"; then
+    gate
+    DOCKER_CONFIG=$(anon_config) timeout 1500 docker pull --quiet "$ref_ghcr" >/dev/null || return 1
+    docker tag "$ref_ghcr" "$ref_local" || return 1
+    docker image rm "$ref_ghcr" >/dev/null 2>&1 || true # the extra GHCR tag is not needed any more
+  fi
+  STAGE="checking the image"
+  revision=$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$ref_local") || return 1
+  if [ "$revision" != "$sha" ]; then
+    log "the image is labelled revision '$revision', not $sha"
+    return 1
+  fi
+  [ "$(docker image inspect --format '{{ index .Config.Labels "service" }}' "$ref_local")" = muster-cloud ] || return 1
+
+  STAGE="exporting the release for Kamal"
+  export_source "$sha" || return 1
+
+  KAMAL_VERSION=$sha
+  # Nothing has changed yet: when someone else runs Kamal, or a live deploy lock
+  # is held, this run ends here (no attempt is counted).
+  gate_or_exit
+  attempt_record "$sha"
+
+  # `kamal app boot` assumes kamal-proxy exists and nothing else creates it, so
+  # a fresh or rebuilt host gets its proxy and database here. Both commands are
+  # only run when no container of that name exists at all (a stopped one is the
+  # guard's business), and both are safe to repeat: `proxy boot` is
+  # start-or-run with config/deploy.yml's proxy.run (v0.10.3, loopback ports
+  # 18110/18111), and `accessory boot db` skips an existing container;
+  # PostgreSQL's entrypoint runs initdb only when the data directory has no
+  # PG_VERSION, so an existing /srv/muster-cloud/pg/data is used as it is.
+  STAGE="booting kamal-proxy"
+  if [ "$(container_status "$PROXY_CONTAINER")" = missing ]; then
+    decide "no $PROXY_CONTAINER container exists; booting it with Kamal (proxy boot)"
+    run_kamal proxy boot || return 1
+  fi
+  STAGE="booting the database"
+  if [ "$(container_status "$DB_CONTAINER")" = missing ]; then
+    decide "no $DB_CONTAINER container exists; booting it with Kamal (accessory boot db)"
+    run_kamal accessory boot db || return 1
+    db_wait || {
+      log "$DB_CONTAINER did not accept connections within ${DB_WAIT}s"
+      return 1
+    }
+  fi
+
+  STAGE="switching with Kamal"
+  # A marker for the span in which a kill (or a crash of this script) leaves the
+  # deploy half done: the next run sees it and boots the commit again.
+  gate
+  printf '%s\n' "$sha" >"$STATE/deploying"
+  SWITCHED=1
+  # No `kamal app stale_containers --stop` here or anywhere: Kamal picks the
+  # container it keeps by the `latest` image tag, which can be the one the proxy
+  # does not route to, and would stop the one that serves. `app boot` stops the
+  # old version only once the new one is healthy and routed; any other web
+  # container is stopped by name after the checks (stop_other_webs).
+  log "kamal: booting $(short "$sha")"
+  run_kamal app boot || return 1
+  serves_now "$sha" warn || {
+    log "after the boot kamal-proxy does not route to $(short "$sha")"
+    return 1
+  }
+
+  finish_deploy "$sha"
+}
+
+rollback() { # previous sha -> 0 when it serves again
+  local prev=$1 ok=1
+  log "rolling back to $(short "$prev")"
+  KAMAL_VERSION=$prev
+  run_kamal rollback "$prev" || ok=0
+  serves_now "$prev" warn || ok=0
+  if [ "$ok" -eq 1 ]; then
+    # Never reinstall muster-cloud-ops for the older release: the host keeps the
+    # newest one (muster-cloud-install-ops refuses an older image on purpose).
+    log "the host keeps the newest muster-cloud-ops; it is not reinstalled for $(short "$prev")"
+    verify_ready "$LOCAL_URL" || ok=0
+  fi
+  [ "$ok" -eq 1 ]
+}
+
+# ---- liveness guard ---------------------------------------------------------------------------
+# Docker's `unless-stopped` policy restarts a container that crashed, but a
+# container someone stopped by hand (docker stop / docker kill) stays down. At
+# the start of every run the guard starts the three containers the service needs
+# when they exist and are stopped: the database, kamal-proxy and the web
+# container of the version recorded as deployed. It never starts any other
+# container and never an older web version.
+readonly DB_CONTAINER=muster-cloud-db
+readonly PROXY_CONTAINER=kamal-proxy
+readonly GUARD_WAIT=${MUSTER_AUTODEPLOY_GUARD_WAIT:-60}
+readonly DB_WAIT=${MUSTER_AUTODEPLOY_DB_WAIT:-60}
+
+# db_wait: PostgreSQL in the freshly booted database container accepts connections.
+db_wait() {
+  local deadline=$((SECONDS + DB_WAIT))
+  while ! docker exec "$DB_CONTAINER" pg_isready -q -U muster -d muster >/dev/null 2>&1; do
+    [ "$SECONDS" -lt "$deadline" ] || return 1
+    sleep 1
+  done
+}
+
+# The version that is current: written by every successful deploy and rollback,
+# and refreshed at the start of each run from the version kamal-proxy routes the
+# service to (so a version someone booted by hand with Kamal becomes the current
+# one). Only a routed version is ever recorded, and only when nothing is
+# ambiguous (see guard).
+deployed_record() {
+  local sha=""
+  [ ! -r "$STATE/deployed" ] || read -r sha <"$STATE/deployed" || true
+  [[ $sha =~ $SHA_RE ]] && printf '%s' "$sha"
+  return 0
+}
+
+record_deployed() { # sha
+  [ "$(deployed_record)" != "$1" ] || return 0
+  gate
+  if printf '%s\n' "$1" >"$STATE/deployed.tmp"; then
+    mv -f -- "$STATE/deployed.tmp" "$STATE/deployed" || log "could not record $(short "$1") as the deployed version"
+  else
+    log "could not record $(short "$1") as the deployed version"
+  fi
+}
+
+# container_status NAME -> Docker's state of that container, or "missing".
+container_status() {
+  docker inspect --type container --format '{{.State.Status}}' "$1" 2>/dev/null || echo missing
+}
+
+# web_status SHA -> state of the labelled web container of that version, or "missing".
+web_status() {
+  local out name state
+  out=$(docker ps -a --filter label=service=muster-cloud --filter label=role=web --format '{{.Names}} {{.State}}') || return 1
+  while read -r name state; do
+    if [ "$name" = "muster-cloud-web-$1" ]; then
+      printf '%s' "$state"
+      return 0
+    fi
+  done <<<"$out"
+  printf missing
+}
+
+guard_ready() {
+  local deadline=$((SECONDS + GUARD_WAIT))
+  while ! curl -fsS --max-time 5 -- "$LOCAL_URL/readyz" >/dev/null 2>&1; do
+    [ "$SECONDS" -lt "$deadline" ] || return 1
+    sleep 1
+  done
+}
+
+join_names() { # names...
+  local out="" n
+  for n in "$@"; do
+    [[ $n =~ ^(muster-cloud-web-[0-9a-f]{12})[0-9a-f]{28}$ ]] && n=${BASH_REMATCH[1]}
+    out+="${out:+, }$n"
+  done
+  printf '%s' "$out"
+}
+
+# guard_kamal_prepare: an export of the source checkout (whatever commit it is at)
+# to run Kamal from, outside a deploy. A missing checkout is created first, at the
+# routed (else recorded) sha, with the same update_source the deploy uses. Returns
+# 1 when there is none and none can be made.
+guard_kamal_prepare() {
+  local rev sha=""
+  if [ ! -d "$SOURCE/.git" ]; then
+    sha=$(routed_version) || sha=""
+    [ -n "$sha" ] || sha=$(deployed_record)
+    [ -n "$sha" ] || return 1
+    decide "guard: no source checkout; creating it at $(short "$sha") to run Kamal from"
+    update_source "$sha" "" || return 1
+  fi
+  rev=$(git_src rev-parse HEAD 2>/dev/null) || return 1
+  [[ $rev =~ $SHA_RE ]] || return 1
+  KAMAL_VERSION=$rev
+  export_source "$rev"
+}
+
+# guard_infra: create what is MISSING (not merely stopped): kamal-proxy and the
+# database, with Kamal, as the deploy does on a fresh host. Under the flock, at
+# most once per INFRA_GAP seconds. Appends what it booted to BOOTED.
+BOOTED=()
+guard_infra() {
+  local -a missing=()
+  local now last=0 name
+  [ "$(container_status "$PROXY_CONTAINER")" != missing ] || missing+=("$PROXY_CONTAINER")
+  [ "$(container_status "$DB_CONTAINER")" != missing ] || missing+=("$DB_CONTAINER")
+  if [ "${#missing[@]}" -eq 0 ]; then
+    gate
+    rm -f -- "$STATE/infra-attempt"
+    return 0
+  fi
+  now=$(date +%s)
+  [ ! -r "$STATE/infra-attempt" ] || read -r last <"$STATE/infra-attempt" || true
+  [[ $last =~ ^[0-9]+$ ]] || last=0
+  [ $((now - last)) -ge "$INFRA_GAP" ] || return 0
+  gate_or_exit
+  printf '%s\n' "$now" >"$STATE/infra-attempt"
+  if ! guard_kamal_prepare; then
+    decide "guard: $(join_names "${missing[@]}") missing; no source checkout to run Kamal from and none could be made (retrying every $((INFRA_GAP / 60)) min); leaving it to the deploy"
+    return 0
+  fi
+  for name in "${missing[@]}"; do
+    if [ "$name" = "$PROXY_CONTAINER" ]; then
+      decide "guard: no $name container exists; booting it with Kamal (proxy boot)"
+      kamal_exec proxy boot || name=""
+    else
+      decide "guard: no $name container exists; booting it with Kamal (accessory boot db)"
+      if kamal_exec accessory boot db; then
+        db_wait || {
+          log "guard: $name did not accept connections within ${DB_WAIT}s"
+          name=""
+        }
+      else
+        name=""
+      fi
+    fi
+    if [ -z "$name" ]; then
+      decide "guard: could not boot the missing container with Kamal"
+      alert_fire autodeploy-guard-infra "muster-cloud: $(join_names "${missing[@]}") is missing and \`kamal\` could not boot it (retrying every $((INFRA_GAP / 60)) min). Check: journalctl -u muster-cloud-autodeploy -u muster-cloud-guard -n 80"
+      return 0
+    fi
+    BOOTED+=("$name")
+    "$SBIN/muster-cloud-alert" resolve -q autodeploy-guard-infra || true
+    alert_notify "muster-cloud: $name was missing; booted it with Kamal"
+  done
+  gate
+  rm -f -- "$STATE/infra-attempt"
+}
+
+guard() {
+  local current status name running_webs routed web_count
+  local -a todo=() started=() failed=() acted=()
+  if ! running_webs=$(running_web_versions); then
+    log "guard: docker did not answer; skipping the liveness guard"
+    return 0
+  fi
+  guard_infra
+  web_count=$(grep -c . <<<"$running_webs" || true)
+  # The current version is the one kamal-proxy routes to, never merely a
+  # container that happens to run (a deploy interrupted after the new container
+  # was created but before the proxy switched leaves two). It becomes the
+  # recorded version only when it is unambiguous: at most one web container
+  # runs and no deploy was cut short (the `deploying` marker). With two running
+  # and a routed version that differs from the record, the full run decides
+  # (incomplete deploy), so the record is left alone. When the proxy does not
+  # answer (it may be what is stopped), the record stands.
+  current=$(deployed_record)
+  if routed=$(routed_version) && [ -n "$routed" ]; then
+    if [ "$web_count" -le 1 ] && [ ! -e "$STATE/deploying" ]; then
+      record_deployed "$routed"
+      current=$routed
+    elif [ -z "$current" ]; then
+      current=$routed
+    fi
+  fi
+
+  # Order: database, proxy, web.
+  for name in "$DB_CONTAINER" "$PROXY_CONTAINER"; do
+    case $(container_status "$name") in exited | created) todo+=("$name") ;; esac
+  done
+  if [ -n "$current" ]; then
+    status=$(web_status "$current") || {
+      log "guard: docker did not answer; skipping the web container"
+      status=missing
+    }
+    case $status in exited | created) todo+=("muster-cloud-web-$current") ;; esac
+  fi
+  [ "${#todo[@]}" -gt 0 ] || [ "${#BOOTED[@]}" -gt 0 ] || return 0
+
+  for name in "${todo[@]}"; do
+    gate
+    if timeout 60 docker start "$name" >/dev/null 2>&1; then
+      started+=("$name")
+    else
+      failed+=("$name")
+    fi
+  done
+
+  if [ "${#failed[@]}" -gt 0 ]; then
+    decide "guard: could not start $(join_names "${failed[@]}")"
+    alert_fire autodeploy-guard "muster-cloud: $(join_names "${failed[@]}") was stopped and \`docker start\` failed. Check: docker ps -a; journalctl -u muster-cloud-autodeploy -n 50"
+    return 0
+  fi
+  acted=("${BOOTED[@]}" "${started[@]}")
+  if guard_ready; then
+    if [ "${#started[@]}" -gt 0 ]; then
+      decide "guard: started $(join_names "${started[@]}") (it was stopped); /readyz answers again"
+      alert_notify "muster-cloud: $(join_names "${started[@]}") was stopped; started it again"
+    else
+      decide "guard: booted $(join_names "${BOOTED[@]}") (it was missing); /readyz answers again"
+    fi
+    "$SBIN/muster-cloud-alert" resolve -q autodeploy-guard || true
+  else
+    decide "guard: restored $(join_names "${acted[@]}") but /readyz did not answer within ${GUARD_WAIT}s"
+    alert_fire autodeploy-guard "muster-cloud: $(join_names "${acted[@]}") was down; restored it, but /readyz did not answer within ${GUARD_WAIT} s. Check: docker ps -a; docker logs muster-cloud-web-<sha>"
+  fi
+}
+
+# The guard, unless a Kamal run (a deploy by hand, outside the lock) is going on.
+guard_when_idle() {
+  if kamal_busy; then
+    decide "guard: skipped, $BUSY_WHY"
+    return 0
+  fi
+  guard
+}
+
+# ---- hold: maintenance mode ----------------------------------------------------------------
+# `touch $STATE/hold`: the guard and the full run do NOTHING (no container is
+# started or stopped, nothing is deployed or booted, no record changes) until the
+# file is removed. For a manual rollback or a disaster-recovery cutover. One
+# journal line when the marker is new and then every HOLD_LOG_EVERY seconds, and
+# one alert when it is older than HOLD_ALERT_AFTER, then at most once per that
+# time. Returns 0 while held.
+hold_active() {
+  local now mtime stamp seen_epoch=0 seen_stamp="" age alerted=0
+  if [ ! -e "$STATE/hold" ]; then
+    rm -f -- "$STATE/hold.seen" "$STATE/hold.alerted"
+    return 1
+  fi
+  now=$(date +%s)
+  mtime=$(stat -c %Y -- "$STATE/hold" 2>/dev/null) || mtime=$now
+  stamp=$(stat -c %y -- "$STATE/hold" 2>/dev/null) || stamp=unknown
+  age=$((now - mtime))
+  [ "$age" -ge 0 ] || age=0
+  [ ! -r "$STATE/hold.seen" ] || IFS=$'\t' read -r seen_epoch seen_stamp <"$STATE/hold.seen" || true
+  [[ $seen_epoch =~ ^[0-9]+$ ]] || seen_epoch=0
+  if [ "$seen_stamp" != "$stamp" ] || [ $((now - seen_epoch)) -ge "$HOLD_LOG_EVERY" ]; then
+    decide "hold: $STATE/hold exists (since $((age / 60)) min); doing nothing: no guard, no deploy, no record changes"
+    printf '%s\t%s\n' "$now" "$stamp" >"$STATE/hold.seen"
+  fi
+  if [ "$age" -gt "$HOLD_ALERT_AFTER" ]; then
+    [ ! -r "$STATE/hold.alerted" ] || read -r alerted <"$STATE/hold.alerted" || true
+    [[ $alerted =~ ^[0-9]+$ ]] || alerted=0
+    if [ $((now - alerted)) -ge "$HOLD_ALERT_AFTER" ]; then
+      printf '%s\n' "$now" >"$STATE/hold.alerted"
+      alert_notify "muster-cloud: autodeploy has been on hold for $((age / 3600)) h ($STATE/hold): no guard and no deploys. Remove the file to resume."
+    fi
+  fi
+  return 0
+}
+
+# attempts_exhausted SHA COUNT: the retry limit of SHA is reached. A failed
+# deploy was alerted when it failed; a CUT-SHORT one (the `deploying` marker,
+# attempts spent by kills) has said nothing, so it must not stay stuck silently:
+# when the service is in a clean state (one web container, routed, ready) and
+# finish_deploy passes for it (muster-cloud-ops installed, /readyz through the
+# proxy and the public URL) the routed version is recorded and the marker cleared;
+# otherwise an alert fires and the marker stays until it is clean.
+attempts_exhausted() {
+  decide "skip: the deploy of $(short "$1") failed $2 times; waiting for a newer commit"
+  if [ ! -e "$STATE/deploying" ]; then
+    "$SBIN/muster-cloud-alert" resolve -q autodeploy-stuck || true
+    return 0
+  fi
+  if [ "$web_count" -eq 1 ] && [ "$routed_ok" -eq 1 ] && [ -n "$running" ] &&
+    [ "$(head -n 1 <<<"$web_versions")" = "$running" ] && guard_ready && finish_deploy "$running"; then
+    commit_deploy "$running"
+    decide "cleared the stale deploying marker: $(short "$running") is the only web container, routed and ready"
+    "$SBIN/muster-cloud-alert" resolve autodeploy-stuck "muster-cloud: the interrupted deploy of $(short "$1") is settled; $(short "$running") serves" || true
+    return 0
+  fi
+  fail_handled autodeploy-stuck "muster-cloud: the deploy of $(short "$1") was cut short $2 times and the service is not in a clean state ($web_count web containers run, routed: $(short "$running"), ready: $(local_ready && echo yes || echo no))${STAGE:+; failed while $STAGE}. Autodeploy will not retry it. Check: docker ps; docker exec kamal-proxy kamal-proxy list; then fix it or rm $STATE/deploying"
+}
+
+# ================================ main ====================================================
+# The liveness guard runs first, before anything is asked of GitHub. With the
+# marker `touch /var/lib/muster-cloud/autodeploy/guard-only` it is all that runs:
+# deploys are held, the containers are still kept up.
+if hold_active; then
+  exit 0
+fi
+if [ "$RUN_MODE" = guard ]; then
+  guard_when_idle || log "guard: unexpected error"
+  exit 0
+fi
+# A full run does nothing while Kamal may be running (a manual rollback, a
+# cutover): the next deploy must not undo it. Checked again before every Kamal
+# step (kamal_gate).
+if kamal_busy; then
+  decide "skip: $BUSY_WHY; not deploying, not touching anything"
+  exit 0
+fi
+guard_when_idle || log "guard: unexpected error; continuing"
+if [ -e "$STATE/guard-only" ]; then
+  decide "guard-only: $STATE/guard-only exists; not checking GitHub, no deploy"
+  exit 0
+fi
+
+# What runs now is what kamal-proxy routes the service to, not whichever web
+# container Docker lists first. `routed_ok` is 0 when the proxy exists but does
+# not answer: then nothing is known to run, so it is never a no-op, and the
+# recorded version stands in for the older-commit check and the rollback.
+routed_ok=1
+running=$(routed_version) || routed_ok=0
+recorded=$(deployed_record)
+[ "$routed_ok" -eq 1 ] || running=$recorded
+web_versions=$(running_web_versions) || web_versions=""
+web_count=$(grep -c . <<<"$web_versions" || true)
+
+# A redeploy request is consumed here, atomically (redeploy -> redeploy.inflight);
+# redeploy_settle removes it after a successful deploy and gives it back otherwise.
+redeploy_settle # a killed run's leftover (this run holds the flock: nobody else owns it)
+redeploy=0
+if [ -e "$STATE/redeploy" ]; then
+  gate
+  if mv -- "$STATE/redeploy" "$STATE/redeploy.inflight" 2>/dev/null; then
+    INFLIGHT_MINE=1
+    redeploy=1
+  fi
+fi
+
+if [ "$redeploy" -eq 1 ]; then
+  # Boot what runs now again: no GitHub, no CI, never a newer commit.
+  target=${running:-$recorded}
+  if [ -z "$target" ]; then
+    decide "redeploy requested, but no version runs or is recorded; deploying main HEAD as usual"
+    REDEPLOY_DONE=1
+    redeploy=0
+  elif [ "$(attempts_count "$target")" -ge "$MAX_ATTEMPTS" ]; then
+    # A request that already failed the limit must not pin every later run to
+    # this sha (and so block every later release): drop it, say so once, and go
+    # on with main's HEAD in this same run.
+    gate
+    rm -f -- "$STATE/redeploy.inflight"
+    decide "redeploy of $(short "$target") failed $MAX_ATTEMPTS times; dropping the request and continuing with main HEAD"
+    alert_fire "autodeploy-redeploy:$(short "$target")" "muster-cloud: redeploy of $(short "$target") failed $MAX_ATTEMPTS times; dropped. Autodeploy goes on with main HEAD. Check: journalctl -u muster-cloud-autodeploy -n 100; ask again with: touch $STATE/redeploy"
+    redeploy=0
+  else
+    decide "redeploy requested: booting the running version $(short "$target") again (no GitHub, no CI)"
+  fi
+fi
+
+if [ "$redeploy" -eq 0 ]; then
+  target=$(head_sha) || {
+    decide "skip: cannot read the HEAD of main from GitHub"
+    exit 0
+  }
+  gate
+  touch -- "$STATE/last-ok-check"
+  s=$(short "$target")
+
+  # An incomplete deploy: a previous run was cut short between the first step that
+  # changes anything and the end of its checks (the `deploying` marker), or two web
+  # containers run and the proxy routes to one that is not the recorded version or
+  # does not answer /readyz. It is never a no-op: the target is booted again through
+  # the normal deploy path (readiness checks, rollback, alert).
+  incomplete=""
+  if [ -e "$STATE/deploying" ]; then
+    incomplete="a previous deploy was cut short while booting $(short "$(head -c 40 "$STATE/deploying" 2>/dev/null || true)")"
+  elif [ "$routed_ok" -eq 1 ] && [ "$web_count" -gt 1 ]; then
+    if [ "$running" != "$recorded" ]; then
+      incomplete="$web_count web containers run, the proxy routes to $(short "$running") but the deployed version is recorded as $(short "$recorded")"
+    elif ! local_ready; then
+      incomplete="$web_count web containers run and the routed $(short "$running") does not answer /readyz"
+    fi
+  fi
+
+  if [ -n "$incomplete" ]; then
+    decide "incomplete deploy: $incomplete; will boot $s again"
+  elif [ "$routed_ok" -eq 0 ] && [ "$target" = "$recorded" ] && guard_ready; then
+    # kamal-proxy exists but its routes cannot be read, the service answers and
+    # HEAD is the version on record: a boot would only be followed by a rollback to
+    # the very same commit. Change nothing.
+    decide "no change: cannot read the proxy routes, but /readyz answers and main HEAD $s is the recorded version"
+    fail_handled autodeploy-routes "muster-cloud: cannot read proxy routes (docker exec kamal-proxy kamal-proxy list failed); /readyz answers and main HEAD $s is the recorded version, so nothing was changed. Check: docker logs kamal-proxy"
+  elif [ "$target" = "$running" ] && [ "$routed_ok" -eq 1 ]; then
+    "$SBIN/muster-cloud-alert" resolve -q autodeploy-routes || true
+    if guard_ready; then
+      "$SBIN/muster-cloud-alert" resolve autodeploy-notready "muster-cloud: /readyz answers again" || true
+      decide "no-op: main HEAD $s is already running"
+      exit 0
+    fi
+    decide "no-op refused: main HEAD $s is routed but /readyz does not answer within ${GUARD_WAIT}s"
+    fail_handled autodeploy-notready "muster-cloud: main HEAD $s is the routed version but /readyz does not answer (waited ${GUARD_WAIT} s). The guard did what it could. Check: docker ps -a; docker logs muster-cloud-web-$s; journalctl -u muster-cloud-autodeploy -n 80"
+  fi
+
+  ci=$(ci_state "$target") || {
+    decide "skip: cannot read the Cloud CI runs of $s from GitHub"
+    exit 0
+  }
+  case $ci in
+    success\ *) ci_done=${ci#success } ;;
+    pending)
+      decide "skip: Cloud CI for $s is still running"
+      exit 0
+      ;;
+    none)
+      decide "skip: no Cloud CI push run for $s yet"
+      exit 0
+      ;;
+    *)
+      decide "skip: Cloud CI for $s did not succeed ($ci)"
+      exit 0
+      ;;
+  esac
+
+  if ! image_available "$target"; then
+    decide "skip: $IMAGE_REPO:$s cannot be pulled anonymously (yet)"
+    waited=$(($(date +%s) - ci_done))
+    if [ "$waited" -gt "$IMAGE_GRACE" ]; then
+      alert_fire "autodeploy-image:$s" "Cloud CI has been green for $((waited / 60)) min on $s but $IMAGE_REPO:$s cannot be pulled anonymously. Is the GHCR package public, and did the Publish muster Cloud image workflow build it? (deploy/KAMAL.md)"
+    fi
+    exit 0
+  fi
+fi
+s=$(short "$target")
+
+# Where a failed deploy goes back to: the routed version, except when that is the
+# commit being booted again; then the recorded version, when it is another one.
+prev=$running
+if [ "$running" = "$target" ] && [[ $recorded =~ $SHA_RE ]] && [ "$recorded" != "$target" ]; then
+  prev=$recorded
+fi
+
+attempts_prune "$target"
+attempts_allow "$target" || exit 0
+
+if ! update_source "$target" "$running"; then
+  if [ "$OLDER" -eq 1 ]; then
+    decide "refused: $s is older than the running $(short "$running")"
+    fail_handled "autodeploy-older:$s" "autodeploy refused main HEAD $s: it is OLDER than the running $(short "$running") (was main rewound?). Nothing was changed."
+  fi
+  decide "refused: the source checkout could not be moved to $s"
+  fail_handled "autodeploy-source:$s" "autodeploy could not update the source checkout to $s (see journalctl -u muster-cloud-autodeploy). Nothing was changed."
+fi
+decide "source checkout is at $s"
+
+gate
+hs_out="$work/host-setup.out"
+if MUSTER_HOST_SETUP_CALLER=autodeploy "$SOURCE/deploy/kamal/host-setup.sh" >"$hs_out" 2>&1; then
+  hs_rc=0
+else
+  hs_rc=$?
+fi
+grep -E '^(done|FAIL|TODO)' "$hs_out" | sed 's/^/autodeploy: host-setup: /' || true
+if [ "$hs_rc" -ne 0 ]; then
+  decide "refused: host-setup.sh exited $hs_rc; not deploying $s"
+  fail_handled "autodeploy-hostsetup:$s" "autodeploy did not deploy $s: host-setup.sh exited $hs_rc ($(grep -E '^(FAIL|TODO)' "$hs_out" | head -n 2 | tr '\n' ' ' | head -c 300)). The running version was not touched."
+fi
+decide "host files reconciled by host-setup.sh for $s"
+
+prev_desc=none
+[ -z "$prev" ] || prev_desc=$(short "$prev")
+decide "deploying $s (running: $prev_desc)"
+deploy_rc=0
+deploy_steps "$target" || deploy_rc=$?
+ATTEMPT_SHA="" # counted from here on, hold or not
+if [ "$deploy_rc" -eq 0 ]; then
+  [ "$redeploy" -eq 0 ] || REDEPLOY_DONE=1 # redeploy_settle drops the request at exit
+  commit_deploy "$target"
+  for key in $("$SBIN/muster-cloud-alert" keys autodeploy); do
+    "$SBIN/muster-cloud-alert" resolve -q "$key" || true
+  done
+  decide "deployed $s"
+  subject=$(git_src log -1 --format=%s "$target" || true)
+  alert_notify "deployed $s (${subject:0:80}); was $prev_desc"
+  stop_other_webs "$target"
+  log "kamal: pruning old containers and images"
+  KAMAL_VERSION=$target
+  run_kamal prune all >/dev/null 2>&1 || log "kamal prune failed (ignored)"
+  exit 0
+fi
+
+# ---- failure ---------------------------------------------------------------------------------
+log "deploy of $s FAILED while $STAGE"
+outcome="the running version was not touched"
+if [ "$SWITCHED" -eq 1 ]; then
+  now_running=$(routed_version) || now_running=""
+  if [ -n "$prev" ] && [ "$prev" = "$target" ]; then
+    # Never roll back to the commit that was just booted: it is not a rollback.
+    if local_ready; then
+      outcome="there is no other version to roll back to; the previous instance of $(short "$prev") still answers /readyz"
+    else
+      outcome="THERE IS NO OTHER VERSION TO ROLL BACK TO and /readyz does not answer: check the service now"
+    fi
+  elif [ -n "$prev" ] && { [ "$now_running" != "$prev" ] || ! verify_ready "$LOCAL_URL"; }; then
+    if rollback "$prev"; then
+      outcome="rolled back to $(short "$prev"), which serves again"
+      record_deployed "$prev"
+    else
+      outcome="ROLLBACK TO $(short "$prev") FAILED: check the service now"
+    fi
+  elif [ -z "$prev" ]; then
+    outcome="nothing was running before, so there is nothing to roll back to"
+  else
+    outcome="the previous version $(short "$prev") is still serving"
+  fi
+fi
+# The failure is handled (rolled back or alerted): the marker of a cut-short
+# deploy is for kills and crashes only. (Before the switch a hold may have been
+# set meanwhile: then the marker of an earlier cut-short run stays.)
+if [ "$SWITCHED" -eq 1 ] || [ ! -e "$STATE/hold" ]; then rm -f -- "$STATE/deploying"; fi
+decide "failed: $s while $STAGE; $outcome"
+fail_handled "autodeploy:$s" "deploy of $s FAILED while $STAGE; $outcome. Retries: at most $MAX_ATTEMPTS, 30 minutes apart. Details: journalctl -u muster-cloud-autodeploy -n 100"

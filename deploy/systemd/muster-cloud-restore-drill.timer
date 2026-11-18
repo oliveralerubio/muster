@@ -1,0 +1,13 @@
+# Installed by deploy/kamal/host-setup.sh (never by CI). Monthly restore drill.
+# Persistent: a month missed because the host was off runs at the next boot.
+[Unit]
+Description=Muster Cloud: monthly restore drill
+
+[Timer]
+OnCalendar=*-*-03 03:30:00
+RandomizedDelaySec=3h
+Persistent=true
+Unit=muster-cloud-restore-drill.service
+
+[Install]
+WantedBy=timers.target

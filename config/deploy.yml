@@ -1,0 +1,156 @@
+# Kamal 2.12 deployment of muster Cloud to the `personal` VPS.
+# Guide: deploy/KAMAL.md. Run Kamal only through ./bin/kamal (pinned image).
+#
+# Nothing secret lives here: secret values are read from
+# /etc/muster-cloud/kamal.env on the host by .kamal/secrets. The ERB below
+# only reads non-secret values from the environment (bin/kamal loads them
+# from /etc/muster-cloud/deploy.env).
+
+service: muster-cloud
+
+# CI builds and pushes ghcr.io/oliveralerubio/muster-cloud:<sha> (a public
+# package). Kamal itself never talks to a registry and never needs a
+# credential: `registry.server: localhost:...` is Kamal's "local registry"
+# mode, in which its login step is skipped (lib/kamal/commands/registry.rb:
+# `return if registry_config.local?`) and the registry has no username or
+# password at all.
+#
+# The host's own muster-cloud-autodeploy pulls the CI image anonymously from
+# GHCR, tags it with the name below and then runs only the Kamal commands
+# that never pull (`kamal app boot`, `kamal rollback`): see deploy/KAMAL.md.
+# Never run `kamal deploy` (it pulls through an SSH tunnel to the local
+# registry, which does not exist here).
+image: oliveralerubio/muster-cloud
+
+registry:
+  server: localhost:5000
+
+ssh:
+  user: gha
+
+servers:
+  web:
+    hosts:
+      - 100.92.84.56
+    options:
+      # Same uid/gid as the host's muster-cloud user, so the files the service
+      # writes (repos, control journal, witness) are the ones the host-side
+      # muster-cloud-ops timers read and write.
+      user: "10001:10001"
+      memory: 1g
+      memory-swap: 1g
+      cpus: 2
+      cpu-shares: 2048
+      oom-score-adj: -500
+      # The service writes only under the three mounted directories below
+      # (repo root, control dir, witness dir). Git runs inside the repo root.
+      # /tmp is a tmpfs as a safety net for any library or git temp file.
+      read-only: true
+      tmpfs: /tmp
+
+# The same absolute paths inside the container and on the host: the host-side
+# muster-cloud-ops (timers) and the service share the control journal, the
+# witness, the repo root and the flock files by path.
+volumes:
+  - /srv/muster-cloud/repos:/srv/muster-cloud/repos
+  - /srv/muster-cloud/control:/srv/muster-cloud/control
+  - /var/lib/muster-witness/w:/var/lib/muster-witness/w
+
+env:
+  clear:
+    MUSTER_ENV: production
+    MUSTER_BIND: 0.0.0.0:8080
+    # Public HTTPS comes from Tailscale Funnel today. Moving to a real domain
+    # is one value: set MUSTER_CLOUD_PUBLIC_URL in /etc/muster-cloud/deploy.env
+    # (see deploy/KAMAL.md, "Moving to a real domain").
+    MUSTER_PUBLIC_URL: <%= ENV.fetch("MUSTER_CLOUD_PUBLIC_URL", "https://personal.tailbb30e7.ts.net:10000") %>
+    MUSTER_REPO_ROOT: /srv/muster-cloud/repos
+    MUSTER_CONTROL_DIR: /srv/muster-cloud/control
+    MUSTER_CONTROL_WITNESS: /var/lib/muster-witness/w/witness.json
+    # kamal-proxy container plus the Docker bridge gateway (172.31.250.1),
+    # which is where Tailscale Funnel's loopback connection shows up. The
+    # network is created with this fixed subnet by deploy/kamal/host-setup.sh.
+    MUSTER_TRUSTED_PROXIES: 172.31.250.0/24
+    MUSTER_PADDLE_ENVIRONMENT: <%= ENV.fetch("MUSTER_PADDLE_ENVIRONMENT", "sandbox") %>
+    # Paddle price ids are not secret. Empty = billing disabled (the service
+    # ignores empty values; see deploy/KAMAL.md).
+    MUSTER_PADDLE_PRICE_PERSONAL: "<%= ENV.fetch("MUSTER_PADDLE_PRICE_PERSONAL", "") %>"
+    MUSTER_PADDLE_PRICE_TEAM_SEAT: "<%= ENV.fetch("MUSTER_PADDLE_PRICE_TEAM_SEAT", "") %>"
+    # Extra ID token audiences (Zitadel: its project id); not secret. Empty =
+    # strict, only the client id is accepted.
+    MUSTER_OIDC_EXTRA_AUDIENCES: "<%= ENV.fetch("MUSTER_OIDC_EXTRA_AUDIENCES", "") %>"
+  secret:
+    - MUSTER_DATABASE_URL
+    - MUSTER_OIDC_ISSUER
+    - MUSTER_OIDC_CLIENT_ID
+    - MUSTER_OIDC_CLIENT_SECRET
+    - MUSTER_PADDLE_API_KEY
+    - MUSTER_PADDLE_WEBHOOK_SECRET
+
+proxy:
+  # No TLS and no host here: Tailscale Funnel terminates HTTPS on the host and
+  # forwards to this proxy on loopback; the proxy accepts any Host header.
+  ssl: false
+  app_port: 8080
+  # Funnel (tailscaled) sends X-Forwarded-For; the service applies it only to
+  # peers in MUSTER_TRUSTED_PROXIES and uses the rightmost untrusted hop.
+  forward_headers: true
+  # Time to the first response header. Long pushes finish on the old instance
+  # during a deploy (see drain_timeout).
+  response_timeout: 120
+  healthcheck:
+    path: /readyz
+    interval: 2
+    timeout: 5
+  buffering:
+    requests: true
+    responses: true
+    # 32 MiB: above the service's 25 MiB sync bundle cap plus envelope.
+    max_request_body: 33554432
+  run:
+    version: v0.10.3
+    # Loopback only. Docker-published ports bypass UFW, so the proxy must
+    # never publish on a public interface.
+    http_port: 18110
+    https_port: 18111
+    bind_ips:
+      - 127.0.0.1
+
+# A new instance must pass /readyz (journal, witness, database) within 90 s;
+# the old one drains in-flight requests (long pushes) for up to 120 s.
+deploy_timeout: 90
+drain_timeout: 120
+# After the proxy drained the old container, give workers 30 s to wind down.
+stop_timeout: 30
+retain_containers: 3
+
+accessories:
+  db:
+    # Exact patch release plus the multi-arch index digest. Update both
+    # together, deliberately; accessories are never touched by `kamal deploy`.
+    image: postgres:16.16-bookworm@sha256:a49f7438ba03589f9b1ca062f2da82e899b48ea1dc50d2449fa09a70be83ebca
+    host: 100.92.84.56
+    # No `port:`: reachable only on the Docker network `kamal` (as
+    # muster-cloud-db:5432) and through the unix socket below.
+    options:
+      user: "10002:10002"
+      memory: 1g
+      oom-score-adj: -500
+      shm-size: 256m
+    env:
+      clear:
+        POSTGRES_USER: muster
+        POSTGRES_DB: muster
+        POSTGRES_INITDB_ARGS: "--auth-local=scram-sha-256 --auth-host=scram-sha-256"
+      secret:
+        - POSTGRES_PASSWORD
+    volumes:
+      - /srv/muster-cloud/pg/data:/var/lib/postgresql/data
+      - /srv/muster-cloud/pgsocket:/var/run/postgresql
+
+builder:
+  arch: amd64
+  dockerfile: deploy/Dockerfile
+  # Not used: CI builds the image (.github/workflows/deploy.yml) and nothing
+  # here ever builds or pushes.
+  context: "."

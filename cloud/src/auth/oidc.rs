@@ -4,10 +4,12 @@
 use axum::extract::{Query, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use openidconnect::core::{CoreAuthenticationFlow, CoreClient, CoreProviderMetadata};
+use openidconnect::core::{
+    CoreAuthenticationFlow, CoreClient, CoreIdToken, CoreIdTokenClaims, CoreProviderMetadata,
+};
 use openidconnect::{
-    reqwest, ClientId, ClientSecret, CsrfToken, EndpointMaybeSet, EndpointNotSet, EndpointSet,
-    IssuerUrl, Nonce, PkceCodeChallenge, RedirectUrl, Scope,
+    reqwest, ClaimsVerificationError, ClientId, ClientSecret, CsrfToken, EndpointMaybeSet,
+    EndpointNotSet, EndpointSet, IssuerUrl, Nonce, PkceCodeChallenge, RedirectUrl, Scope,
 };
 use serde::Deserialize;
 
@@ -34,6 +36,9 @@ pub struct Oidc {
     pub client: Client,
     /// HTTP client for back-channel calls; never follows redirects (SSRF).
     pub http: reqwest::Client,
+    /// Audiences besides the client id that an ID token may carry
+    /// (`MUSTER_OIDC_EXTRA_AUDIENCES`); empty keeps the strict default.
+    extra_audiences: Vec<String>,
 }
 
 impl Oidc {
@@ -64,7 +69,48 @@ impl Oidc {
             Some(ClientSecret::new(config.oidc_client_secret().to_string())),
         )
         .set_redirect_uri(RedirectUrl::from_url(redirect));
-        Ok(Self { client, http })
+        Ok(Self {
+            client,
+            http,
+            extra_audiences: config.oidc_extra_audiences.clone(),
+        })
+    }
+}
+
+impl Oidc {
+    /// Verifies signature, issuer, expiry and nonce of `id_token`, trusting
+    /// only the client id and the configured extra audiences. When more than
+    /// one audience is present the token must name this client as its
+    /// authorized party (`azp`), and any `azp` present must be this client:
+    /// the `openidconnect` crate leaves both checks to the caller.
+    fn verify_id_token<'a>(
+        &self,
+        id_token: &'a CoreIdToken,
+        nonce: Nonce,
+    ) -> Result<&'a CoreIdTokenClaims, ClaimsVerificationError> {
+        let extra = &self.extra_audiences;
+        let verifier = self
+            .client
+            .id_token_verifier()
+            .set_other_audience_verifier_fn(|aud| extra.iter().any(|a| a == aud.as_str()));
+        let claims = id_token.claims(&verifier, &nonce)?;
+        let client_id = self.client.client_id();
+        let multiple_audiences = claims.audiences().len() > 1;
+        match claims.authorized_party() {
+            Some(azp) if azp == client_id => {}
+            Some(_) => {
+                return Err(ClaimsVerificationError::InvalidAudience(
+                    "authorized party is not this client".into(),
+                ))
+            }
+            None if multiple_audiences => {
+                return Err(ClaimsVerificationError::InvalidAudience(
+                    "multiple audiences but no authorized party".into(),
+                ))
+            }
+            None => {}
+        }
+        Ok(claims)
     }
 }
 
@@ -191,8 +237,9 @@ pub async fn callback(
     let id_token = token
         .id_token()
         .ok_or_else(|| AppError::bad_request("identity provider returned no ID token"))?;
-    let claims = id_token
-        .claims(&state.oidc.client.id_token_verifier(), &Nonce::new(nonce))
+    let claims = state
+        .oidc
+        .verify_id_token(id_token, Nonce::new(nonce))
         .map_err(|err| {
             tracing::warn!(error = %err, "ID token rejected");
             AppError::bad_request("identity provider returned an invalid ID token")

@@ -39,7 +39,38 @@ use error::AppError;
 use protocol::HealthResponse;
 use state::AppState;
 
+/// Sent on every response when the public URL is https (production always is;
+/// a development setup on plain http never is): browsers then use https for
+/// this origin for a year. No `includeSubDomains` and no `preload`: this origin
+/// says nothing about the rest of its domain.
+const HSTS_VALUE: &str = "max-age=31536000";
+
+/// `Some(Strict-Transport-Security)` when `MUSTER_PUBLIC_URL` is https.
+fn hsts_header(config: &config::Config) -> Option<axum::http::HeaderValue> {
+    (config.public_url.scheme() == "https")
+        .then(|| axum::http::HeaderValue::from_static(HSTS_VALUE))
+}
+
 pub fn router(state: AppState) -> Router {
+    let hsts = hsts_header(&state.config);
+    let router = api_router(state);
+    match hsts {
+        // The outermost layer: errors, fallbacks and fenced responses carry it too.
+        Some(value) => router.layer(middleware::map_response(
+            move |mut resp: axum::response::Response| {
+                let value = value.clone();
+                async move {
+                    resp.headers_mut()
+                        .insert(axum::http::header::STRICT_TRANSPORT_SECURITY, value);
+                    resp
+                }
+            },
+        )),
+        None => router,
+    }
+}
+
+fn api_router(state: AppState) -> Router {
     Router::new()
         .route(protocol::routes::HEALTHZ, get(healthz))
         .route(protocol::routes::READYZ, get(readyz))

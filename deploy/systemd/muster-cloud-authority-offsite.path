@@ -1,0 +1,22 @@
+# Installed by deploy/kamal/host-setup.sh (never by CI). Copies the lifecycle
+# authority offsite seconds after the control journal changes (a deletion
+# request, a tombstone, an activation...), so a whole-host restore can no
+# longer bring back a workspace that was deleted a minute ago. The hourly timer
+# stays as the backstop.
+#
+# PathChanged= fires when the journal is closed after being written; reading it
+# does not. There is no trigger limit (0 disables it, systemd 250 and newer):
+# when one is exceeded systemd stops this path unit and a change would be
+# dropped until muster-cloud-backup-check starts it again. Nothing is lost by
+# having none: the service coalesces however often it is started.
+[Unit]
+Description=Muster Cloud: offsite copy of the lifecycle authority when the control journal changes
+
+[Path]
+PathChanged=/srv/muster-cloud/control/journal.v1.jsonl
+Unit=muster-cloud-authority-offsite.service
+TriggerLimitIntervalSec=0
+TriggerLimitBurst=0
+
+[Install]
+WantedBy=multi-user.target

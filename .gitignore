@@ -218,3 +218,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Kamal: .kamal/secrets is committed (it only runs deploy/kamal/secret, which
+# reads values from a file on the host). Never commit anything else in there.
+.kamal/secrets.*
+.kamal/secrets-common
+.kamal/*.env
+.kamal/apps/
+.kamal/proxy/
