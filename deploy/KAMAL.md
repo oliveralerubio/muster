@@ -189,7 +189,7 @@ From a checkout of this repository, as root:
 ```
 sudo deploy/kamal/host-setup.sh --check     # changes nothing; lists what is missing
 sudo deploy/kamal/host-setup.sh             # does it
-sudo systemctl stop muster-cloud-autodeploy.timer   # until step 7: no deploy before init
+sudo touch /var/lib/muster-cloud/autodeploy/guard-only   # until step 7: no deploy before init (see Day to day)
 ```
 
 It creates what is missing (accounts, directories with exact modes, the
@@ -240,6 +240,7 @@ sudo systemd-run --pipe --wait --collect -p User=muster-cloud -p Group=muster-cl
 ### 7. First real deploy
 
 ```
+sudo rm -f /var/lib/muster-cloud/autodeploy/guard-only
 sudo systemctl start muster-cloud-autodeploy.timer
 sudo systemctl start muster-cloud-autodeploy.service     # do not wait 5 minutes
 journalctl -u muster-cloud-autodeploy -n 40 --no-pager
@@ -305,6 +306,20 @@ re-enable the workflow in the Actions tab.
   and `sudo systemctl start muster-cloud-autodeploy.service`. The marker is
   consumed by that one deploy. A new commit on `main` needs nothing: it deploys
   itself.
+- Containers stopped by hand: Docker's restart policy brings a crashed container
+  back but not one that was stopped with `docker stop` / `docker kill`. At the
+  start of every run (before GitHub is asked) autodeploy starts `muster-cloud-db`,
+  `kamal-proxy` and the web container of the version it recorded as deployed
+  (`/var/lib/muster-cloud/autodeploy/deployed`) if they exist and are stopped,
+  in that order, waits up to 60 s for `/readyz`, and alerts once. It never starts
+  any other container or an older web version.
+- Hold deploys but keep the guard (for example before the first merge to `main`,
+  or while investigating): `sudo touch /var/lib/muster-cloud/autodeploy/guard-only`.
+  While the file exists every run does only the guard and exits 0 without
+  contacting GitHub; `sudo rm -f /var/lib/muster-cloud/autodeploy/guard-only`
+  resumes deploys. Unlike stopping the timer, this keeps the containers up. A run
+  that does not check GitHub does not refresh the `autodeploy-silent` stamp, so
+  after 6 hours of holding that alert fires as a reminder that deploys are held.
 - A commit that failed 3 times is skipped until a newer one arrives; to retry it
   now: `sudo rm -f /var/lib/muster-cloud/autodeploy/attempts/*` and start the
   service.
