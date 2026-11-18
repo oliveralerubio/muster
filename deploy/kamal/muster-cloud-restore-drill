@@ -7,6 +7,7 @@
 #
 #   sudo deploy/kamal/muster-cloud-restore-drill --age-identity FILE
 #        [--shred-identity] [--workdir DIR] [--max-age-days N] [--select-only]
+#   sudo deploy/kamal/muster-cloud-restore-drill --clean-only [--workdir DIR]
 #
 #   --age-identity FILE   an age PRIVATE key (a path). Two kinds are used: the
 #                         main backup key, supplied by you at run time and
@@ -24,6 +25,8 @@
 #   --max-age-days N      the snapshot must be younger than N days (default 8)
 #   --select-only         print which snapshot and authority copy would be used
 #                         and stop (nothing is downloaded or restored)
+#   --clean-only          only remove the leftovers of an earlier drill (see
+#                         below) and stop; needs no identity
 #
 # What it does, as the supported recovery procedure does it:
 #   1. picks the newest COMPLETE snapshot (manifest.json present) whose manifest
@@ -48,16 +51,27 @@
 #      copy used, repositories fscked, the tenant comparison and the elapsed
 #      seconds;
 #   7. removes everything it created (container, scratch directory), even on
-#      failure.
+#      failure, and exits non-zero (the summary says "cleanup failed", the unit
+#      alerts and last-ok is not touched) when it could not.
 #
 # Restored data is plaintext inside the scratch directory (mode 0700, root) for
-# the minutes the drill runs. Exit 0 only when every check passed.
+# the minutes the drill runs. A drill that was killed or cut by a reboot leaves
+# it behind, so every drill starts by removing leftover muster-restore-drill.*
+# directories in the workdir and muster-drill-pg-* containers (and says so; a
+# lock in the workdir keeps two drills from removing each other's), and
+# host-setup.sh installs a tmpfiles.d rule that removes the directories at boot.
+# Exit 0 only when every check passed and the cleanup succeeded.
 #
 # Exit codes: 0 ok; 1 a check or step failed (the JSON says which); 64 usage;
 # 69 a required tool or file is missing; 77 not root.
 #
+# The restore runs as the owner of the scratch control directory (uid
+# MUSTER_DRILL_CTRL_UID, default 10001, the service's), like the real recovery
+# (deploy/pg-restore.sh runs ops as that user): the scratch directory, its
+# control, witness and pgsocket directories are made traversable for it.
+#
 # Test hooks (all optional): MUSTER_OFFSITE_REMOTE, MUSTER_RCLONE, MUSTER_AGE,
-# MUSTER_AGE_KEYGEN,
+# MUSTER_AGE_KEYGEN, MUSTER_DOCKER,
 # MUSTER_OPS_BIN, MUSTER_DRILL_NOW (epoch seconds), MUSTER_DRILL_ALLOW_NONROOT=1
 # (then the PostgreSQL container runs as the calling user).
 
@@ -74,8 +88,10 @@ readonly RCLONE=${MUSTER_RCLONE:-rclone}
 readonly OPS_BIN=${MUSTER_OPS_BIN:-/usr/local/bin/muster-cloud-ops}
 readonly AGE=${MUSTER_AGE:-age}
 readonly AGE_KEYGEN=${MUSTER_AGE_KEYGEN:-age-keygen}
+readonly DOCKER=${MUSTER_DOCKER:-docker}
 readonly PG_RESTORE_SH=$REPO/deploy/pg-restore.sh
 readonly PG_UID=${MUSTER_DRILL_PG_UID:-10002}
+readonly CTRL_UID=${MUSTER_DRILL_CTRL_UID:-10001}
 readonly ID_RE='^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$'
 readonly AUTH_RE='^authority-[0-9]{8}T[0-9]{6}Z-[0-9]+\.tar\.age$'
 readonly NEW_DB=muster_restore
@@ -85,6 +101,7 @@ shred_identity=0
 workdir=/var/tmp
 max_age_days=8
 select_only=0
+clean_only=0
 
 usage() {
   sed -n '2,/^# Exit codes/p' "$0" | sed 's/^# \{0,1\}//' >&2
@@ -116,10 +133,14 @@ while [ "$#" -gt 0 ]; do
       select_only=1
       shift
       ;;
+    --clean-only)
+      clean_only=1
+      shift
+      ;;
     *) usage ;;
   esac
 done
-[ -n "$identity" ] || usage
+[ -n "$identity" ] || [ "$clean_only" -eq 1 ] || usage
 [[ $max_age_days =~ ^[0-9]+$ ]] && [ "$max_age_days" -ge 1 ] || usage
 
 # ---- result and cleanup --------------------------------------------------------
@@ -129,6 +150,8 @@ DONE=0
 S=""
 container=""
 PW=""
+SUMMARY=""
+CLEANUP_FAILED=""
 snapshot_id=""
 snapshot_at=""
 snapshot_age=""
@@ -168,15 +191,33 @@ cleanup() {
     rc=1
   fi
   if [ -n "$container" ]; then
-    docker rm -f "$container" >/dev/null 2>&1 || printf 'restore-drill: warning: could not remove container %s\n' "$container" >&2
+    "$DOCKER" rm -f "$container" >/dev/null 2>&1 || {
+      printf 'restore-drill: could not remove container %s\n' "$container" >&2
+      CLEANUP_FAILED="could not remove container $container"
+    }
   fi
   if [ -n "$S" ] && [ -d "$S" ]; then
-    rm -rf --one-file-system -- "$S" || printf 'restore-drill: warning: could not remove %s\n' "$S" >&2
+    rm -rf --one-file-system -- "$S" || {
+      printf 'restore-drill: could not remove %s (restored data is still there)\n' "$S" >&2
+      CLEANUP_FAILED="could not remove $S"
+    }
+    [ ! -e "$S" ] || CLEANUP_FAILED="could not remove $S"
   fi
   if [ "$shred_identity" -eq 1 ] && [ -f "$identity" ]; then
     shred -u -- "$identity" 2>/dev/null || rm -f -- "$identity"
   fi
   unset PW PGPASSWORD POSTGRES_PASSWORD
+  if [ -n "$CLEANUP_FAILED" ]; then
+    # Never report ok when the restored data could not be removed.
+    if [ "$DONE" -eq 1 ]; then
+      ERR_MSG="cleanup failed: $CLEANUP_FAILED"
+      STAGE="cleanup"
+      fail_json
+    fi
+    rc=1
+  elif [ "$DONE" -eq 1 ] && [ -n "$SUMMARY" ]; then
+    printf '%s\n' "$SUMMARY"
+  fi
   exit "$rc"
 }
 trap cleanup EXIT
@@ -191,11 +232,51 @@ say() { printf 'restore-drill: %s\n' "$*" >&2; }
 
 rc_run() { "$RCLONE" "$@" --contimeout 30s --timeout 300s --retries 3 --low-level-retries 10 --stats 0 --log-level NOTICE; }
 
+# remove_leftovers — a drill that was killed or cut by a reboot leaves restored
+# plaintext data and a container behind: remove them. The lock keeps two drills
+# from removing each other's.
+remove_leftovers() {
+  local old
+  STAGE="removing leftovers of an earlier drill"
+  exec 8>"$workdir/.drill.lock"
+  flock -n 8 || die "another restore drill is running"
+  for old in "$workdir"/muster-restore-drill.*; do
+    [ -e "$old" ] || [ -L "$old" ] || continue
+    say "removing leftover scratch directory of an earlier drill: $old"
+    rm -rf --one-file-system -- "$old" && [ ! -e "$old" ] || die "cannot remove the leftover $old"
+  done
+  while IFS= read -r old; do
+    [[ $old =~ ^muster-drill-pg-[0-9a-f]+$ ]] || continue
+    say "removing leftover container of an earlier drill: $old"
+    "$DOCKER" rm -f "$old" >/dev/null 2>&1 || die "cannot remove the leftover container $old"
+  done < <("$DOCKER" ps -a --filter name=muster-drill-pg- --format '{{.Names}}' 2>/dev/null)
+}
+
+# check_workdir — the scratch directory exists and is not production data.
+check_workdir() {
+  case $(realpath -m -- "$workdir") in
+    /srv/muster-cloud | /srv/muster-cloud/* | /var/lib/muster-witness | /var/lib/muster-witness/*)
+      die "the scratch directory must not be under the production data ($workdir)"
+      ;;
+  esac
+  [ -d "$workdir" ] || die "workdir does not exist: $workdir"
+}
+
 # ---- preflight --------------------------------------------------------------------
 if [ "${MUSTER_DRILL_ALLOW_NONROOT:-0}" != 1 ] && [ "$(id -u)" -ne 0 ]; then
   ERR_MSG="must run as root"
   printf 'restore-drill: must run as root\n' >&2
   exit 77
+fi
+if [ "$clean_only" -eq 1 ]; then
+  for tool in "$DOCKER" flock; do
+    command -v "$tool" >/dev/null 2>&1 || die "required tool not found: $tool"
+  done
+  check_workdir
+  remove_leftovers
+  DONE=1
+  say "no leftovers of an earlier drill remain in $workdir"
+  exit 0
 fi
 for tool in "$RCLONE" "$AGE" "$AGE_KEYGEN" python3 sha256sum; do
   command -v "$tool" >/dev/null 2>&1 || {
@@ -266,12 +347,7 @@ if [ "$select_only" -eq 1 ]; then
 fi
 
 # ---- the scratch space: refuse cleanly, before anything is downloaded -------------------
-case $(realpath -m -- "$workdir") in
-  /srv/muster-cloud | /srv/muster-cloud/* | /var/lib/muster-witness | /var/lib/muster-witness/*)
-    die "the scratch directory must not be under the production data ($workdir)"
-    ;;
-esac
-[ -d "$workdir" ] || die "workdir does not exist: $workdir"
+check_workdir
 
 STAGE="checking free space"
 snap_bytes=$(rc_run size --json "$REMOTE/snapshots/$snapshot_id" | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["bytes"])') \
@@ -282,7 +358,7 @@ if [ "$avail" -lt $((snap_bytes * 4 + 1073741824)) ]; then
 fi
 
 # ---- the rest needs the full toolset and a scratch directory ---------------------------
-for tool in docker tar git psql pg_restore createdb dropdb flock; do
+for tool in "$DOCKER" tar git psql pg_restore createdb dropdb flock; do
   command -v "$tool" >/dev/null 2>&1 || {
     ERR_MSG="required tool not found: $tool"
     printf 'restore-drill: %s\n' "$ERR_MSG" >&2
@@ -294,8 +370,17 @@ done
 pg_image=$(sed -n 's/^[[:space:]]*image:[[:space:]]*\(postgres:[^[:space:]]*\)[[:space:]]*$/\1/p' "$REPO/config/deploy.yml" | head -n 1)
 [[ $pg_image =~ ^postgres:[0-9A-Za-z._-]+@sha256:[0-9a-f]{64}$ ]] || die "cannot read the pinned postgres image from config/deploy.yml"
 
+remove_leftovers
 S=$(mktemp -d "$workdir/muster-restore-drill.XXXXXX") || die "cannot create a scratch directory in $workdir"
 mkdir -m 0700 -- "$S/snapshot" "$S/authority" "$S/control" "$S/witness" || die "cannot create the scratch layout"
+# The authority is written as its owner (the service's uid), who must reach it:
+# only the directories it needs open up, the snapshot and restored data stay root's.
+ctrl_owner=""
+if [ "${MUSTER_DRILL_ALLOW_NONROOT:-0}" != 1 ]; then
+  ctrl_owner="$CTRL_UID:$CTRL_UID"
+  chmod 0711 -- "$S" || die "cannot open the scratch directory"
+  chown "$ctrl_owner" -- "$S/control" "$S/witness" || die "cannot hand the scratch authority directories to uid $CTRL_UID"
+fi
 say "scratch directory $S"
 
 STAGE="downloading"
@@ -310,8 +395,10 @@ members=$(tar -tf "$S/authority/authority.tar" | sort | tr '\n' ' ')
 [ "$members" = "META.json journal.v1.jsonl witness.json " ] || die "the authority archive holds unexpected members: $members"
 mkdir -m 0700 -- "$S/authority/x"
 tar -xf "$S/authority/authority.tar" --no-same-owner --no-same-permissions -C "$S/authority/x" || die "cannot unpack the authority archive"
-install -m 0600 -- "$S/authority/x/journal.v1.jsonl" "$S/control/journal.v1.jsonl"
-install -m 0600 -- "$S/authority/x/witness.json" "$S/witness/witness.json"
+install -m 0600 ${ctrl_owner:+-o "${ctrl_owner%%:*}" -g "${ctrl_owner##*:}"} -- "$S/authority/x/journal.v1.jsonl" "$S/control/journal.v1.jsonl" \
+  || die "cannot install the journal"
+install -m 0600 ${ctrl_owner:+-o "${ctrl_owner%%:*}" -g "${ctrl_owner##*:}"} -- "$S/authority/x/witness.json" "$S/witness/witness.json" \
+  || die "cannot install the witness"
 authority_seq=$(python3 -I -c 'import json,sys; print(int(json.load(open(sys.argv[1]))["journal_sequence"]))' "$S/authority/x/META.json") \
   || die "cannot read META.json of the authority copy"
 rm -rf --one-file-system -- "$S/authority"
@@ -322,13 +409,16 @@ pg_user_arg="$PG_UID:$PG_UID"
 if [ "${MUSTER_DRILL_ALLOW_NONROOT:-0}" = 1 ]; then
   pg_user_arg="$(id -u):$(id -g)"
 else
-  mkdir -m 0700 -- "$S/pgdata" "$S/pgsocket"
-  chown "$PG_UID:$PG_UID" "$S/pgdata" "$S/pgsocket"
+  # pgsocket: postgres writes, the restore (running as CTRL_UID) connects through it.
+  mkdir -m 0700 -- "$S/pgdata"
+  mkdir -m 0750 -- "$S/pgsocket"
+  chown "$PG_UID:$PG_UID" "$S/pgdata"
+  chown "$PG_UID:$CTRL_UID" "$S/pgsocket"
 fi
 [ -d "$S/pgdata" ] || mkdir -m 0700 -- "$S/pgdata" "$S/pgsocket"
 PW=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
 container=muster-drill-pg-$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')
-POSTGRES_PASSWORD=$PW docker run --detach --name "$container" --network none \
+POSTGRES_PASSWORD=$PW "$DOCKER" run --detach --name "$container" --network none \
   --user "$pg_user_arg" --memory 1g --cpus 2 --shm-size 256m --pids-limit 512 \
   --security-opt no-new-privileges --cap-drop ALL \
   -e POSTGRES_USER=muster -e POSTGRES_DB=postgres -e POSTGRES_PASSWORD \
@@ -339,7 +429,7 @@ POSTGRES_PASSWORD=$PW docker run --detach --name "$container" --network none \
 export PGHOST=$S/pgsocket PGUSER=muster PGPASSWORD=$PW PGDATABASE=postgres
 ready=0
 for _ in $(seq 1 90); do
-  if docker logs "$container" 2>&1 | grep -q 'PostgreSQL init process complete' \
+  if "$DOCKER" logs "$container" 2>&1 | grep -q 'PostgreSQL init process complete' \
     && psql -Atc 'SELECT 1' >/dev/null 2>&1; then
     ready=1
     break
@@ -452,10 +542,11 @@ at = datetime.fromisoformat(sys.argv[1])
 print(int(time.time() - at.astimezone(timezone.utc).timestamp()))
 ' "$snapshot_at") || die "cannot compute the snapshot age"
 
-DONE=1
-json_out ok:=true "snapshot_id=$snapshot_id" "snapshot_at=$snapshot_at" \
+# Printed by the exit trap once the cleanup has succeeded.
+SUMMARY=$(json_out ok:=true "snapshot_id=$snapshot_id" "snapshot_at=$snapshot_at" \
   "snapshot_age_seconds:=$snapshot_age" "max_data_loss_seconds:=$snapshot_age" \
   "authority_copy=$authority_name" "authority_journal_sequence:=$authority_seq" \
   "restored_incarnation_role=$role" "repos_fscked:=$repos_fscked" \
   "tenants:=$tenant_json" "restore_check:=$restore_check_json" \
-  "elapsed_seconds:=$SECONDS" cleanup=done
+  "elapsed_seconds:=$SECONDS" cleanup=done) || die "cannot write the summary"
+DONE=1

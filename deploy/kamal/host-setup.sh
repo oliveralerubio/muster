@@ -24,7 +24,16 @@
 #                 from deploy/kamal/. No sudoers rule exists or is created: user
 #                 `gha` has no privilege here, and the old drop-in
 #                 /etc/sudoers.d/muster-cloud-deploy is DELETED when found
-#   state dirs    /var/lib/muster-cloud/{alerts,offsite,authority,drill} (root 0700)
+#   state dirs    /var/lib/muster-cloud/{alerts,offsite,authority} (root 0700) and
+#                 drill (root 0711: the restore drill runs the restore as the
+#                 service's uid, which must reach its scratch directory; every
+#                 scratch directory is 0700 or 0711 and the snapshot inside root's)
+#   tmpfiles      /etc/tmpfiles.d/muster-cloud-drill.conf removes the scratch
+#                 directories of a restore drill cut short by a reboot
+#   fresh host    when /var/lib/muster-cloud/autodeploy/deployed does not exist
+#                 yet, the marker .../autodeploy/guard-only is created BEFORE the
+#                 timers are enabled, so nothing can deploy before `init` (the
+#                 guide's bootstrap removes it at the end of step 6)
 #   drill key     /etc/muster-cloud/drill-age.key (root 0400): a SECOND age
 #                 identity only the monthly restore drill uses, generated here
 #                 when missing. Its public half is added to ops.env as an extra
@@ -298,9 +307,12 @@ ensure_dir "$ROOT_DIR/pgsocket" "$PG_UID" "$SVC_UID" 0750
 # State of the root-run host scripts (alerts, offsite, authority copies). The
 # autodeploy state and checkout under the same base are created by the script.
 ensure_dir "$STATE_BASE" 0 0 0755
-for sub in alerts offsite authority drill; do
+for sub in alerts offsite authority; do
   ensure_dir "$STATE_BASE/$sub" 0 0 0700
 done
+# 0711: the drill's scratch directories are made reachable for uid 10001 (see
+# muster-cloud-restore-drill); the contents stay 0700 or root-only.
+ensure_dir "$STATE_BASE/drill" 0 0 0711
 
 printf '\n== witness (own filesystem, never the root disk)\n'
 if mountpoint -q "$WITNESS_MOUNT"; then
@@ -646,6 +658,29 @@ ensure_dropin muster-cloud-retention.service.d 10-docker.conf "$dropin_tmp/docke
 ensure_dropin muster-cloud-backup.service.d 20-alert.conf "$dropin_tmp/alert.conf"
 ensure_dropin muster-cloud-retention.service.d 20-alert.conf "$dropin_tmp/alert.conf"
 ensure_dropin muster-cloud-backup.service.d 30-authority-copy.conf "$dropin_tmp/authority.conf"
+
+# A restore drill cut short by a reboot leaves plaintext restored data in its
+# scratch directory: remove it at boot (the next drill also removes leftovers).
+printf '%s\n' "R! $STATE_BASE/drill/muster-restore-drill.*" >"$dropin_tmp/drill.tmpfiles"
+if [ -f /etc/tmpfiles.d/muster-cloud-drill.conf ] && cmp -s -- "$dropin_tmp/drill.tmpfiles" /etc/tmpfiles.d/muster-cloud-drill.conf; then
+  ok "/etc/tmpfiles.d/muster-cloud-drill.conf up to date"
+else
+  change "install /etc/tmpfiles.d/muster-cloud-drill.conf" \
+    bash -c 'install -d -m 0755 /etc/tmpfiles.d && install -m 0644 -o 0 -g 0 "$1" /etc/tmpfiles.d/muster-cloud-drill.conf' _ "$dropin_tmp/drill.tmpfiles"
+fi
+
+# A fresh host has no `deployed` record: until `init` has run, nothing may
+# deploy (the timer would pull the HEAD of main onto an empty database).
+# guard-only keeps the guard but stops deploys; the bootstrap removes it. It is
+# created BEFORE the timers are enabled below, never on a host that deployed.
+if [ -e "$STATE_BASE/autodeploy/deployed" ]; then
+  ok "this host has deployed before ($STATE_BASE/autodeploy/deployed): no guard-only marker is added"
+elif [ -e "$STATE_BASE/autodeploy/guard-only" ] || [ -e "$STATE_BASE/autodeploy/hold" ]; then
+  ok "fresh host: $STATE_BASE/autodeploy already has a guard-only or hold marker"
+else
+  change "fresh host: create $STATE_BASE/autodeploy/guard-only (no deploy before init)" \
+    bash -c 'install -d -m 0755 "$1" && : >"$1/guard-only"' _ "$STATE_BASE/autodeploy"
+fi
 
 if [ "$MODE" = apply ] && [ "$n_change" -gt 0 ]; then
   # Cheap and idempotent: pick up any unit or drop-in written above.

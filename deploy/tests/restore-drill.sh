@@ -178,5 +178,64 @@ check "no space: the JSON result says ok=false" has_out '"ok": false'
 check "no space: nothing was created in the workdir" bash -c '[ -z "$(ls -A "$1")" ]' _ "$T/work"
 check "no space: nothing was downloaded" bash -c '! grep -q "^copy" "$1" 2>/dev/null' _ "$T/rclone.log"
 
+# ---- leftovers of an interrupted drill are removed (plaintext restored data must not stay) ---------
+# A fake docker: `ps` lists the containers named in $T/containers, `rm -f NAME` drops the name
+# and logs it.
+fake_docker() {
+  cat >"$T/docker" <<'FAKE'
+#!/bin/sh
+dir=$(dirname "$0")
+case $1 in
+  ps) cat "$dir/containers" ;;
+  rm) shift; shift; for n in "$@"; do printf '%s\n' "$n" >>"$dir/removed"; grep -vxF "$n" "$dir/containers" >"$dir/c.new"; mv "$dir/c.new" "$dir/containers"; done ;;
+  *) exit 1 ;;
+esac
+FAKE
+  chmod +x "$T/docker"
+}
+clean() {
+  rc=0
+  MUSTER_DRILL_ALLOW_NONROOT=1 MUSTER_DOCKER="$T/docker" "$SCRIPT" --clean-only --workdir "$T/work" "$@" >"$T/out" 2>"$T/err" || rc=$?
+  out=$(cat "$T/out")
+  err=$(cat "$T/err")
+}
+setup leftovers
+fake_docker
+mkdir -p "$T/work/muster-restore-drill.AbC123/snapshot" "$T/work/muster-restore-drill.Zzz999/repos" "$T/work/keep-me"
+printf 'plaintext\n' >"$T/work/muster-restore-drill.AbC123/snapshot/db.dump"
+printf 'muster-drill-pg-0123abcd\nmuster-drill-pg-ffff0000\nunrelated\nmuster-drill-pg-NOTHEX\n' >"$T/containers"
+clean
+check "leftovers: exits 0" rc_is 0
+check "leftovers: the scratch directories are gone" bash -c '[ ! -e "$1/muster-restore-drill.AbC123" ] && [ ! -e "$1/muster-restore-drill.Zzz999" ]' _ "$T/work"
+check "leftovers: other directories are kept" test -d "$T/work/keep-me"
+check "leftovers: the drill containers are removed" bash -c 'grep -qx muster-drill-pg-0123abcd "$1" && grep -qx muster-drill-pg-ffff0000 "$1"' _ "$T/removed"
+check "leftovers: other containers are never touched" bash -c '! grep -q "unrelated\|NOTHEX" "$1"' _ "$T/removed"
+check "leftovers: says what it removed" has_err "removing leftover scratch directory"
+clean
+check "no leftovers: exits 0" rc_is 0
+# A leftover that cannot be removed fails the run (so the unit fails, alerts and last-ok stays old).
+if [ "$(id -u)" -ne 0 ]; then
+  setup stuck
+  fake_docker
+  : >"$T/containers"
+  mkdir -p "$T/work/muster-restore-drill.Stuck/sub"
+  chmod 0555 "$T/work/muster-restore-drill.Stuck"
+  clean
+  check "cannot remove: exits non-zero" test "$rc" -ne 0
+  check "cannot remove: says which" has_err "cannot remove the leftover"
+  chmod 0755 "$T/work/muster-restore-drill.Stuck"
+fi
+# Two drills never remove each other's directories.
+setup locked
+fake_docker
+: >"$T/containers"
+mkdir -p "$T/work/muster-restore-drill.Live"
+(
+  exec 8>"$T/work/.drill.lock"
+  flock -n 8 || exit 1
+  clean
+  [ "$rc" -ne 0 ] && [ -d "$T/work/muster-restore-drill.Live" ] && has_err "another restore drill is running"
+) && ok "a running drill's directory survives a second drill" || bad "a running drill's directory survives a second drill"
+
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
