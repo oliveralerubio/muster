@@ -525,9 +525,13 @@ deploy/pg-restore.sh --backup <backup-dir> \
   `workspace_heads` must exist in the restored Git store AND be reachable
   from `refs/muster/uploads/*`; every restored repo must pass `git fsck`.
   Any failure tears down the targets created in that run.
-- Cutover is a separate MANUAL step: `muster-cloud-ops activate
-  --incarnation <id printed by the restore> --database-url <new db>`, which
-  fences the source incarnation (its running service starts refusing every
+- The authority (journal, lock, witness) is written as the owner of the control
+  directory (`setpriv`, the service's uid), never chowned; a control directory
+  owned by root, or a witness in a directory with another owner, is refused (73).
+- Cutover is a separate MANUAL step: `MUSTER_DATABASE_URL=<new db>
+  muster-cloud-ops activate --incarnation <id printed by the restore>` (the URL
+  in the environment, not `--database-url`: a flag puts the password in the
+  process list), which fences the source incarnation (its running service starts refusing every
   request), then start a NEW service instance pointed at the restored
   database and repo root (`MUSTER_DATABASE_URL`, `MUSTER_REPO_ROOT`). The
   script never restarts or reconfigures a service, and never overwrites the

@@ -281,7 +281,7 @@ jobs:
                    deploy/kamal/muster-cloud-install-ops deploy/tests/install-ops.sh \
                    deploy/pg-restore.sh deploy/tests/restore-owner.sh \
                    deploy/tests/autodeploy-guard.sh deploy/tests/offsite.sh \
-                   deploy/tests/authority-offsite.sh \
+                   deploy/tests/authority-offsite.sh deploy/tests/host-setup-fresh.sh \
                    deploy/tests/restore-drill.sh deploy/tests/backup-check-units.sh; do
             bash -n "$f"
           done
@@ -297,6 +297,9 @@ jobs:
 
       - name: Restore runs ops as the owner of the authority (user namespace; skipped when unavailable)
         run: deploy/tests/restore-owner.sh
+
+      - name: A fresh host starts guard-only before any timer is enabled (user namespace; skipped when unavailable)
+        run: deploy/tests/host-setup-fresh.sh
 
       - name: Restore drill selection and backup-check tests
         run: |

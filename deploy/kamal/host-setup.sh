@@ -33,7 +33,7 @@
 #   fresh host    when /var/lib/muster-cloud/autodeploy/deployed does not exist
 #                 yet, the marker .../autodeploy/guard-only is created BEFORE the
 #                 timers are enabled, so nothing can deploy before `init` (the
-#                 guide's bootstrap removes it at the end of step 6)
+#                 guide's bootstrap removes it in step 7)
 #   drill key     /etc/muster-cloud/drill-age.key (root 0400): a SECOND age
 #                 identity only the monthly restore drill uses, generated here
 #                 when missing. Its public half is added to ops.env as an extra
