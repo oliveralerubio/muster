@@ -35,7 +35,10 @@
 # therefore leaves the newest ops in place, which is safe: ops never migrates the
 # database except in `init` and `register`, and a service that rolled back
 # starts at all only when the schema is the one the newest ops was built for
-# (deploy/KAMAL.md, "Rolling back"). To go back on purpose, e.g. the newest ops
+# (deploy/KAMAL.md, "Rolling back"). An install made by the first version of
+# this script has no creation time recorded: it is derived from the image of the
+# installed version (still on the host) and recorded; when that image is gone,
+# nothing but the same version is accepted. To go back on purpose, e.g. the newest ops
 # is broken and the older one reads every manifest made since, set
 # MUSTER_OPS_ALLOW_OLDER=1 for that one call.
 #
@@ -47,7 +50,7 @@
 # this on every install with `ldd`, and it was checked on ubuntu:24.04.
 #
 # Exit codes: 0 installed; 64 usage; 65 refused (image, binary, symlink, or an
-# older version than the one installed);
+# older version than the one installed, or one that cannot be told apart from it);
 # 69 docker unavailable or image missing; 74 I/O.
 
 set -euo pipefail
@@ -89,12 +92,43 @@ docker image inspect "$ref" >/dev/null 2>&1 \
 # Creation time of this image, in epoch seconds; never go back in time.
 created=$(date -u -d "$(docker image inspect --format '{{.Created}}' "$ref")" +%s 2>/dev/null) \
   || fail "cannot read the creation time of $ref" 69
-if [ -L "$LINK" ] && [ "${MUSTER_OPS_ALLOW_OLDER:-0}" != 1 ]; then
+# image_created_epoch ref — the creation time of an image on this host, in
+# epoch seconds; fails when the image is not there.
+image_created_epoch() {
+  local raw
+  raw=$(docker image inspect --format '{{.Created}}' "$1" 2>/dev/null) || return 1
+  date -u -d "$raw" +%s 2>/dev/null
+}
+
+# What is installed now. A binary installed by the first version of this script
+# has the symlink but no `created` file: its creation time is derived from the
+# image it came from (the directory is named after the image tag, and the image
+# is looked up under both registries) and written down for the next runs.
+if [ -L "$LINK" ]; then
   current_dir=$(dirname -- "$(readlink -- "$LINK")")
-  if [ "${current_dir##*/}" != "$sha" ] && [ -r "$current_dir/created" ]; then
-    current_created=$(cat -- "$current_dir/created" 2>/dev/null || true)
-    if [[ $current_created =~ ^[0-9]+$ ]] && [ "$created" -lt "$current_created" ]; then
-      fail "refused: $ref is older than the installed muster-cloud-ops (${current_dir##*/}); an older ops can miss manifests that a newer one wrote. Keep the newest ops (deploy/KAMAL.md, Rolling back)" 65
+  current_sha=${current_dir##*/}
+  if [ "$current_sha" != "$sha" ]; then
+    current_created=""
+    [ ! -r "$current_dir/created" ] || current_created=$(cat -- "$current_dir/created" 2>/dev/null || true)
+    if ! [[ $current_created =~ ^[0-9]+$ ]]; then
+      current_created=""
+      if [[ $current_sha =~ ^[0-9a-f]{40}$ ]]; then
+        for registry in localhost:5000 ghcr.io; do
+          current_created=$(image_created_epoch "$registry/oliveralerubio/muster-cloud:$current_sha") && break
+          current_created=""
+        done
+      fi
+      if [ -n "$current_created" ] && [ -d "$current_dir" ]; then
+        printf '%s\n' "$current_created" >"$current_dir/created.new" 2>/dev/null \
+          && mv -f -- "$current_dir/created.new" "$current_dir/created" 2>/dev/null || true
+      fi
+    fi
+    if [ "${MUSTER_OPS_ALLOW_OLDER:-0}" != 1 ]; then
+      if [ -z "$current_created" ]; then
+        fail "refused: cannot tell when the installed muster-cloud-ops (${current_dir##*/}) was built (no creation time recorded and its image is not on this host), so $ref could be older than it. Installing the same version is always fine; to go on purpose set MUSTER_OPS_ALLOW_OLDER=1 for that one call (deploy/KAMAL.md, Rolling back)" 65
+      elif [ "$created" -lt "$current_created" ]; then
+        fail "refused: $ref is older than the installed muster-cloud-ops (${current_dir##*/}); an older ops can miss manifests that a newer one wrote. Keep the newest ops (deploy/KAMAL.md, Rolling back)" 65
+      fi
     fi
   fi
 fi

@@ -2,7 +2,10 @@
 # deploy/tests/install-ops.sh — tests that `muster-cloud-install-ops` never
 # repoints /usr/local/bin/muster-cloud-ops to an image built BEFORE the one that
 # is installed (an older ops can miss manifests a newer one wrote; retention
-# then misses deletion deadlines), unless MUSTER_OPS_ALLOW_OLDER=1.
+# then misses deletion deadlines), unless MUSTER_OPS_ALLOW_OLDER=1. Includes the
+# layout of the first installer (a symlink but no `created` file): the creation
+# time is derived from the installed version's image and recorded, and when that
+# image is gone only the same version is accepted.
 #
 #   deploy/tests/install-ops.sh
 #
@@ -44,10 +47,12 @@ case "$1 $2" in
   "image inspect")
     if [ "$3" = --format ]; then
       ref=$5; sha=${ref##*:}
+      [ "$sha" != "$FAKE_DOCKER_HIDE" ] || exit 1 # an image that is gone from this host
       [ -f "$T/created-$sha" ] || exit 1
       cat "$T/created-$sha"
     else
       sha=${3##*:}
+      [ "$sha" != "$FAKE_DOCKER_HIDE" ] || exit 1
       [ -f "$T/created-$sha" ] || exit 1
     fi ;;
   "create --pull=never") echo fake-cid ;;
@@ -61,6 +66,8 @@ A=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 B=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 printf '2026-11-10T10:00:00.000000000Z\n' >"$T/created-$A"
 printf '2026-11-18T10:00:00.000000000Z\n' >"$T/created-$B"
+C=cccccccccccccccccccccccccccccccccccccccc
+printf '2026-11-19T10:00:00.000000000Z\n' >"$T/created-$C"
 
 cat >"$T/inner.sh" <<'EOF'
 T=$1
@@ -89,10 +96,32 @@ inst $A_SHA MUSTER_OPS_ALLOW_OLDER=1
 echo "link: $(readlink /usr/local/bin/muster-cloud-ops)"
 echo "== the newer one after that"
 inst $B_SHA
+LIB=/usr/local/lib/muster-cloud
+echo "== legacy layout: the older one is refused"
+rm -f $LIB/$B_SHA/created # what the first installer left: the link, no created file
+inst $A_SHA
+echo "link: $(readlink /usr/local/bin/muster-cloud-ops)"
+echo "recorded: $(cat $LIB/$B_SHA/created 2>/dev/null)"
+echo "== legacy layout: the same one is fine"
+rm -f $LIB/$B_SHA/created
+inst $B_SHA
+echo "== legacy layout: a newer one is installed and the old one's time is recorded"
+rm -f $LIB/$B_SHA/created
+inst $C_SHA
+echo "link: $(readlink /usr/local/bin/muster-cloud-ops)"
+echo "recorded: $(cat $LIB/$B_SHA/created 2>/dev/null)"
+echo "== legacy layout, its image gone: anything else is refused"
+rm -f $LIB/$C_SHA/created
+# (the image of the installed version is gone, so only OTHER images can be offered)
+inst $B_SHA FAKE_DOCKER_HIDE=$C_SHA
+echo "link: $(readlink /usr/local/bin/muster-cloud-ops)"
+echo "== legacy layout, its image gone: on purpose"
+inst $B_SHA MUSTER_OPS_ALLOW_OLDER=1 FAKE_DOCKER_HIDE=$C_SHA
+echo "link: $(readlink /usr/local/bin/muster-cloud-ops)"
 echo "== end"
 EOF
 
-out=$(A_SHA=$A B_SHA=$B unshare --user --mount --map-users=100000,0,65536 --map-groups=100000,0,65536 --setuid=0 --setgid=0 \
+out=$(A_SHA=$A B_SHA=$B C_SHA=$C unshare --user --mount --map-users=100000,0,65536 --map-groups=100000,0,65536 --setuid=0 --setgid=0 \
   bash "$T/inner.sh" "$T" 2>&1) || skip "no usable user namespace: $(printf '%s' "$out" | head -n 2 | tr '\n' ' ')"
 
 pass=0
@@ -118,6 +147,17 @@ check "...and the link stays on the newest" "the older one is refused" "link: /u
 check "installing the same version again is fine" "the same one again" "rc=0"
 check "MUSTER_OPS_ALLOW_OLDER=1 goes back on purpose" "the older one on purpose" "link: /usr/local/lib/muster-cloud/$A/muster-cloud-ops"
 check "going forward again after that works" "the newer one after that" "rc=0"
+
+check "legacy: the older one is refused (65)" "legacy layout: the older one is refused" "rc=65"
+check "legacy: ...and the link stays" "legacy layout: the older one is refused" "link: /usr/local/lib/muster-cloud/$B/muster-cloud-ops"
+check "legacy: ...and the creation time was recorded for the next run" "legacy layout: the older one is refused" "recorded: $(date -u -d 2026-11-18T10:00:00Z +%s)"
+check "legacy: the same version installs fine" "legacy layout: the same one is fine" "rc=0"
+check "legacy: a newer image is installed" "legacy layout: a newer one is installed and the old one's time is recorded" "link: /usr/local/lib/muster-cloud/$C/muster-cloud-ops"
+check "legacy: ...and the old one's time is recorded" "legacy layout: a newer one is installed and the old one's time is recorded" "recorded: $(date -u -d 2026-11-18T10:00:00Z +%s)"
+check "legacy, image gone: another version is refused (65)" "legacy layout, its image gone: anything else is refused" "rc=65"
+check "legacy, image gone: ...and says it cannot tell" "legacy layout, its image gone: anything else is refused" "cannot tell when the installed"
+check "legacy, image gone: ...and the link stays" "legacy layout, its image gone: anything else is refused" "link: /usr/local/lib/muster-cloud/$C/muster-cloud-ops"
+check "legacy, image gone: MUSTER_OPS_ALLOW_OLDER=1 goes on purpose" "legacy layout, its image gone: on purpose" "link: /usr/local/lib/muster-cloud/$B/muster-cloud-ops"
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

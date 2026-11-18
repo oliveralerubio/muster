@@ -536,7 +536,11 @@ that must expire would stay. For the same reason an older ops cannot verify or
 restore those snapshots: use the newest `deploy/pg-restore.sh` and
 `muster-cloud-ops` for recoveries. `muster-cloud-install-ops` therefore refuses
 (exit 65) an image that was built before the one installed now (it compares the
-image creation times it recorded); installing the same version again is fine.
+image creation times it recorded); installing the same version again is fine. An
+install made by the first version of the installer has no creation time
+recorded: it is read from the installed version's image (while that image is
+still on the host) and recorded; when that image is gone, only the same version
+is accepted until `MUSTER_OPS_ALLOW_OLDER=1` is used for one call.
 Autodeploy's own rollback after a failed deploy does not reinstall ops at all:
 it leaves the newest ops in place and logs "the host keeps the newest
 muster-cloud-ops". `MUSTER_OPS_ALLOW_OLDER=1` in front
@@ -716,7 +720,13 @@ muster-cloud-restore-drill --age-identity /etc/muster-cloud/drill-age.key --work
   snapshot and the repositories inside are root's or the service's only). A
   drill that is killed, or cut short by a power loss or reboot, would leave it
   there: so every drill first removes any `muster-restore-drill.*` directory in
-  its workdir and any `muster-drill-pg-*` container (and logs a line saying so),
+  its workdir, in `/var/tmp` and in `/var/lib/muster-cloud/drill`, and any
+  `muster-drill-pg-*` container (and logs a line saying so), before it checks the
+  free space. That cleanup is host-wide, so every drill, whatever its workdir,
+  holds one lock (`/run/lock/muster-cloud-restore-drill.lock`): a second drill
+  says "another restore drill is running" and touches nothing instead of killing
+  the first one's container. When Docker cannot be listed the drill fails, and so
+  does `--clean-only`, rather than report a clean host.
   `host-setup.sh` installs `/etc/tmpfiles.d/muster-cloud-drill.conf`, which
   removes those directories at boot, and
   `muster-cloud-restore-drill --clean-only --workdir /var/lib/muster-cloud/drill`
