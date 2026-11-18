@@ -537,9 +537,9 @@ restore those snapshots: use the newest `deploy/pg-restore.sh` and
 `muster-cloud-ops` for recoveries. `muster-cloud-install-ops` therefore refuses
 (exit 65) an image that was built before the one installed now (it compares the
 image creation times it recorded); installing the same version again is fine.
-Autodeploy's own rollback after a failed deploy goes through the same command,
-so it also leaves the newest ops in place and logs "could not reinstall the
-matching muster-cloud-ops": that is expected. `MUSTER_OPS_ALLOW_OLDER=1` in front
+Autodeploy's own rollback after a failed deploy does not reinstall ops at all:
+it leaves the newest ops in place and logs "the host keeps the newest
+muster-cloud-ops". `MUSTER_OPS_ALLOW_OLDER=1` in front
 of one `muster-cloud-install-ops` call overrides the refusal; use it only if the
 newest ops is itself broken and you have checked that the older one reads every
 manifest made since.

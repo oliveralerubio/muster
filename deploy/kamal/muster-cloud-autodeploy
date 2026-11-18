@@ -836,8 +836,9 @@ rollback() { # previous sha -> 0 when it serves again
   run_kamal rollback "$prev" || ok=0
   serves_now "$prev" warn || ok=0
   if [ "$ok" -eq 1 ]; then
-    gate
-    "$SBIN/muster-cloud-install-ops" "$LOCAL_REPO:$prev" || log "could not reinstall the matching muster-cloud-ops for $(short "$prev")"
+    # Never reinstall muster-cloud-ops for the older release: the host keeps the
+    # newest one (muster-cloud-install-ops refuses an older image on purpose).
+    log "the host keeps the newest muster-cloud-ops; it is not reinstalled for $(short "$prev")"
     verify_ready "$LOCAL_URL" || ok=0
   fi
   [ "$ok" -eq 1 ]

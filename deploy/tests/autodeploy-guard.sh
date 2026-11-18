@@ -1037,6 +1037,7 @@ printf 'unhealthy\n' >"$T/health-muster-cloud-web-$REL"
 run_it
 check "routes unreadable and the target unhealthy: the failure path" has "FAILED while switching with Kamal" || has "deploy of ${REL:0:12} FAILED"
 check "routes unreadable and the target unhealthy: rolls back to the previous commit, never to the new one" eval 'logged kamal.log "kamal rollback $SHA" && not_logged kamal.log "kamal rollback $REL"'
+check "a rollback never calls install-ops: the host keeps the newest muster-cloud-ops" eval 'has "the host keeps the newest muster-cloud-ops" && not_logged alert.log "install-ops localhost:5000/oliveralerubio/muster-cloud:$SHA"'
 
 setup_head_running routes-unreadable-redeploy-boot-fails
 touch "$T/routes-unreadable" "$T/state/redeploy" "$T/fail-app-boot"
@@ -1172,7 +1173,11 @@ bg_run
 wait_for "$T/github-asked"
 run_it --hold # blocks on the flock until the run in flight has finished
 check "--hold: exit 0 and prints held" eval '[ "$rc" -eq 0 ] && [ "$out" = held ]'
-check "--hold: returns only after the run in flight has finished" eval '[ -e "$T/bg.rc" ] && ! kill -0 "$bg_pid" 2>/dev/null'
+# --hold returns the moment the run releases the flock; the background subshell
+# still has to write its result and exit, so give that tail a moment. A --hold that
+# returned early would leave the run in the fake GitHub's 2 s sleep: far longer.
+bg_done() { for _ in $(seq 1 10); do [ -e "$T/bg.rc" ] && ! kill -0 "$bg_pid" 2>/dev/null && return 0; sleep 0.1; done; return 1; }
+check "--hold: returns only after the run in flight has finished" bg_done
 out=$(cat "$T/bg.out")
 check "--hold: the run in flight stopped at its next gate, changing nothing" eval '[ "$(cat "$T/bg.rc")" -eq 0 ] && has "decision: hold:" && [ ! -s "$T/kamal.log" ] && recorded_is "$SHA"'
 check "--hold: the marker exists" [ -e "$T/state/hold" ]
