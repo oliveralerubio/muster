@@ -29,12 +29,23 @@
 #   d. pulls the image anonymously (an empty Docker config: no credential is
 #      ever sent), tags it for Kamal's local-registry naming and runs Kamal as
 #      user gha from a gha-readable export of that commit:
-#      `kamal app boot --version <sha>` (Kamal never pulls or logs in);
+#      `kamal app boot --version <sha>` (Kamal never pulls or logs in). When no
+#      kamal-proxy container exists at all (a fresh or rebuilt host) it first
+#      runs `kamal proxy boot`, and when no muster-cloud-db container exists,
+#      `kamal accessory boot db`;
 #   e. installs the matching muster-cloud-ops (muster-cloud-install-ops);
 #   f. verifies /readyz through kamal-proxy and through the public URL.
 #
 # `touch /var/lib/muster-cloud/autodeploy/redeploy` boots the running commit
 # again on the next run (after editing a file in /etc/muster-cloud).
+#
+# "What runs now" is the version kamal-proxy routes the muster-cloud-web service
+# to (`kamal-proxy list`), not a container that merely exists. A deploy cut short
+# is never a silent no-op: the run boots the commit again, through the normal
+# path with its readiness checks and rollback, when a `deploying` marker is left
+# in the state directory (the previous run died between the first change and the
+# end of its checks), or when two web containers run and the proxy routes to one
+# that is not the recorded deployed version or does not answer /readyz.
 #
 # Any failure after the switch starts (d to f) runs `kamal rollback
 # <previous sha>` (only when the previous version no longer serves) and
@@ -45,7 +56,9 @@
 # that Docker's restart policy does not bring back because it was stopped by hand
 # (docker stop / docker kill) is started again. Only three containers are ever
 # started: muster-cloud-db, kamal-proxy and the web container of the version
-# recorded as deployed (never an older one; no container of that version at all
+# recorded as deployed (the guard records the version kamal-proxy routes to, only
+# when at most one web container runs and no deploy was cut short; never one the
+# proxy does not route to; never an older one; no container of that version at all
 # is left to the deploy below). It waits up to 60 s for /readyz, logs one line
 # and alerts once. `touch /var/lib/muster-cloud/autodeploy/guard-only` makes a
 # run do only the guard (deploys held, containers still kept up); remove it to
@@ -59,8 +72,9 @@
 # container that Kamal just stopped or fight the proxy switch:
 #   - the flock below is held (the full run holds it from before the guard
 #     until it exits, so across the whole deploy and any rollback), or
-#   - a Kamal container (the image pinned in bin/kamal) runs on the host, for
-#     example someone running ./bin/kamal by hand outside the lock.
+#   - a Kamal container runs on the host (one with the label muster.kamal=1 that
+#     bin/kamal sets, or any ghcr.io/basecamp/kamal image), for example someone
+#     running ./bin/kamal by hand outside the lock.
 # The second check also guards the first step of the full run. When everything
 # is up the guard writes nothing to the journal.
 #
@@ -73,7 +87,7 @@
 # OnFailure alert fires); 77 not root.
 #
 # Test hooks (all optional): MUSTER_AUTODEPLOY_PATH (prepended to PATH),
-# MUSTER_AUTODEPLOY_{SOURCE,STATE,RUN,ALLOW_NONROOT,LOCAL_URL,GUARD_WAIT},
+# MUSTER_AUTODEPLOY_{SOURCE,STATE,RUN,ALLOW_NONROOT,LOCAL_URL,GUARD_WAIT,DB_WAIT},
 # MUSTER_GITHUB_API, MUSTER_GITHUB_URL, MUSTER_SBIN, MUSTER_CLOUD_DEPLOY_ENV.
 # Tests: deploy/tests/autodeploy-guard.sh.
 
@@ -213,15 +227,43 @@ image_available() {
 }
 
 # ---- what runs now ---------------------------------------------------------------
-running_version() {
+# running_web_versions -> one sha per line, for every RUNNING muster-cloud web
+# container (there are two while a deploy is between the boot and the stop of
+# the old one, or after one was interrupted there). Returns 1 when Docker does
+# not answer.
+running_web_versions() {
   local names name
   names=$(docker ps --filter label=service=muster-cloud --filter label=role=web --format '{{.Names}}') || return 1
   while IFS= read -r name; do
-    if [[ $name =~ -([0-9a-f]{40})$ ]]; then
-      printf '%s' "${BASH_REMATCH[1]}"
-      return 0
+    if [[ $name =~ ^muster-cloud-web-([0-9a-f]{40})$ ]]; then
+      printf '%s\n' "${BASH_REMATCH[1]}"
     fi
   done <<<"$names"
+  return 0
+}
+
+# routed_version -> the sha of the web container kamal-proxy sends the
+# muster-cloud-web service to: the version that actually serves, whatever other
+# containers exist. Prints nothing (and returns 0) when there is no kamal-proxy
+# container, nothing is routed, or the target is not a muster-cloud-web-<sha>
+# container. Returns 1 when kamal-proxy exists but does not answer.
+# (`kamal-proxy list --json`: {"muster-cloud-web": {"targets": ["<id>:8080"]}}.)
+routed_version() {
+  local json target cname
+  [ "$(container_status "$PROXY_CONTAINER")" != missing ] || return 0
+  json=$(timeout 20 docker exec "$PROXY_CONTAINER" kamal-proxy list --json 2>/dev/null) || return 1
+  target=$(python3 -I -c '
+import json, sys
+svc = json.load(sys.stdin).get("muster-cloud-web") or {}
+targets = svc.get("targets") or []
+print(targets[0].rsplit(":", 1)[0] if targets else "")
+' <<<"$json" 2>/dev/null) || return 1
+  [ -n "$target" ] || return 0
+  cname=$(docker inspect --type container --format '{{.Name}}' "$target" 2>/dev/null) || return 0
+  cname=${cname#/}
+  if [[ $cname =~ ^muster-cloud-web-([0-9a-f]{40})$ ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+  fi
   return 0
 }
 
@@ -374,16 +416,43 @@ deploy_steps() {
   STAGE="exporting the release for Kamal"
   export_source "$sha" || return 1
 
-  STAGE="switching with Kamal"
   KAMAL_VERSION=$sha
   attempt_record "$sha"
+
+  # `kamal app boot` assumes kamal-proxy exists and nothing else creates it, so
+  # a fresh or rebuilt host gets its proxy and database here. Both commands are
+  # only run when no container of that name exists at all (a stopped one is the
+  # guard's business), and both are safe to repeat: `proxy boot` is
+  # start-or-run with config/deploy.yml's proxy.run (v0.10.3, loopback ports
+  # 18110/18111), and `accessory boot db` skips an existing container;
+  # PostgreSQL's entrypoint runs initdb only when the data directory has no
+  # PG_VERSION, so an existing /srv/muster-cloud/pg/data is used as it is.
+  STAGE="booting kamal-proxy"
+  if [ "$(container_status "$PROXY_CONTAINER")" = missing ]; then
+    decide "no $PROXY_CONTAINER container exists; booting it with Kamal (proxy boot)"
+    run_kamal proxy boot || return 1
+  fi
+  STAGE="booting the database"
+  if [ "$(container_status "$DB_CONTAINER")" = missing ]; then
+    decide "no $DB_CONTAINER container exists; booting it with Kamal (accessory boot db)"
+    run_kamal accessory boot db || return 1
+    db_wait || {
+      log "$DB_CONTAINER did not accept connections within ${DB_WAIT}s"
+      return 1
+    }
+  fi
+
+  STAGE="switching with Kamal"
+  # A marker for the span in which a kill (or a crash of this script) leaves the
+  # deploy half done: the next run sees it and boots the commit again.
+  printf '%s\n' "$sha" >"$STATE/deploying"
   SWITCHED=1
   log "kamal: stopping stale containers"
   run_kamal app stale_containers --stop || return 1
   log "kamal: booting $(short "$sha")"
   run_kamal app boot || return 1
-  [ "$(running_version)" = "$sha" ] || {
-    log "after the boot the running version is not $(short "$sha")"
+  [ "$(routed_version || true)" = "$sha" ] || {
+    log "after the boot kamal-proxy does not route to $(short "$sha")"
     return 1
   }
 
@@ -401,7 +470,7 @@ rollback() { # previous sha -> 0 when it serves again
   log "rolling back to $(short "$prev")"
   KAMAL_VERSION=$prev
   run_kamal rollback "$prev" || ok=0
-  [ "$(running_version)" = "$prev" ] || ok=0
+  [ "$(routed_version || true)" = "$prev" ] || ok=0
   if [ "$ok" -eq 1 ]; then
     "$SBIN/muster-cloud-install-ops" "$LOCAL_REPO:$prev" || log "could not reinstall the matching muster-cloud-ops for $(short "$prev")"
     verify_ready "$LOCAL_URL" || ok=0
@@ -419,10 +488,22 @@ rollback() { # previous sha -> 0 when it serves again
 readonly DB_CONTAINER=muster-cloud-db
 readonly PROXY_CONTAINER=kamal-proxy
 readonly GUARD_WAIT=${MUSTER_AUTODEPLOY_GUARD_WAIT:-60}
+readonly DB_WAIT=${MUSTER_AUTODEPLOY_DB_WAIT:-60}
+
+# db_wait: PostgreSQL in the freshly booted database container accepts connections.
+db_wait() {
+  local deadline=$((SECONDS + DB_WAIT))
+  while ! docker exec "$DB_CONTAINER" pg_isready -q -U muster -d muster >/dev/null 2>&1; do
+    [ "$SECONDS" -lt "$deadline" ] || return 1
+    sleep 1
+  done
+}
 
 # The version that is current: written by every successful deploy and rollback,
-# and refreshed from whatever web container runs at the start of each run (so a
-# version someone booted by hand with Kamal becomes the current one).
+# and refreshed at the start of each run from the version kamal-proxy routes the
+# service to (so a version someone booted by hand with Kamal becomes the current
+# one). Only a routed version is ever recorded, and only when nothing is
+# ambiguous (see guard).
 deployed_record() {
   local sha=""
   [ ! -r "$STATE/deployed" ] || read -r sha <"$STATE/deployed" || true
@@ -475,16 +556,29 @@ join_names() { # names...
 }
 
 guard() {
-  local current status name
+  local current status name running_webs routed web_count
   local -a todo=() started=() failed=()
-  if ! current=$(running_version); then
+  if ! running_webs=$(running_web_versions); then
     log "guard: docker did not answer; skipping the liveness guard"
     return 0
   fi
-  if [ -n "$current" ]; then
-    record_deployed "$current"
-  else
-    current=$(deployed_record)
+  web_count=$(grep -c . <<<"$running_webs" || true)
+  # The current version is the one kamal-proxy routes to, never merely a
+  # container that happens to run (a deploy interrupted after the new container
+  # was created but before the proxy switched leaves two). It becomes the
+  # recorded version only when it is unambiguous: at most one web container
+  # runs and no deploy was cut short (the `deploying` marker). With two running
+  # and a routed version that differs from the record, the full run decides
+  # (incomplete deploy), so the record is left alone. When the proxy does not
+  # answer (it may be what is stopped), the record stands.
+  current=$(deployed_record)
+  if routed=$(routed_version) && [ -n "$routed" ]; then
+    if [ "$web_count" -le 1 ] && [ ! -e "$STATE/deploying" ]; then
+      record_deployed "$routed"
+      current=$routed
+    elif [ -z "$current" ]; then
+      current=$routed
+    fi
   fi
 
   # Order: database, proxy, web.
@@ -523,22 +617,20 @@ guard() {
   fi
 }
 
-# kamal_running -> 0 when a Kamal container runs on this host. Kamal runs from
-# the image pinned as KAMAL_IMAGE in bin/kamal (read from the checkout, so the
-# pin exists in one place only); without a readable pin, any ghcr.io/basecamp/
-# kamal image counts.
+# kamal_running -> 0 when a Kamal container runs on this host: one that carries
+# the label bin/kamal puts on its `docker run` (muster.kamal=1), or any running
+# container whose image reference starts with ghcr.io/basecamp/kamal (Kamal run
+# by hand, an older bin/kamal, another version). The image is NOT looked up by
+# `ancestor=`: bin/kamal pulls by digest, which never creates the tag that
+# filter needs.
+readonly KAMAL_LABEL=muster.kamal=1
 readonly KAMAL_IMAGE_REPO=ghcr.io/basecamp/kamal
 kamal_running() {
-  local ref ids
-  ref=$(sed -n "s/^KAMAL_IMAGE='\\([^'@]*\\).*/\\1/p" "$SOURCE/bin/kamal" 2>/dev/null | head -n 1) || ref=""
-  case $ref in "$KAMAL_IMAGE_REPO":*) ;; *) ref="" ;; esac
-  if [ -n "$ref" ]; then
-    ids=$(docker ps -q --filter "ancestor=$ref" 2>/dev/null) || return 1
-    [ -n "$ids" ]
-  else
-    ids=$(docker ps --format '{{.Image}}' 2>/dev/null) || return 1
-    grep -q "^$KAMAL_IMAGE_REPO[:@]" <<<"$ids"
-  fi
+  local ids images
+  ids=$(docker ps -q --filter "label=$KAMAL_LABEL" 2>/dev/null) || return 1
+  [ -z "$ids" ] || return 0
+  images=$(docker ps --format '{{.Image}}' 2>/dev/null) || return 1
+  grep -Eq "^$KAMAL_IMAGE_REPO([:@]|\$)" <<<"$images"
 }
 
 # The guard, unless a Kamal run (a deploy by hand, outside the lock) is going on.
@@ -570,16 +662,51 @@ target=$(head_sha) || {
 }
 touch -- "$STATE/last-ok-check"
 s=$(short "$target")
-running=$(running_version)
+
+# What runs now is what kamal-proxy routes the service to, not whichever web
+# container Docker lists first. `routed_ok` is 0 when the proxy exists but does
+# not answer: then nothing is known to run, so it is never a no-op, and the
+# recorded version stands in for the older-commit check and the rollback.
+routed_ok=1
+running=$(routed_version) || routed_ok=0
+recorded=$(deployed_record)
+[ "$routed_ok" -eq 1 ] || running=$recorded
+
+# An incomplete deploy: a previous run was cut short between the first step that
+# changes anything and the end of its checks (the `deploying` marker), or two web
+# containers run and the proxy routes to one that is not the recorded version or
+# does not answer /readyz. It is never a no-op: the target is booted again through
+# the normal deploy path (readiness checks, rollback, alert).
+incomplete=""
+web_versions=$(running_web_versions) || web_versions=""
+web_count=$(grep -c . <<<"$web_versions" || true)
+if [ -e "$STATE/deploying" ]; then
+  incomplete="a previous deploy was cut short while booting $(short "$(head -c 40 "$STATE/deploying" 2>/dev/null || true)")"
+elif [ "$routed_ok" -eq 1 ] && [ "$web_count" -gt 1 ]; then
+  if [ "$running" != "$recorded" ]; then
+    incomplete="$web_count web containers run, the proxy routes to $(short "$running") but the deployed version is recorded as $(short "$recorded")"
+  elif ! curl -fsS --max-time 5 -- "$LOCAL_URL/readyz" >/dev/null 2>&1; then
+    incomplete="$web_count web containers run and the routed $(short "$running") does not answer /readyz"
+  fi
+fi
 
 # `touch /var/lib/muster-cloud/autodeploy/redeploy` asks for the running commit to
 # be booted again (a changed secret or settings file); it is consumed right
 # before that deploy starts, so it can never loop.
 redeploy=0
 [ ! -e "$STATE/redeploy" ] || redeploy=1
-if [ "$target" = "$running" ] && [ "$redeploy" -eq 0 ]; then
+if [ -n "$incomplete" ]; then
+  decide "incomplete deploy: $incomplete; will boot $s again"
+elif [ "$target" = "$running" ] && [ "$routed_ok" -eq 1 ] && [ "$redeploy" -eq 0 ]; then
   decide "no-op: main HEAD $s is already running"
   exit 0
+fi
+
+# Where a failed deploy goes back to: the routed version, except when that is the
+# commit being booted again; then the recorded version, when it is another one.
+prev=$running
+if [ "$running" = "$target" ] && [[ $recorded =~ $SHA_RE ]] && [ "$recorded" != "$target" ]; then
+  prev=$recorded
 fi
 
 ci=$(ci_state "$target") || {
@@ -643,9 +770,10 @@ fi
 decide "host files reconciled by host-setup.sh for $s"
 
 prev_desc=none
-[ -z "$running" ] || prev_desc=$(short "$running")
+[ -z "$prev" ] || prev_desc=$(short "$prev")
 decide "deploying $s (running: $prev_desc)"
 if deploy_steps "$target"; then
+  rm -f -- "$STATE/deploying"
   rm -f -- "$(attempt_file "$target")"
   record_deployed "$target"
   for key in $("$SBIN/muster-cloud-alert" keys autodeploy); do
@@ -664,19 +792,22 @@ fi
 log "deploy of $s FAILED while $STAGE"
 outcome="the running version was not touched"
 if [ "$SWITCHED" -eq 1 ]; then
-  now_running=$(running_version)
-  if [ -n "$running" ] && { [ "$now_running" != "$running" ] || ! verify_ready "$LOCAL_URL"; }; then
-    if rollback "$running"; then
-      outcome="rolled back to $(short "$running"), which serves again"
-      record_deployed "$running"
+  now_running=$(routed_version) || now_running=""
+  if [ -n "$prev" ] && { [ "$now_running" != "$prev" ] || ! verify_ready "$LOCAL_URL"; }; then
+    if rollback "$prev"; then
+      outcome="rolled back to $(short "$prev"), which serves again"
+      record_deployed "$prev"
     else
-      outcome="ROLLBACK TO $(short "$running") FAILED: check the service now"
+      outcome="ROLLBACK TO $(short "$prev") FAILED: check the service now"
     fi
-  elif [ -z "$running" ]; then
+  elif [ -z "$prev" ]; then
     outcome="nothing was running before, so there is nothing to roll back to"
   else
-    outcome="the previous version $(short "$running") is still serving"
+    outcome="the previous version $(short "$prev") is still serving"
   fi
 fi
+# The failure is handled (rolled back or alerted): the marker of a cut-short
+# deploy is for kills and crashes only.
+rm -f -- "$STATE/deploying"
 decide "failed: $s while $STAGE; $outcome"
 fail_handled "autodeploy:$s" "deploy of $s FAILED while $STAGE; $outcome. Retries: at most $MAX_ATTEMPTS, 30 min apart. Details: journalctl -u muster-cloud-autodeploy -n 100"

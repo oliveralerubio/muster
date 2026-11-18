@@ -30,6 +30,10 @@
 # ALERT_TARGET, which only the host's alert script reads and is ignored here),
 # and a variable already set in your environment wins.
 #
+# The container carries the label muster.kamal=1: muster-cloud-autodeploy's
+# guard does nothing while a container with it (or any ghcr.io/basecamp/kamal
+# image) runs. Keep the label if you edit the `docker run` below.
+#
 # The container shares the host network so SSH to the host's own Tailscale
 # address works the same from the autodeploy timer (which runs on that host)
 # and from a laptop. The Docker socket is NOT mounted unless
@@ -87,7 +91,10 @@ case $secrets_file in
   *) die "MUSTER_CLOUD_SECRETS_FILE must be an absolute path" ;;
 esac
 
+# The label is how the host's liveness guard (muster-cloud-autodeploy) knows a
+# Kamal run is going on, whatever Kamal version or image reference it uses.
 args=(run --rm --network host
+  --label muster.kamal=1
   --user "$(id -u):$(id -g)"
   --env HOME=/home/kamal
   --volume "$repo:/workdir")

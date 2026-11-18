@@ -205,9 +205,23 @@ other Tailscale serve entries. Anything left for you appears as `TODO` or
 `FAIL`; fix it and run it again until it is quiet (it is safe to repeat).
 After this first run autodeploy runs it by itself on every release.
 
-### 5. Start the database
+### 5. Start the database (optional: autodeploy does it)
 
-As `gha`, from the checkout:
+Autodeploy starts what is missing by itself. `kamal app boot` assumes
+kamal-proxy exists and nothing else creates it, so before booting the app a
+deploy runs `kamal proxy boot` when no `kamal-proxy` container exists at all,
+and `kamal accessory boot db` when no `muster-cloud-db` container exists (it logs
+one decision line for each; a failure takes the usual failure and alert path).
+A stopped container is not "missing": the liveness guard starts it. Both
+commands are safe to repeat and read `config/deploy.yml`: `proxy boot` is
+start-or-run with `proxy.run` (kamal-proxy v0.10.3, published only on
+`127.0.0.1:18110` and `127.0.0.1:18111`; checked in the Kamal 2.12.0 source and
+by rendering the command), and `accessory boot db` skips an existing container.
+PostgreSQL's entrypoint runs `initdb` only when the data directory has no
+`PG_VERSION`, so an existing `/srv/muster-cloud/pg/data` is used as it is.
+
+To start the database yourself before the first deploy (for example to restore
+into it first), as `gha`, from the checkout:
 
 ```
 sudo -iu gha
@@ -295,8 +309,12 @@ is retried by the next run. Every alert also goes to the journal.
 minutes) asks the public `/readyz` with retries and fails the run if it is not
 200; GitHub emails the failure. This is the only alarm that works when the whole
 host or its tunnel is down. GitHub disables scheduled workflows after 60 days
-without repository activity (it emails a warning first); if that ever happens,
-re-enable the workflow in the Actions tab.
+without repository activity, so the workflow re-enables itself once a week (a job
+that calls the "enable workflow" API with its own `GITHUB_TOKEN`, no commits).
+That relies on GitHub's enable API restarting the inactivity timer, which is how
+the `keepalive-workflow` action works too; it is not a documented guarantee, so
+if GitHub ever changed it, the failure mode is the old one: re-enable the
+workflow in the Actions tab (GitHub emails a warning first).
 
 ## Day to day
 
@@ -318,7 +336,23 @@ re-enable the workflow in the Actions tab.
   under a minute, and also at the start of every 5-minute autodeploy run. It
   writes nothing to the journal while everything is up. It does nothing (one
   journal line) while a deploy, rollback or redeploy holds the autodeploy lock
-  or while any Kamal container runs on the host, so it cannot undo a switch.
+  or while a Kamal container runs on the host (one that carries the label
+  `muster.kamal=1`, which `bin/kamal` sets on its `docker run`, or any
+  `ghcr.io/basecamp/kamal` image, so also another Kamal version or a Kamal
+  started by hand), so it cannot undo a switch, for example during
+  `kamal proxy reboot` or `kamal accessory reboot db`.
+- What "the deployed version" is: the version kamal-proxy routes the
+  `muster-cloud-web` service to (`docker exec kamal-proxy kamal-proxy list`),
+  not a container that merely runs. The guard records it in
+  `/var/lib/muster-cloud/autodeploy/deployed` only when at most one web
+  container runs and no deploy was cut short; it never records a version the proxy
+  does not route to. A full run treats a deploy that was cut short as incomplete
+  and boots the commit again through the normal path (readiness checks,
+  rollback, alert), never as a no-op: when the file
+  `/var/lib/muster-cloud/autodeploy/deploying` was left behind (the previous
+  run died after it started changing things), or when two web containers run and
+  the proxy routes to one that is not the recorded version or does not answer
+  `/readyz`. The journal says `decision: incomplete deploy: ...`.
 - Stop the guard on purpose (for example to stop a container by hand for
   maintenance): `sudo systemctl stop muster-cloud-guard.timer`, and
   `sudo systemctl start muster-cloud-guard.timer` afterwards. Stopping it is not
