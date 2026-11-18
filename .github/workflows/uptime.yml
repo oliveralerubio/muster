@@ -7,30 +7,35 @@ name: Cloud uptime
 # Guide: deploy/KAMAL.md.
 #
 # GitHub disables scheduled workflows in a repository after 60 days without
-# activity. The repository is active while this project is developed; if it
-# ever goes quiet, re-enable this workflow in the Actions tab (GitHub emails a
-# warning first). The host's own checks (backup-check, autodeploy alerts) do not
-# depend on it.
+# activity, which would silently remove this alarm. So once a week the second
+# job below calls the "enable workflow" API on this very workflow with the
+# run's own GITHUB_TOKEN (permission actions: write, nothing else). No commits.
+# This is what the keepalive-workflow action (v2) does. It relies on GitHub's
+# enable API restarting the inactivity timer; that is observed behaviour, not a
+# documented guarantee. If GitHub ever stopped honouring it the old failure
+# mode returns: re-enable the workflow in the Actions tab (GitHub emails a
+# warning first). A workflow that is ALREADY disabled cannot re-enable itself.
+# The host's own checks (backup-check, autodeploy alerts) do not depend on it.
 #
 # It holds no secret and reads nothing from the repository.
 
 on:
   schedule:
     - cron: "11,41 * * * *"
+    - cron: "23 5 * * 1" # weekly: keep this workflow enabled
   workflow_dispatch:
 
 permissions: {}
 
-concurrency:
-  group: cloud-uptime
-  cancel-in-progress: true
-
 jobs:
   readyz:
     name: public /readyz
-    if: github.repository == 'oliveralerubio/muster'
+    if: github.repository == 'oliveralerubio/muster' && github.event.schedule != '23 5 * * 1'
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    concurrency:
+      group: cloud-uptime
+      cancel-in-progress: true
     env:
       URL: https://personal.tailbb30e7.ts.net:10000
     steps:
@@ -46,3 +51,16 @@ jobs:
           done
           echo "::error::$URL/readyz answered HTTP $code after 5 attempts"
           exit 1
+
+  keepalive:
+    name: keep this workflow enabled
+    if: github.repository == 'oliveralerubio/muster' && (github.event.schedule == '23 5 * * 1' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Enable this workflow (restarts GitHub's 60-day inactivity timer)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/uptime.yml/enable"
