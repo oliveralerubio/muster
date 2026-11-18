@@ -274,9 +274,9 @@ jobs:
           for f in bin/kamal deploy/kamal/muster-cloud-autodeploy deploy/kamal/host-setup.sh \
                    deploy/kamal/muster-cloud-offsite deploy/kamal/muster-cloud-authority-offsite \
                    deploy/kamal/muster-cloud-backup-check deploy/kamal/muster-cloud-restore-drill \
-                   deploy/pg-restore.sh deploy/pg-control-owner.sh \
+                   deploy/pg-restore.sh deploy/tests/restore-owner.sh \
                    deploy/tests/autodeploy-guard.sh deploy/tests/offsite.sh \
-                   deploy/tests/authority-offsite.sh deploy/tests/control-owner.sh \
+                   deploy/tests/authority-offsite.sh \
                    deploy/tests/restore-drill.sh deploy/tests/backup-check-units.sh; do
             bash -n "$f"
           done
@@ -290,8 +290,8 @@ jobs:
       - name: Authority copy tests (every recipient decrypts, copies again when the journal grows)
         run: deploy/tests/authority-offsite.sh
 
-      - name: Authority ownership after a restore
-        run: deploy/tests/control-owner.sh
+      - name: Restore runs ops as the owner of the authority (user namespace; skipped when unavailable)
+        run: deploy/tests/restore-owner.sh
 
       - name: Restore drill selection and backup-check tests
         run: |

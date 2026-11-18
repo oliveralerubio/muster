@@ -1883,45 +1883,45 @@ async fn activate_reads_the_database_url_from_the_environment() {
     assert!(text(&out).contains("MUSTER_DATABASE_URL"), "{}", text(&out));
 }
 
-/// pg-restore.sh runs as root and the ops commands rewrite the witness (and
-/// may create the lock) as that user: the files must go back to the owner of
-/// their directory, which the script does with `chown --reference`. Without
-/// root the real ownership cannot be changed here, so a chown shim records the
-/// calls (the real owner is proven as root by deploy/tests/control-owner.sh).
+/// The authority is written only as the owner of its directory, so nothing is
+/// ever chowned: a `chown` shim must record no call at all, the witness is
+/// replaced with mode 0600 and still opens for the service.
 #[tokio::test]
-async fn a_restore_gives_the_authority_files_back_to_the_service() {
-    use std::os::unix::fs::PermissionsExt;
+async fn a_restore_writes_the_authority_as_its_owner_and_never_chowns() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let s = seeded_stack().await;
     let dir = tempfile::tempdir().unwrap();
     let bk = backup(&s, dir.path()).await;
     let auth = s.env.clone();
     let control = PathBuf::from(value(&auth, "MUSTER_CONTROL_DIR"));
     let witness = PathBuf::from(value(&auth, "MUSTER_CONTROL_WITNESS"));
-    // A world-readable witness: the script must put 0600 back.
+    // A world-readable witness: the replaced file must come back as 0600.
     std::fs::set_permissions(&witness, std::fs::Permissions::from_mode(0o644)).unwrap();
 
     let shim = dir.path().join("shim");
     std::fs::create_dir_all(&shim).unwrap();
     let log = dir.path().join("chown.log");
-    let real = String::from_utf8(
-        std::process::Command::new("sh")
-            .args(["-c", "command -v chown"])
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .unwrap();
-    let chown = shim.join("chown");
-    std::fs::write(
-        &chown,
-        format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >>'{}'\nexec {} \"$@\"\n",
-            log.display(),
-            real.trim()
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&chown, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for name in ["chown", "chmod"] {
+        let real = String::from_utf8(
+            std::process::Command::new("sh")
+                .args(["-c", &format!("command -v {name}")])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let path = shim.join(name);
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nprintf '{name} %s\\n' \"$*\" >>'{}'\nexec {} \"$@\"\n",
+                log.display(),
+                real.trim()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
     let path = format!(
         "{}:{}",
         shim.display(),
@@ -1932,20 +1932,61 @@ async fn a_restore_gives_the_authority_files_back_to_the_service() {
     let out = restore_with(&bk, &t, &auth, &[("PATH", path)]).await;
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     let calls = std::fs::read_to_string(&log).unwrap_or_default();
-    let witness_dir = witness.parent().unwrap();
-    for (dir, file) in [
-        (&control, control.join("journal.v1.jsonl")),
-        (&PathBuf::from(witness_dir), witness.clone()),
-    ] {
-        let want = format!("--reference={} -- {}", dir.display(), file.display());
-        assert!(calls.contains(&want), "no `{want}` in:\n{calls}");
+    for file in [control.display().to_string(), witness.display().to_string()] {
+        assert!(
+            !calls.contains(&file),
+            "the authority file {file} was chowned or chmodded:\n{calls}"
+        );
     }
-    assert_eq!(
-        std::fs::metadata(&witness).unwrap().permissions().mode() & 0o777,
-        0o600
-    );
+    let me = std::fs::metadata(&control).unwrap();
+    let after = std::fs::metadata(&witness).unwrap();
+    assert_eq!((after.uid(), after.gid()), (me.uid(), me.gid()));
+    assert_eq!(after.permissions().mode() & 0o777, 0o600);
     // ... and the restored authority still opens for the service.
     assert_restored_serves(&s, &t).await;
+}
+
+/// A witness path that is not in the control directory's owner's directory (a
+/// typo that points at an unrelated file) is refused before anything exists,
+/// and the file is left alone.
+#[tokio::test]
+async fn a_restore_refuses_a_witness_in_a_directory_with_another_owner() {
+    let s = seeded_stack().await;
+    let dir = tempfile::tempdir().unwrap();
+    let bk = backup(&s, dir.path()).await;
+    // /etc belongs to root, the control directory to the test user.
+    let victim = Path::new("/etc/hostname");
+    let before = std::fs::read(victim).ok();
+    let auth = with(
+        &s.env,
+        "MUSTER_CONTROL_WITNESS",
+        &victim.display().to_string(),
+    );
+    let t = new_target();
+    let out = restore_with(&bk, &t, &auth, &[]).await;
+    assert_eq!(out.status.code(), Some(73), "{}", text(&out));
+    assert!(text(&out).contains("different owners"), "{}", text(&out));
+    assert_eq!(std::fs::read(victim).ok(), before);
+    assert!(!t.repos.exists(), "a target was created");
+}
+
+/// A control directory owned by root is refused: the authority belongs to the
+/// service's user, and the script writes it as that user.
+#[tokio::test]
+async fn a_restore_refuses_a_control_directory_owned_by_root() {
+    let s = seeded_stack().await;
+    let dir = tempfile::tempdir().unwrap();
+    let bk = backup(&s, dir.path()).await;
+    let auth = with(
+        &with(&s.env, "MUSTER_CONTROL_DIR", "/etc"),
+        "MUSTER_CONTROL_WITNESS",
+        "/etc/witness.json",
+    );
+    let t = new_target();
+    let out = restore_with(&bk, &t, &auth, &[]).await;
+    assert_eq!(out.status.code(), Some(73), "{}", text(&out));
+    assert!(text(&out).contains("owned by root"), "{}", text(&out));
+    assert!(!t.repos.exists(), "a target was created");
 }
 
 fn sha256_text(text: &str) -> String {

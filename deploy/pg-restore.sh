@@ -51,12 +51,16 @@
 #     rejects is refused (67) before any target exists. Legacy format 1
 #     directories restore only with the explicit --legacy-format1.
 #     Synthetic plaintext snapshots restore as-is.
-#   - Ownership of the authority: this script runs as root, and `muster-cloud-
-#     ops` replaces the witness and may create control.lock as root:root 0600,
-#     which the service (uid 10001) could not read. After every ops call and
-#     on exit, the journal, the lock, the witness and any temporary file next
-#     to them get the owner and group of their directory and mode 0600
-#     (deploy/pg-control-owner.sh).
+#   - Ownership of the authority: every `muster-cloud-ops` call that can write
+#     the control directory or the witness runs AS THE OWNER of the control
+#     directory (the service's uid; `setpriv --reuid --regid --clear-groups`
+#     when this script is root), so the journal, the lock and the replaced
+#     witness are created with the right owner and nothing is ever chowned
+#     afterwards. Refused (73) before anything is created when that owner is
+#     root, or when the witness file's directory has another owner (a mistaken
+#     witness path can then never be rewritten). The new repo root is handed
+#     to the same owner right after it is created, so the erasure of deleted
+#     tenants can run as that user too.
 #   - Prints only target names and counts; never connection strings.
 #
 # Exit codes: 64 usage; 66 target already exists; 67 invalid/missing backup;
@@ -70,8 +74,6 @@ umask 077
 
 # shellcheck source=pg-conn.sh
 . "$(dirname "$0")/pg-conn.sh"
-# shellcheck source=pg-control-owner.sh
-. "$(dirname "$0")/pg-control-owner.sh"
 
 readonly PG_RESTORE_EXIT_USAGE=64
 readonly PG_RESTORE_EXIT_EXISTS=66
@@ -139,6 +141,41 @@ ops_bin=${MUSTER_CLOUD_OPS:-$(command -v muster-cloud-ops 2>/dev/null || true)}
   || fail "muster-cloud-ops not found (PATH or MUSTER_CLOUD_OPS)" "$PG_RESTORE_EXIT_USAGE"
 [ -d "$backup_dir" ] || fail "backup dir does not exist: $backup_dir" "$PG_RESTORE_EXIT_BACKUP"
 
+# The authority is only ever written as the owner of its directory. Read that
+# owner once, refuse anything odd before a single resource exists.
+for authority_dir in "$control_dir" "$(dirname -- "$control_witness")"; do
+  [ -d "$authority_dir" ] && [ ! -L "$authority_dir" ] \
+    || fail "not a real directory: $authority_dir" "$PG_RESTORE_EXIT_AUTHORITY"
+done
+control_owner=$(stat -c '%u:%g' -- "$control_dir") \
+  || fail "cannot read the owner of $control_dir" "$PG_RESTORE_EXIT_AUTHORITY"
+witness_owner=$(stat -c '%u:%g' -- "$(dirname -- "$control_witness")") \
+  || fail "cannot read the owner of the witness directory" "$PG_RESTORE_EXIT_AUTHORITY"
+ctl_uid=${control_owner%%:*}
+ctl_gid=${control_owner##*:}
+[ "$ctl_uid" != 0 ] && [ "$ctl_gid" != 0 ] \
+  || fail "the control directory is owned by root: it must belong to the service's user, which is who the authority is written as" "$PG_RESTORE_EXIT_AUTHORITY"
+[ "$witness_owner" = "$control_owner" ] \
+  || fail "the witness directory ($witness_owner) and the control directory ($control_owner) have different owners; check --control-witness" "$PG_RESTORE_EXIT_AUTHORITY"
+if [ -e "$control_witness" ] || [ -L "$control_witness" ]; then
+  [ -f "$control_witness" ] && [ ! -L "$control_witness" ] \
+    || fail "the witness is not a regular file: $control_witness" "$PG_RESTORE_EXIT_AUTHORITY"
+fi
+
+# as_owner CMD... — run CMD as the authority's owner.
+as_owner() {
+  local me
+  me=$(id -u)
+  if [ "$me" = "$ctl_uid" ]; then
+    "$@"
+  elif [ "$me" = 0 ]; then
+    setpriv --reuid="$ctl_uid" --regid="$ctl_gid" --clear-groups --no-new-privs "$@"
+  else
+    printf 'pg-restore.sh: run as root or as the control directory'"'"'s owner (uid %s), not uid %s\n' "$ctl_uid" "$me" >&2
+    return 126
+  fi
+}
+
 # The database name becomes part of SQL literals and libpq arguments: accept
 # only safe lowercase identifiers (what PostgreSQL folds unquoted names to),
 # so quoting stays trivial and quoting/injection bugs are structurally
@@ -163,6 +200,8 @@ command -v psql >/dev/null 2>&1 || fail "psql not found" "$PG_RESTORE_EXIT_USAGE
 command -v createdb >/dev/null 2>&1 || fail "createdb not found" "$PG_RESTORE_EXIT_USAGE"
 command -v pg_restore >/dev/null 2>&1 || fail "pg_restore not found" "$PG_RESTORE_EXIT_USAGE"
 command -v git >/dev/null 2>&1 || fail "git not found" "$PG_RESTORE_EXIT_USAGE"
+[ "$(id -u)" != 0 ] || command -v setpriv >/dev/null 2>&1 \
+  || fail "setpriv not found (util-linux)" "$PG_RESTORE_EXIT_USAGE"
 
 [ -f "$backup_dir/manifest.json" ] \
   || fail "backup is incomplete (no manifest.json): $backup_dir" "$PG_RESTORE_EXIT_BACKUP"
@@ -182,17 +221,9 @@ fi
 # The authority must open cleanly before anything is created. `ops` exit
 # 65 is a refusal; 78 a configuration error (e.g. overlapping paths).
 authority_ops() {
-  local ops_rc=0
-  MUSTER_CONTROL_DIR=$control_dir MUSTER_CONTROL_WITNESS=$control_witness \
-    MUSTER_REPO_ROOT=$new_repo_root "$ops_bin" "$@" || ops_rc=$?
-  # Whatever ops rewrote as this user goes back to the directory's owner. (It
-  # runs in command substitutions, so a failure is reported by the final check
-  # below rather than remembered here.)
-  fix_control_ownership "$control_dir" "$control_witness" || true
-  return "$ops_rc"
+  as_owner env MUSTER_CONTROL_DIR="$control_dir" MUSTER_CONTROL_WITNESS="$control_witness" \
+    MUSTER_REPO_ROOT="$new_repo_root" "$ops_bin" "$@"
 }
-# Also when this script stops early (a failure, a signal).
-trap 'fix_control_ownership "$control_dir" "$control_witness" >/dev/null 2>&1' EXIT
 authority_out=$(authority_ops status 2>&1 >/dev/null)
 authority_rc=$?
 case $authority_rc in
@@ -290,6 +321,12 @@ else
     || { teardown_fail; fail "cannot create repo root: $new_repo_root" "$PG_RESTORE_EXIT_USAGE"; }
 fi
 created_root=$new_repo_root
+# The erasure of deleted tenants runs as the authority's owner: the (empty, 0700,
+# just created by this script) repo root goes to that user.
+if [ "$(id -u)" = 0 ]; then
+  chown --no-dereference "$ctl_uid:$ctl_gid" -- "$new_repo_root" \
+    || { teardown_fail; fail "cannot hand the repo root to uid $ctl_uid" "$PG_RESTORE_EXIT_USAGE"; }
+fi
 
 createdb "$new_db" || { teardown_fail; fail "cannot create database $new_db" "$PG_RESTORE_EXIT_PGRESTORE"; }
 created_db=$new_db
@@ -415,14 +452,12 @@ if [ "$gate_rc" != 0 ]; then
     "$PG_RESTORE_EXIT_AUTHORITY"
 fi
 
-fix_control_ownership "$control_dir" "$control_witness" \
-  || fail "the authority files could not be given back to the service's owner (see above); fix their owner and group by hand before activating" \
-    "$PG_RESTORE_EXIT_AUTHORITY"
 printf 'pg-restore.sh: authority verified: %s\n' "$gate_json"
 printf 'pg-restore.sh: restore complete (NEW resources only; cutover is manual)\n'
 printf 'pg-restore.sh: database=%s repo_root=%s heads_checked=%s repos_fscked=%s\n' \
   "$new_db" "$new_repo_root" "$heads_checked" "$repos_fscked"
 printf 'pg-restore.sh: the restore is a CANDIDATE incarnation: it refuses to serve until activated.\n'
-printf 'pg-restore.sh: next step (manual): muster-cloud-ops activate --incarnation <db.incarnation_id above>\n'
-printf 'pg-restore.sh: --database-url <the new database>; activation FENCES the source instance, which\n'
-printf 'pg-restore.sh: then refuses every request. Start a NEW service on MUSTER_DATABASE_URL/MUSTER_REPO_ROOT.\n'
+printf 'pg-restore.sh: next step (manual): MUSTER_DATABASE_URL=<the new database> muster-cloud-ops activate\n'
+printf 'pg-restore.sh: --incarnation <db.incarnation_id above>, run as the service user (the URL in the\n'
+printf 'pg-restore.sh: environment, never as a flag: deploy/KAMAL.md). Activation FENCES the source instance,\n'
+printf 'pg-restore.sh: which then refuses every request. Start a NEW service on MUSTER_DATABASE_URL/MUSTER_REPO_ROOT.\n'
