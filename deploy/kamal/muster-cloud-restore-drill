@@ -299,12 +299,17 @@ role=$(printf '%s' "$restore_check_json" | python3 -I -c 'import json,sys; print
   || die "cannot read the restore-check output"
 [ "$role" = candidate ] || die "the restored database is '$role', expected a candidate incarnation"
 
+# Restored repos keep the service uid (tar -x as root preserves ownership), but
+# this script runs as root, so git refuses them ("dubious ownership"). Trust
+# exactly this one repo path through protected command-line config.
+rgit() { local r=$1; shift; git -c safe.directory="$r" -C "$r" "$@"; }
+
 STAGE="git fsck"
 repos_fscked=0
 for repo in "$S"/repos/*.git; do
   [ -d "$repo" ] || continue
   repos_fscked=$((repos_fscked + 1))
-  git -C "$repo" fsck --no-progress --no-dangling >/dev/null 2>&1 || die "git fsck failed for restored repository ${repo##*/}"
+  rgit "$repo" fsck --no-progress --no-dangling >/dev/null 2>&1 || die "git fsck failed for restored repository ${repo##*/}"
 done
 
 STAGE="comparing tenants and heads with manifest.json"

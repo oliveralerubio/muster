@@ -311,6 +311,11 @@ if [ "$fin_rc" != 0 ]; then
 fi
 printf 'pg-restore.sh: reconciled: %s\n' "$fin_json"
 
+# Restored repos keep the service uid (tar -x as root preserves ownership), but
+# this script runs as root, so git refuses them ("dubious ownership"). Trust
+# exactly this one repo path through protected command-line config.
+rgit() { local r=$1; shift; git -c safe.directory="$r" -C "$r" "$@"; }
+
 # Pre-cutover integrity gate: PG-referenced heads must exist in the restored
 # git store, reachable from upload refs; every restored repo must fsck clean.
 heads=$(psql -d "$new_db" -Atc \
@@ -330,7 +335,7 @@ if [ -n "$heads" ]; then
       failed=1
       continue
     fi
-    if ! git -C "$repo" cat-file -e "$head^{commit}" 2>/dev/null; then
+    if ! rgit "$repo" cat-file -e "$head^{commit}" 2>/dev/null; then
       printf 'pg-restore.sh: FAIL workspace %s: head %s object missing\n' "$ws" "$head" >&2
       failed=1
       continue
@@ -338,7 +343,7 @@ if [ -n "$heads" ]; then
     # Capture ref lists instead of piping into `grep -q` / early-exiting readers:
     # under pipefail, an early reader exit SIGPIPEs the producer (141) and a
     # reachable head would be reported unreachable.
-    upload_refs=$(git -C "$repo" for-each-ref --format='%(refname)' refs/muster/uploads/) \
+    upload_refs=$(rgit "$repo" for-each-ref --format='%(refname)' refs/muster/uploads/) \
       || upload_refs=""
     if [ -z "$upload_refs" ]; then
       printf 'pg-restore.sh: FAIL workspace %s: no upload refs restored\n' "$ws" >&2
@@ -348,7 +353,7 @@ if [ -n "$heads" ]; then
     reachable=""
     while IFS= read -r ref; do
       [ -n "$ref" ] || continue
-      git -C "$repo" merge-base --is-ancestor "$head" "$ref"
+      rgit "$repo" merge-base --is-ancestor "$head" "$ref"
       ancestor_rc=$?
       if [ "$ancestor_rc" -eq 0 ]; then
         reachable=1
@@ -374,7 +379,7 @@ fi
 for repo in "$new_repo_root"/*.git; do
   [ -d "$repo" ] || continue
   repos_fscked=$((repos_fscked + 1))
-  git -C "$repo" fsck --no-progress --no-dangling >/dev/null 2>&1 \
+  rgit "$repo" fsck --no-progress --no-dangling >/dev/null 2>&1 \
     || { teardown_fail; printf 'pg-restore.sh: FAIL git fsck: %s\n' "$repo" >&2; \
          fail "restored repo failed git fsck; targets torn down" "$PG_RESTORE_EXIT_FSCK"; }
 done
