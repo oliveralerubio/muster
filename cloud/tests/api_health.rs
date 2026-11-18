@@ -60,3 +60,40 @@ async fn a_service_whose_chosen_port_is_taken_starts_on_a_new_one() {
     assert_eq!(resp.status(), 200);
     drop(taken);
 }
+
+/// Strict-Transport-Security is sent on every response when the public URL is
+/// https (the harness talks plain http to the process; only the configuration
+/// differs), and never when it is http.
+#[tokio::test]
+async fn hsts_is_sent_only_when_the_public_url_is_https() {
+    const PATHS: [&str; 4] = ["/healthz", "/", "/assets/app.js", "/no-such-route"];
+
+    let plain = stack().await;
+    for path in PATHS {
+        let resp = http().get(plain.url(path)).send().await.unwrap();
+        assert!(
+            !resp.headers().contains_key("strict-transport-security"),
+            "{path}: no HSTS over an http public URL"
+        );
+    }
+
+    let s = support::stack_with_env(&[(
+        "MUSTER_PUBLIC_URL",
+        "https://cloud.example.test".to_string(),
+    )])
+    .await;
+    for path in PATHS {
+        let resp = http().get(s.url(path)).send().await.unwrap();
+        assert_eq!(
+            resp.headers()
+                .get("strict-transport-security")
+                .and_then(|v| v.to_str().ok()),
+            Some("max-age=31536000"),
+            "{path}: HSTS over an https public URL"
+        );
+    }
+    // Next to the headers the console already sets.
+    let resp = http().get(s.url("/")).send().await.unwrap();
+    assert_eq!(resp.headers()["x-content-type-options"], "nosniff");
+    assert!(resp.headers().contains_key("content-security-policy"));
+}
