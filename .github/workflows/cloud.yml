@@ -241,6 +241,10 @@ jobs:
           fi
           exit "$status"
 
+      # Uses the muster-cloud-ops just built; skips itself without a user namespace.
+      - name: Host ops binary never goes back to an older release
+        run: deploy/tests/install-ops.sh
+
   # The host deploy scripts (deploy/kamal) tested against a fake docker, curl,
   # Kamal and alert command: no Docker daemon, root or network needed.
   deploy-scripts:
@@ -274,6 +278,7 @@ jobs:
           for f in bin/kamal deploy/kamal/muster-cloud-autodeploy deploy/kamal/host-setup.sh \
                    deploy/kamal/muster-cloud-offsite deploy/kamal/muster-cloud-authority-offsite \
                    deploy/kamal/muster-cloud-backup-check deploy/kamal/muster-cloud-restore-drill \
+                   deploy/kamal/muster-cloud-install-ops deploy/tests/install-ops.sh \
                    deploy/pg-restore.sh deploy/tests/restore-owner.sh \
                    deploy/tests/autodeploy-guard.sh deploy/tests/offsite.sh \
                    deploy/tests/authority-offsite.sh \

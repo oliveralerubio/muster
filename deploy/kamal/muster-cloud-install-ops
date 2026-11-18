@@ -26,6 +26,19 @@
 # The timers' units (muster-cloud-backup/retention) call the symlink, so they
 # always run the operator tool built from the code that is deployed.
 #
+# NEVER BACKWARDS: an older binary may not read what a newer one wrote (a backup
+# made for several recipients has a manifest field an older ops refuses, and
+# retention then skips those snapshots and misses their deletion deadlines). So
+# an image that was built BEFORE the one the symlink points to now is refused
+# (exit 65), judged by the image's creation time recorded next to each installed
+# binary. Installing the same version again is fine. A rollback of the service
+# therefore leaves the newest ops in place, which is safe: ops never migrates the
+# database except in `init` and `register`, and a service that rolled back
+# starts at all only when the schema is the one the newest ops was built for
+# (deploy/KAMAL.md, "Rolling back"). To go back on purpose, e.g. the newest ops
+# is broken and the older one reads every manifest made since, set
+# MUSTER_OPS_ALLOW_OLDER=1 for that one call.
+#
 # Compatibility: the binary is built in the bookworm-based image (glibc 2.36)
 # and runs on the Ubuntu 24.04 host (glibc 2.39). glibc is backward
 # compatible: a binary needs only symbol versions at or below those it was
@@ -33,7 +46,8 @@
 # libraries are libc, libm and libgcc_s, all present on Ubuntu. Step 2 re-checks
 # this on every install with `ldd`, and it was checked on ubuntu:24.04.
 #
-# Exit codes: 0 installed; 64 usage; 65 refused (image, binary, or symlink);
+# Exit codes: 0 installed; 64 usage; 65 refused (image, binary, symlink, or an
+# older version than the one installed);
 # 69 docker unavailable or image missing; 74 I/O.
 
 set -euo pipefail
@@ -71,6 +85,19 @@ fi
 
 docker image inspect "$ref" >/dev/null 2>&1 \
   || fail "image $ref is not on this host (muster-cloud-autodeploy pulls it first)" 69
+
+# Creation time of this image, in epoch seconds; never go back in time.
+created=$(date -u -d "$(docker image inspect --format '{{.Created}}' "$ref")" +%s 2>/dev/null) \
+  || fail "cannot read the creation time of $ref" 69
+if [ -L "$LINK" ] && [ "${MUSTER_OPS_ALLOW_OLDER:-0}" != 1 ]; then
+  current_dir=$(dirname -- "$(readlink -- "$LINK")")
+  if [ "${current_dir##*/}" != "$sha" ] && [ -r "$current_dir/created" ]; then
+    current_created=$(cat -- "$current_dir/created" 2>/dev/null || true)
+    if [[ $current_created =~ ^[0-9]+$ ]] && [ "$created" -lt "$current_created" ]; then
+      fail "refused: $ref is older than the installed muster-cloud-ops (${current_dir##*/}); an older ops can miss manifests that a newer one wrote. Keep the newest ops (deploy/KAMAL.md, Rolling back)" 65
+    fi
+  fi
+fi
 
 work=$(mktemp -d "$LIB_DIR/.install.XXXXXX") || fail "mktemp failed" 74
 cid=""
@@ -117,6 +144,7 @@ mkdir -p -- "$dest"
 chmod 0755 -- "$dest"
 mv -f -- "$bin" "$dest/muster-cloud-ops.new"
 mv -f -- "$dest/muster-cloud-ops.new" "$dest/muster-cloud-ops"
+printf '%s\n' "$created" >"$dest/created"
 touch -- "$dest"
 
 # Atomic switch: rename(2) replaces the old symlink in one step.
