@@ -241,6 +241,42 @@ jobs:
           fi
           exit "$status"
 
+  # The host deploy scripts (deploy/kamal) tested against a fake docker, curl,
+  # Kamal and alert command: no Docker daemon, root or network needed.
+  deploy-scripts:
+    name: deploy scripts
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ci-docker
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools (git, python3, flock)
+        run: |
+          set -eu
+          apt="apt-get"
+          [ "$(id -u)" -eq 0 ] || apt="sudo apt-get"
+          install=""
+          command -v git >/dev/null 2>&1 || install="$install git"
+          command -v python3 >/dev/null 2>&1 || install="$install python3"
+          command -v flock >/dev/null 2>&1 || install="$install util-linux"
+          if [ -n "$install" ]; then
+            $apt update
+            $apt install -y --no-install-recommends $install
+          fi
+
+      - name: Syntax of the deploy scripts
+        run: |
+          set -eu
+          for f in bin/kamal deploy/kamal/muster-cloud-autodeploy deploy/kamal/host-setup.sh \
+                   deploy/tests/autodeploy-guard.sh; do
+            bash -n "$f"
+          done
+
+      - name: Autodeploy tests (guard, proxy and database bootstrap, incomplete deploys)
+        run: deploy/tests/autodeploy-guard.sh
+
   backup-drill:
     name: backup-drill
     if: >-
