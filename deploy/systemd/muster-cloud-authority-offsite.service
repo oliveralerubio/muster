@@ -13,13 +13,17 @@ OnFailure=muster-cloud-alert@%n.service
 # The path unit may ask for a start often; a start while a run is active is a
 # no-op, and the script copies again by itself when the journal grew meanwhile.
 # A failed run (Drive down, or the journal still moving after 5 rounds: exit 75)
-# is started again by Restart= every 30 s; OnFailure= does NOT fire for those
-# restarts, only when the start limit is hit: 40 starts within 30 minutes, which
-# the restarts alone reach after about 20 minutes of failing in a row. Normal use
-# (every journal change starts one run, several seconds long) stays far below 40
-# in 30 minutes. muster-cloud-alert sends one message per 6 hours per unit.
-StartLimitIntervalSec=30min
-StartLimitBurst=40
+# is started again by Restart= every 30 s.
+# No start limit (StartLimitIntervalSec=0): systemd counts every start, also the
+# successful ones the path unit makes, against it, so a busy period could make
+# systemd REFUSE a start and a journal change would wait for the hourly timer.
+# The script coalesces, so unlimited starts are harmless. The price: Restart=
+# never ends in a "failed" unit, so OnFailure= fires only for what is not
+# retried (exit 65, 69 or 77, below); a copy that keeps failing is reported by
+# muster-cloud-backup-check instead (authority-stale after 90 minutes behind,
+# gdrive-unreachable). muster-cloud-alert sends one message per key per 6 hours
+# (REPEAT_SECONDS=21600, key unit:<unit>), so neither path can spam.
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot

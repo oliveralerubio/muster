@@ -592,24 +592,30 @@ this guide does not claim it is:
   burst of records becomes one or two uploads), archives, encrypts and uploads,
   and, if the journal grew while it ran, copies again by itself (up to 5 rounds
   per start; a start while a copy runs is a no-op for systemd, which is why the
-  script does this itself). The path unit is rate-limited (60 triggers per 30
-  seconds). When the journal is still moving after the fifth round, the copy
-  does not report success: it exits 75 and the service (`Restart=on-failure`,
-  every 30 seconds) runs it again, so a busy period catches up without waiting
-  for the hourly timer. Those restarts do not alert one by one: the alert fires
-  only when the service finally fails (40 starts within 30 minutes, about 20
-  minutes of failing in a row, or a configuration problem, which is not retried),
-  and `muster-cloud-alert` sends one message per 6 hours for it. The hourly timer
-  is the backstop for anything this missed, and the 30-minute check restarts the
-  path unit if systemd ever stopped it (or refused its triggers while the service
-  was in that failed state).
+  script does this itself). Neither unit has a rate limit (`StartLimitIntervalSec=0`
+  on the service, `TriggerLimitIntervalSec=0` and `TriggerLimitBurst=0` on the
+  path unit): systemd counts successful starts too, so a limit could make it
+  refuse a start, or stop watching, in a busy period and a change would wait for
+  the hourly timer. The script coalesces, so unlimited starts are harmless. When
+  the journal is still moving after the fifth round, the copy does not report
+  success: it exits 75 and the service (`Restart=on-failure`, every 30 seconds)
+  runs it again, so a busy period catches up without waiting for the hourly
+  timer. Because of that, retries never end in a "failed" unit: the failure
+  alert (`unit:muster-cloud-authority-offsite.service`) fires at once only for
+  what is not retried (a configuration problem), and a copy that keeps failing
+  is reported by the 30-minute check instead (`authority-stale` once it is more
+  than 90 minutes behind, `gdrive-unreachable` when Drive does not answer).
+  `muster-cloud-alert` sends one message per problem per 6 hours, so a long
+  failure is one message, not a stream. The hourly timer is the backstop for
+  anything this missed, and the 30-minute check restarts the path unit if
+  systemd ever stopped it.
 - So the window between a journal change and its copy on Drive is **seconds to
   about a minute** when Drive answers (the settle time plus the upload), and up
   to an hour when an upload fails and the timer has to retry; the
   `authority-stale` alert fires when a copy has been behind for more than 90
-  minutes, and a copy that keeps failing raises
-  `unit:muster-cloud-authority-offsite.service` (after about 20 minutes of
-  retries every 30 seconds; at once for a configuration problem). A host lost inside that window recovers with an authority copy that
+  minutes (a copy that keeps failing is retried every 30 seconds meanwhile; a
+  configuration problem raises
+  `unit:muster-cloud-authority-offsite.service` at once). A host lost inside that window recovers with an authority copy that
   misses the last change: a deletion made in those seconds is not in the copy,
   and a restore from it would not erase that tenant again until the deletion is
   repeated. The window is small, not zero.
@@ -627,10 +633,10 @@ not a valid retention record, is refused and alerts.
 Before it deletes anything the script lists Drive **afresh** (never a listing
 from before an earlier purge of the same run) and checks that a complete
 snapshot at least as new as the newest local one would remain: its
-`manifest.json` is read back and must pass the rules the restore applies
-(format `muster-backup` version 2, the encryption scheme's two artifact names for
-the kinds `db` and `git` and nothing else, valid timestamps), and both artifacts
-must be on Drive with exactly the listed size (and SHA-256, when Drive reports
+`manifest.json` is read back and must pass `muster-cloud-ops backup
+verify-manifest`, which is the restore's own manifest parser (the offsite script
+has no copy of those rules; without the ops binary nothing is deleted), and both
+artifacts must be on Drive with exactly the listed size (and SHA-256, when Drive reports
 one). The first deletion that fails stops all deletions for that run: the
 remaining audit records stay unprocessed, the run exits 3 and alerts, and the
 next run lists Drive again, so a half-deleted snapshot is never counted as the

@@ -164,7 +164,12 @@ check "busy journal: the log says the copy is behind" has "still changing after 
 UNIT=$REPO/deploy/systemd/muster-cloud-authority-offsite.service
 check "unit: Restart=on-failure" grep -qx 'Restart=on-failure' "$UNIT"
 check "unit: RestartSec=30s" grep -qx 'RestartSec=30s' "$UNIT"
-check "unit: a sane start limit (not unlimited)" bash -c 'grep -qx "StartLimitBurst=40" "$1" && grep -qx "StartLimitIntervalSec=30min" "$1"' _ "$UNIT"
+# A start limit would count the successful path-triggered copies too and make
+# systemd refuse a start in a busy period: none, on the service and on the path.
+PATH_UNIT=$REPO/deploy/systemd/muster-cloud-authority-offsite.path
+check "unit: no start limit (starts are never refused)" grep -qx 'StartLimitIntervalSec=0' "$UNIT"
+check "unit: no StartLimitBurst left behind" bash -c '! grep -q "^StartLimitBurst" "$1"' _ "$UNIT"
+check "path: no trigger limit (a change is never dropped)" bash -c 'grep -qx "TriggerLimitIntervalSec=0" "$1" && grep -qx "TriggerLimitBurst=0" "$1"' _ "$PATH_UNIT"
 check "unit: configuration errors are not retried" grep -qx 'RestartPreventExitStatus=65 69 77' "$UNIT"
 check "unit: still alerts through OnFailure" grep -qx 'OnFailure=muster-cloud-alert@%n.service' "$UNIT"
 
