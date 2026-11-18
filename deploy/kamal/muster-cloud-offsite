@@ -29,11 +29,19 @@
 # run) gone, Drive still holds a COMPLETE snapshot at least as new as the
 # newest complete local one. "Complete" is verified, not assumed: its
 # manifest.json is read back, every artifact it lists exists on Drive with the
-# listed size and, when Drive reports a SHA-256 for it, the listed hash. When
-# the check fails (Drive full so the newest upload failed, a truncated file, an
+# listed size and, when Drive reports a SHA-256 for it, the listed hash, and
+# the manifest passes the same structure rules `muster-cloud-ops backup verify`
+# and the restore apply (format muster-backup version 2, exactly the db and the
+# git artifact under the names of its encryption scheme, nothing else in the
+# directory). Drive is listed afresh before every purge decision, never reused.
+# When the check fails (Drive full so the newest upload failed, a truncated file, an
 # unreadable Drive, or nothing left but the snapshots about to be purged) the
 # purge is skipped, the audit stays unprocessed so the next run retries it, and
 # the run exits 3 so the failure alert fires.
+#
+# The first failed deletion stops all deletions for the rest of the run (a
+# half-purged snapshot must not be mistaken for a complete one, and the next run
+# lists Drive afresh): the remaining audits stay unprocessed and the run exits 3.
 #
 # Guard: at most 100 ids are deleted per run. An audit file that lists more
 # than 100 ids, or that is not a valid retention record, is refused (exit 3,
@@ -139,13 +147,11 @@ else
 fi
 
 # ---- 2. deletions recorded by retention ---------------------------------------
-# What Drive really holds, read once and only when a purge is pending.
-remote_ready=0
 purged_now=()
-declare -A verdict=()
 
-load_remote() {
-  [ "$remote_ready" -eq 0 ] || return 0
+# list_remote — what Drive holds right now. Called before EVERY purge decision:
+# a listing that predates a (possibly partial) purge must never be reused.
+list_remote() {
   local rc=0
   "$RCLONE" lsjson "$REMOTE/snapshots" --recursive --files-only --hash "${rc_common[@]}" \
     >"$work/remote.json" 2>"$work/remote.err" || rc=$?
@@ -163,42 +169,59 @@ for entry in json.load(open(sys.argv[1])):
     if tail == "manifest.json" and re.fullmatch(r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}", head):
         ids.add(head)
 print("\n".join(sorted(ids, reverse=True)))
-' "$work/remote.json" >"$work/remote-ids.lst" || return 1
-  remote_ready=1
+' "$work/remote.json" >"$work/remote-ids.lst"
 }
 
 # verify_remote_snapshot id — the snapshot on Drive is complete: its manifest
-# is readable and every artifact it lists is there with the listed size (and
-# the listed SHA-256, when Drive reports one).
+# passes the rules of cloud/src/backup.rs read_snapshot (the restore's own) and
+# every artifact it lists is there with the listed size (and the listed
+# SHA-256, when Drive reports one). The manifest is the only thing downloaded,
+# so the hashes of the artifacts themselves are not recomputed here.
 verify_remote_snapshot() {
   local id=$1
-  if [ -n "${verdict[$id]:-}" ]; then
-    [ "${verdict[$id]}" = ok ]
-    return
-  fi
-  verdict[$id]=bad
   "$RCLONE" cat "$REMOTE/snapshots/$id/manifest.json" "${rc_common[@]}" >"$work/manifest-$id.json" 2>/dev/null || return 1
   python3 -I -c '
 import json, re, sys
 listing = json.load(open(sys.argv[1]))
 sid = sys.argv[2]
 manifest = json.load(open(sys.argv[3]))
-if not isinstance(manifest, dict) or manifest.get("backup_id") != sid:
+if not isinstance(manifest, dict):
+    sys.exit("the manifest is not an object")
+keys = {"format", "version", "backup_id", "op_id", "snapshot_at", "created_at", "encryption",
+        "normal_expires_at", "tenants", "artifacts"}
+if set(manifest) != keys:
+    sys.exit("the manifest has missing or unknown fields")
+version = manifest["version"]
+if manifest["format"] != "muster-backup" or version != 2 or isinstance(version, bool):
+    sys.exit("unsupported manifest format or version")
+if manifest["backup_id"] != sid:
     sys.exit("the manifest names another snapshot")
-artifacts = manifest.get("artifacts")
-if not isinstance(artifacts, list) or not artifacts:
-    sys.exit("the manifest lists no artifacts")
-if {a.get("kind") for a in artifacts if isinstance(a, dict)} < {"db", "git"}:
-    sys.exit("the manifest lacks the db or the git artifact")
-files = {}
+for field in ("snapshot_at", "created_at", "normal_expires_at"):
+    value = manifest[field]
+    if not isinstance(value, str) or not re.fullmatch(
+            r"[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?([Zz]|[+-][0-9]{2}:[0-9]{2})", value):
+        sys.exit(field + " is not a timestamp")
+scheme = (manifest["encryption"] or {}).get("scheme") if isinstance(manifest["encryption"], dict) else None
+names = {"age-x25519": ("db.dump.age", "git.tar.age"), "none": ("db.dump", "git.tar")}.get(scheme)
+if names is None:
+    sys.exit("unknown encryption scheme")
+want = {names[0]: "db", names[1]: "git"}
+artifacts = manifest["artifacts"]
+if not isinstance(artifacts, list) or len(artifacts) != 2:
+    sys.exit("the manifest must list exactly two artifacts")
+files, under = {}, 0
 for entry in listing:
     head, _, tail = entry.get("Path", "").partition("/")
-    if head == sid and tail and "/" not in tail:
-        files[tail] = entry
+    if head == sid and tail:
+        under += 1
+        if "/" not in tail:
+            files[tail] = entry
 for art in artifacts:
-    name, size, sha = art.get("name"), art.get("bytes"), art.get("sha256")
-    if not isinstance(name, str) or not re.fullmatch(r"(db\.dump|git\.tar)(\.age)?", name):
-        sys.exit("an artifact name is not valid")
+    if not isinstance(art, dict):
+        sys.exit("an artifact entry is not an object")
+    name, kind, size, sha = art.get("name"), art.get("kind"), art.get("bytes"), art.get("sha256")
+    if want.pop(name, None) != kind or not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha):
+        sys.exit("unexpected artifact %s" % (name,))
     if not isinstance(size, int) or isinstance(size, bool):
         sys.exit(name + ": no size in the manifest")
     entry = files.get(name)
@@ -207,20 +230,21 @@ for art in artifacts:
     if entry.get("Size") != size:
         sys.exit("%s: %s bytes on the remote, %s in the manifest" % (name, entry.get("Size"), size))
     remote_sha = (entry.get("Hashes") or {}).get("sha256")
-    if remote_sha and sha and remote_sha.lower() != str(sha).lower():
+    if remote_sha and remote_sha.lower() != sha:
         sys.exit(name + ": the remote SHA-256 differs from the manifest")
+if under != 3:
+    sys.exit("unexpected files in the remote snapshot directory")
 ' "$work/remote.json" "$id" "$work/manifest-$id.json" 2>"$work/verify.err" || {
     log "audit: remote snapshot $id is not complete: $(head -c 200 "$work/verify.err" | tr '\n' ' ')"
     return 1
   }
-  verdict[$id]=ok
 }
 
 # purge_is_safe id... — with these ids (and everything purged earlier in this
 # run) gone, Drive still holds a verified complete snapshot at least as new as
 # the newest complete local one.
 purge_is_safe() {
-  load_remote || return 1
+  list_remote || return 1
   local -A excluded=()
   local candidate
   for candidate in "$@" ${purged_now[@]+"${purged_now[@]}"}; do
@@ -330,8 +354,9 @@ print("\n".join(seen))
           log "audit: $name: $id was already absent from the remote"
           ;;
         *)
-          log "audit: $name: deleting $id FAILED (rclone exit $rc); will retry next run"
+          log "audit: $name: deleting $id FAILED (rclone exit $rc); it may be half deleted. STOPPING all deletions for this run; the next run lists Drive afresh"
           failed=1
+          break
           ;;
       esac
     done
@@ -340,6 +365,7 @@ print("\n".join(seen))
       log "audit: $name processed ($count id(s))"
     else
       status=3
+      break # the remaining audits stay unprocessed
     fi
   done
 fi

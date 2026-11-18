@@ -75,13 +75,27 @@ for kind, name in (("db", "db.dump.age"), ("git", "git.tar.age")):
         handle.write(data)
     arts.append({"name": name, "kind": kind, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()})
 with open(os.path.join(path, "manifest.json"), "w") as handle:
-    json.dump({"format": "muster-backup", "version": 2, "backup_id": sid, "tenants": [], "artifacts": arts}, handle)
+    json.dump({"format": "muster-backup", "version": 2, "backup_id": sid,
+               "op_id": "11111111-2222-3333-4444-555555555555",
+               "snapshot_at": "2026-11-18T00:00:00Z", "created_at": "2026-11-18T00:00:05Z",
+               "encryption": {"scheme": "age-x25519", "recipient_sha256": "0" * 64},
+               "normal_expires_at": "2026-12-18T00:00:00Z", "tenants": [], "artifacts": arts}, handle)
 PY
 }
 
-audit_removing() { # id...
+# patch_manifest dir id 'python statement on m' — edit a published manifest.
+patch_manifest() {
+  python3 -I - "$1/$2/manifest.json" "$3" <<'PY'
+import json, sys
+m = json.load(open(sys.argv[1]))
+exec(sys.argv[2])
+json.dump(m, open(sys.argv[1], "w"))
+PY
+}
+
+audit_removing() { # id...   (the audit file is $AUDIT_FILE, default $AUDIT_NAME)
   mkdir -p "$T/backups/audit"
-  python3 -I - "$T/backups/audit/$AUDIT_NAME" "$@" <<'PY'
+  python3 -I - "$T/backups/audit/${AUDIT_FILE:-$AUDIT_NAME}" "$@" <<'PY'
 import json, sys
 with open(sys.argv[1], "w") as handle:
     json.dump({"format": "muster-retention", "version": 1, "removed": sys.argv[2:]}, handle)
@@ -200,6 +214,54 @@ audit_removing "$OLD"
 run_offsite
 check "still local: the remote copy stays" on_remote "$OLD"
 check "still local: the audit is processed (nothing to delete)" processed
+
+# ---- 9. a manifest the restore would refuse is not a complete snapshot ---------------------------
+for variant in 'm["version"] = 3' 'm["artifacts"][1]["kind"] = "extra"' 'm["format"] = "other"' \
+  'm["encryption"]["scheme"] = "rot13"' 'm["artifacts"].append(dict(m["artifacts"][0]))'; do
+  setup bad-manifest
+  mk_snap "$T/backups/snapshots" "$NEW"
+  mk_snap "$T/remote/snapshots" "$OLD"
+  mk_snap "$T/remote/snapshots" "$NEW"
+  patch_manifest "$T/remote/snapshots" "$NEW" "$variant"
+  audit_removing "$OLD"
+  FAKE_RCLONE_FULL=1 run_offsite
+  check "invalid manifest ($variant): the older complete snapshot is kept" on_remote "$OLD"
+  check "invalid manifest ($variant): the audit is not consumed" not_processed
+done
+
+# ---- 10. a failed purge stops every deletion of the run ---------------------------------------------
+SECOND_AUDIT=retention-20261118T020000Z-66666666-2222-3333-4444-555555555555.json
+setup purge-fails
+mk_snap "$T/backups/snapshots" "$NEW"
+mk_snap "$T/remote/snapshots" "$OLD"
+mk_snap "$T/remote/snapshots" "$MID"
+audit_removing "$OLD" "$MID"
+AUDIT_FILE=$SECOND_AUDIT audit_removing "$MID"
+FAKE_RCLONE_PURGE_FAIL=$OLD run_offsite
+check "purge fails: exits 3 (the alert fires)" rc_is 3
+check "purge fails: the log says all deletions stopped" has "STOPPING all deletions"
+check "purge fails: nothing else is purged after the failure" on_remote "$MID"
+check "purge fails: neither audit is consumed" not_processed
+check "purge fails: the second audit is left unprocessed" bash -c "! grep -qxF '$SECOND_AUDIT' '$T/state/processed-audits.txt'"
+# The damaged snapshot (its db artifact is gone, the manifest stays) is never
+# counted as the complete survivor of a later purge; the next run, listing
+# Drive afresh, finishes the job.
+check "purge fails: the damaged snapshot has no db artifact left" bash -c "! [ -e '$T/remote/snapshots/$OLD/db.dump.age' ]"
+run_offsite
+check "next run: succeeds" rc_is 0
+check "next run: both expired snapshots are gone" bash -c "[ ! -e '$T/remote/snapshots/$OLD' ] && [ ! -e '$T/remote/snapshots/$MID' ]"
+check "next run: the newest stays" on_remote "$NEW"
+
+# ---- 11. Drive is listed afresh before every purge decision ------------------------------------------
+setup relist
+mk_snap "$T/backups/snapshots" "$NEW"
+mk_snap "$T/remote/snapshots" "$OLD"
+mk_snap "$T/remote/snapshots" "$MID"
+audit_removing "$OLD"
+AUDIT_FILE=$SECOND_AUDIT audit_removing "$MID"
+run_offsite
+check "relist: both audits are purged" bash -c "[ ! -e '$T/remote/snapshots/$OLD' ] && [ ! -e '$T/remote/snapshots/$MID' ]"
+check "relist: two purge decisions, two listings" test "$(grep -c '^lsjson' "$T/rclone.log")" -eq 2
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

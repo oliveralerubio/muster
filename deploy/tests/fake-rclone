@@ -5,6 +5,7 @@
 #   FAKE_RCLONE_FULL=1       copy and copyto fail (Drive's storage quota is full)
 #   FAKE_RCLONE_LS_FAIL=1    lsjson fails (Drive cannot be listed)
 #   FAKE_RCLONE_NO_HASH=1    lsjson reports no hashes
+#   FAKE_RCLONE_PURGE_FAIL=ID purge of that snapshot deletes its db artifact, then fails
 #   FAKE_RCLONE_SIZE_BYTES=N `size --json` reports N bytes
 import hashlib, json, os, shutil, sys
 
@@ -42,6 +43,13 @@ if cmd == "copy":
         os.makedirs(os.path.dirname(target), exist_ok=True)
         shutil.copyfile(os.path.join(src, name), target)
 elif cmd == "purge":
+    broken = os.environ.get("FAKE_RCLONE_PURGE_FAIL")
+    if broken and pos[0].rstrip("/").endswith("/" + broken):
+        for name in sorted(os.listdir(pos[0])):
+            if name.startswith("db."):
+                os.remove(os.path.join(pos[0], name))
+        print("fake rclone: purge interrupted", file=sys.stderr)
+        sys.exit(1)
     if not os.path.isdir(pos[0]):
         sys.exit(3)
     shutil.rmtree(pos[0])
