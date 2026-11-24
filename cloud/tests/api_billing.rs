@@ -328,6 +328,151 @@ async fn billing_when(
     }
 }
 
+fn stack_env<'a>(s: &'a Stack, name: &str) -> &'a str {
+    s.env.iter().find(|(k, _)| *k == name).unwrap().1.as_str()
+}
+
+#[tokio::test]
+async fn completed_transaction_reconciles_the_workspace_that_created_the_checkout() {
+    let paddle = start_paddle().await;
+    let s = stack_with_paddle(&paddle).await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let ws = create_workspace(&s, &alice, "Paid Team").await;
+    let other = create_workspace(&s, &alice, "Another Workspace").await;
+    let txn = checkout(&s, &alice, &ws.id, "team", 3).await;
+    let sub = "sub_01h8vzp8f4kek3ydg1paidtxn";
+    paddle.complete_checkout(&txn, sub, "ctm_01h8vzp8f4kek3ydg1paidtxn");
+    let mut event = serde_json::json!({
+        "event_id": "evt_completed_team_checkout",
+        "event_type": "transaction.completed",
+        "occurred_at": support::paddle_fixture::now_rfc3339(),
+        "data": paddle.transaction(&txn).unwrap(),
+    });
+    event["data"]["custom_data"]["workspace_id"] = other.id.clone().into();
+
+    let mut unrelated = event.clone();
+    unrelated["event_id"] = "evt_completed_unknown_checkout".into();
+    unrelated["data"]["id"] = "txn_unknown_to_muster".into();
+    unrelated["data"]["transaction_id"] = txn.clone().into();
+    assert_eq!(post_webhook(&s, &paddle, &unrelated).await, 200);
+    assert_eq!(paddle.calls("get_subscription"), 0);
+
+    assert_eq!(post_webhook(&s, &paddle, &event).await, 200);
+    let billing = billing_when(&s, &alice, &ws.id, "Team active with 3 seats", |b| {
+        b.plan == "team" && b.plan_status == PlanStatus::Active && b.seats == 3
+    })
+    .await;
+    assert!(billing.can_push);
+    assert_eq!(billing_of(&s, &alice, &other.id).await.plan, "trial");
+
+    let reconciliations = paddle.calls("get_subscription");
+    assert!(reconciliations >= 1);
+    assert_eq!(post_webhook(&s, &paddle, &event).await, 200);
+    assert_eq!(paddle.calls("get_subscription"), reconciliations);
+
+    let db = sqlx::PgPool::connect(stack_env(&s, "MUSTER_DATABASE_URL"))
+        .await
+        .unwrap();
+    let events: Vec<(String, Option<uuid::Uuid>)> =
+        sqlx::query_as("SELECT event_id, workspace_id FROM billing_events ORDER BY event_id")
+            .fetch_all(&db)
+            .await
+            .unwrap();
+    assert_eq!(
+        events,
+        vec![
+            (
+                "evt_completed_team_checkout".into(),
+                Some(ws.id.parse().unwrap())
+            ),
+            ("evt_completed_unknown_checkout".into(), None),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn completed_transaction_for_a_tombstoned_workspace_only_records_dedupe() {
+    let paddle = start_paddle().await;
+    let mut s = stack_with_paddle(&paddle).await;
+    s.restart_with_env(&[("MUSTER_DEV_DELETION_GRACE_SECS", "1".into())])
+        .await;
+    let alice = s.login_user("alice", "alice@example.com").await;
+    let ws = create_workspace(&s, &alice, "Deleted Team").await;
+    let ws_id: uuid::Uuid = ws.id.parse().unwrap();
+    let txn = checkout(&s, &alice, &ws.id, "team", 3).await;
+    let sub = "sub_01h8vzp8f4kek3ydg1tombtxn";
+    paddle.complete_checkout(&txn, sub, "ctm_01h8vzp8f4kek3ydg1tombtxn");
+    // Leave the checkout unresolved by the deletion's provider worker.
+    paddle.revoke_permission("transaction.read");
+
+    let db = sqlx::PgPool::connect(stack_env(&s, "MUSTER_DATABASE_URL"))
+        .await
+        .unwrap();
+    let root = std::path::Path::new(stack_env(&s, "MUSTER_REPO_ROOT"));
+    let _held = muster_cloud::lifecycle_purge::repo_access(&db, root, ws_id)
+        .await
+        .unwrap();
+    let deletion = http()
+        .delete(s.url(&format!("/v1/workspaces/{ws_id}")))
+        .header("Cookie", format!("__Host-mc_session={}", alice.cookie))
+        .header("Origin", s.origin())
+        .header("X-CSRF-Token", &alice.csrf_token)
+        .header("Idempotency-Key", uuid::Uuid::new_v4().to_string())
+        .json(&serde_json::json!({
+            "confirm_workspace_id": ws.id,
+            "confirm_workspace_name": "Deleted Team",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deletion.status(), 202);
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let tombstoned = sqlx::query_scalar::<_, bool>(
+                "SELECT purge_committed_at IS NOT NULL FROM workspace_lifecycle WHERE workspace_id = $1",
+            )
+            .bind(ws_id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+            if tombstoned {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("tombstone committed while a reader holds the workspace");
+
+    let event = serde_json::json!({
+        "event_id": "evt_completed_tombstoned_checkout",
+        "event_type": "transaction.completed",
+        "occurred_at": support::paddle_fixture::now_rfc3339(),
+        "data": paddle.transaction(&txn).unwrap(),
+    });
+    assert_eq!(post_webhook(&s, &paddle, &event).await, 200);
+    assert_eq!(post_webhook(&s, &paddle, &event).await, 200);
+    assert_eq!(paddle.calls("get_subscription"), 0);
+    let recorded: (Option<uuid::Uuid>, serde_json::Value) =
+        sqlx::query_as("SELECT workspace_id, payload FROM billing_events WHERE event_id = $1")
+            .bind(event["event_id"].as_str())
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(recorded, (None, serde_json::json!({})));
+    let checkout: (String, Option<String>, bool) = sqlx::query_as(
+        "SELECT status, subscription_id,
+                EXISTS (SELECT 1 FROM billing_reconcile_jobs WHERE workspace_id = $2)
+           FROM billing_checkouts WHERE transaction_id = $1",
+    )
+    .bind(&txn)
+    .bind(ws_id)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(checkout, ("open".into(), None, false));
+}
+
 /// Entitlements come from the subscription Paddle returns on
 /// `GET /subscriptions/{id}`, with the plan derived from the configured
 /// price ids, not from the (possibly stale) event payload or custom_data.

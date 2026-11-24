@@ -1342,35 +1342,44 @@ fn verify_paddle_signature(
     Ok(())
 }
 
-/// Workspace an event belongs to, from server-side state only: a subscription
-/// already bound to a workspace, or the checkout transaction this server
-/// created (`transaction_id`, present on `subscription.created`).
-/// `custom_data` is never consulted.
+/// Resolves the workspace from a recorded checkout or subscription. A completed
+/// transaction identifies its checkout by `id`; subscription events can name
+/// their originating checkout by `transaction_id`. Hold the workspace row so
+/// its tombstone cannot commit between this lookup and recording the event.
 async fn associated_workspace(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    event_type: &str,
     data: Option<&serde_json::Value>,
 ) -> Result<Option<Uuid>, AppError> {
     let Some(data) = data else { return Ok(None) };
-    if let Some(sub_id) = data.get("id").and_then(|v| v.as_str()) {
-        let bound: Option<(Uuid,)> = sqlx::query_as(
-            "SELECT workspace_id FROM subscriptions WHERE paddle_subscription_id = $1",
+    let is_completed_transaction = event_type == "transaction.completed";
+    if let Some(sub_id) = data["id"].as_str().filter(|_| !is_completed_transaction) {
+        let bound = sqlx::query_scalar(
+            "SELECT w.id FROM subscriptions s JOIN workspaces w ON w.id = s.workspace_id
+              WHERE s.paddle_subscription_id = $1 FOR KEY SHARE OF w",
         )
         .bind(sub_id)
         .fetch_optional(&mut **tx)
         .await?;
-        if let Some((ws,)) = bound {
-            return Ok(Some(ws));
+        if bound.is_some() {
+            return Ok(bound);
         }
     }
-    let Some(txn) = data.get("transaction_id").and_then(|v| v.as_str()) else {
+    let checkout_field = if is_completed_transaction {
+        "id"
+    } else {
+        "transaction_id"
+    };
+    let Some(txn_id) = data[checkout_field].as_str() else {
         return Ok(None);
     };
-    let checkout: Option<(Uuid,)> =
-        sqlx::query_as("SELECT workspace_id FROM billing_checkouts WHERE transaction_id = $1")
-            .bind(txn)
-            .fetch_optional(&mut **tx)
-            .await?;
-    Ok(checkout.map(|(ws,)| ws))
+    Ok(sqlx::query_scalar(
+        "SELECT w.id FROM billing_checkouts c JOIN workspaces w ON w.id = c.workspace_id
+          WHERE c.transaction_id = $1 FOR KEY SHARE OF w",
+    )
+    .bind(txn_id)
+    .fetch_optional(&mut **tx)
+    .await?)
 }
 
 /// `POST /v1/billing/webhook`: unauthenticated webhook endpoint for Paddle.
@@ -1417,7 +1426,7 @@ pub async fn handle_webhook(
     let mut tx = state.db.begin().await?;
 
     let data = event.get("data");
-    let ws_id = associated_workspace(&mut tx, data).await?;
+    let ws_id = associated_workspace(&mut tx, event_type, data).await?;
     // An event about a tombstoned workspace (associated with it, naming it in
     // `custom_data`, or about one of its provider objects) is kept for dedup
     // with an empty payload.
@@ -1451,6 +1460,7 @@ pub async fn handle_webhook(
     } else {
         event.clone()
     };
+    let ws_id = ws_id.filter(|_| !tombstoned);
 
     // Dedupe on event_id by the insert itself: a concurrent delivery of the
     // same event waits for this one and then inserts nothing. A duplicate
@@ -1473,48 +1483,32 @@ pub async fn handle_webhook(
         return Ok(StatusCode::OK);
     }
 
-    // Subscription events for an associated workspace trigger a canonical
-    // re-read from Paddle; the payload itself never writes entitlements.
-    let sub_to_reconcile = match (ws_id, data) {
-        (Some(ws), Some(data)) if event_type.starts_with("subscription.") => data
-            .get("id")
-            .and_then(|v| v.as_str())
-            .filter(|id| id.starts_with("sub_"))
-            .map(|id| (id.to_string(), ws)),
-        _ => None,
+    let (Some(ws), Some(data)) = (ws_id, data) else {
+        tx.commit().await?;
+        return Ok(StatusCode::OK);
     };
-    if let Some((sub, ws)) = &sub_to_reconcile {
-        crate::billing_reconcile::enqueue(&mut tx, sub, *ws).await?;
-    }
-    // Paddle paid this checkout: a subscription event names it as the origin
-    // of the subscription (`transaction_id`), a completed transaction is that
-    // transaction itself. Never offer its payment link again, and no other
-    // checkout until that subscription is reconciled here. Any other event
-    // that merely names a transaction (an adjustment or refund, say) says
-    // nothing about its checkout being paid.
-    let paid_txn = match data {
-        Some(d) if event_type.starts_with("subscription.") => d
-            .get("transaction_id")
-            .and_then(|v| v.as_str())
-            .map(|txn| (txn, sub_to_reconcile.as_ref().map(|(sub, _)| sub.as_str()))),
-        Some(d) if event_type == "transaction.completed" => {
-            d.get("id").and_then(|v| v.as_str()).map(|txn| {
-                let sub = d
-                    .get("subscription_id")
-                    .and_then(|v| v.as_str())
-                    .filter(|id| id.starts_with("sub_"));
-                (txn, sub)
-            })
+
+    // Only these events report payment or subscription changes. Record the
+    // paid checkout before queueing so reconciliation can see its origin.
+    let (paid_txn, sub) = match event_type {
+        "transaction.completed" => (data["id"].as_str(), data["subscription_id"].as_str()),
+        kind if kind.starts_with("subscription.") => {
+            (data["transaction_id"].as_str(), data["id"].as_str())
         }
-        _ => None,
+        _ => (None, None),
     };
-    if let Some((txn, sub)) = paid_txn {
+    let sub = sub.filter(|id| id.starts_with("sub_"));
+    if let Some(txn) = paid_txn {
         record_paid_checkout(&mut tx, txn, sub).await?;
+    }
+    // Entitlements come from the canonical subscription at Paddle.
+    if let Some(sub) = sub {
+        crate::billing_reconcile::enqueue(&mut tx, sub, ws).await?;
     }
     tx.commit().await?;
 
-    if let Some((sub, _)) = sub_to_reconcile {
-        crate::billing_reconcile::run_now(&state, &sub).await;
+    if let Some(sub) = sub {
+        crate::billing_reconcile::run_now(&state, sub).await;
     }
     Ok(StatusCode::OK)
 }
