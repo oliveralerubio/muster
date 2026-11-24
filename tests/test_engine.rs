@@ -768,6 +768,43 @@ fn dotfile_mode_changes_are_planned_and_new_execute_requires_approval() {
 
 #[cfg(unix)]
 #[test]
+fn private_dotfile_mode_repair_survives_a_restrictive_umask() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let env = MusterEnv::new();
+    let declaration = "[files.\".settings\"]\nsource = 'files/settings'\n";
+    dotfile_manifest(&env, declaration);
+    std::fs::write(env.config_dir().join("files/settings"), "setting=true\n").unwrap();
+    env.run(&["sync", "--yes"]).assert().success();
+    let settings = env.path().join(".settings");
+    std::fs::set_permissions(&settings, std::fs::Permissions::from_mode(0o644)).unwrap();
+    dotfile_manifest(&env, &format!("{declaration}private = true\n"));
+
+    let output = std::process::Command::new("sh")
+        .args([
+            "-c",
+            "umask 0400; exec \"$1\" sync --yes",
+            "sh",
+            env!("CARGO_BIN_EXE_muster"),
+        ])
+        .env_clear()
+        .env("HOME", env.path())
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    assert_eq!(mode(&settings), 0o600);
+    assert_eq!(
+        std::fs::read_to_string(&settings).unwrap(),
+        "setting=true\n"
+    );
+    let (out, sync) = all_json(&env, &["sync"]);
+    assert!(out.status.success(), "{}", stdout_of(&out));
+    assert_eq!(sync.result()["applied"], false);
+}
+
+#[cfg(unix)]
+#[test]
 fn dotfile_execute_drift_uses_previous_approval_and_the_symlink_target_mode() {
     use std::os::unix::fs::{symlink, PermissionsExt};
 

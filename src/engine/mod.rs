@@ -2350,6 +2350,10 @@ fn write_file_with_permissions(
     }
     let mut file = options.open(&tmp).map_err(|e| io_error(&tmp, e))?;
     std::io::Write::write_all(&mut file, contents.as_bytes()).map_err(|e| io_error(&tmp, e))?;
+    if let Some(permissions) = permissions.as_ref().filter(|_| private) {
+        file.set_permissions(permissions.clone())
+            .map_err(|e| io_error(&tmp, e))?;
+    }
     file.sync_all().map_err(|e| io_error(&tmp, e))?;
     drop(file);
     if !private {
