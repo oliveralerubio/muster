@@ -2099,21 +2099,27 @@ function openMcpEdit(server) {
 // ever sends the relative path it was given by `skills/files`.
 const skillDialog = $("#skill-edit");
 let skillEditing = null;
+let skillEditSession = 0;
 let skillFileLoaded = null;
 let skillFileSaved = "";
 
 async function loadSkillFile(path) {
+  const session = ++skillEditSession;
+  skillFileLoaded = null;
+  const editor = $("#skill-text");
+  editor.value = "";
+  editor.readOnly = true;
   $("#skill-error").textContent = "";
   const data = await api(`skills/file?name=${encodeURIComponent(skillEditing)}&path=${encodeURIComponent(path)}`);
+  if (session !== skillEditSession) return;
   if (!data.ok) {
     $("#skill-error").textContent = failMessage(data);
-    $("#skill-text").value = "";
-    skillFileLoaded = null;
     return;
   }
   skillFileLoaded = path;
   skillFileSaved = (data.result && data.result.content) || "";
-  $("#skill-text").value = skillFileSaved;
+  editor.value = skillFileSaved;
+  editor.readOnly = false;
 }
 
 // Unsaved edits are lost on file switch or close; ask first.
@@ -2136,12 +2142,15 @@ async function customizeSkill(s) {
 }
 
 async function openSkillEdit(name) {
+  const session = ++skillEditSession;
   skillEditing = name;
   skillFileLoaded = null;
   $("#skill-edit-title").textContent = `Edit skill ${name}`;
   $("#skill-error").textContent = "";
   $("#skill-text").value = "";
+  $("#skill-text").readOnly = true;
   const data = await api(`skills/files?name=${encodeURIComponent(name)}`);
+  if (session !== skillEditSession) return;
   const select = $("#skill-file");
   const files = ((data.result || {}).files || []).map((f) => f.path);
   select.replaceChildren(...files.map((path) => el("option", { value: path }, path)));
@@ -2163,11 +2172,15 @@ if (skillFileEl) skillFileEl.addEventListener("change", () => {
 });
 const skillCloseEl = $("#skill-close");
 if (skillCloseEl) skillCloseEl.addEventListener("click", () => {
-  if (skillDialog && skillEditsDiscardable()) skillDialog.close();
+  if (skillDialog && skillEditsDiscardable()) {
+    ++skillEditSession;
+    skillDialog.close();
+  }
 });
 // Escape closes a <dialog> via "cancel"; guard it the same way.
 if (skillDialog) skillDialog.addEventListener("cancel", (event) => {
-  if (!skillEditsDiscardable()) event.preventDefault();
+  if (skillEditsDiscardable()) ++skillEditSession;
+  else event.preventDefault();
 });
 if (skillDialog) skillDialog.addEventListener("close", () => { if (current === "skills") show("skills"); });
 const skillFormEl = $("#skill-form");
@@ -2175,15 +2188,19 @@ if (skillFormEl) skillFormEl.addEventListener("submit", async (event) => {
   event.preventDefault();
   const saveBtn = $("#skill-save");
   if (!saveBtn || saveBtn.disabled || skillFileLoaded === null) return;
-  if (!confirm(`Save ${skillFileLoaded} in skill ${skillEditing}?`)) return;
+  const session = skillEditSession;
+  const name = skillEditing;
+  const path = skillFileLoaded;
+  const content = $("#skill-text").value;
+  if (!confirm(`Save ${path} in skill ${name}?`)) return;
   await busy(saveBtn, async () => {
-    const data = await api("skills/file", {
-      name: skillEditing, path: skillFileLoaded, content: $("#skill-text").value, confirm: true,
-    });
+    const data = await api("skills/file", { name, path, content, confirm: true }, true);
+    if (session !== skillEditSession) return;
+    showCli(data.cli);
     if (data.ok) {
       $("#skill-error").textContent = "";
-      skillFileSaved = $("#skill-text").value;
-      toast(`Saved ${skillFileLoaded}.`, "info");
+      skillFileSaved = content;
+      toast(`Saved ${path}.`, "info");
       await show("skills");
     } else {
       $("#skill-error").textContent = failMessage(data);
