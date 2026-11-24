@@ -51,6 +51,9 @@
     revisionsMoreError: null,
     loadingMoreRevisions: false,
     hasMoreRevisions: false,
+    exportManifest: null,
+    exportInFlight: false,
+    exportError: null,
     selectedDiffRev: null,
     diffsByRev: {},
     loadingDiffRev: null,
@@ -131,6 +134,9 @@
     state.revisionsMoreError = null;
     state.loadingMoreRevisions = false;
     state.hasMoreRevisions = false;
+    state.exportManifest = null;
+    state.exportInFlight = false;
+    state.exportError = null;
     state.selectedDiffRev = null;
     state.diffsByRev = {};
     state.loadingDiffRev = null;
@@ -3242,6 +3248,51 @@
     return el('section', { className: 'card stack-md', 'aria-labelledby': 'billing-heading' }, children);
   }
 
+  async function downloadWorkspaceExport(ws) {
+    const ctx = captureWorkspaceContext(ws.id);
+    if (!isCurrentWorkspaceContext(ctx) || !isExportAllowed(ws) || state.exportInFlight) return;
+    state.exportInFlight = true;
+    state.exportError = null;
+    renderShell();
+    try {
+      const resp = await fetch(`/v1/workspaces/${encodeURIComponent(ws.id)}/export`, {
+        credentials: 'same-origin',
+        cache: 'no-store',
+      });
+      if (!isCurrentWorkspaceContext(ctx)) return;
+      if (resp.status === 401) {
+        expireSession();
+        return;
+      }
+      if (resp.status !== 200) throw new Error(`HTTP ${resp.status}`);
+
+      const manifest = JSON.parse(resp.headers.get('x-muster-export-manifest'));
+      if (!manifest || !/^[0-9a-f]{40}$/.test(manifest.revision) ||
+          !/^musterpk1[0-9a-f]{64}$/.test(manifest.signer)) {
+        throw new Error('Invalid export manifest');
+      }
+      const bundle = await resp.blob();
+      if (!isCurrentWorkspaceContext(ctx)) return;
+
+      const fileName = `workspace-${manifest.revision}.bundle`;
+      const url = URL.createObjectURL(bundle);
+      const link = el('a', { href: url, download: fileName, hidden: true });
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      state.exportManifest = { ...manifest, fileName };
+    } catch (_err) {
+      if (!isCurrentWorkspaceContext(ctx)) return;
+      state.exportError = 'Could not download the Git bundle. Please try again.';
+    } finally {
+      if (isCurrentWorkspaceContext(ctx)) {
+        state.exportInFlight = false;
+        renderShell();
+      }
+    }
+  }
+
   function renderExportSection(ws) {
     const heading = el('h2', {
       id: 'export-heading',
@@ -3317,11 +3368,8 @@
       );
     }
 
-    const head = revisions[0];
-    const ossCommands = [
-      'git clone -b main workspace.bundle muster-config',
-      `muster sync --pull --expect-signer ${head.signer}`,
-    ].join('\n');
+    const downloaded = state.exportManifest;
+    const head = downloaded || revisions[0];
 
     return el(
       'section',
@@ -3331,7 +3379,7 @@
         note,
         el('dl', { className: 'meta-list' }, [
           el('div', { className: 'meta-item' }, [
-            el('dt', { textContent: 'Head revision' }),
+            el('dt', { textContent: downloaded ? 'Downloaded revision' : 'Head revision' }),
             el('dd', { className: 'mono', textContent: head.revision.slice(0, 8) }),
           ]),
           el('div', { className: 'meta-item' }, [
@@ -3344,23 +3392,30 @@
           ]),
         ]),
         el('div', { className: 'btn-row' }, [
-          el('a', {
-            href: `/v1/workspaces/${encodeURIComponent(ws.id)}/export`,
-            download: 'workspace.bundle',
+          el('button', {
+            type: 'button',
             className: 'btn btn-primary btn-sm',
-            textContent: 'Download Git bundle',
+            disabled: state.exportInFlight,
+            onClick: () => downloadWorkspaceExport(ws),
+            textContent: state.exportInFlight ? 'Downloading…' : 'Download Git bundle',
           }),
         ]),
-        el('div', { className: 'stack-sm' }, [
-          el('p', {
-            className: 'muted',
-            textContent:
-              'Offline exit with the open-source CLI (unbundle with Git and pin your trusted signer):',
-          }),
-          el('pre', { className: 'diff-patch mono' }, [
-            el('code', { textContent: ossCommands }),
-          ]),
-        ]),
+        state.exportError
+          ? el('p', { className: 'alert', role: 'alert', textContent: state.exportError })
+          : null,
+        downloaded && !state.exportInFlight
+          ? el('div', { className: 'stack-sm' }, [
+              el('p', {
+                className: 'muted',
+                textContent: 'Run this command from the folder where you downloaded the bundle.',
+              }),
+              el('pre', { className: 'diff-patch mono' }, [
+                el('code', {
+                  textContent: `muster sync --pull --remote "$PWD/${downloaded.fileName}" --expect-signer ${downloaded.signer}`,
+                }),
+              ]),
+            ])
+          : null,
       ]
     );
   }

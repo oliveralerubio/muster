@@ -291,6 +291,12 @@ fn write_private(path: &Path, contents: &str) -> Result<(), MusterError> {
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
     let mut file = options.open(path).map_err(|e| io_error(path, e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| io_error(path, e))?;
+    }
     file.write_all(contents.as_bytes())
         .map_err(|e| io_error(path, e))
 }

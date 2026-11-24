@@ -170,6 +170,14 @@ profileSave.disabled = true; // index.html ships the Save button disabled
 seed("button", "profile-cancel", profileForm);
 seed("pre", "profile-diff", profileDialog);
 seed("p", "profile-error", profileDialog);
+const skillDialog = seed("dialog", "skill-edit");
+const skillForm = seed("form", "skill-form", skillDialog);
+seed("h2", "skill-edit-title", skillForm);
+const skillFile = seed("select", "skill-file", skillForm);
+const skillText = seed("textarea", "skill-text", skillForm);
+const skillSave = seed("button", "skill-save", skillForm);
+const skillClose = seed("button", "skill-close", skillForm);
+const skillError = seed("p", "skill-error", skillForm);
 
 // --- browser globals ----------------------------------------------------------
 
@@ -1155,6 +1163,102 @@ async function testModifiedSkillShowsResolutionAndHistoryLabelsUnverifiedGitComm
   setResponder();
 }
 
+async function testSkillSaveKeepsLaterEditsAndIgnoresOldSessions() {
+  const original = "Original skill\n";
+  const submitted = "Saved skill\n";
+  const laterEdit = submitted + "Unsaved line\n";
+  let stored = original;
+  let finishSave;
+  let finishFileLoad;
+  let discard = false;
+  const discardPrompts = [];
+  const confirm = sandbox.confirm;
+  sandbox.confirm = (message) => {
+    if (!message.startsWith("Discard ")) return true;
+    discardPrompts.push(message);
+    return discard;
+  };
+  const reply = (result) => ({ ok: true, diagnostics: [], result });
+  setResponder(async ({ path, method, body }) => {
+    if (path === "skills") return reply({ skills: [{ name: "demo", origin: "local", status: "local" }] });
+    if (path === "skills/files?name=demo") return reply({ files: [{ path: "SKILL.md" }, { path: "notes.md" }] });
+    if (path === "skills/file?name=demo&path=SKILL.md") return reply({ content: stored });
+    if (path === "skills/file?name=demo&path=notes.md") {
+      await new Promise((resolve) => { finishFileLoad = resolve; });
+      return reply({ content: "Notes\n" });
+    }
+    if (path === "skills/file" && method === "POST") {
+      const saved = await new Promise((resolve) => { finishSave = resolve; });
+      if (!saved) return { ok: false, error: "Previous save failed", diagnostics: [] };
+      stored = body.content;
+      return reply({ saved: true });
+    }
+    return reply({});
+  });
+  try {
+    await sandbox.show("skills");
+    liveButton("Edit").fire("click");
+    await flush();
+    assert.equal(skillText.value, original);
+
+    skillText.value = submitted;
+    skillForm.fire("submit", { preventDefault() {} });
+    assert.equal(skillSave.disabled, true);
+    assert.deepEqual(lastCall().body, { name: "demo", path: "SKILL.md", content: submitted, confirm: true });
+    skillText.value = laterEdit;
+    finishSave(true);
+    await flush();
+    assert.equal(skillText.value, laterEdit);
+    assert.equal(stored, submitted);
+
+    skillClose.fire("click");
+    assert.equal(skillDialog.open, true, "declining to discard keeps the editor open");
+    let canceled = false;
+    skillDialog.fire("cancel", { preventDefault() { canceled = true; } });
+    assert.equal(canceled, true, "Escape also asks before discarding the later edit");
+    assert.deepEqual(discardPrompts, Array(2).fill("Discard unsaved changes to SKILL.md?"));
+
+    skillText.value = submitted;
+    skillClose.fire("click");
+    assert.equal(skillDialog.open, false, "the submitted text is the new clean baseline");
+    assert.equal(discardPrompts.length, 2);
+    await flush();
+    liveButton("Edit").fire("click");
+    await flush();
+
+    skillText.value = laterEdit;
+    skillForm.fire("submit", { preventDefault() {} });
+    discard = true;
+    skillFile.value = "notes.md";
+    skillFile.fire("change");
+    finishSave(false);
+    await flush();
+    assert.equal(skillError.textContent, "", "the old save cannot update an editor loading another file");
+    finishFileLoad();
+    await flush();
+    assert.equal(skillText.value, "Notes\n");
+
+    skillFile.value = "SKILL.md";
+    skillFile.fire("change");
+    await flush();
+    skillText.value = laterEdit;
+    skillForm.fire("submit", { preventDefault() {} });
+    skillClose.fire("click");
+    assert.equal(skillDialog.open, false);
+    await flush();
+    liveButton("Edit").fire("click");
+    await flush();
+    assert.equal(skillText.value, submitted);
+    finishSave(false);
+    await flush();
+    assert.equal(skillError.textContent, "", "reopening the same document starts a new session");
+    assert.equal(skillText.value, submitted);
+  } finally {
+    sandbox.confirm = confirm;
+    setResponder();
+  }
+}
+
 const tests = {
   testSkillsViewRendersUnmanagedSectionAndEscapesNames,
   testEffectiveViewShowsStatesAndEscapesNames,
@@ -1178,6 +1282,7 @@ const tests = {
   testDashboardShowsOnboardingAndPendingMachines,
   testDoctorDistinguishesWarningsFromErrorsAndShowsFixConsequences,
   testModifiedSkillShowsResolutionAndHistoryLabelsUnverifiedGitCommits,
+  testSkillSaveKeepsLaterEditsAndIgnoresOldSessions,
 };
 
 let failed = 0;

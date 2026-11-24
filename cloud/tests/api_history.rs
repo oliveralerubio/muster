@@ -2,8 +2,10 @@ mod support;
 
 use muster_cloud::protocol::{
     DiffChange, RevisionDiff, RevisionItem, HEADER_EPOCH, HEADER_EXPORT_MANIFEST, HEADER_REVISION,
+    SYNC_REF,
 };
-use support::fleet::{account_token, create_workspace, link, FleetRepo, MachineKey};
+use muster_cloud::repo_store::RepoStore;
+use support::fleet::{account_token, create_workspace, git, link, FleetRepo, MachineKey};
 use support::{http, stack, UserSession};
 
 async fn session_get<T: serde::de::DeserializeOwned>(
@@ -24,6 +26,37 @@ async fn session_get<T: serde::de::DeserializeOwned>(
         None
     };
     (status, body)
+}
+
+#[test]
+fn bundle_keeps_requested_revision_when_published_main_has_advanced() {
+    let root = tempfile::tempdir().unwrap();
+    let store = RepoStore::open(root.path().to_path_buf()).unwrap();
+    let ws = uuid::Uuid::new_v4();
+    let repo = FleetRepo::genesis(&MachineKey::new("node-a"));
+    let first = repo.head();
+    let staged = store
+        .stage(ws, &repo.bundle(None), uuid::Uuid::new_v4())
+        .unwrap();
+    store.commit_staged(ws, staged).unwrap();
+    store.set_main(ws, &first).unwrap();
+
+    let next = repo.touch("settings.toml", "enabled = true\n");
+    let staged = store
+        .stage(ws, &repo.bundle(Some(&first)), uuid::Uuid::new_v4())
+        .unwrap();
+    store.commit_staged(ws, staged).unwrap();
+    store.set_main(ws, &next).unwrap();
+
+    let bytes = store.bundle(ws, &first, None).unwrap();
+    assert_eq!(FleetRepo::clone_from_bundle(&bytes).head(), first);
+    assert_eq!(
+        git(
+            &root.path().join(format!("{ws}.git")),
+            &["rev-parse", SYNC_REF]
+        ),
+        next
+    );
 }
 
 #[tokio::test]

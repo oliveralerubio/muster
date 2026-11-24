@@ -8,8 +8,9 @@
 //! `refs/muster/uploads/<id>` moved into the workspace repository, and that
 //! happens **before** the PostgreSQL transaction that records it commits.
 //! Refused uploads leave nothing behind. PostgreSQL is the only
-//! authority on the accepted head; `refs/heads/main` is a derived ref that is
-//! repaired to the PostgreSQL head before it is served. The upload refs of
+//! authority on the accepted head; publication updates the derived
+//! `refs/heads/main` as a convenience. Reads pin the PostgreSQL head under
+//! that ref in a private view of the objects. The upload refs of
 //! accepted states and of open proposals are never deleted, so they survive
 //! any repack; only a closed proposal's upload is released
 //! ([`RepoStore::release_uploads`]).
@@ -67,6 +68,24 @@ fn initialize_repo(path: &Path) -> Result<(), AppError> {
     git_ok(path, &["init", "--quiet", "--bare", "--template="])?;
     git_ok(path, &["config", "transfer.fsckObjects", "true"])?;
     git_ok(path, &["config", "gc.auto", "0"])?;
+    Ok(())
+}
+
+fn initialize_private_repo(path: &Path, source: &Path) -> Result<(), AppError> {
+    fs::create_dir(path).map_err(AppError::internal)?;
+    git_ok(path, &["init", "--quiet", "--bare", "--template="])?;
+    if source.join("HEAD").exists() {
+        let objects = source
+            .join("objects")
+            .canonicalize()
+            .map_err(|e| AppError::internal(format!("workspace objects: {e}")))?;
+        fs::create_dir_all(path.join("objects/info")).map_err(AppError::internal)?;
+        fs::write(
+            path.join("objects/info/alternates"),
+            format!("{}\n", objects.display()),
+        )
+        .map_err(AppError::internal)?;
+    }
     Ok(())
 }
 
@@ -298,26 +317,9 @@ impl RepoStore {
         // The workspace repository is not created here: a refused upload
         // must leave nothing behind. Without one there are no stored objects
         // to borrow (and a bundle with prerequisites fails `verify`).
-        let repo = self.repo(ws);
         let dir = self.scratch()?;
         let stage = dir.path().join("stage.git");
-        let stage_str = stage.to_str().ok_or_else(|| AppError::internal("path"))?;
-        git_ok(
-            dir.path(),
-            &["init", "--quiet", "--bare", "--template=", stage_str],
-        )?;
-        if repo.join("HEAD").exists() {
-            let objects = repo
-                .join("objects")
-                .canonicalize()
-                .map_err(|e| AppError::internal(format!("workspace objects: {e}")))?;
-            fs::create_dir_all(stage.join("objects/info")).map_err(AppError::internal)?;
-            fs::write(
-                stage.join("objects/info/alternates"),
-                format!("{}\n", objects.display()),
-            )
-            .map_err(AppError::internal)?;
-        }
+        initialize_private_repo(&stage, &self.repo(ws))?;
 
         let file = dir.path().join("upload.bundle");
         fs::write(&file, bundle).map_err(AppError::internal)?;
@@ -557,12 +559,12 @@ impl RepoStore {
         Ok(out.status.success())
     }
 
-    /// Repairs the derived `refs/heads/main` to the PostgreSQL head.
+    /// Sets the derived `refs/heads/main` after publication.
     pub fn set_main(&self, ws: uuid::Uuid, head: &str) -> Result<(), AppError> {
         git_ok(&self.repo(ws), &["update-ref", SYNC_REF, head]).map(|_| ())
     }
 
-    /// Bundle of `refs/heads/main` at `head` (repaired first): the complete
+    /// Bundle of `refs/heads/main` pinned privately at `head`: the complete
     /// history, or `since..head` when `since` is a stored ancestor of head.
     pub fn bundle(
         &self,
@@ -570,9 +572,10 @@ impl RepoStore {
         head: &str,
         since: Option<&str>,
     ) -> Result<Vec<u8>, AppError> {
-        self.set_main(ws, head)?;
-        let repo = self.repo(ws);
         let scratch = self.scratch()?;
+        let view = scratch.path().join("view.git");
+        initialize_private_repo(&view, &self.repo(ws))?;
+        git_ok(&view, &["update-ref", SYNC_REF, head])?;
         let file = scratch.path().join("out.bundle");
         let file_str = file.to_str().ok_or_else(|| AppError::internal("path"))?;
         let range = match since {
@@ -581,7 +584,7 @@ impl RepoStore {
             }
             _ => SYNC_REF.to_string(),
         };
-        git_ok(&repo, &["bundle", "create", "--quiet", file_str, &range])?;
+        git_ok(&view, &["bundle", "create", "--quiet", file_str, &range])?;
         fs::read(&file).map_err(AppError::internal)
     }
 

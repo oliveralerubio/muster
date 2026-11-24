@@ -81,6 +81,7 @@ struct Entry {
     private: bool,
     /// Written executable (managed dotfiles only).
     executable: bool,
+    dotfile_mode: Option<dotfiles::Mode>,
     created: bool,
     drift: bool,
 }
@@ -90,7 +91,11 @@ impl Entry {
         match (&self.before, &self.after) {
             (None, Some(_)) => Action::Add,
             (Some(_), None) => Action::Remove,
-            (Some(b), Some(a)) if b != a => Action::Modify,
+            (Some(b), Some(a))
+                if b != a || self.dotfile_mode.as_ref().is_some_and(|mode| mode.changed) =>
+            {
+                Action::Modify
+            }
             _ => Action::Unchanged,
         }
     }
@@ -561,9 +566,19 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
     }
 
     // Managed dotfiles: user scope only, and not when one adapter is selected.
-    if options.target == Target::Global && options.agent.is_none() {
-        dotfiles::plan(ctx, &manifest, &roots, &ours, records, &key, &mut entries)?;
-    }
+    let declared_dotfiles = if options.target == Target::Global && options.agent.is_none() {
+        Some(dotfiles::plan(
+            ctx,
+            &manifest,
+            &roots,
+            &ours,
+            records,
+            &key,
+            &mut entries,
+        )?)
+    } else {
+        None
+    };
 
     // Adapters no longer enabled: prune what they own in this target.
     if options.agent.is_none() {
@@ -612,6 +627,10 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
         entry.private |= is_agent_config(entry.format)
             || holds_secret(entry.before.as_deref(), &secrets)
             || holds_secret(entry.after.as_deref(), &secrets);
+        if entry.managed && entry.agents == [dotfiles::OWNER] && entry.before.is_some() {
+            entry.dotfile_mode =
+                dotfiles::Mode::read(&entry.path, entry.private, entry.executable)?;
+        }
         if entry.drift {
             ctx.diag(
                 Diagnostic::new(
@@ -634,8 +653,8 @@ pub fn plan(ctx: &mut Context, options: &Options) -> Result<Plan, MusterError> {
         .cloned()
         .unwrap_or_default();
     let (mut approvals, mut approved) = approvals(&selected, &merged, previous, &options.target);
-    if options.target == Target::Global && options.agent.is_none() {
-        dotfiles::approvals(&entries, &mut approved, &mut approvals);
+    if let Some(declared) = declared_dotfiles {
+        dotfiles::approvals(&entries, &declared, &ours, &mut approved, &mut approvals);
     }
     let bin_dir = installer::bin_dir()?;
     let installs = agent_installs(ctx, options.agent, &bin_dir)?;
@@ -820,6 +839,7 @@ fn plan_adapter(
             },
             private: record.is_some_and(|r| r.private),
             executable: false,
+            dotfile_mode: None,
             created,
             drift,
         });
@@ -850,6 +870,7 @@ fn plan_adapter(
             owned: ownership::owned_keys(FileFormat::Text, &file.contents),
             private: record.is_some_and(|r| r.private),
             executable: false,
+            dotfile_mode: None,
         });
     }
     Ok((entries, rendered.diagnostics))
@@ -906,6 +927,7 @@ fn unmanaged_entry(
             owned: Vec::new(),
             private: record.private,
             executable: false,
+            dotfile_mode: None,
             created: record.created,
         }),
         diag,
@@ -1266,9 +1288,18 @@ pub fn apply(ctx: &mut Context, mut plan: Plan) -> Result<Value, MusterError> {
                 pending.backup(&entry.path, before)?;
             }
             match &entry.after {
-                Some(after) => {
-                    write_file(&entry.path, after, entry.private, entry.executable, confine)
-                }
+                Some(after) => write_file_with_permissions(
+                    &entry.path,
+                    after,
+                    entry.private,
+                    entry.executable,
+                    confine,
+                    entry
+                        .dotfile_mode
+                        .as_ref()
+                        .filter(|mode| mode.changed && entry.before == entry.after)
+                        .map(|mode| mode.permissions.clone()),
+                ),
                 None => {
                     std::fs::remove_file(&entry.path).map_err(|e| io_error(&entry.path, e))?;
                     // Whole files (skills) leave no empty skill directories.
@@ -2281,6 +2312,17 @@ fn write_file(
     executable: bool,
     confine: Option<&Path>,
 ) -> Result<Written, MusterError> {
+    write_file_with_permissions(path, contents, private, executable, confine, None)
+}
+
+fn write_file_with_permissions(
+    path: &Path,
+    contents: &str,
+    private: bool,
+    executable: bool,
+    confine: Option<&Path>,
+    permissions: Option<std::fs::Permissions>,
+) -> Result<Written, MusterError> {
     check_symlinks(path, confine)?;
     let symlink_target = std::fs::symlink_metadata(path)
         .ok()
@@ -2297,18 +2339,41 @@ fn write_file(
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
-    if private {
-        // The plaintext never exists with looser permissions, even briefly.
-        let mode = if executable { 0o700 } else { 0o600 };
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, mode);
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        if let Some(permissions) = &permissions {
+            options.mode(permissions.mode() & if private { 0o700 } else { 0o666 });
+        } else if private {
+            // The plaintext never exists with looser permissions, even briefly.
+            options.mode(if executable { 0o700 } else { 0o600 });
+        }
     }
     let mut file = options.open(&tmp).map_err(|e| io_error(&tmp, e))?;
     std::io::Write::write_all(&mut file, contents.as_bytes()).map_err(|e| io_error(&tmp, e))?;
+    if let Some(permissions) = permissions.as_ref().filter(|_| private) {
+        file.set_permissions(permissions.clone())
+            .map_err(|e| io_error(&tmp, e))?;
+    }
     file.sync_all().map_err(|e| io_error(&tmp, e))?;
     drop(file);
-    if !private && symlink_target.is_none() {
-        if let Ok(meta) = std::fs::metadata(path) {
-            std::fs::set_permissions(&tmp, meta.permissions()).map_err(|e| io_error(&tmp, e))?;
+    if !private {
+        let permissions = permissions.or_else(|| {
+            if symlink_target.is_none() {
+                std::fs::metadata(path).ok().map(|meta| meta.permissions())
+            } else {
+                None
+            }
+        });
+        if let Some(permissions) = permissions {
+            #[cfg(unix)]
+            let permissions = if symlink_target.is_some() {
+                use std::os::unix::fs::PermissionsExt;
+                // A new file cannot inherit special bits from the link target.
+                std::fs::Permissions::from_mode(permissions.mode() & 0o777)
+            } else {
+                permissions
+            };
+            std::fs::set_permissions(&tmp, permissions).map_err(|e| io_error(&tmp, e))?;
         }
     }
     #[cfg(unix)]
