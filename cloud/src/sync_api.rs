@@ -557,15 +557,15 @@ pub async fn post_sync(
     .await?;
     tx.commit().await?;
 
-    // Derived ref; repaired again before every read, so a failure here is
-    // not fatal to what PostgreSQL accepted.
+    // Update the convenience ref after commit. Reads pin the accepted
+    // PostgreSQL revision in a private repository.
     let repos = state.repos.clone();
     let rev = tip.clone();
     if let Err(err) = tokio::task::spawn_blocking(move || repos.set_main(ws_id, &rev))
         .await
         .map_err(AppError::internal)?
     {
-        tracing::warn!(error = %err.message, "main not updated; repaired on next read");
+        tracing::warn!(error = %err.message, "could not update derived main after publication");
     }
     let mut response = (StatusCode::OK, Json(accepted_dto)).into_response();
     head_headers(&mut response, &tip, epoch);
