@@ -3267,20 +3267,21 @@
       if (resp.status !== 200) throw new Error(`HTTP ${resp.status}`);
 
       const manifest = JSON.parse(resp.headers.get('x-muster-export-manifest'));
-      if (!manifest || typeof manifest.revision !== 'string' ||
+      if (!manifest || !/^[0-9a-f]{40}$/.test(manifest.revision) ||
           !/^musterpk1[0-9a-f]{64}$/.test(manifest.signer)) {
         throw new Error('Invalid export manifest');
       }
       const bundle = await resp.blob();
       if (!isCurrentWorkspaceContext(ctx)) return;
 
+      const fileName = `workspace-${manifest.revision}.bundle`;
       const url = URL.createObjectURL(bundle);
-      const link = el('a', { href: url, download: 'workspace.bundle', hidden: true });
+      const link = el('a', { href: url, download: fileName, hidden: true });
       document.body.appendChild(link);
       link.click();
       link.remove();
       setTimeout(() => URL.revokeObjectURL(url), 1000);
-      state.exportManifest = manifest;
+      state.exportManifest = { ...manifest, fileName };
     } catch (_err) {
       if (!isCurrentWorkspaceContext(ctx)) return;
       state.exportError = 'Could not download the Git bundle. Please try again.';
@@ -3406,11 +3407,11 @@
           ? el('div', { className: 'stack-sm' }, [
               el('p', {
                 className: 'muted',
-                textContent: 'Keep the downloaded file named workspace.bundle and run this command from the folder where you downloaded it.',
+                textContent: 'Run this command from the folder where you downloaded the bundle.',
               }),
               el('pre', { className: 'diff-patch mono' }, [
                 el('code', {
-                  textContent: `muster sync --pull --remote "$PWD/workspace.bundle" --expect-signer ${downloaded.signer}`,
+                  textContent: `muster sync --pull --remote "$PWD/${downloaded.fileName}" --expect-signer ${downloaded.signer}`,
                 }),
               ]),
             ])

@@ -1071,40 +1071,37 @@ async function journey15RequestRestoreProposal(browser) {
 }
 
 
-async function verifyExportRecovery(exportSection, download, revision) {
+async function verifyExportRecovery(exportSection, download, revision, downloadDir) {
   const cli = process.env.MUSTER_CLI_BIN;
   assert.ok(cli, "MUSTER_CLI_BIN must point to the built CLI");
   const command = await exportSection.locator("pre code").textContent();
-  const args = command.match(/^muster sync --pull --remote "\$PWD\/workspace\.bundle" --expect-signer (musterpk1[0-9a-f]{64})$/);
+  const args = command.match(/^muster sync --pull --remote "\$PWD\/(workspace-[0-9a-f]{40}\.bundle)" --expect-signer (musterpk1[0-9a-f]{64})$/);
   assert.ok(args, `expected a standalone recovery command, got: ${command}`);
-  assert.equal(args[1], revision.signer);
+  assert.equal(args[1], `workspace-${revision.revision}.bundle`);
+  assert.equal(args[2], revision.signer);
   await exportSection.getByText(revision.revision.slice(0, 8), { exact: true }).waitFor({ timeout: 3000 });
   await exportSection.getByText(/from the folder where you downloaded/i).waitFor({ timeout: 3000 });
-  assert.equal(download.suggestedFilename(), "workspace.bundle");
+  assert.equal(download.suggestedFilename(), args[1]);
 
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "muster-export-recover-"));
-  try {
-    const home = path.join(tmpDir, "home");
-    const configHome = path.join(home, "config");
-    const bundlePath = path.join(tmpDir, "workspace.bundle");
-    fs.mkdirSync(home);
-    await download.saveAs(bundlePath);
-    const result = JSON.parse(execFileSync(cli, [
-      "--format", "json", "sync", "--pull", "--remote", bundlePath, "--expect-signer", args[1],
-    ], {
-      cwd: tmpDir,
-      env: { PATH: process.env.PATH, HOME: home, XDG_CONFIG_HOME: configHome, GIT_CONFIG_NOSYSTEM: "1" },
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-    }));
-    assert.equal(result.ok, true);
-    assert.equal(result.result.joined, true);
-    assert.equal(result.result.applied, false);
-    const head = execFileSync("git", ["-C", path.join(configHome, "muster"), "rev-parse", "HEAD"], { encoding: "utf8" });
-    assert.equal(head.trim(), revision.revision);
-  } finally {
-    fs.rmSync(tmpDir, { recursive: true, force: true });
-  }
+  const home = fs.mkdtempSync(path.join(downloadDir, "home-"));
+  const configHome = path.join(home, "config");
+  const bundlePath = path.join(downloadDir, download.suggestedFilename());
+  assert.ok(!fs.existsSync(bundlePath), "the download must not collide with a different revision");
+  await download.saveAs(bundlePath);
+  const result = JSON.parse(execFileSync(cli, [
+    "--format", "json", "sync", "--pull", "--remote", path.join(downloadDir, args[1]), "--expect-signer", args[2],
+  ], {
+    cwd: downloadDir,
+    env: { PATH: process.env.PATH, HOME: home, XDG_CONFIG_HOME: configHome, GIT_CONFIG_NOSYSTEM: "1" },
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  }));
+  assert.equal(result.ok, true);
+  assert.equal(result.result.joined, true);
+  assert.equal(result.result.applied, false);
+  const head = execFileSync("git", ["-C", path.join(configHome, "muster"), "rev-parse", "HEAD"], { encoding: "utf8" });
+  assert.equal(head.trim(), revision.revision);
+  return bundlePath;
 }
 
 async function journey16ExportBundleAndOssInstructions(browser) {
@@ -1143,13 +1140,10 @@ async function journey16ExportBundleAndOssInstructions(browser) {
     page.waitForEvent("download"),
     exportSection.getByText("Download Git bundle", { exact: true }).click(),
   ]);
-  await verifyExportRecovery(exportSection, download, revHead);
-  const bundlePath = await download.path();
-  assert.ok(bundlePath, "downloaded bundle must exist");
-
-  // Real offline OSS verification via git clone
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "muster-export-verify-"));
   try {
+    const bundlePath = await verifyExportRecovery(exportSection, download, revHead, tmpDir);
+    // The downloaded file also works with Git alone.
     const cloneDir = path.join(tmpDir, "muster-config");
     execFileSync("git", ["clone", "-q", "-b", "main", bundlePath, cloneDir], { stdio: "pipe" });
     const clonedHead = execFileSync("git", ["-C", cloneDir, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
@@ -1159,26 +1153,26 @@ async function journey16ExportBundleAndOssInstructions(browser) {
     assert.ok(gitLog.includes("genesis"));
     assert.ok(fs.existsSync(path.join(cloneDir, "settings.toml")));
     assert.ok(fs.existsSync(path.join(cloneDir, "vault/default.age")));
+
+    await saveScreenshot(page, "28-export-and-oss-recovery");
+
+    // 3. Serve a different signed export under the same URL to exercise stale page metadata.
+    const nextHead = fixtures.paginationRevisions[0];
+    assert.notEqual(nextHead.signer, revHead.signer);
+    await page.route(`**/v1/workspaces/${fixtures.historyWorkspaceId}/export`, async (route) => {
+      const response = await route.fetch({ url: `${baseUrl}/v1/workspaces/${fixtures.paginationWorkspaceId}/export` });
+      await route.fulfill({ response });
+    });
+    const [nextDownload] = await Promise.all([
+      page.waitForEvent("download"),
+      exportSection.getByRole("button", { name: /Download Git bundle/i }).click(),
+    ]);
+    await exportSection.getByText(nextHead.signer, { exact: true }).waitFor({ timeout: 3000 });
+    await verifyExportRecovery(exportSection, nextDownload, nextHead, tmpDir);
+    assert.equal(await exportSection.getByText(revHead.signer, { exact: true }).count(), 0);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
-
-  await saveScreenshot(page, "28-export-and-oss-recovery");
-
-  // 3. Serve a different signed export under the same URL to exercise stale page metadata.
-  const nextHead = fixtures.paginationRevisions[0];
-  assert.notEqual(nextHead.signer, revHead.signer);
-  await page.route(`**/v1/workspaces/${fixtures.historyWorkspaceId}/export`, async (route) => {
-    const response = await route.fetch({ url: `${baseUrl}/v1/workspaces/${fixtures.paginationWorkspaceId}/export` });
-    await route.fulfill({ response });
-  });
-  const [nextDownload] = await Promise.all([
-    page.waitForEvent("download"),
-    exportSection.getByRole("button", { name: /Download Git bundle/i }).click(),
-  ]);
-  await exportSection.getByText(nextHead.signer, { exact: true }).waitFor({ timeout: 3000 });
-  await verifyExportRecovery(exportSection, nextDownload, nextHead);
-  assert.equal(await exportSection.getByText(revHead.signer, { exact: true }).count(), 0);
 
   // 4. Member role can also export full bundle
   const memberCtx = await browser.newContext({ viewport: { width: 1280, height: 800 }, acceptDownloads: true });
