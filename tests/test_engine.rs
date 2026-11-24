@@ -663,6 +663,146 @@ fn approved_dotfile_applies_and_does_not_reprompt_until_content_changes() {
     );
 }
 
+fn dotfile_manifest(env: &MusterEnv, files: &str) {
+    let config = env.config_dir();
+    std::fs::create_dir_all(config.join("files")).unwrap();
+    std::fs::write(
+        config.join("muster.toml"),
+        format!("version = 1\n[agents]\nenabled = []\n{files}"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn dotfile_source_errors_keep_the_installed_file_and_its_approval() {
+    let env = MusterEnv::new();
+    let declaration = "[files.\".managed\"]\nsource = 'files/payload'\n";
+    dotfile_manifest(&env, declaration);
+    let source = env.config_dir().join("files/payload");
+    let target = env.path().join(".managed");
+    std::fs::write(&source, "approved\n").unwrap();
+    env.run(&["sync", "--yes"]).assert().success();
+
+    std::fs::remove_file(&source).unwrap();
+    let (out, sync) = all_json(&env, &["sync"]);
+    assert!(out.status.success(), "{}", stdout_of(&out));
+    assert_eq!(sync.diagnostics()[0]["code"], "dotfile_source_missing");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "approved\n");
+
+    std::fs::write(&target, "local edit\n").unwrap();
+    dotfile_manifest(&env, "[files.\".managed\"]\nsource = '../payload'\n");
+    let (out, sync) = all_json(&env, &["sync"]);
+    assert!(out.status.success(), "{}", stdout_of(&out));
+    assert_eq!(sync.diagnostics()[0]["code"], "dotfile_source_invalid");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "local edit\n");
+
+    dotfile_manifest(&env, declaration);
+    std::fs::write(&source, [0xff]).unwrap();
+    let (out, sync) = all_json(&env, &["sync"]);
+    assert!(out.status.success(), "{}", stdout_of(&out));
+    assert_eq!(sync.diagnostics()[0]["code"], "dotfile_source_invalid");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "local edit\n");
+
+    std::fs::write(&source, "approved\n").unwrap();
+    env.run(&["sync"]).assert().success();
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "approved\n");
+
+    std::fs::remove_file(&source).unwrap();
+    dotfile_manifest(&env, "");
+    env.run(&["sync"]).assert().success();
+    assert!(!target.exists());
+}
+
+#[cfg(unix)]
+fn mode(path: &std::path::Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+}
+
+#[cfg(unix)]
+#[test]
+fn dotfile_mode_changes_are_planned_and_new_execute_requires_approval() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let env = MusterEnv::new();
+    let declarations = |private, executable| {
+        format!(
+            "[files.\".settings\"]\nsource = 'files/settings'\nprivate = {private}\n\
+             [files.\".tool\"]\nsource = 'files/tool'\nexecutable = {executable}\n"
+        )
+    };
+    dotfile_manifest(&env, &declarations(false, false));
+    std::fs::write(env.config_dir().join("files/settings"), "setting=true\n").unwrap();
+    std::fs::write(env.config_dir().join("files/tool"), "#!/bin/sh\nexit 0\n").unwrap();
+    env.run(&["sync", "--yes"]).assert().success();
+    let settings = env.path().join(".settings");
+    let tool = env.path().join(".tool");
+    std::fs::set_permissions(&settings, std::fs::Permissions::from_mode(0o444)).unwrap();
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+    dotfile_manifest(&env, &declarations(true, true));
+    let (out, plan) = all_json(&env, &["plan"]);
+    assert!(out.status.success(), "{}", stdout_of(&out));
+    let files = plan.result()["files"].as_array().unwrap();
+    assert_eq!(files.len(), 2);
+    for file in files {
+        assert_eq!(file["action"], "modify", "{file}");
+        assert_eq!(file["diff"], "");
+    }
+    env.run(&["sync"]).assert().code(2);
+    assert_eq!(mode(&settings), 0o444);
+    assert_eq!(mode(&tool), 0o640);
+
+    env.run(&["sync", "--yes"]).assert().success();
+    assert_eq!(mode(&settings), 0o400);
+    assert_eq!(mode(&tool), 0o751);
+    let (out, sync) = all_json(&env, &["sync"]);
+    assert!(out.status.success(), "{}", stdout_of(&out));
+    assert_eq!(sync.result()["applied"], false);
+
+    dotfile_manifest(&env, &declarations(false, false));
+    env.run(&["sync"]).assert().success();
+    assert_eq!(mode(&settings), 0o400);
+    assert_eq!(mode(&tool), 0o751);
+}
+
+#[cfg(unix)]
+#[test]
+fn dotfile_execute_drift_uses_previous_approval_and_the_symlink_target_mode() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let env = MusterEnv::new();
+    let body = "#!/bin/sh\nexit 0\n";
+    dotfile_manifest(
+        &env,
+        "[files.\".tool\"]\nsource = 'files/tool'\nexecutable = true\n",
+    );
+    let source = env.config_dir().join("files/tool");
+    std::fs::write(&source, body).unwrap();
+    env.run(&["sync", "--yes"]).assert().success();
+    let tool = env.path().join(".tool");
+    let shared = env.path().join("shared-tool");
+    std::fs::rename(&tool, &shared).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o711)).unwrap();
+    symlink(&shared, &tool).unwrap();
+    let (out, sync) = all_json(&env, &["sync"]);
+    assert!(out.status.success(), "{}", stdout_of(&out));
+    assert_eq!(sync.result()["applied"], false);
+    assert!(tool.is_symlink());
+
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::remove_file(&source).unwrap();
+    env.run(&["sync"]).assert().success();
+    assert!(tool.is_symlink());
+    std::fs::write(&source, body).unwrap();
+
+    env.run(&["sync"]).assert().success();
+    assert!(!tool.is_symlink());
+    assert_eq!(mode(&tool), 0o711);
+    assert_eq!(mode(&shared), 0o600);
+    assert_eq!(std::fs::read_to_string(&shared).unwrap(), body);
+}
+
 // ---------------------------------------------------------------------------
 // 7. Escaped serializations of a secret never reach plans or diffs
 // ---------------------------------------------------------------------------
