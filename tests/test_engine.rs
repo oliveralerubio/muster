@@ -790,7 +790,7 @@ fn dotfile_execute_drift_uses_previous_approval_and_the_symlink_target_mode() {
     assert_eq!(sync.result()["applied"], false);
     assert!(tool.is_symlink());
 
-    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1600)).unwrap();
     std::fs::remove_file(&source).unwrap();
     env.run(&["sync"]).assert().success();
     assert!(tool.is_symlink());
@@ -799,8 +799,33 @@ fn dotfile_execute_drift_uses_previous_approval_and_the_symlink_target_mode() {
     env.run(&["sync"]).assert().success();
     assert!(!tool.is_symlink());
     assert_eq!(mode(&tool), 0o711);
-    assert_eq!(mode(&shared), 0o600);
+    assert_eq!(mode(&shared), 0o1600);
     assert_eq!(std::fs::read_to_string(&shared).unwrap(), body);
+}
+
+#[cfg(unix)]
+#[test]
+fn dotfile_content_update_uses_new_file_permissions_when_replacing_a_symlink() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let env = MusterEnv::new();
+    dotfile_manifest(
+        &env,
+        "[files.\".managed\"]\nsource = 'files/payload'\n\
+         [files.\".new\"]\nsource = 'files/payload'\n",
+    );
+    std::fs::write(env.config_dir().join("files/payload"), "new content\n").unwrap();
+    let shared = env.path().join("shared");
+    let managed = env.path().join(".managed");
+    std::fs::write(&shared, "old content\n").unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1666)).unwrap();
+    symlink(&shared, &managed).unwrap();
+
+    env.run(&["sync", "--yes"]).assert().success();
+    assert!(!managed.is_symlink());
+    assert_eq!(mode(&managed), mode(&env.path().join(".new")));
+    assert_eq!(mode(&shared), 0o1666);
+    assert_eq!(std::fs::read_to_string(&shared).unwrap(), "old content\n");
 }
 
 // ---------------------------------------------------------------------------

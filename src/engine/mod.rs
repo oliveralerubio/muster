@@ -1297,6 +1297,7 @@ pub fn apply(ctx: &mut Context, mut plan: Plan) -> Result<Value, MusterError> {
                     entry
                         .dotfile_mode
                         .as_ref()
+                        .filter(|mode| mode.changed && entry.before == entry.after)
                         .map(|mode| mode.permissions.clone()),
                 ),
                 None => {
@@ -2360,6 +2361,14 @@ fn write_file_with_permissions(
             }
         });
         if let Some(permissions) = permissions {
+            #[cfg(unix)]
+            let permissions = if symlink_target.is_some() {
+                use std::os::unix::fs::PermissionsExt;
+                // A new file cannot inherit special bits from the link target.
+                std::fs::Permissions::from_mode(permissions.mode() & 0o777)
+            } else {
+                permissions
+            };
             std::fs::set_permissions(&tmp, permissions).map_err(|e| io_error(&tmp, e))?;
         }
     }
