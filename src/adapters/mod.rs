@@ -497,9 +497,7 @@ pub fn detect_calling_agent_signals(
     if let Some(value) = get("AI_AGENT") {
         let lower = value.trim().to_ascii_lowercase();
         let token = lower.split('_').next().unwrap_or("");
-        if lower.starts_with("opencode") {
-            add("opencode", "AI_AGENT");
-        } else if let Some(id) = resolve_agent_id(token) {
+        if let Some(id) = resolve_agent_id(token) {
             add(id, "AI_AGENT");
         }
     }
@@ -1014,6 +1012,7 @@ mod agent_id_tests {
         assert!(detect(&[("CODEX_COMPANION_FOO", "x")]).is_empty());
         assert!(detect(&[("CLAUDECODE", "0")]).is_empty());
         assert!(detect(&[("AI_AGENT", "mystery_1")]).is_empty());
+        assert!(detect(&[("AI_AGENT", "opencode-helper")]).is_empty());
         assert!(detect(&[]).is_empty());
     }
 

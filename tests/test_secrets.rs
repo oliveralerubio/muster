@@ -1577,7 +1577,106 @@ fn secret_get_without_agent_or_signals_lists_known_ids() {
         "{msg}"
     );
     assert!(
-        msg.contains("rerun: muster secret get native://app/guarded --agent <id>"),
+        msg.contains("rerun the same command with --agent <id>, e.g. muster secret get native://app/guarded --agent <id> --reveal --yes"),
         "{msg}"
     );
+}
+
+#[test]
+fn secret_get_ambiguous_suggests_the_allowed_candidate() {
+    let env = initialized();
+    let added = env
+        .run(&[
+            "--format",
+            "json",
+            "secret",
+            "add",
+            "app/guarded",
+            "--value-stdin",
+            "--allow",
+            "codex",
+        ])
+        .write_stdin("guarded-secret-value-12345")
+        .output()
+        .unwrap();
+    assert!(added.status.success());
+    let (out, raw) = get_guarded(
+        &env,
+        &[],
+        &[("CLAUDECODE", "1"), ("CODEX_THREAD_ID", "thread")],
+    );
+    assert_eq!(out.status.code(), Some(5));
+    let msg = message_of(&raw, "secret_policy_requires_agent");
+    assert!(msg.contains("--agent codex"), "{msg}");
+    assert!(!msg.contains("--agent claude"), "{msg}");
+}
+
+fn run_guarded(
+    env: &support::MusterEnv,
+    extra: &[&str],
+    vars: &[(&str, &str)],
+) -> (std::process::Output, serde_json::Value) {
+    let mut args = vec!["--format", "json", "secret", "run"];
+    args.extend_from_slice(extra);
+    args.extend_from_slice(&[
+        "--env",
+        "API_KEY=native://app/guarded",
+        "--yes",
+        "--",
+        "true",
+    ]);
+    let mut cmd = env.run(&args);
+    for (k, v) in vars {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().unwrap();
+    let raw = serde_json::from_slice(&out.stdout).unwrap();
+    (out, raw)
+}
+
+#[test]
+fn secret_run_rejects_unknown_agent_ids() {
+    let env = initialized();
+    add_guarded(&env);
+    let (out, raw) = run_guarded(&env, &["--agent", "nope"], &[]);
+    assert_eq!(out.status.code(), Some(2), "{raw}");
+    assert!(
+        codes(&raw).contains(&"unknown_agent_id".to_owned()),
+        "{raw}"
+    );
+}
+
+#[test]
+fn secret_run_accepts_product_name_alias() {
+    let env = initialized();
+    add_guarded(&env);
+    let (out, raw) = run_guarded(&env, &["--agent", "claude-code"], &[]);
+    assert!(out.status.success(), "{raw}");
+}
+
+#[test]
+fn secret_run_infers_the_single_detected_agent() {
+    let env = initialized();
+    add_guarded(&env);
+    let (out, raw) = run_guarded(&env, &[], &[("CLAUDECODE", "1")]);
+    assert!(out.status.success(), "{raw}");
+    assert!(
+        codes(&raw).contains(&"secret_agent_inferred".to_owned()),
+        "{raw}"
+    );
+}
+
+#[test]
+fn secret_run_ambiguous_refuses_with_agent_hint() {
+    let env = initialized();
+    add_guarded(&env);
+    let (out, raw) = run_guarded(
+        &env,
+        &[],
+        &[("CLAUDECODE", "1"), ("CODEX_THREAD_ID", "thread")],
+    );
+    assert_eq!(out.status.code(), Some(5), "{raw}");
+    let msg = message_of(&raw, "secret_policy_requires_agent");
+    assert!(msg.contains("--agent"), "{msg}");
+    assert!(!codes(&raw).contains(&"secret_agent_inferred".to_owned()));
 }

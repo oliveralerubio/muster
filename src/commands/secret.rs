@@ -867,11 +867,24 @@ fn rm(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     Ok(json!({ "removed": format!("{group}/{name}") }))
 }
 
+/// Quote `value` for a POSIX shell only when it has characters outside the safe set.
+fn shell_quote(value: &str) -> String {
+    let safe = !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_./:@%+=-".contains(c));
+    if safe {
+        value.to_owned()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
 fn authorize_secret_use(
     ctx: &mut Context,
     reference: &SecretRef,
     actor: Option<&str>,
-    rerun: &str,
+    example: Option<&str>,
 ) -> Result<Option<crate::secret_leases::Store>, MusterError> {
     // A secret with an allow list or per-use approval is never used or revealed
     // by an unnamed caller: `--yes` alone does not satisfy a policy.
@@ -908,6 +921,11 @@ fn authorize_secret_use(
         if restricted {
             let candidates: Vec<&str> =
                 crate::adapters::detect_calling_agents(|k| std::env::var(k).ok());
+            let allowed: Vec<&str> = candidates
+                .iter()
+                .copied()
+                .filter(|c| policy.is_some_and(|p| p.allows(c, None)))
+                .collect();
             let (which, id) = if candidates.is_empty() {
                 (
                     format!("known ids: {}", crate::adapters::known_agent_ids()),
@@ -916,15 +934,25 @@ fn authorize_secret_use(
             } else {
                 (
                     format!("detected: {}", candidates.join(", ")),
-                    candidates[0].to_owned(),
+                    if allowed.len() == 1 {
+                        allowed[0].to_owned()
+                    } else {
+                        "<id>".to_owned()
+                    },
                 )
+            };
+            let rerun = match example {
+                Some(template) => format!(
+                    "rerun the same command with --agent {id}, e.g. {}",
+                    template.replace("<id>", &id)
+                ),
+                None => format!("rerun the same command with --agent {id}"),
             };
             ctx.diag(Diagnostic::error(
                 "secret_policy_requires_agent",
                 format!(
                     "{reference} has an access policy; pass --agent <id> so the policy (and any \
-                     approval lease) can be enforced ({which}); rerun: {}",
-                    rerun.replace("<id>", &id)
+                     approval lease) can be enforced ({which}); {rerun}"
                 ),
             ));
             return Err(MusterError::Security(
@@ -988,8 +1016,11 @@ fn get(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let actor = declared_actor(ctx, params, &[&reference])?;
     // Check current policy before resolving any value, including MCP calls.
     let _lease_guard = if reveal {
-        let rerun = format!("muster secret get {reference} --agent <id> --reveal --yes");
-        authorize_secret_use(ctx, &reference, actor.as_deref(), &rerun)?
+        let example = format!(
+            "muster secret get {} --agent <id> --reveal --yes",
+            shell_quote(reference.as_str())
+        );
+        authorize_secret_use(ctx, &reference, actor.as_deref(), Some(&example))?
     } else {
         None
     };
@@ -1125,11 +1156,10 @@ fn run_with_secrets(ctx: &mut Context, params: &Params) -> Result<Value, MusterE
 
     let all_refs: Vec<&SecretRef> = unique_refs.iter().collect();
     let actor = declared_actor(ctx, params, &all_refs)?;
-    let rerun = "muster secret run --agent <id> --env VAR=<reference> --yes -- <command>";
 
     let mut lease_guards = Vec::new();
     for reference in &unique_refs {
-        if let Some(guard) = authorize_secret_use(ctx, reference, actor.as_deref(), rerun)? {
+        if let Some(guard) = authorize_secret_use(ctx, reference, actor.as_deref(), None)? {
             lease_guards.push(guard);
         }
     }
@@ -2449,4 +2479,19 @@ fn revoke_lease(ctx: &mut Context, params: &Params) -> Result<Value, MusterError
         store.save()?;
     }
     Ok(json!({"revoked": selected.len()}))
+}
+
+#[cfg(test)]
+mod shell_quote_tests {
+    use super::shell_quote;
+
+    #[test]
+    fn quotes_only_when_needed() {
+        assert_eq!(shell_quote("native://app/x-1.2"), "native://app/x-1.2");
+        assert_eq!(
+            shell_quote("op://Team Vault/Item/password"),
+            "'op://Team Vault/Item/password'"
+        );
+        assert_eq!(shell_quote("a'b c"), "'a'\\''b c'");
+    }
 }
