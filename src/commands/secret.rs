@@ -880,11 +880,24 @@ fn shell_quote(value: &str) -> String {
     }
 }
 
+/// The "rerun with --agent" hint. The example is built by formatting the chosen
+/// id directly, so a reference that contains `<id>` is never rewritten.
+fn rerun_hint(id: &str, example: Option<&dyn Fn(&str) -> String>) -> String {
+    match example {
+        Some(build) => format!(
+            "rerun the same command with --agent {id}, e.g. {}",
+            build(id)
+        ),
+        None => format!("rerun the same command with --agent {id}"),
+    }
+}
+
 fn authorize_secret_use(
     ctx: &mut Context,
     reference: &SecretRef,
     actor: Option<&str>,
-    example: Option<&str>,
+    scope: &[&SecretRef],
+    example: Option<&dyn Fn(&str) -> String>,
 ) -> Result<Option<crate::secret_leases::Store>, MusterError> {
     // A secret with an allow list or per-use approval is never used or revealed
     // by an unnamed caller: `--yes` alone does not satisfy a policy.
@@ -921,33 +934,40 @@ fn authorize_secret_use(
         if restricted {
             let candidates: Vec<&str> =
                 crate::adapters::detect_calling_agents(|k| std::env::var(k).ok());
+            // The suggestion must satisfy every restricted reference in the call.
+            let restricted_policies: Vec<&crate::manifest::SecretPolicy> = manifest
+                .as_ref()
+                .map(|m| {
+                    scope
+                        .iter()
+                        .filter_map(|r| m.secrets.get(r.as_str()))
+                        .filter(|p| {
+                            !p.allow_list().is_empty() || p.approval == SecretApproval::Each
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             let allowed: Vec<&str> = candidates
                 .iter()
                 .copied()
-                .filter(|c| policy.is_some_and(|p| p.allows(c, None)))
+                .filter(|c| restricted_policies.iter().all(|p| p.allows(c, None)))
                 .collect();
             let (which, id) = if candidates.is_empty() {
                 (
                     format!("known ids: {}", crate::adapters::known_agent_ids()),
-                    "<id>".to_owned(),
+                    "<id>",
                 )
             } else {
                 (
                     format!("detected: {}", candidates.join(", ")),
                     if allowed.len() == 1 {
-                        allowed[0].to_owned()
+                        allowed[0]
                     } else {
-                        "<id>".to_owned()
+                        "<id>"
                     },
                 )
             };
-            let rerun = match example {
-                Some(template) => format!(
-                    "rerun the same command with --agent {id}, e.g. {}",
-                    template.replace("<id>", &id)
-                ),
-                None => format!("rerun the same command with --agent {id}"),
-            };
+            let rerun = rerun_hint(id, example);
             ctx.diag(Diagnostic::error(
                 "secret_policy_requires_agent",
                 format!(
@@ -1016,11 +1036,19 @@ fn get(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let actor = declared_actor(ctx, params, &[&reference])?;
     // Check current policy before resolving any value, including MCP calls.
     let _lease_guard = if reveal {
-        let example = format!(
-            "muster secret get {} --agent <id> --reveal --yes",
-            shell_quote(reference.as_str())
-        );
-        authorize_secret_use(ctx, &reference, actor.as_deref(), Some(&example))?
+        let example = |id: &str| {
+            format!(
+                "muster secret get {} --agent {id} --reveal --yes",
+                shell_quote(reference.as_str())
+            )
+        };
+        authorize_secret_use(
+            ctx,
+            &reference,
+            actor.as_deref(),
+            &[&reference],
+            Some(&example),
+        )?
     } else {
         None
     };
@@ -1159,7 +1187,9 @@ fn run_with_secrets(ctx: &mut Context, params: &Params) -> Result<Value, MusterE
 
     let mut lease_guards = Vec::new();
     for reference in &unique_refs {
-        if let Some(guard) = authorize_secret_use(ctx, reference, actor.as_deref(), None)? {
+        if let Some(guard) =
+            authorize_secret_use(ctx, reference, actor.as_deref(), &all_refs, None)?
+        {
             lease_guards.push(guard);
         }
     }
@@ -2493,5 +2523,23 @@ mod shell_quote_tests {
             "'op://Team Vault/Item/password'"
         );
         assert_eq!(shell_quote("a'b c"), "'a'\\''b c'");
+    }
+}
+
+#[cfg(test)]
+mod rerun_hint_tests {
+    use super::rerun_hint;
+
+    #[test]
+    fn keeps_a_reference_that_contains_the_placeholder() {
+        let reference = "op://Team Vault/Item/<id>";
+        let build =
+            |id: &str| format!("muster secret get '{reference}' --agent {id} --reveal --yes");
+        let hint = rerun_hint("codex", Some(&build));
+        assert_eq!(
+            hint,
+            "rerun the same command with --agent codex, e.g. muster secret get \
+             'op://Team Vault/Item/<id>' --agent codex --reveal --yes"
+        );
     }
 }

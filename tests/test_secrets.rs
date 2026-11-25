@@ -1677,6 +1677,70 @@ fn secret_run_ambiguous_refuses_with_agent_hint() {
     );
     assert_eq!(out.status.code(), Some(5), "{raw}");
     let msg = message_of(&raw, "secret_policy_requires_agent");
-    assert!(msg.contains("--agent"), "{msg}");
+    assert!(
+        msg.contains("rerun the same command with --agent claude"),
+        "{msg}"
+    );
     assert!(!codes(&raw).contains(&"secret_agent_inferred".to_owned()));
+}
+
+fn add_allowing(env: &support::MusterEnv, name: &str, allow: &[&str]) {
+    let mut args = vec!["--format", "json", "secret", "add", name, "--value-stdin"];
+    for a in allow {
+        args.extend_from_slice(&["--allow", a]);
+    }
+    let added = env
+        .run(&args)
+        .write_stdin("guarded-secret-value-12345")
+        .output()
+        .unwrap();
+    assert!(added.status.success());
+}
+
+fn run_two_ambiguous(env: &support::MusterEnv) -> String {
+    let out = env
+        .run(&[
+            "--format",
+            "json",
+            "secret",
+            "run",
+            "--env",
+            "A=native://app/first",
+            "--env",
+            "B=native://app/second",
+            "--yes",
+            "--",
+            "true",
+        ])
+        .env("CLAUDECODE", "1")
+        .env("CODEX_THREAD_ID", "thread")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(5));
+    let raw = serde_json::from_slice(&out.stdout).unwrap();
+    message_of(&raw, "secret_policy_requires_agent")
+}
+
+#[test]
+fn secret_run_hint_suggests_the_agent_every_secret_allows() {
+    let env = initialized();
+    add_allowing(&env, "app/first", &["claude", "codex"]);
+    add_allowing(&env, "app/second", &["codex"]);
+    let msg = run_two_ambiguous(&env);
+    assert!(
+        msg.contains("rerun the same command with --agent codex"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn secret_run_hint_uses_placeholder_when_no_agent_fits_every_secret() {
+    let env = initialized();
+    add_allowing(&env, "app/first", &["codex"]);
+    add_allowing(&env, "app/second", &["claude"]);
+    let msg = run_two_ambiguous(&env);
+    assert!(
+        msg.contains("rerun the same command with --agent <id>"),
+        "{msg}"
+    );
 }
