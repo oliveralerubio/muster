@@ -78,6 +78,18 @@ impl MusterEnv {
                 cmd.env_remove(&k);
             }
         }
+        // The suite may itself run inside an agent: never inherit its identity.
+        for k in [
+            "CLAUDECODE",
+            "CLAUDE_CODE_ENTRYPOINT",
+            "AI_AGENT",
+            "CODEX_THREAD_ID",
+            "OPENCODE_SESSION_ID",
+            "ANTIGRAVITY_AGENT",
+            "PI_CODING_AGENT",
+        ] {
+            cmd.env_remove(k);
+        }
         cmd
     }
 

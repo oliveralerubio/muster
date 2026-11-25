@@ -171,9 +171,13 @@ pub fn authorize(
         .get(reference)
         .filter(|p| p.allows(agent, None))
     else {
+        let allowed = manifest
+            .secrets
+            .get(reference)
+            .map_or_else(|| "none".to_owned(), |p| p.allowed_text());
         ctx.diag(Diagnostic::error(
             "secret_not_allowed_for_agent",
-            format!("{reference} is not allowed for {agent}"),
+            format!("{reference} is not allowed for {agent}; allowed: {allowed}"),
         ));
         return Err(MusterError::Security("secret not allowed for agent".into()));
     };

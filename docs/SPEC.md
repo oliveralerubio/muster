@@ -226,7 +226,7 @@ SSO/SAML, SCIM y contratos enterprise quedan para una ampliación posterior.
   sustitución atómica y bloqueo entre procesos. Guarda referencias, agentes y
   fechas Unix en segundos, nunca valores; elimina aprobaciones caducadas al leer.
   Solicitar, aprobar, revelar, denegar y revocar dejan auditoría local con actor.
-  Sin `--agent`, la CLI humana conserva su confirmación habitual.
+  Sin `--agent`, la CLI humana conserva su confirmación habitual. `--agent` acepta ids de adaptador (o alias como `claude-code`); un id desconocido da `unknown_agent_id` (uso, exit 2) y uno no permitido da `secret_not_allowed_for_agent` con la lista `allowed:`; sin `--agent` y con política, se infiere del entorno solo si hay un único agente detectado.
   El agente declarado por CLI o MCP es autodeclarado: evita entregas por error
   y permite trazabilidad, pero no protege frente a procesos maliciosos del
   mismo usuario, que pueden leer la bóveda, modificar estado o disponer de TTY.

@@ -224,6 +224,21 @@ approvals, and `secret revoke <id>` or `secret revoke --all` removes them.
 Approve, deny, and revoke are never MCP tools. Human CLI reveals without an
 agent retain ordinary confirmation. Local state and audit contain no values.
 
+Agent ids for `--agent` are the Muster adapter ids: `claude`, `codex`,
+`opencode`, `antigravity`, `pi`, `hermes`. Use the id, not the product name,
+though aliases such as `claude-code`, `claudecode`, `codex-cli`, `agy` and
+`pi-coding-agent` are accepted and recorded under the canonical id. The exact
+call is `muster secret get native://<group>/<name> --agent claude --reveal --quiet --yes`;
+`--yes` is required without a terminal. When `--agent` is missing and the secret
+has a policy, Muster infers the agent from the environment (`CLAUDECODE`,
+`CODEX_THREAD_ID`, `OPENCODE_SESSION_ID`, `ANTIGRAVITY_AGENT`,
+`PI_CODING_AGENT`, `AI_AGENT`) only if exactly one is detected, and reports
+`secret_agent_inferred`. With none or several (nested agents),
+`secret_policy_requires_agent` lists the candidates (or the known ids) and the
+command to rerun. An unknown id is a usage error (exit 2, `unknown_agent_id`,
+listing the known ids). A valid id the policy excludes is exit 5,
+`secret_not_allowed_for_agent`, with `allowed: <entries>` in the message.
+
 CLI agent names and MCP client names are self-declared, not authenticated.
 These controls provide traceability and prevent accidental delivery, not
 isolation from malicious processes running as the same OS user. Leases allow

@@ -237,7 +237,7 @@ fn type_matches(kind: ParamKind, value: &Value) -> bool {
 /// Serve until stdin reaches EOF (exit 0). SIGINT is handled in `main` (130).
 pub fn serve(globals: Globals, pinned: Option<String>) -> i32 {
     let pinned_id = if let Some(ref a) = pinned {
-        match client_agent(a).or_else(|| crate::adapters::find(a).map(|ad| ad.id)) {
+        match client_agent(a).or_else(|| crate::adapters::resolve_agent_id(a)) {
             Some(id) => Some(id),
             None => {
                 let err = MusterError::Usage(format!("unknown agent `{a}` for --agent"));

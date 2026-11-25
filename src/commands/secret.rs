@@ -867,10 +867,37 @@ fn rm(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     Ok(json!({ "removed": format!("{group}/{name}") }))
 }
 
+/// Quote `value` for a POSIX shell only when it has characters outside the safe set.
+fn shell_quote(value: &str) -> String {
+    let safe = !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_./:@%+=-".contains(c));
+    if safe {
+        value.to_owned()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+/// The "rerun with --agent" hint. The example is built by formatting the chosen
+/// id directly, so a reference that contains `<id>` is never rewritten.
+fn rerun_hint(id: &str, example: Option<&dyn Fn(&str) -> String>) -> String {
+    match example {
+        Some(build) => format!(
+            "rerun the same command with --agent {id}, e.g. {}",
+            build(id)
+        ),
+        None => format!("rerun the same command with --agent {id}"),
+    }
+}
+
 fn authorize_secret_use(
     ctx: &mut Context,
     reference: &SecretRef,
     actor: Option<&str>,
+    scope: &[&SecretRef],
+    example: Option<&dyn Fn(&str) -> String>,
 ) -> Result<Option<crate::secret_leases::Store>, MusterError> {
     // A secret with an allow list or per-use approval is never used or revealed
     // by an unnamed caller: `--yes` alone does not satisfy a policy.
@@ -905,11 +932,47 @@ fn authorize_secret_use(
         let restricted = policy
             .is_some_and(|p| !p.allow_list().is_empty() || p.approval == SecretApproval::Each);
         if restricted {
+            let candidates: Vec<&str> =
+                crate::adapters::detect_calling_agents(|k| std::env::var(k).ok());
+            // The suggestion must satisfy every restricted reference in the call.
+            let restricted_policies: Vec<&crate::manifest::SecretPolicy> = manifest
+                .as_ref()
+                .map(|m| {
+                    scope
+                        .iter()
+                        .filter_map(|r| m.secrets.get(r.as_str()))
+                        .filter(|p| {
+                            !p.allow_list().is_empty() || p.approval == SecretApproval::Each
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let allowed: Vec<&str> = candidates
+                .iter()
+                .copied()
+                .filter(|c| restricted_policies.iter().all(|p| p.allows(c, None)))
+                .collect();
+            let (which, id) = if candidates.is_empty() {
+                (
+                    format!("known ids: {}", crate::adapters::known_agent_ids()),
+                    "<id>",
+                )
+            } else {
+                (
+                    format!("detected: {}", candidates.join(", ")),
+                    if allowed.len() == 1 {
+                        allowed[0]
+                    } else {
+                        "<id>"
+                    },
+                )
+            };
+            let rerun = rerun_hint(id, example);
             ctx.diag(Diagnostic::error(
                 "secret_policy_requires_agent",
                 format!(
-                    "{reference} has an access policy; reveal it with --agent <id> so the \
-                     policy (and any approval lease) can be enforced"
+                    "{reference} has an access policy; pass --agent <id> so the policy (and any \
+                     approval lease) can be enforced ({which}); {rerun}"
                 ),
             ));
             return Err(MusterError::Security(
@@ -924,16 +987,68 @@ fn authorize_secret_use(
     }
 }
 
+/// The declared agent for a secret command: `--agent` (alias-resolved, unknown
+/// ids refused), else the MCP actor, else the single agent the environment
+/// reveals, when the secret has a policy that needs one.
+fn declared_actor(
+    ctx: &mut Context,
+    params: &Params,
+    references: &[&SecretRef],
+) -> Result<Option<String>, MusterError> {
+    if let Some(raw) = params.get_string("agent") {
+        let id = crate::adapters::resolve_agent_id(raw)
+            .ok_or_else(|| MusterError::Usage(crate::adapters::unknown_agent_message(raw)))
+            .inspect_err(|e| {
+                ctx.diag(Diagnostic::error("unknown_agent_id", e.to_string()));
+            })?;
+        return Ok(Some(id.to_owned()));
+    }
+    if let Some(actor) = ctx.audit_actor.clone() {
+        return Ok(Some(actor));
+    }
+    let signals = crate::adapters::detect_calling_agent_signals(|k| std::env::var(k).ok());
+    let [(id, signal)] = signals.as_slice() else {
+        return Ok(None);
+    };
+    let Ok(manifest) = Manifest::load(&ctx.config_dir) else {
+        return Ok(None);
+    };
+    let governed = references.iter().any(|r| {
+        manifest
+            .secrets
+            .get(r.as_str())
+            .is_some_and(|p| !p.allow_list().is_empty() || p.approval == SecretApproval::Each)
+    });
+    if !governed {
+        return Ok(None);
+    }
+    ctx.diag(Diagnostic::new(
+        crate::output::Severity::Info,
+        "secret_agent_inferred",
+        format!("--agent not given; using `{id}` detected from {signal}"),
+    ));
+    Ok(Some((*id).to_owned()))
+}
+
 fn get(ctx: &mut Context, params: &Params) -> Result<Value, MusterError> {
     let reference = SecretRef::parse(required(params, "reference")?)?;
     let reveal = params.get_bool("reveal");
-    let actor = params
-        .get_string("agent")
-        .map(str::to_owned)
-        .or_else(|| ctx.audit_actor.clone());
+    let actor = declared_actor(ctx, params, &[&reference])?;
     // Check current policy before resolving any value, including MCP calls.
     let _lease_guard = if reveal {
-        authorize_secret_use(ctx, &reference, actor.as_deref())?
+        let example = |id: &str| {
+            format!(
+                "muster secret get {} --agent {id} --reveal --yes",
+                shell_quote(reference.as_str())
+            )
+        };
+        authorize_secret_use(
+            ctx,
+            &reference,
+            actor.as_deref(),
+            &[&reference],
+            Some(&example),
+        )?
     } else {
         None
     };
@@ -1067,14 +1182,14 @@ fn run_with_secrets(ctx: &mut Context, params: &Params) -> Result<Value, MusterE
         None => None,
     };
 
-    let actor = params
-        .get_string("agent")
-        .map(str::to_owned)
-        .or_else(|| ctx.audit_actor.clone());
+    let all_refs: Vec<&SecretRef> = unique_refs.iter().collect();
+    let actor = declared_actor(ctx, params, &all_refs)?;
 
     let mut lease_guards = Vec::new();
     for reference in &unique_refs {
-        if let Some(guard) = authorize_secret_use(ctx, reference, actor.as_deref())? {
+        if let Some(guard) =
+            authorize_secret_use(ctx, reference, actor.as_deref(), &all_refs, None)?
+        {
             lease_guards.push(guard);
         }
     }
@@ -2394,4 +2509,37 @@ fn revoke_lease(ctx: &mut Context, params: &Params) -> Result<Value, MusterError
         store.save()?;
     }
     Ok(json!({"revoked": selected.len()}))
+}
+
+#[cfg(test)]
+mod shell_quote_tests {
+    use super::shell_quote;
+
+    #[test]
+    fn quotes_only_when_needed() {
+        assert_eq!(shell_quote("native://app/x-1.2"), "native://app/x-1.2");
+        assert_eq!(
+            shell_quote("op://Team Vault/Item/password"),
+            "'op://Team Vault/Item/password'"
+        );
+        assert_eq!(shell_quote("a'b c"), "'a'\\''b c'");
+    }
+}
+
+#[cfg(test)]
+mod rerun_hint_tests {
+    use super::rerun_hint;
+
+    #[test]
+    fn keeps_a_reference_that_contains_the_placeholder() {
+        let reference = "op://Team Vault/Item/<id>";
+        let build =
+            |id: &str| format!("muster secret get '{reference}' --agent {id} --reveal --yes");
+        let hint = rerun_hint("codex", Some(&build));
+        assert_eq!(
+            hint,
+            "rerun the same command with --agent codex, e.g. muster secret get \
+             'op://Team Vault/Item/<id>' --agent codex --reveal --yes"
+        );
+    }
 }

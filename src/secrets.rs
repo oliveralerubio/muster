@@ -215,6 +215,14 @@ impl SecretAccess {
             .get(reference)
             .is_some_and(|p| p.allows(agent, self.project.as_deref()))
     }
+
+    /// The allow entries of `reference` for messages (`none` when empty).
+    pub fn allowed_list(&self, reference: &str) -> String {
+        self.policies.get(reference).map_or_else(
+            || "none".to_owned(),
+            crate::manifest::SecretPolicy::allowed_text,
+        )
+    }
 }
 
 /// Vault group and secret names: letters, digits, `_`, `-`, `.`; no leading dot.

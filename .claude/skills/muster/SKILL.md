@@ -22,6 +22,7 @@ Never ask the user to paste a secret in chat, and never print, log or echo secre
 - `muster secret run --agent <agent> [--env VAR=<ref>...] [--stdin <ref>] --yes -- <command> [args...]`: runs `<command>` with authorized secrets injected into child environment variables or stdin and scrubs raw/encoded secret occurrences from captured `stdout` and `stderr`.
 - `muster secret add <path> --value-stdin`: read the value from stdin in scripts, e.g. `printf %s "$VALUE" | muster secret add <path> --value-stdin`. Do not put the value in argv or shell history.
 - `muster secret get <ref> --reveal --yes` (e.g. `muster secret get native://app/api --reveal --yes`): prints the plaintext value for human terminal pipelines; agents should prefer `muster secret run` or `muster sync` so plaintext never enters model context.
+- Secrets with an `allow` policy need your muster agent id: `muster secret get native://<group>/<name> --agent claude --reveal --quiet --yes` (same `--agent` for `secret run`). Ids: `claude`, `codex`, `opencode`, `antigravity`, `pi`, `hermes`. It is the muster id, not the product name (aliases such as `claude-code` are accepted). `--yes` is required without a TTY. Without `--agent`, muster infers it from the environment when exactly one agent is detected; otherwise the error lists the candidates and the command to rerun. `unknown_agent_id` means the id is wrong (the message lists valid ids); `secret_not_allowed_for_agent` means the id is valid but the secret's `allowed:` list excludes it, so ask the user to allow it.
 
 ## Apply changes
 

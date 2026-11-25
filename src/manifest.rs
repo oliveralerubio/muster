@@ -309,6 +309,15 @@ impl SecretPolicy {
         self.allow.as_deref().unwrap_or(&[])
     }
 
+    /// The allow entries joined for messages, `none` when there are none.
+    pub fn allowed_text(&self) -> String {
+        if self.allow_list().is_empty() {
+            "none".to_owned()
+        } else {
+            self.allow_list().join(", ")
+        }
+    }
+
     /// Whether `agent` may receive the secret when rendering for `project`
     /// (`None` = user scope).
     pub fn allows(&self, agent: &str, project: Option<&str>) -> bool {
