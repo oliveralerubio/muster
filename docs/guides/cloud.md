@@ -139,6 +139,8 @@ vault ciphertext history.
 
 ## Rate limits
 
-When the service answers `429 rate_limited`, the CLI waits for the `Retry-After`
-interval it sends. Background sync of a normal fleet makes only a few signed
-requests per run.
+When the service answers `429 rate_limited`, the CLI retries once if the request
+is safe to repeat, after the `Retry-After` interval (up to 60 seconds; 1 second
+when none is sent). A longer `Retry-After`, or a second `429`, is reported at once
+with when to try again; a timer-driven sync simply tries on its next run.
+Background sync of a normal fleet makes only a few signed requests per run.
