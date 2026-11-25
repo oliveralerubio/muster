@@ -424,6 +424,96 @@ pub fn find(id: &str) -> Option<&'static Adapter> {
     ADAPTERS.iter().copied().find(|a| a.id == id)
 }
 
+/// Product names and spellings people use for an adapter id.
+const AGENT_ALIASES: &[(&str, &str)] = &[
+    ("claude-code", "claude"),
+    ("claudecode", "claude"),
+    ("claude_code", "claude"),
+    ("codex-cli", "codex"),
+    ("codexcli", "codex"),
+    ("open-code", "opencode"),
+    ("agy", "antigravity"),
+    ("pi-coding-agent", "pi"),
+    ("hermes-agent", "hermes"),
+];
+
+/// The one place an agent name becomes an adapter id: a known id or a
+/// product-name alias, case-insensitive and trimmed.
+pub fn resolve_agent_id(input: &str) -> Option<&'static str> {
+    let lower = input.trim().to_ascii_lowercase();
+    if let Some(adapter) = find(&lower) {
+        return Some(adapter.id);
+    }
+    AGENT_ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == lower)
+        .map(|(_, id)| *id)
+}
+
+/// Known adapter ids, comma separated, for messages.
+pub fn known_agent_ids() -> String {
+    ADAPTERS.iter().map(|a| a.id).collect::<Vec<_>>().join(", ")
+}
+
+/// The message for an unrecognised `--agent` value.
+pub fn unknown_agent_message(input: &str) -> String {
+    format!(
+        "unknown agent id \"{input}\"; known ids: {}",
+        known_agent_ids()
+    )
+}
+
+/// Agents the environment says are running this process, each with the
+/// variable that revealed it. Pure over `get` so it can be tested.
+pub fn detect_calling_agent_signals(
+    get: impl Fn(&str) -> Option<String>,
+) -> Vec<(&'static str, String)> {
+    let set = |name: &str| get(name).is_some_and(|v| !v.is_empty());
+    let mut found: Vec<(&'static str, String)> = Vec::new();
+    let mut add = |id: &'static str, signal: &str| {
+        if !found.iter().any(|(existing, _)| *existing == id) {
+            found.push((id, signal.to_owned()));
+        }
+    };
+    if get("CLAUDECODE").as_deref() == Some("1") {
+        add("claude", "CLAUDECODE");
+    }
+    if set("CLAUDE_CODE_ENTRYPOINT") {
+        add("claude", "CLAUDE_CODE_ENTRYPOINT");
+    }
+    // CODEX_COMPANION_* is set by the Codex plugin inside Claude Code: not a signal.
+    if set("CODEX_THREAD_ID") {
+        add("codex", "CODEX_THREAD_ID");
+    }
+    if set("OPENCODE_SESSION_ID") {
+        add("opencode", "OPENCODE_SESSION_ID");
+    }
+    if set("ANTIGRAVITY_AGENT") {
+        add("antigravity", "ANTIGRAVITY_AGENT");
+    }
+    if set("PI_CODING_AGENT") {
+        add("pi", "PI_CODING_AGENT");
+    }
+    if let Some(value) = get("AI_AGENT") {
+        let lower = value.trim().to_ascii_lowercase();
+        let token = lower.split('_').next().unwrap_or("");
+        if lower.starts_with("opencode") {
+            add("opencode", "AI_AGENT");
+        } else if let Some(id) = resolve_agent_id(token) {
+            add(id, "AI_AGENT");
+        }
+    }
+    found
+}
+
+/// Adapter ids of the agents detected in the process environment.
+pub fn detect_calling_agents(get: impl Fn(&str) -> Option<String>) -> Vec<&'static str> {
+    detect_calling_agent_signals(get)
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect()
+}
+
 /// Adapters applied when `[agents] enabled` is not set.
 pub fn default_enabled() -> Vec<&'static str> {
     ADAPTERS
@@ -526,9 +616,10 @@ fn resolve_mcp_map(
             (
                 "secret_not_allowed_for_agent",
                 format!(
-                    "{value} is not allowed for agent `{}` (add it to \
+                    "{value} is not allowed for agent `{}` (allowed: {}; add it to \
                      [secrets.\"{value}\"] allow in muster.toml)",
-                    adapter.id
+                    adapter.id,
+                    desired.access.allowed_list(value)
                 ),
             )
         } else if let Some(secret) = desired.secrets.get(value) {
@@ -859,5 +950,78 @@ mod tests {
     fn pascal_case_maps_hook_events() {
         assert_eq!(pascal_case("pre_tool_use"), "PreToolUse");
         assert_eq!(pascal_case("stop"), "Stop");
+    }
+}
+
+#[cfg(test)]
+mod agent_id_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn detect(vars: &[(&str, &str)]) -> Vec<&'static str> {
+        let map: HashMap<String, String> = vars
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        detect_calling_agents(|k| map.get(k).cloned())
+    }
+
+    #[test]
+    fn resolves_ids_and_aliases_case_insensitively() {
+        assert_eq!(resolve_agent_id("claude"), Some("claude"));
+        assert_eq!(resolve_agent_id("Claude-Code"), Some("claude"));
+        assert_eq!(resolve_agent_id("claudecode"), Some("claude"));
+        assert_eq!(resolve_agent_id("agy"), Some("antigravity"));
+        assert_eq!(resolve_agent_id("codex-cli"), Some("codex"));
+        assert_eq!(resolve_agent_id("pi-coding-agent"), Some("pi"));
+        assert_eq!(resolve_agent_id("nope"), None);
+        assert_eq!(resolve_agent_id("claude-code-x"), None);
+    }
+
+    #[test]
+    fn unknown_message_lists_known_ids() {
+        assert_eq!(
+            unknown_agent_message("claude-code-x"),
+            "unknown agent id \"claude-code-x\"; known ids: claude, codex, opencode, antigravity, pi, hermes"
+        );
+    }
+
+    #[test]
+    fn detects_single_agents() {
+        assert_eq!(detect(&[("CLAUDECODE", "1")]), ["claude"]);
+        assert_eq!(detect(&[("CLAUDE_CODE_ENTRYPOINT", "cli")]), ["claude"]);
+        assert_eq!(detect(&[("CODEX_THREAD_ID", "t")]), ["codex"]);
+        assert_eq!(detect(&[("OPENCODE_SESSION_ID", "s")]), ["opencode"]);
+        assert_eq!(detect(&[("AI_AGENT", "opencode")]), ["opencode"]);
+        assert_eq!(detect(&[("ANTIGRAVITY_AGENT", "1")]), ["antigravity"]);
+        assert_eq!(detect(&[("PI_CODING_AGENT", "true")]), ["pi"]);
+        assert_eq!(
+            detect(&[("AI_AGENT", "claude-code_2-1-332_agent")]),
+            ["claude"]
+        );
+    }
+
+    #[test]
+    fn deduplicates_and_ignores_noise() {
+        assert_eq!(
+            detect(&[
+                ("CLAUDECODE", "1"),
+                ("CLAUDE_CODE_ENTRYPOINT", "cli"),
+                ("AI_AGENT", "claude-code_1_agent"),
+            ]),
+            ["claude"]
+        );
+        assert!(detect(&[("CODEX_COMPANION_FOO", "x")]).is_empty());
+        assert!(detect(&[("CLAUDECODE", "0")]).is_empty());
+        assert!(detect(&[("AI_AGENT", "mystery_1")]).is_empty());
+        assert!(detect(&[]).is_empty());
+    }
+
+    #[test]
+    fn nested_agents_are_all_reported() {
+        assert_eq!(
+            detect(&[("CLAUDECODE", "1"), ("CODEX_THREAD_ID", "t")]),
+            ["claude", "codex"]
+        );
     }
 }
