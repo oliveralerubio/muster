@@ -3,8 +3,11 @@
 //!
 //! Only plain data lives here: route paths, header names, JSON DTOs, error
 //! codes and the canonical byte strings that devices sign. No I/O, no
-//! policy. The human-readable map is `API-CONTRACT.md` (kept next to the
-//! implementation plan); this module is the normative source for names.
+//! policy. This module is the normative source for names.
+//!
+//! The service lives in the private repo `oliveralerubio/muster-cloud`;
+//! changes to this file are made here first, then the private repo bumps its
+//! pinned rev.
 //!
 //! Conventions (all routes):
 //! - JSON bodies, UTF-8. Lists are JSON arrays; details are JSON objects.
@@ -13,9 +16,7 @@
 //! - Every response carries `X-Request-Id`; every error body is
 //!   [`ApiError`].
 //!
-//! Status of each route (implemented or contract-only) is tracked in
-//! `API-CONTRACT.md`; a DTO being defined here does not mean the route is
-//! served yet.
+//! A DTO being defined here does not mean the route is served yet.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

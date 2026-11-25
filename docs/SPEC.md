@@ -64,7 +64,7 @@ El transporte conserva la historia Git autenticada completa. Un cambio basado
 en una revisión antigua se conserva como propuesta para resolverlo sin perder
 datos. Restaurar crea una revisión nueva bajo el gobierno vigente. La salida
 al núcleo gratuito incluye una exportación verificable sin suscripción.
-[ADR 0006](adr/0006-cloud-service.md) registra estas decisiones.
+El código del servicio vive en un repositorio privado, fuera de este repositorio.
 
 La aceptación usa tres interfaces confirmadas: API HTTP pública, CLI instalada
 en dos máquinas y navegador. Los recorridos incluyen aislamiento, permisos,
@@ -169,7 +169,7 @@ SSO/SAML, SCIM y contratos enterprise quedan para una ampliación posterior.
 ## Implementation Decisions
 
 ### Producto y alcance
-- Producto open source con licencia **Apache-2.0**. El mismo núcleo sirve al modo individual y al modo equipo. Muster Cloud añade un servicio opcional sobre el mismo modelo de datos, según la ampliación de alcance y ADR 0006.
+- Producto open source con licencia **Apache-2.0**. El mismo núcleo sirve al modo individual y al modo equipo. Muster Cloud añade un servicio opcional sobre el mismo modelo de datos, según la ampliación de alcance.
 - **Dependencia externa obligatoria: solo Git.** chezmoi, Bitwarden (`bws`/`bw`), Tailscale y el model hub dejan de ser obligatorios.
 - **Agentes soportados de forma completa en v1: Claude Code, Codex, OpenCode, Antigravity CLI y Pi.** Hermes, como adaptador experimental.
 - **Plataformas:** Linux, WSL2 y macOS. Windows nativo no entra.

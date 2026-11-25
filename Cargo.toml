@@ -1,7 +1,4 @@
 [workspace]
-members = [".", "cloud"]
-# `cargo build`/`cargo test` at the root keep building only the OSS CLI.
-default-members = ["."]
 exclude = ["fuzz"]
 resolver = "2"
 
@@ -52,10 +49,3 @@ tempfile = "3.10"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
-
-# The test OIDC fixture generates an RSA key per test process; unoptimised
-# bignum arithmetic makes that take tens of seconds.
-[profile.dev.package.num-bigint-dig]
-opt-level = 3
-[profile.dev.package.rsa]
-opt-level = 3

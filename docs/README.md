@@ -4,7 +4,7 @@ Welcome to the Muster documentation directory. Below is the index of available d
 
 ## Guides
 
-- [Connect a machine to Muster Cloud](guides/cloud.md). Account login, linking, verified sync, the workspace console and local cleanup in the development service.
+- [Connect a machine to Muster Cloud](guides/cloud.md). Account login, linking, verified sync, export and local cleanup (CLI side only).
 - [Guía del Modo Equipo (Team Mode)](guides/team-mode.md) — Guía paso a paso para configurar repositorios compartidos, flujos de invitación, enrolamiento de máquinas, quórum de administradores, revocación y rotación de secretos.
 
 ## Security
@@ -13,7 +13,6 @@ Welcome to the Muster documentation directory. Below is the index of available d
 
 ## Research
 
-- [Muster Cloud: un SaaS de pago junto al núcleo abierto](research/paid-product.md). Segunda investigación: producto autoservicio, comparación personal y equipos, arquitectura propuesta y economía reproducible.
 
 ## Specifications & Concepts
 
@@ -31,4 +30,3 @@ Welcome to the Muster documentation directory. Below is the index of available d
 
 - [ADR 0001: Single Command Registry](adr/0001-single-command-registry.md)
 - [ADR 0002: Skills Vendoring and Lockfile](adr/0002-skills-vendoring-and-lockfile.md)
-- [ADR 0006: Optional Cloud transport with local fleet authority](adr/0006-cloud-service.md)

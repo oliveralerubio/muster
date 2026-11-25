@@ -1,9 +1,9 @@
 # Connect a machine to Muster Cloud
 
 Muster Cloud is an optional hosted transport. The free CLI, team mode and your
-own Git remote continue to work without a Cloud account. Cloud implementation
-is in progress; this guide describes workflows tested against the development
-service, not an available production deployment.
+own Git remote continue to work without a Cloud account. Muster Cloud is a
+separate hosted service; its source is not in this repository. This guide covers
+only what the CLI does.
 
 ## Sign in and select a workspace
 
@@ -65,76 +65,7 @@ The fleet's local signed enrollment rules, including team quorum, govern that
 permission. The complete Cloud enrollment and conflict-resolution CLI workflows
 are still being implemented.
 
-## Use the workspace console
-
-The browser console lists linked machines, members, invitations, accepted
-history and retained proposals. Diffs redact encrypted `.age` file contents.
-A restore request creates a proposal; it does not apply an old state on the
-server. An authorized client must review and sign a forward change under the
-current fleet rules.
-
-The console also shows the server's plan, limits and storage usage. Where billing
-is configured, owners and admins can open checkout or the customer portal,
-change a plan, and confirm cancellation. A checkout return URL never activates
-a subscription: only the server's verified provider state does. Pull and export
-remain available when payment blocks publication.
-
-After a plan change or cancellation, the console checks the billing state again
-for about a minute and shows the change once Paddle confirms it. If Paddle has
-not confirmed it by then, the console says so and stops checking; the change
-appears on the next refresh after Paddle confirms it. Choosing another plan
-before paying cancels the earlier checkout link, and a checkout link that Paddle
-reports canceled is never offered again: asking for that plan creates a new one.
-
-Once Paddle reports a checkout paid, no other checkout is offered for that
-workspace, on any plan, until its subscription is registered. The server
-registers it from Paddle itself, without waiting for Paddle's notification.
-When Paddle cannot report the status of an open checkout, its link is offered
-at most three times in a row; after that, checkout answers "not ready" until
-Paddle answers again. Billing actions on one workspace run one at a time; one
-that waits more than 10 seconds for its turn answers "not ready", so retry it
-shortly.
-
-Changing the configured prices (`MUSTER_PADDLE_PRICE_PERSONAL`,
-`MUSTER_PADDLE_PRICE_TEAM_SEAT`) never strands a payment already made. A
-subscription Paddle created from a checkout of the workspace keeps that
-checkout's plan (a team keeps the seat count Paddle bills), even when its
-price is no longer configured. The workspace gets the plan it paid for, and
-it is not offered a second checkout. Paddle's checkout transaction must show
-that it created the subscription and that the subscription's customer paid
-it. Once granted, the subscription keeps following Paddle: a cancellation or
-a seat change applies without that proof being repeated. If Paddle cannot
-return the checkout transaction, the payment stays pending and is retried;
-no second checkout is offered meanwhile. A subscription that cannot be
-traced to a checkout of the workspace, or that a customer other than the
-workspace's paid, grants nothing. The server never cancels or changes such a
-subscription at Paddle.
-
-The server checks its Paddle API key in the background, shortly after it
-starts and then every 10 minutes, by reading subscriptions and
-transactions; it creates nothing. Only an instance that is allowed to serve
-runs the check. A refusal counts only when Paddle itself sends it, and it is
-asked again three times in about 15 seconds. If Paddle keeps rejecting the
-key, or the key lacks `subscription.read` or `transaction.read`, the server
-keeps running: sync, sign-in and Paddle notifications are not affected. Only
-checkout, plan changes, cancellation and the customer portal answer "billing
-unconfigured", with a message that lists every missing permission (never the
-key), and the billing page shows billing as unavailable. Once Paddle accepts
-the key, billing comes back by itself at the next check. If Paddle cannot be
-reached, answers with a server error, or a refusal comes from something in
-front of Paddle, the server logs a warning and nothing changes. In
-development the check runs only against a local Paddle fixture
-(`MUSTER_PADDLE_BASE_URL`), never Paddle's own API.
-
-The workspace list shows the same plan status as the billing page. Limits
-follow the subscription's status: when a subscription is canceled or paused, the
-workspace returns to the base limits. Existing machines and stored data stay in
-place. New machines and pushes are measured against the base limits. A team
-plan accepts at most 1000 seats per checkout or plan change; larger requests are
-refused before anything is charged. Once a workspace deletion is requested,
-checkout, plan changes, cancellation and the customer portal are refused.
-
-Accepting an invitation requires the browser console. A CLI login can read
+Accepting an invitation requires the service's web console. A CLI login can read
 workspaces and link machines, but it cannot join a workspace.
 
 ## Inspect or remove local access
@@ -206,44 +137,8 @@ cat recovery.key | muster approve laptop --recovery-key-stdin
 Keep the exported bundle private — it contains the full configuration and
 vault ciphertext history.
 
-## Limits, retries and retention
+## Rate limits
 
-The service limits request rates in memory and answers `429 rate_limited` with
-a `Retry-After` header (seconds) when a budget is spent. Each budget refills
-continuously over one minute:
-
-| Budget | Default | Setting |
-|---|---|---|
-| Signed requests per machine | 60/min | `MUSTER_RATE_LIMIT_DEVICE_PER_MINUTE` |
-| Link codes (`POST /v1/device/authorize`) per client address | 10/min | `MUSTER_RATE_LIMIT_LINK_CODES_PER_MINUTE` |
-| Login polls (`POST /v1/device/token`) per client address | 60/min | `MUSTER_RATE_LIMIT_DEVICE_TOKEN_PER_MINUTE` |
-
-`0` disables a budget. Background sync of a normal fleet makes a few signed
-requests per run and stays far below the machine budget. The client address is
-the TCP peer. Behind a reverse proxy, list the proxy in `MUSTER_TRUSTED_PROXIES`
-(comma-separated addresses or CIDR networks, for example `127.0.0.1,10.0.0.0/8`):
-only then is `X-Forwarded-For` read, and its rightmost hop that is not a listed
-proxy is the client. Without it, every client behind the proxy shares one
-address budget. IPv6 clients share a budget per `/64`.
-
-A publication retried with the same `Idempotency-Key` and the same bytes gets
-the original outcome again: the accepted revision, or the same held or conflict
-proposal. The same key with other bytes is `422 idempotency_mismatch`. A
-machine the accepted governance does not authorize gets `403` and the service
-keeps nothing from its upload.
-
-When a proposal is closed (rejected, resolved or superseded), the service
-releases its retained upload automatically within about a minute: its bytes
-stop counting as storage use, a push refused with `507 quota_exceeded` fits
-again, and its bundle is no longer downloadable. Open proposals and the
-accepted history are never released.
-
-Bookkeeping is deleted automatically: replay nonces 15 minutes after use
-(longer than a signature stays valid), idempotency records after 30 days
-(longer than any client retries a request), and expired account tokens,
-sessions and logins.
-
-See [ADR 0006](../adr/0006-cloud-service.md) for the data and trust boundaries,
-and the [deployment guide](../../deploy/README.md) for service configuration and
-backup tools. Workspace deletion and automated backup retention remain under
-development.
+When the service answers `429 rate_limited`, the CLI waits for the `Retry-After`
+interval it sends. Background sync of a normal fleet makes only a few signed
+requests per run.
