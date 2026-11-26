@@ -830,11 +830,6 @@ input[type="checkbox"], input[type="radio"] {
 .table-wrap.fleet-table th:nth-child(2) { width: 18%; }
 .table-wrap.fleet-table th:nth-child(3) { width: 22%; }
 .table-wrap.fleet-table th:nth-child(4) { width: 28%; }
-.table-wrap.fleet-table.actions-end th:nth-child(1) { width: 30%; }
-.table-wrap.fleet-table.actions-end th:nth-child(2) { width: 14%; }
-.table-wrap.fleet-table.actions-end th:nth-child(3) { width: 18%; }
-.table-wrap.fleet-table.actions-end th:nth-child(4) { width: 24%; }
-.table-wrap.fleet-table.actions-end th:nth-child(5) { width: 14%; }
 
 .sync-time, .muted.data {
   font-family: var(--font-mono);
